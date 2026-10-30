@@ -17,7 +17,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install` and `sandbox` scripts |
-| `docs/` | Documentation, and ADRs in `docs/decisions/` |
+| `docs/` | Documentation: the specification in `docs/spec/`, ADRs in `docs/decisions/` |
 
 One row per top-level directory; deeper only where the tree alone would not tell an agent where a change belongs.
 
@@ -100,6 +100,7 @@ Every document except ADRs is listed here. Read one only when the task needs it.
 
 | Document | Covers |
 | --- | --- |
+| `docs/spec/` | The NaN OS specification, one chapter per mechanism; `00-charter.md` maps the chapters |
 | `docs/sandbox.md` | The sandbox: what an instance runs and how to observe it |
 
 ## ADR

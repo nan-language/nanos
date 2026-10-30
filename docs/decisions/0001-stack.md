@@ -1,6 +1,6 @@
 # 0001. Stack
 
-Status: accepted
+Status: superseded by 0003
 
 ## Context
 

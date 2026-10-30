@@ -20,6 +20,10 @@ tools/sandbox start
 
 builds NaN OS and boots it under QEMU, its serial console on the terminal, until Ctrl-C. [docs/sandbox.md](docs/sandbox.md) describes the sandbox.
 
+## Specification
+
+[docs/spec](docs/spec/00-charter.md) specifies NaN OS: the boot loader, the kernel and the default utilities.
+
 ## Commands
 
 Run from the repository root:
