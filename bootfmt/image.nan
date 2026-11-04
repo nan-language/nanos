@@ -1,0 +1,336 @@
+//! The kernel image: an ELF64 executable whose loadable segments lie at physical addresses, entered at its PVH entry.
+
+const ELF_IDENT: Slice[u8] = b"\x7fELF\x02\x01\x01"
+
+const ELF_EXECUTABLE: u16 = 2
+
+const ELF_X86_64: u16 = 62
+
+const HEADER_BYTES: u64 = 64
+
+const PROGRAM_HEADER_BYTES: u64 = 56
+
+const PT_LOAD: u32 = 1
+
+const PT_NOTE: u32 = 4
+
+const XEN_ELFNOTE_PHYS32_ENTRY: u32 = 18
+
+pub const PAGE_BYTES: u64 = 4_096
+
+/// A valid kernel image: its PVH entry, below 4 GiB, and its program header table.
+pub closed struct KernelImage derives Copy, Eq {
+    pub entry: u64
+    pub headers_at: u64
+    pub header_count: u16
+} KernelImage
+
+/// A loadable segment: the `file_bytes` bytes at `offset` in the image, then zeros, filling `memory_bytes` bytes from physical address `address`.
+pub closed struct Segment derives Copy, Eq {
+    pub offset: u64
+    pub address: u64
+    pub file_bytes: u64
+    pub memory_bytes: u64
+} Segment
+
+/// Why an image is no kernel image the loader can start.
+pub closed enum ImageError derives Copy, Eq, Render {
+    NotExecutable
+    ProgramHeaders
+    Segments
+    NoEntry
+} ImageError
+
+/// The image when it is an ELF64 executable for x86_64 whose loadable segments lie inside the file and are disjoint in memory, with a `XEN_ELFNOTE_PHYS32_ENTRY` note naming an entry inside one of them.
+pub validator fn KernelImage.read(image: Untrusted[Slice[u8]]) -> KernelImage fails ImageError {
+    let bytes = image.inspect()
+    let size = u64.widen(bytes.len())
+    let Some(ident) = bytes.prefix(ELF_IDENT.len()) else {
+        fail ImageError.NotExecutable
+    }
+    if size < HEADER_BYTES or ident != ELF_IDENT or bytes.u16_le(16) != ELF_EXECUTABLE or bytes.u16_le(18) != ELF_X86_64 or bytes.u32_le(20) != 1 {
+        fail ImageError.NotExecutable
+    }
+    let headers_at = bytes.u64_le(32)
+    let count = bytes.u16_le(56)
+    let Some(table) = (u64.widen(count) * PROGRAM_HEADER_BYTES).checked_add(headers_at) else {
+        fail ImageError.ProgramHeaders
+    }
+    if bytes.u16_le(54) != u16.fit(PROGRAM_HEADER_BYTES) or table > size {
+        fail ImageError.ProgramHeaders
+    }
+    var entry: Option[u64] = None
+    var loads: u16 = 0
+    for index in 0..<count {
+        let at = usize.widen(header_offset(headers_at, index))
+        if bytes.u32_le(at) == PT_NOTE {
+            let found = pvh_entry(bytes, offset: bytes.u64_le(at + 8), len: bytes.u64_le(at + 32))
+            if found.is_some() {
+                entry = found
+            }
+        }
+        let Some(segment) = load_at(bytes, at) else {
+            continue
+        }
+        if not segment.lies_in(size) or overlaps_earlier(bytes, headers_at, segment, index) {
+            fail ImageError.Segments
+        }
+        loads += 1
+    }
+    let Some(start) = entry else {
+        fail ImageError.NoEntry
+    }
+    if loads == 0 or not entry_loaded(bytes, headers_at, count, entry: start) {
+        fail ImageError.NoEntry
+    }
+    return KernelImage(entry: start, headers_at: headers_at, header_count: count)
+} KernelImage.read
+
+/// The loadable segment that program header `index` of a valid image describes, `None` for other program headers.
+pub validator fn KernelImage.segment(self, image: Untrusted[Slice[u8]], index: u16) -> Option[Segment] {
+    let bytes = image.inspect()
+    let at = header_offset(self.headers_at, index)
+    if index >= self.header_count or at + PROGRAM_HEADER_BYTES > u64.widen(bytes.len()) {
+        return None
+    }
+    return load_at(bytes, at: usize.widen(at))
+} KernelImage.segment
+
+/// Copies into `page`, the 4 KiB of memory from physical address `base`, the bytes of the image that this segment places there, leaving its other bytes as they are.
+pub validator fn Segment.copy_into(self, image: Untrusted[Slice[u8]], base: u64, mut page: Array[u8, 4_096]) {
+    let bytes = image.inspect()
+    let from = max(self.address, b: base)
+    let to = min(self.address + self.file_bytes, b: base + PAGE_BYTES)
+    if from >= to or self.offset + self.file_bytes > u64.widen(bytes.len()) {
+        return
+    }
+    for address in from..<to {
+        page[usize.widen(address - base)] = bytes[usize.widen(self.offset + address - self.address)]
+    }
+} Segment.copy_into
+
+/// The pages of the memory this segment fills, `None` when it fills none.
+pub fn Segment.pages(self) -> Option[PageRange] {
+    if self.memory_bytes == 0 {
+        return None
+    }
+    return Some(PageRange(start: self.address - self.address % PAGE_BYTES, last: (self.address + self.memory_bytes - 1) / PAGE_BYTES * PAGE_BYTES))
+} Segment.pages
+
+/// The pages from address `start` to address `last`, both included.
+pub closed struct PageRange derives Copy, Eq {
+    pub start: u64
+    pub last: u64
+} PageRange
+
+fn header_offset(headers_at: u64, index: u16) -> u64 {
+    return headers_at + u64.widen(index) * PROGRAM_HEADER_BYTES
+} header_offset
+
+fn Segment.lies_in(self, size: u64) -> bool {
+    let Some(end) = self.offset.checked_add(self.file_bytes) else {
+        return false
+    }
+    return end <= size and self.file_bytes <= self.memory_bytes and self.address.checked_add(self.memory_bytes).is_some()
+} Segment.lies_in
+
+fn Segment.overlaps(self, other: Segment) -> bool {
+    if self.memory_bytes == 0 or other.memory_bytes == 0 {
+        return false
+    }
+    return self.address < other.address + other.memory_bytes and other.address < self.address + self.memory_bytes
+} Segment.overlaps
+
+fn load_at(bytes: Slice[u8], at: usize) -> Option[Segment] {
+    if bytes.u32_le(at) != PT_LOAD {
+        return None
+    }
+    return Some(Segment(offset: bytes.u64_le(at + 8), address: bytes.u64_le(at + 24), file_bytes: bytes.u64_le(at + 32), memory_bytes: bytes.u64_le(at + 40)))
+} load_at
+
+fn overlaps_earlier(bytes: Slice[u8], headers_at: u64, segment: Segment, index: u16) -> bool {
+    for earlier in 0..<index {
+        let Some(other) = load_at(bytes, at: usize.widen(header_offset(headers_at, index: earlier))) else {
+            continue
+        }
+        if segment.overlaps(other) {
+            return true
+        }
+    }
+    return false
+} overlaps_earlier
+
+fn entry_loaded(bytes: Slice[u8], headers_at: u64, count: u16, entry: u64) -> bool {
+    for index in 0..<count {
+        let Some(segment) = load_at(bytes, at: usize.widen(header_offset(headers_at, index))) else {
+            continue
+        }
+        if entry >= segment.address and entry - segment.address < segment.memory_bytes {
+            return true
+        }
+    }
+    return false
+} entry_loaded
+
+/// The entry a `XEN_ELFNOTE_PHYS32_ENTRY` note of owner `Xen` gives among the notes at `offset`, when it is below 4 GiB.
+fn pvh_entry(bytes: Slice[u8], offset: u64, len: u64) -> Option[u64] {
+    let Some(end) = offset.checked_add(len) else {
+        return None
+    }
+    if end > u64.widen(bytes.len()) {
+        return None
+    }
+    var at = offset
+    while at + 12 <= end {
+        let name_bytes = bytes.u32_le(usize.widen(at))
+        let desc_bytes = bytes.u32_le(usize.widen(at + 4))
+        let kind = bytes.u32_le(usize.widen(at + 8))
+        let desc_at = at + 12 + align4(name_bytes)
+        let next = desc_at + align4(desc_bytes)
+        if next > end {
+            return None
+        }
+        let Some(rest) = bytes.split_at(usize.widen(at + 12)) else {
+            return None
+        }
+        let owner = rest.tail.prefix(4) == Some(b"Xen\x00")
+        if kind == XEN_ELFNOTE_PHYS32_ENTRY and name_bytes == 4 and owner and (desc_bytes == 4 or desc_bytes == 8) {
+            var entry = u64.widen(bytes.u32_le(usize.widen(desc_at)))
+            if desc_bytes == 8 {
+                entry = bytes.u64_le(usize.widen(desc_at))
+            }
+            if entry < 0x1_0000_0000 {
+                return Some(entry)
+            }
+            return None
+        }
+        at = next
+    }
+    return None
+} pvh_entry
+
+fn align4(value: u32) -> u64 {
+    return (u64.widen(value) + 3) / 4 * 4
+} align4
+
+fn max(a: u64, b: u64) -> u64 {
+    if a > b {
+        return a
+    }
+    return b
+} max
+
+fn min(a: u64, b: u64) -> u64 {
+    if a < b {
+        return a
+    }
+    return b
+} min
+
+/// An image shaped like a NaN kernel: a note at 0x78 giving entry 0x10_0000, then two loadable segments from 0x10_0000, the second with zero fill.
+fn sample_image(alloc: mem::Alloc) -> mem::Bytes {
+    var image = mem::Bytes.zeroed(0x3000, alloc)
+    for i in 0..<ELF_IDENT.len() {
+        image[i] = ELF_IDENT[i]
+    }
+    image[0x1000] = 0xC3
+    image[0x200F] = 0x5A
+    var bytes = mut image.view_mut()
+    mut bytes.write_u16_le(16, value: ELF_EXECUTABLE)
+    mut bytes.write_u16_le(18, value: ELF_X86_64)
+    mut bytes.write_u32_le(20, value: 1)
+    mut bytes.write_u64_le(32, value: 0x100)
+    mut bytes.write_u16_le(54, value: 56)
+    mut bytes.write_u16_le(56, value: 3)
+    write_header(mut bytes, at: 0x100, kind: PT_NOTE, offset: 0x78, address: 0, file_bytes: 24, memory_bytes: 0)
+    write_header(mut bytes, at: 0x138, kind: PT_LOAD, offset: 0x1000, address: 0x10_0000, file_bytes: 0x1000, memory_bytes: 0x1000)
+    write_header(mut bytes, at: 0x170, kind: PT_LOAD, offset: 0x2000, address: 0x10_1000, file_bytes: 0x10, memory_bytes: 0x2000)
+    mut bytes.write_u32_le(0x78, value: 4)
+    mut bytes.write_u32_le(0x7C, value: 8)
+    mut bytes.write_u32_le(0x80, value: XEN_ELFNOTE_PHYS32_ENTRY)
+    mut bytes.write_u32_le(0x84, value: 0x006E_6558)
+    mut bytes.write_u64_le(0x88, value: 0x10_0000)
+    return image
+} sample_image
+
+fn write_header(
+    mut bytes: SliceMut[u8],
+    at: usize,
+    kind: u32,
+    offset: u64,
+    address: u64,
+    file_bytes: u64,
+    memory_bytes: u64,
+    ) {
+    mut bytes.write_u32_le(at, value: kind)
+    mut bytes.write_u64_le(at + 8, value: offset)
+    mut bytes.write_u64_le(at + 16, value: address)
+    mut bytes.write_u64_le(at + 24, value: address)
+    mut bytes.write_u64_le(at + 32, value: file_bytes)
+    mut bytes.write_u64_le(at + 40, value: memory_bytes)
+} write_header
+
+fn read_image(image: mem::Bytes) -> Result[KernelImage, ImageError] {
+    return attempt KernelImage.read(Untrusted.of(image.view()))
+} read_image
+
+fn changed(alloc: mem::Alloc, at: usize, value: u64) -> mem::Bytes {
+    var image = sample_image(alloc)
+    mut image.view_mut().write_u64_le(at, value)
+    return image
+} changed
+
+test kernel_images_are_validated for KernelImage.read {
+    let alloc = testing::world().alloc
+    let image = sample_image(alloc)
+    let read = read_image(image)
+    expect read == Ok(KernelImage(entry: 0x10_0000, headers_at: 0x100, header_count: 3))
+    let not_elf = changed(alloc, at: 0, value: 0)
+    let not_elf_read = read_image(not_elf)
+    expect not_elf_read == Err(ImageError.NotExecutable)
+    let aarch64 = changed(alloc, at: 18, value: 0x0001_0000_00B7)
+    let aarch64_read = read_image(aarch64)
+    expect aarch64_read == Err(ImageError.NotExecutable)
+    let table = changed(alloc, at: 56, value: 300)
+    let table_read = read_image(table)
+    expect table_read == Err(ImageError.ProgramHeaders)
+    let outside = changed(alloc, at: 0x178, value: 0x2FF8)
+    let outside_read = read_image(outside)
+    expect outside_read == Err(ImageError.Segments)
+    let overlap = changed(alloc, at: 0x188, value: 0x10_0800)
+    let overlap_read = read_image(overlap)
+    expect overlap_read == Err(ImageError.Segments)
+    let no_note = changed(alloc, at: 0x80, value: 0x006E_6558_0000_0011)
+    let no_note_read = read_image(no_note)
+    expect no_note_read == Err(ImageError.NoEntry)
+    let far_entry = changed(alloc, at: 0x88, value: 0x20_0000)
+    let far_entry_read = read_image(far_entry)
+    expect far_entry_read == Err(ImageError.NoEntry)
+} kernel_images_are_validated
+
+test segments_fill_their_pages for Segment.copy_into {
+    let alloc = testing::world().alloc
+    let image = sample_image(alloc)
+    let raw = Untrusted.of(image.view())
+    let Ok(kernel) = attempt KernelImage.read(raw) else {
+        expect false
+        return
+    }
+    let note = kernel.segment(raw, index: 0)
+    expect note == None
+    let Some(data) = kernel.segment(raw, index: 2) else {
+        expect false
+        return
+    }
+    expect data == Segment(offset: 0x2000, address: 0x10_1000, file_bytes: 0x10, memory_bytes: 0x2000)
+    expect data.pages() == Some(PageRange(start: 0x10_1000, last: 0x10_2000))
+    expect Segment(offset: 0, address: 0x10_0000, file_bytes: 0, memory_bytes: 0).pages() == None
+    var page = Array[u8, 4_096].filled(0xFF)
+    data.copy_into(raw, base: 0x10_1000, mut page)
+    expect page[0xE] == 0
+    expect page[0xF] == 0x5A
+    expect page[0x10] == 0xFF
+    var next = Array[u8, 4_096].filled(0xFF)
+    data.copy_into(raw, base: 0x10_2000, page: mut next)
+    expect next[0] == 0xFF
+} segments_fill_their_pages

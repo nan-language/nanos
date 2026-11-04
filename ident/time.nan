@@ -1,0 +1,275 @@
+//! The text form of wall times.
+
+const UNKNOWN_NS: u64 = 0x8000_0000_0000_0000
+
+const NS_PER_S: i64 = 1_000_000_000
+
+const S_PER_DAY: i64 = 86_400
+
+/// A date of the proleptic Gregorian calendar.
+struct Date derives Copy {
+    year: i64
+    month: i64
+    day: i64
+} Date
+
+/// The RFC 3339 date and time in UTC with milliseconds rounded down, `Z`, `~`, and the uncertainty rounded up to whole milliseconds below 10 s, else to whole seconds, or `unknown`: `2026-10-29T21:14:03.120Z~12ms`.
+pub fn WallTime.to_text(self) -> text::Fixed[40] {
+    let seconds = self.utc_ns.div_floor(NS_PER_S)
+    let millis = self.utc_ns.mod_floor(NS_PER_S).div_floor(1_000_000)
+    let time = seconds.mod_floor(S_PER_DAY)
+    let date = Date.of_days(seconds.div_floor(S_PER_DAY))
+    var form = text::Fixed[40].empty()
+    push_padded(date.year, width: 4, out: mut form)
+    mut form.push('-')
+    push_padded(date.month, width: 2, out: mut form)
+    mut form.push('-')
+    push_padded(date.day, width: 2, out: mut form)
+    mut form.push('T')
+    push_padded(time.div_floor(3_600), width: 2, out: mut form)
+    mut form.push(':')
+    push_padded(time.mod_floor(3_600).div_floor(60), width: 2, out: mut form)
+    mut form.push(':')
+    push_padded(time.mod_floor(60), width: 2, out: mut form)
+    mut form.push('.')
+    push_padded(millis, width: 3, out: mut form)
+    mut form.append("Z~")
+    if self.uncertainty_ns >= UNKNOWN_NS {
+        mut form.append("unknown")
+    } else if self.uncertainty_ns < 10_000_000_000 {
+        push_number(round_up(self.uncertainty_ns, unit: 1_000_000), out: mut form)
+        mut form.append("ms")
+    } else {
+        push_number(round_up(self.uncertainty_ns, unit: 1_000_000_000), out: mut form)
+        mut form.push('s')
+    }
+    return form
+} WallTime.to_text
+
+/// The wall time an RFC 3339 date and time in UTC writes, with 0 to 9 fractional digits and the uncertainty in the form [WallTime.to_text] writes it, 0 when omitted.
+pub fn WallTime.parse(text: Str) -> Option[WallTime] {
+    let bytes = text.as_bytes()
+    if bytes.len() < 20 or bytes[4] != b'-' or bytes[7] != b'-' or bytes[10] != b'T' or bytes[13] != b':' or bytes[16] != b':' {
+        return None
+    }
+    let Some(date) = Date.parse(bytes) else {
+        return None
+    }
+    let Some(hour) = decimal_at(bytes, at: 11, count: 2) else {
+        return None
+    }
+    let Some(minute) = decimal_at(bytes, at: 14, count: 2) else {
+        return None
+    }
+    let Some(second) = decimal_at(bytes, at: 17, count: 2) else {
+        return None
+    }
+    if hour > 23 or minute > 59 or second > 59 {
+        return None
+    }
+    let Some(parts) = bytes.split_at(19) else {
+        return None
+    }
+    let Some(fraction) = Fraction.parse(parts.tail) else {
+        return None
+    }
+    let Some(rest) = parts.tail.split_at(fraction.end) else {
+        return None
+    }
+    let Some(uncertainty_ns) = parse_uncertainty(rest.tail) else {
+        return None
+    }
+    let seconds = date.days() * S_PER_DAY + hour * 3_600 + minute * 60 + second
+    let Some(whole) = seconds.checked_mul(NS_PER_S) else {
+        return None
+    }
+    let Some(utc_ns) = whole.checked_add(fraction.ns) else {
+        return None
+    }
+    return Some(WallTime(utc_ns: utc_ns, uncertainty_ns: uncertainty_ns))
+} WallTime.parse
+
+/// The nanoseconds of an optional fractional part, `.` and 1 to 9 digits, and the position after the `Z` that follows it.
+struct Fraction derives Copy {
+    ns: i64
+    end: usize
+} Fraction
+
+fn Fraction.parse(bytes: Slice[u8]) -> Option[Fraction] {
+    var at: usize = 0
+    var ns: i64 = 0
+    if at < bytes.len() and bytes[at] == b'.' {
+        at += 1
+        var scale: i64 = 100_000_000
+        while at < bytes.len() and bytes[at] >= b'0' and bytes[at] <= b'9' {
+            if scale == 0 {
+                return None
+            }
+            ns += i64.widen(bytes[at] - b'0') * scale
+            scale = scale.div_trunc(10)
+            at += 1
+        }
+        if at == 1 {
+            return None
+        }
+    }
+    if at >= bytes.len() or bytes[at] != b'Z' {
+        return None
+    }
+    return Some(Fraction(ns: ns, end: at + 1))
+} Fraction.parse
+
+fn parse_uncertainty(text: Slice[u8]) -> Option[u64] {
+    let Some(mark) = text.split_at(1) else {
+        return Some(0)
+    }
+    let rest = mark.tail
+    if mark.head[0] != b'~' or rest.is_empty() {
+        return None
+    }
+    if rest == b"unknown" {
+        return Some(UNKNOWN_NS)
+    }
+    if rest.len() > 2 {
+        let Some(millis) = rest.split_at(rest.len() - 2) else {
+            return None
+        }
+        if millis.tail == b"ms" {
+            let Some(count) = parse_number(millis.head) else {
+                return None
+            }
+            return count.checked_mul(1_000_000)
+        }
+    }
+    let Some(seconds) = rest.split_at(rest.len() - 1) else {
+        return None
+    }
+    if seconds.tail != b"s" {
+        return None
+    }
+    let Some(count) = parse_number(seconds.head) else {
+        return None
+    }
+    return count.checked_mul(1_000_000_000)
+} parse_uncertainty
+
+/// The date `days` days after 1970-01-01.
+fn Date.of_days(days: i64) -> Date {
+    let shifted = days + 719_468
+    let era = shifted.div_floor(146_097)
+    let day_of_era = shifted - era * 146_097
+    let year_of_era = (day_of_era - day_of_era.div_floor(1_460) + day_of_era.div_floor(36_524) - day_of_era.div_floor(146_096)).div_floor(365)
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era.div_floor(4) - year_of_era.div_floor(100))
+    let shifted_month = (5 * day_of_year + 2).div_floor(153)
+    let day = day_of_year - (153 * shifted_month + 2).div_floor(5) + 1
+    if shifted_month < 10 {
+        return Date(year: year_of_era + era * 400, month: shifted_month + 3, day: day)
+    }
+    return Date(year: year_of_era + era * 400 + 1, month: shifted_month - 9, day: day)
+} Date.of_days
+
+/// The number of days from 1970-01-01 to this date.
+fn Date.days(self) -> i64 {
+    var year = self.year
+    var shifted_month = self.month + 9
+    if self.month > 2 {
+        shifted_month = self.month - 3
+    } else {
+        year -= 1
+    }
+    let era = year.div_floor(400)
+    let year_of_era = year - era * 400
+    let day_of_year = (153 * shifted_month + 2).div_floor(5) + self.day - 1
+    let day_of_era = year_of_era * 365 + year_of_era.div_floor(4) - year_of_era.div_floor(100) + day_of_year
+    return era * 146_097 + day_of_era - 719_468
+} Date.days
+
+/// The valid date that `YYYY-MM-DD` writes at the start of `bytes`.
+fn Date.parse(bytes: Slice[u8]) -> Option[Date] {
+    let Some(year) = decimal_at(bytes, at: 0, count: 4) else {
+        return None
+    }
+    let Some(month) = decimal_at(bytes, at: 5, count: 2) else {
+        return None
+    }
+    let Some(day) = decimal_at(bytes, at: 8, count: 2) else {
+        return None
+    }
+    if month < 1 or month > 12 or day < 1 or day > month_days(year, month) {
+        return None
+    }
+    return Some(Date(year: year, month: month, day: day))
+} Date.parse
+
+fn month_days(year: i64, month: i64) -> i64 {
+    if month == 2 {
+        let leap = year.mod_floor(4) == 0 and (year.mod_floor(100) != 0 or year.mod_floor(400) == 0)
+        if leap {
+            return 29
+        }
+        return 28
+    }
+    if month == 4 or month == 6 or month == 9 or month == 11 {
+        return 30
+    }
+    return 31
+} month_days
+
+fn decimal_at(bytes: Slice[u8], at: usize, count: usize) -> Option[i64] {
+    var value: i64 = 0
+    for i in at..<(at + count) {
+        if i >= bytes.len() or bytes[i] < b'0' or bytes[i] > b'9' {
+            return None
+        }
+        value = value * 10 + i64.widen(bytes[i] - b'0')
+    }
+    return Some(value)
+} decimal_at
+
+fn push_padded[N: usize where N > 0](value: i64, width: usize, mut out: text::Fixed[N])
+    requires value >= 0
+{
+    var limit: i64 = 1
+    for _ in 1..<width {
+        limit = limit * 10
+        if value < limit {
+            mut out.push('0')
+        }
+    }
+    push_number(u64.fit(value), mut out)
+} push_padded
+
+fn round_up(value: u64, unit: u64) -> u64
+    requires unit > 0
+{
+    let whole = value / unit
+    if value % unit == 0 {
+        return whole
+    }
+    return whole + 1
+} round_up
+
+test wall_times_render_as_rfc_3339 for WallTime.to_text {
+    let time = WallTime(utc_ns: 1_793_308_443_120_999_999, uncertainty_ns: 11_000_001)
+    expect time.to_text().as_str() == "2026-10-29T21:14:03.120Z~12ms"
+    expect WallTime(utc_ns: -1, uncertainty_ns: 0).to_text().as_str() == "1969-12-31T23:59:59.999Z~0ms"
+    expect WallTime(utc_ns: -9_223_372_036_854_775_808, uncertainty_ns: 9_999_999_999).to_text().as_str() == "1677-09-21T00:12:43.145Z~10000ms"
+    expect WallTime(utc_ns: 9_223_372_036_854_775_807, uncertainty_ns: 10_000_000_001).to_text().as_str() == "2262-04-11T23:47:16.854Z~11s"
+    expect WallTime(utc_ns: 0, uncertainty_ns: UNKNOWN_NS).to_text().as_str() == "1970-01-01T00:00:00.000Z~unknown"
+} wall_times_render_as_rfc_3339
+
+test wall_times_parse_their_forms for WallTime.parse {
+    expect WallTime.parse("2026-10-29T21:14:03.120Z~12ms") == Some(WallTime(utc_ns: 1_793_308_443_120_000_000, uncertainty_ns: 12_000_000))
+    expect WallTime.parse("2024-02-29T00:00:00Z") == Some(WallTime(utc_ns: 1_709_164_800_000_000_000, uncertainty_ns: 0))
+    expect WallTime.parse("2000-02-29T12:00:00.000000001Z~3s") == Some(WallTime(utc_ns: 951_825_600_000_000_001, uncertainty_ns: 3_000_000_000))
+    expect WallTime.parse("1900-01-01T00:00:00Z~unknown") == Some(WallTime(utc_ns: -2_208_988_800_000_000_000, uncertainty_ns: UNKNOWN_NS))
+    expect WallTime.parse("2100-02-29T00:00:00Z") == None
+    expect WallTime.parse("2026-13-01T00:00:00Z") == None
+    expect WallTime.parse("2026-10-29T21:14:60Z") == None
+    expect WallTime.parse("2026-10-29T21:14:03.1234567890Z") == None
+    expect WallTime.parse("2026-10-29T21:14:03.Z") == None
+    expect WallTime.parse("2026-10-29T21:14:03z") == None
+    expect WallTime.parse("2026-10-29T21:14:03Z~") == None
+    expect WallTime.parse("2026-10-29T21:14:03Z~12") == None
+    expect WallTime.parse("3000-01-01T00:00:00Z") == None
+} wall_times_parse_their_forms

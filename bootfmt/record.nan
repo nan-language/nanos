@@ -1,0 +1,232 @@
+//! The boot record: two 512-byte copies ordering the loader's choice among generations.
+
+const RECORD_MAGIC: Slice[u8] = b"NANOSBR1"
+
+const RECORD_FORMAT: u32 = 1
+
+const CHECKED_BYTES: usize = 496
+
+pub layout SlotState: u8 tags {
+    Empty = 0
+    Trial = 1
+    Good = 2
+    Bad = 3
+} SlotState
+
+/// The next boot's choice alone.
+pub layout NextOnce: u8 tags {
+    Unset = 0
+    SlotA = 1
+    SlotB = 2
+    Recovery = 3
+} NextOnce
+
+pub layout OwnerRequestKind: u8 tags {
+    Absent = 0
+    Claim = 1
+    BySignature = 2
+    ByRecoveryCode = 3
+} OwnerRequestKind
+
+/// A slot entry, its state one of [SlotState].
+pub layout SlotEntry: bytes 16 le {
+    generation: u64 at 0
+    state: u8 at 8
+    tries: u8 at 9
+    reserved: Array[u8, 6] at 10
+} SlotEntry
+
+/// A copy of the boot record, `next_once` one of [NextOnce] and `owner_request_kind` one of [OwnerRequestKind].
+pub layout BootRecord: bytes 512 le {
+    magic: Array[u8, 8] at 0
+    format: u32 at 8
+    reserved_a: Array[u8, 4] at 12
+    sequence: u64 at 16
+    boot_counter: u64 at 24
+    slot_a: SlotEntry at 32
+    slot_b: SlotEntry at 48
+    recovery_generation: u64 at 64
+    floor_request: u64 at 72
+    next_once: u8 at 80
+    owner_request_kind: u8 at 81
+    reserved_b: Array[u8, 6] at 82
+    owner_request_key: Array[u8, 32] at 88
+    owner_request_recovery: Array[u8, 32] at 120
+    owner_request_proof: Array[u8, 64] at 152
+    loader_request: Array[u8, 33] at 216
+    reserved_c: Array[u8, 3] at 249
+    loader_request_version: u32 at 252
+    loader_request_signature: Array[u8, 64] at 256
+    reserved_d: Array[u8, 176] at 320
+    checksum: Array[u8, 16] at 496
+} BootRecord
+
+/// A record and the copy holding it, 0 for `/nanos/boot.rec` and 1 for `/nanos/boot.bak`.
+pub closed struct Held derives Copy, Eq {
+    pub record: BootRecord
+    pub copy: u8 where copy < 2
+} Held
+
+/// The record of a boot volume holding none: every slot `empty`, no choice and no request.
+pub fn BootRecord.empty() -> BootRecord {
+    var magic = Array[u8, 8].filled(0)
+    mut magic.view_mut().copy_from(RECORD_MAGIC)
+    let slot = SlotEntry(generation: 0, state: SlotState.Empty.to_bits(), tries: 0, reserved: Array[u8, 6].filled(0))
+    return BootRecord(
+        magic: magic,
+        format: RECORD_FORMAT,
+        reserved_a: Array[u8, 4].filled(0),
+        sequence: 0,
+        boot_counter: 0,
+        slot_a: slot,
+        slot_b: slot,
+        recovery_generation: 0,
+        floor_request: 0,
+        next_once: NextOnce.Unset.to_bits(),
+        owner_request_kind: OwnerRequestKind.Absent.to_bits(),
+        reserved_b: Array[u8, 6].filled(0),
+        owner_request_key: Array[u8, 32].filled(0),
+        owner_request_recovery: Array[u8, 32].filled(0),
+        owner_request_proof: Array[u8, 64].filled(0),
+        loader_request: Array[u8, 33].filled(0),
+        reserved_c: Array[u8, 3].filled(0),
+        loader_request_version: 0,
+        loader_request_signature: Array[u8, 64].filled(0),
+        reserved_d: Array[u8, 176].filled(0),
+        checksum: Array[u8, 16].filled(0),
+    )
+} BootRecord.empty
+
+/// The record a copy holds when it is valid: the magic, format 1, a matching checksum, zero reserved bytes and defined enumerated values.
+pub validator fn BootRecord.read(copy: Untrusted[Slice[u8]]) -> Option[BootRecord] {
+    let bytes = copy.inspect()
+    if bytes.len() != 512 {
+        return None
+    }
+    var bits = Array[u8, 512].filled(0)
+    mut bits.view_mut().copy_from(bytes)
+    let record = BootRecord.from_bits(bits)
+    if NextOnce.checked_from_bits(record.next_once).is_none() or OwnerRequestKind.checked_from_bits(record.owner_request_kind).is_none() {
+        return None
+    }
+    if SlotState.checked_from_bits(record.slot_a.state).is_none() or SlotState.checked_from_bits(record.slot_b.state).is_none() {
+        return None
+    }
+    if record.magic.view() != RECORD_MAGIC or record.format != RECORD_FORMAT or record.sealed().checksum != record.checksum {
+        return None
+    }
+    let reserved_zero = zero(record.reserved_a.view()) and zero(record.reserved_b.view()) and zero(record.reserved_c.view()) and zero(record.reserved_d.view())
+    if not (reserved_zero and zero(record.slot_a.reserved.view()) and zero(record.slot_b.reserved.view())) {
+        return None
+    }
+    return Some(record)
+} BootRecord.read
+
+/// The record the valid copies hold: the copy of higher sequence, copy 0 on a tie.
+pub fn BootRecord.current(rec: Option[BootRecord], bak: Option[BootRecord]) -> Option[Held] {
+    let Some(backup) = bak else {
+        let Some(primary) = rec else {
+            return None
+        }
+        return Some(Held(record: primary, copy: 0))
+    }
+    let Some(primary) = rec else {
+        return Some(Held(record: backup, copy: 1))
+    }
+    if backup.sequence > primary.sequence {
+        return Some(Held(record: backup, copy: 1))
+    }
+    return Some(Held(record: primary, copy: 0))
+} BootRecord.current
+
+/// This record as a write stores it over `held`, the record found: sealed, with the sequence after the found record's, in the copy not holding it, copy 0 when none was found.
+pub fn BootRecord.write_over(self, held: Option[Held]) -> Held {
+    var record = self
+    let Some(found) = held else {
+        record.sequence = 1
+        return Held(record: record.sealed(), copy: 0)
+    }
+    record.sequence = found.record.sequence.wrapping_add(1)
+    return Held(record: record.sealed(), copy: 1 - found.copy)
+} BootRecord.write_over
+
+/// This record with its checksum: XXH3-128 with seed 0 of its first 496 bytes, low 64 bits first.
+fn BootRecord.sealed(self) -> BootRecord {
+    let bits = self.to_bits()
+    let Some(checked) = bits.view().prefix(CHECKED_BYTES) else {
+        return self
+    }
+    let sum = xxh3_128(checked)
+    var record = self
+    mut record.checksum.view_mut().write_u64_le(0, value: sum.low)
+    mut record.checksum.view_mut().write_u64_le(8, value: sum.high)
+    return record
+} BootRecord.sealed
+
+fn zero(bytes: Slice[u8]) -> bool {
+    for byte in bytes {
+        if byte != 0 {
+            return false
+        }
+    }
+    return true
+} zero
+
+fn read_bits(bits: Array[u8, 512]) -> Option[BootRecord] {
+    return BootRecord.read(Untrusted.of(bits.view()))
+} read_bits
+
+test written_records_read_back for BootRecord.read {
+    var record = BootRecord.empty()
+    record.boot_counter = 1
+    let written = record.write_over(None)
+    let bits = written.record.to_bits()
+    expect written.copy == 0
+    expect written.record.sequence == 1
+    expect bits.view().split_at(496).is_some()
+    let Some(parts) = bits.view().split_at(496) else {
+        return
+    }
+    expect parts.tail == b"\xab\xa5\xd9\x99\x84\xa6\x87\x0d\x34\x89\x85\xa4\xa0\x85\x6d\x17"
+    let read = read_bits(bits)
+    expect read == Some(written.record)
+} written_records_read_back
+
+test damaged_copies_are_invalid for BootRecord.read {
+    let sealed = BootRecord.empty().write_over(None).record
+    var magic = sealed.to_bits()
+    magic[0] = b'X'
+    let magic_read = read_bits(magic)
+    expect magic_read == None
+    var body = sealed.to_bits()
+    body[24] = 1
+    let body_read = read_bits(body)
+    expect body_read == None
+    var reserved = sealed
+    reserved.reserved_d[0] = 1
+    let reserved_read = read_bits(reserved.write_over(None).record.to_bits())
+    expect reserved_read == None
+    var format = sealed
+    format.format = 2
+    let format_read = read_bits(format.write_over(None).record.to_bits())
+    expect format_read == None
+    var state = sealed.to_bits()
+    state[40] = 4
+    let state_read = read_bits(state)
+    expect state_read == None
+    let short_read = BootRecord.read(Untrusted.of(b"NANOSBR1"))
+    expect short_read == None
+} damaged_copies_are_invalid
+
+test the_newer_copy_holds_the_record for BootRecord.current {
+    let primary = BootRecord.empty().write_over(None)
+    let backup = primary.record.write_over(Some(primary))
+    expect backup.copy == 1
+    expect backup.record.sequence == 2
+    expect backup.record.write_over(Some(backup)).copy == 0
+    expect BootRecord.current(Some(primary.record), bak: Some(backup.record)) == Some(backup)
+    expect BootRecord.current(Some(backup.record), bak: Some(primary.record)) == Some(Held(record: backup.record, copy: 0))
+    expect BootRecord.current(Some(primary.record), bak: Some(primary.record)) == Some(Held(record: primary.record, copy: 0))
+    expect BootRecord.current(None, bak: Some(primary.record)) == Some(Held(record: primary.record, copy: 1))
+    expect BootRecord.current(None, bak: None) == None
+} the_newer_copy_holds_the_record

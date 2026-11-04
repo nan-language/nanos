@@ -1,0 +1,126 @@
+//! Placing the kernel image's loadable segments at their physical addresses.
+
+const CONVENTIONAL_MEMORY: u32 = 7
+
+/// The pages the image's loadable segments fill, in address order.
+fn kernel_pages(image: Untrusted[mem::Bytes], kernel: bootfmt::KernelImage, alloc: mem::Alloc) -> mem::Set[u64] {
+    var pages = mem::Set[u64].empty(alloc)
+    for index in 0..<kernel.header_count {
+        let Some(segment) = kernel.segment(image.view(), index) else {
+            continue
+        }
+        let Some(range) = segment.pages() else {
+            continue
+        }
+        var page = range.start
+        while page <= range.last {
+            discard mut pages.insert(page)
+            page += bootfmt::PAGE_BYTES
+        }
+    }
+    return pages
+} kernel_pages
+
+/// Whether every page the image fills lies in free memory of the current memory map.
+fn placeable(services: boot::Services, image: Untrusted[mem::Bytes], kernel: bootfmt::KernelImage, alloc: mem::Alloc) -> bool {
+    let Ok(map) = attempt services.memory_map(alloc) else {
+        return false
+    }
+    for page in kernel_pages(image, kernel, alloc) {
+        if not in_free_memory(map, page) {
+            return false
+        }
+    }
+    return true
+} placeable
+
+fn in_free_memory(map: mem::List[boot::MemoryRange], page: u64) -> bool {
+    for range in map {
+        let inside = page >= range.base and page - range.base < range.byte_len and range.byte_len - (page - range.base) >= bootfmt::PAGE_BYTES
+        if range.kind == CONVENTIONAL_MEMORY and inside {
+            return true
+        }
+    }
+    return false
+} in_free_memory
+
+/// Consecutive pages: `count` of them from address `start`.
+struct Run derives Copy {
+    start: u64
+    count: u64
+} Run
+
+/// The pages in runs of consecutive pages, in address order.
+fn runs(pages: mem::Set[u64], alloc: mem::Alloc) -> mem::List[Run] {
+    var found = mem::List[Run].empty(alloc)
+    var current = Run(start: 0, count: 0)
+    for page in pages {
+        if current.count > 0 and page == current.start + current.count * bootfmt::PAGE_BYTES {
+            current.count += 1
+        } else {
+            if current.count > 0 {
+                mut found.push(current)
+            }
+            current = Run(start: page, count: 1)
+        }
+    }
+    if current.count > 0 {
+        mut found.push(current)
+    }
+    return found
+} runs
+
+/// The regions holding the candidate's segments at their physical addresses, the rest of their pages zero, `None` when the firmware cannot give the pages.
+fn place(services: boot::Services, candidate: Candidate, alloc: mem::Alloc) -> Option[mem::List[hw::Region]] {
+    var regions = mem::List[hw::Region].empty(alloc)
+    for run in runs(kernel_pages(candidate.image, kernel: candidate.kernel, alloc), alloc) {
+        if not allocate_run(services, candidate, run, mut regions, alloc) {
+            release(services, take regions)
+            return None
+        }
+    }
+    return Some(take regions)
+} place
+
+/// Allocates the pages of `run` and fills them from the candidate's segments, reporting whether the firmware gave them.
+fn allocate_run(
+    services: boot::Services,
+    candidate: Candidate,
+    run: Run,
+    mut regions: mem::List[hw::Region],
+    alloc: mem::Alloc,
+    ) -> bool {
+    let Ok(region) = attempt services.allocate(run.start, byte_len: run.count * bootfmt::PAGE_BYTES) else {
+        return false
+    }
+    var frames = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    take region.frames(mut frames)
+    for frame in take frames {
+        var page = frame
+        fill_page(mut page, candidate)
+        mut regions.push(take page.into_region())
+    }
+    return true
+} allocate_run
+
+fn fill_page(mut frame: hw::PhysFrame[4_096], candidate: Candidate) {
+    let base = frame.base()
+    let whole = hw::Offset[Array[u8, 4_096]](bytes: 0)
+    clear(mut frame.contents_mut(whole))
+    for index in 0..<candidate.kernel.header_count {
+        let Some(segment) = candidate.kernel.segment(candidate.image.view(), index) else {
+            continue
+        }
+        segment.copy_into(candidate.image.view(), base, page: mut frame.contents_mut(whole))
+    }
+} fill_page
+
+fn clear(mut page: Array[u8, 4_096]) {
+    mut page.view_mut().fill(0)
+} clear
+
+fn release(services: boot::Services, take regions: mem::List[hw::Region]) {
+    for region in take regions {
+        discard attempt services.free(take region)
+    }
+} release

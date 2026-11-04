@@ -1,0 +1,252 @@
+//! BLAKE3-256 digests.
+
+const IV: Array[u32, 8] = initial_words()
+
+const CHUNK_START: u32 = 1
+
+const CHUNK_END: u32 = 2
+
+const PARENT: u32 = 4
+
+const ROOT: u32 = 8
+
+const BLOCK_BYTES: usize = 64
+
+const CHUNK_BLOCKS: u32 = 16
+
+/// A digest of the bytes given to [Blake3.update], kept with the last block and the last chunk pending so that [Blake3.finish] can mark them.
+pkg struct Blake3 {
+    cv: Array[u32, 8]
+    chunks: u64
+    block: Array[u8, 64]
+    block_len: usize
+    blocks: u32
+    stack: Array[Array[u32, 8], 54]
+    depth: usize
+} Blake3
+
+/// The inputs of one compression, which yields a chaining value or, flagged `ROOT`, the digest.
+struct Output derives Copy {
+    cv: Array[u32, 8]
+    words: Array[u32, 16]
+    counter: u64
+    block_len: u32
+    flags: u32
+} Output
+
+pkg fn Blake3.empty() -> Blake3 {
+    return Blake3(
+        cv: IV,
+        chunks: 0,
+        block: Array[u8, 64].filled(0),
+        block_len: 0,
+        blocks: 0,
+        stack: Array[Array[u32, 8], 54].filled(IV),
+        depth: 0,
+    )
+} Blake3.empty
+
+pkg fn Blake3.update(mut self, data: Slice[u8]) {
+    for byte in data {
+        if self.block_len == BLOCK_BYTES {
+            mut self.compress_block()
+        }
+        self.block[self.block_len] = byte
+        self.block_len += 1
+    }
+} Blake3.update
+
+pkg fn Blake3.finish(self) -> Array[u8, 32] {
+    var output = self.chunk_output()
+    var depth = self.depth
+    while depth > 0 {
+        depth -= 1
+        output = parent_node(self.stack[depth], right: output.chaining_value())
+    }
+    let words = compress(output.cv, words: output.words, counter: 0, block_len: output.block_len, flags: output.flags | ROOT)
+    var digest = Array[u8, 32].filled(0)
+    for i in 0..<8usize {
+        mut digest.view_mut().write_u32_le(4 * i, value: words[i])
+    }
+    return digest
+} Blake3.finish
+
+/// Compresses the full block buffer, which more input follows, ending the chunk when it is the chunk's last block.
+fn Blake3.compress_block(mut self) {
+    if self.blocks + 1 == CHUNK_BLOCKS {
+        let cv = self.chunk_output().chaining_value()
+        self.chunks += 1
+        mut self.add_chunk(cv)
+        self.cv = IV
+        self.blocks = 0
+    } else {
+        let words = compress(self.cv, words: block_words(self.block), counter: self.chunks, block_len: 64, flags: self.start_flag())
+        self.cv = chaining(words)
+        self.blocks += 1
+    }
+    self.block = Array[u8, 64].filled(0)
+    self.block_len = 0
+} Blake3.compress_block
+
+/// Merges the chaining value of a finished chunk into the stack of subtrees, the number of finished chunks deciding how many merge.
+fn Blake3.add_chunk(mut self, cv: Array[u32, 8]) {
+    var merged = cv
+    var count = self.chunks
+    while (count & 1) == 0 {
+        self.depth -= 1
+        merged = parent_node(self.stack[self.depth], right: merged).chaining_value()
+        count = count >> 1
+    }
+    self.stack[self.depth] = merged
+    self.depth += 1
+} Blake3.add_chunk
+
+fn Blake3.chunk_output(self) -> Output {
+    return Output(
+        cv: self.cv,
+        words: block_words(self.block),
+        counter: self.chunks,
+        block_len: u32.fit(self.block_len),
+        flags: self.start_flag() | CHUNK_END,
+    )
+} Blake3.chunk_output
+
+fn Blake3.start_flag(self) -> u32 {
+    if self.blocks == 0 {
+        return CHUNK_START
+    }
+    return 0
+} Blake3.start_flag
+
+fn Output.chaining_value(self) -> Array[u32, 8] {
+    return chaining(compress(self.cv, words: self.words, counter: self.counter, block_len: self.block_len, flags: self.flags))
+} Output.chaining_value
+
+fn parent_node(left: Array[u32, 8], right: Array[u32, 8]) -> Output {
+    var words = Array[u32, 16].filled(0)
+    for i in 0..<8usize {
+        words[i] = left[i]
+        words[i + 8] = right[i]
+    }
+    return Output(cv: IV, words: words, counter: 0, block_len: 64, flags: PARENT)
+} parent_node
+
+fn compress(
+    cv: Array[u32, 8],
+    words: Array[u32, 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    ) -> Array[u32, 16] {
+    var state = Array[u32, 16].filled(0)
+    for i in 0..<8usize {
+        state[i] = cv[i]
+    }
+    for i in 0..<4usize {
+        state[i + 8] = IV[i]
+    }
+    state[12] = u32.truncate(counter)
+    state[13] = u32.truncate(counter >> 32)
+    state[14] = block_len
+    state[15] = flags
+    var message = words
+    round(mut state, message)
+    for _ in 0..<6usize {
+        message = permute(message)
+        round(mut state, message)
+    }
+    for i in 0..<8usize {
+        state[i] = state[i] ^ state[i + 8]
+        state[i + 8] = state[i + 8] ^ cv[i]
+    }
+    return state
+} compress
+
+fn round(mut state: Array[u32, 16], message: Array[u32, 16]) {
+    mix(mut state, a: 0, b: 4, c: 8, d: 12, x: message[0], y: message[1])
+    mix(mut state, a: 1, b: 5, c: 9, d: 13, x: message[2], y: message[3])
+    mix(mut state, a: 2, b: 6, c: 10, d: 14, x: message[4], y: message[5])
+    mix(mut state, a: 3, b: 7, c: 11, d: 15, x: message[6], y: message[7])
+    mix(mut state, a: 0, b: 5, c: 10, d: 15, x: message[8], y: message[9])
+    mix(mut state, a: 1, b: 6, c: 11, d: 12, x: message[10], y: message[11])
+    mix(mut state, a: 2, b: 7, c: 8, d: 13, x: message[12], y: message[13])
+    mix(mut state, a: 3, b: 4, c: 9, d: 14, x: message[14], y: message[15])
+} round
+
+fn mix(
+    mut state: Array[u32, 16],
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    x: u32,
+    y: u32,
+    )
+    requires a < 16 and b < 16 and c < 16 and d < 16
+{
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(x)
+    state[d] = rotate16(state[d] ^ state[a])
+    state[c] = state[c].wrapping_add(state[d])
+    state[b] = rotate12(state[b] ^ state[c])
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(y)
+    state[d] = rotate8(state[d] ^ state[a])
+    state[c] = state[c].wrapping_add(state[d])
+    state[b] = rotate7(state[b] ^ state[c])
+} mix
+
+fn permute(message: Array[u32, 16]) -> Array[u32, 16] {
+    var permuted = message
+    permuted[0] = message[2]
+    permuted[1] = message[6]
+    permuted[2] = message[3]
+    permuted[3] = message[10]
+    permuted[4] = message[7]
+    permuted[5] = message[0]
+    permuted[6] = message[4]
+    permuted[7] = message[13]
+    permuted[8] = message[1]
+    permuted[9] = message[11]
+    permuted[10] = message[12]
+    permuted[11] = message[5]
+    permuted[12] = message[9]
+    permuted[13] = message[14]
+    permuted[14] = message[15]
+    permuted[15] = message[8]
+    return permuted
+} permute
+
+fn initial_words() -> Array[u32, 8] {
+    var words = Array[u32, 8].filled(0x6A09_E667)
+    words[1] = 0xBB67_AE85
+    words[2] = 0x3C6E_F372
+    words[3] = 0xA54F_F53A
+    words[4] = 0x510E_527F
+    words[5] = 0x9B05_688C
+    words[6] = 0x1F83_D9AB
+    words[7] = 0x5BE0_CD19
+    return words
+} initial_words
+
+fn block_words(block: Array[u8, 64]) -> Array[u32, 16] {
+    var words = Array[u32, 16].filled(0)
+    for i in 0..<16usize {
+        words[i] = block.view().u32_le(4 * i)
+    }
+    return words
+} block_words
+
+fn chaining(words: Array[u32, 16]) -> Array[u32, 8] {
+    var cv = Array[u32, 8].filled(0)
+    for i in 0..<8usize {
+        cv[i] = words[i]
+    }
+    return cv
+} chaining
+
+fn rotate16(x: u32) -> u32 = (x >> 16) | (x << 16)
+
+fn rotate12(x: u32) -> u32 = (x >> 12) | (x << 20)
+
+fn rotate8(x: u32) -> u32 = (x >> 8) | (x << 24)
+
+fn rotate7(x: u32) -> u32 = (x >> 7) | (x << 25)

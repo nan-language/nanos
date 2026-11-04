@@ -1,6 +1,6 @@
 # Requirements on NaN
 
-This chapter defines the features NaN OS requires of NaN beyond language 1 as the pinned toolchain v0.1.0 implements it. Each requirement states what language 1 provides, what NaN OS requires, the chapters whose rules depend on it, and the issue of the NaN repository that requests it. A rule elsewhere followed by `(requires Nn)`, linked to its entry here, depends on Nn. The identifiers are stable; N18 is unassigned.
+This chapter defines the features NaN OS requires of NaN beyond language 1 as the toolchain v0.1.0 implements it. Each requirement states what language 1 provides, what NaN OS requires, the chapters whose rules depend on it, and the issue of the NaN repository that requests it. A rule elsewhere followed by `(requires Nn)`, linked to its entry here, depends on Nn. The identifiers are stable; N18 is unassigned.
 
 ## N1
 

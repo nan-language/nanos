@@ -4,7 +4,7 @@ An operating system built for AI agents from the root, from the boot loader and 
 
 ## Installation
 
-NaN OS builds on Linux x86_64 and runs under QEMU 10.2 or later (`qemu-system-x86_64`) with OVMF. From the repository root:
+NaN OS builds on Linux x86_64 with a C compiler as `cc`, and runs under QEMU 10.2 or later (`qemu-system-x86_64`) with OVMF and swtpm. From the repository root:
 
 ```bash
 tools/install

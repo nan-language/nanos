@@ -1,6 +1,6 @@
 # 0003. Stack and architectures
 
-Status: accepted
+Status: superseded by 0013
 
 ## Context
 

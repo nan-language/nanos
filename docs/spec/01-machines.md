@@ -138,19 +138,20 @@ A default depends only on measured facts and machine conditions, never on the na
 
 The sandbox is the machine `tools/sandbox start` boots ([sandbox](../sandbox.md)): the emulator machine of NaN's `x86_64-uefi` descriptor ([NaN 27 §Descriptors](https://github.com/nan-language/nan/blob/main/docs/spec/27-program-model.md#descriptors)).
 
-- A q35 machine with 4 CPUs and 512 MiB of RAM, on QEMU's default x86_64 CPU model, `qemu64`, accelerated by KVM when the host offers it.
-- OVMF without secure boot, whose UEFI variables last for the run.
-- An AHCI disk holding the [boot volume](03-boot.md#boot-volume) as a virtual FAT volume made from a host directory at each start: the development loader at `/EFI/BOOT/BOOTX64.EFI`, the kernel image at `/kernel.elf`, and the boot record and the store file the machine writes.
-- A virtio-rng device.
-- The 16550 serial port, on the sandbox's standard output and standard input (requires [N22](22-nan.md#n22)), carrying the console and the link's serial transport.
+- A q35 machine with 4 CPUs and 512 MiB of RAM, on the host's CPU model under KVM when the host offers it, else on QEMU's `max` model.
+- OVMF without secure boot, whose UEFI variables last until the next start.
+- A virtio-blk disk holding the [boot volume](03-boot.md#boot-volume) as a virtual FAT volume made from a host directory at each start: the development loader at `/EFI/BOOT/BOOTX64.EFI`, the kernel image at `/kernel.elf`, and the files the machine writes. It holds no `/nanos` directory, which the loader cannot create, so the loader neither finds nor writes a boot record.
+- A blank virtio-blk disk of 256 MiB, a virtio-net NIC on QEMU's user network, a virtio-rng device, an Intel VT-d IOMMU, a TPM 2.0 that swtpm emulates and an i6300esb watchdog.
+- The 16550 serial port, on the sandbox's standard output and standard input (requires [N22](22-nan.md#n22)), carrying the console and the link's serial transport, and the console port, a second 16550 on a socket.
 - The exit port: writing the byte v ends the run with status v mod 128. [Power off and reboot](08-scheduling.md#power-off-and-reboot) write it, and a halt writes 70; a reset ends the run with status 70, so the sandbox never reboots.
 
-Its facts are `arch: Arch.Amd64`, `cpus: 4`, `level: Level.X86v1`, `smt: false`, `numa_nodes: 1`, `storage: Storage.File` and `power: PowerSource.Mains`. No condition holds except `meltdown-immune`, which holds unless KVM runs the sandbox on a CPU whose vendor is neither AMD nor Hygon: `qemu64` reports AMD as its vendor, and KVM substitutes the host's. Without `user-mode`, `meltdown-immune` changes no rule there.
+Its facts are `arch: Arch.Amd64`, `cpus: 4`, `smt: false`, `numa_nodes: 1`, `storage: Storage.File` and `power: PowerSource.Mains`, its `level` being the CPU model's, `Level.X86v3` on `max`. `iommu`, `tpm`, `user-mode` and `nic` hold, and `secure-boot` does not. On `max`, whose vendor is AMD, `pages-1g`, `mwait` and `meltdown-immune` hold, and `invariant-tsc`, `tsc-deadline` and `pcid` do not; under KVM, the CPU's conditions are the host's.
 
 The sandbox exercises:
 
-- the outcome of each absent condition: 2 MiB pages, HPET time, the local APIC one-shot timer, HLT, unconfined DMA, no measurement, no isolated space, no watchdog and a link on serial only;
-- the development loader and `dev` mode, the loader's path without a valid boot record, the handoff record, and entropy from virtio-rng;
+- the development loader and `dev` mode, the loader's path without a boot record, the handoff record, measurement, and entropy from virtio-rng;
+- DMA confinement, isolated spaces and the network transports;
+- on `max`, 1 GiB pages, MWAIT, HPET time, the local APIC one-shot timer and switches between spaces that flush translations;
 - halts, power off and reboot, through the exit port.
 
-It exercises no rule that needs a condition, a reboot or state kept across runs: trial boots and the health gate, generation switches, recovery, the floor, owner key requests, loader replacement, measurement, DMA confinement, isolated spaces with their split tables and PCIDs, 1 GiB pages, TSC time and deadlines, MWAIT, the watchdog, network transports and AArch64. These rules need an emulator with those devices and CPU features, reboot and persistence (requires [N22](22-nan.md#n22)).
+It exercises no rule that needs a reboot or state kept across starts: trial boots and the health gate, generation switches, recovery, the floor, owner key requests and loader replacement; nor AArch64.

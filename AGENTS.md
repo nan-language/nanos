@@ -6,7 +6,7 @@ NaN OS is an operating system built for AI agents from the root, from the boot l
 
 ## Architecture
 
-The repository root is a NaN workspace: each directory holding a `package.nan` is a package, a program when its manifest names an `entry`. `loader` is the boot loader, a UEFI application (`x86_64-uefi`), and `kernel` the kernel (`x86_64-bare`). `nan build` writes each program's image into `.nan/images/<target>/`, and `nan run loader` boots the loader from a FAT volume that also holds every other UEFI and bare image, `kernel.elf` included. Tests are `test` items beside the code they exercise; each of their runs on `x86_64-uefi` or `x86_64-bare` boots QEMU.
+The repository root is a NaN workspace: each directory holding a `package.nan` is a package, a program when its manifest names an `entry`. `loader` is the boot loader, a UEFI application (`x86_64-uefi`), and `kernel` the kernel (`x86_64-bare`); the libraries they share target `any`. `nan build` writes each program's image into `.nan/images/<target>/`, and `nan run loader` boots the loader from a FAT volume that also holds every other UEFI and bare image, `kernel.elf` included. Tests are `test` items beside the code they exercise; each of their runs on `x86_64-uefi` or `x86_64-bare` boots QEMU, and on `any` runs on the host.
 
 Only what an agent needs to place a change correctly. The why is in ADRs.
 
@@ -14,6 +14,8 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 
 | Path | Holds |
 | --- | --- |
+| `ident/` | The `ident` package: the names, identifiers, hashes and times of NaN OS records |
+| `bootfmt/` | The `bootfmt` package: the boot record, the handoff record and the kernel image |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install` and `sandbox` scripts |
