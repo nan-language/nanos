@@ -102,6 +102,7 @@ Every document except ADRs is listed here. Read one only when the task needs it.
 | --- | --- |
 | `docs/spec/` | The NaN OS specification, one chapter per mechanism; `00-charter.md` maps the chapters |
 | `docs/sandbox.md` | The sandbox: what an instance runs and how to observe it |
+| `roadmap.md` | The tasks, one session each, that implement the specification, first to a system that boots and works |
 
 ## ADR
 
