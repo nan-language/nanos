@@ -1,0 +1,356 @@
+//! The frame allocator, the core reserve and the pools.
+
+const SMALL_FRAME: u64 = 4_096
+
+const LARGE_FRAME: u64 = 2_097_152
+
+const HUGE_FRAME: u64 = 1_073_741_824
+
+const MIB: u64 = 1_048_576
+
+/// The minimum machine's memory.
+const MINIMUM_RAM: u64 = 64 * MIB
+
+/// The frames of the core reserve set aside for page tables and IOMMU tables: 4 MiB.
+const TABLE_FRAMES: u64 = 1_024
+
+/// A range of physical memory, from `base` to `end`.
+pkg struct Extent derives Copy, Eq {
+    pkg base: u64
+    pkg end: u64
+} Extent
+
+/// Where start step 3 puts each region `k.regions()` gives: the node of each, and those holding the core pool and each node's pool, which every other region leaves to the frame allocator.
+pkg struct Plan {
+    pkg ram: u64
+    nodes: mem::List[u32]
+    core: usize
+    pools: mem::List[Option[usize]]
+} Plan
+
+/// The memory the core holds after start step 3: the frame allocator, the core pool, and the pool of each node with memory, holding `pool_bytes` together.
+pkg linear struct Memory {
+    pkg frames: Frames
+    pkg core: mem::Heap
+    pkg pools: mem::List[mem::Heap]
+    pkg pool_bytes: u64
+} Memory
+
+/// The free frames of one node, by size.
+linear struct NodeFrames {
+    small: mem::List[hw::PhysFrame[4_096]]
+    large: mem::List[hw::PhysFrame[2_097_152]]
+    huge: mem::List[hw::PhysFrame[1_073_741_824]]
+} NodeFrames
+
+/// The frame allocator: the free frames of each node, and the core reserve's frames for page tables.
+pkg linear struct Frames {
+    nodes: mem::List[NodeFrames]
+    tables: mem::List[hw::PhysFrame[4_096]]
+} Frames
+
+/// The core pool's size: 4 MiB and 256 KiB per CPU.
+pkg fn core_pool_bytes(cpus: u32) -> u64 = 4 * MIB + 262_144 * u64.widen(cpus)
+
+/// The plan for the regions `k.regions()` gave, whose extents `regions` holds in their order; `None` when they hold less than the minimum machine's memory or cannot hold the core reserve: no region besides the node pools' holds the core pool, or the rest holds fewer than its frames for page tables.
+pkg fn Plan.of(regions: Slice[Extent], nodes: cpu::Nodes, cpus: u32, alloc: mem::Alloc) -> Option[Plan] {
+    var ram: u64 = 0
+    var node_of = mem::List[u32].empty(alloc)
+    var pools = mem::List[Option[usize]].empty(alloc)
+    for _ in 0..<nodes.count() {
+        mut pools.push(None)
+    }
+    for index in 0..<regions.len() {
+        let region = regions[index]
+        ram += region.end - region.base
+        let node = nodes.of_address(region.base)
+        mut node_of.push(node)
+        let held = pools[usize.widen(node)]
+        let larger = match held {
+            Some(other) => region.end - region.base > regions[other].end - regions[other].base
+            None => true
+        }
+        if larger {
+            pools[usize.widen(node)] = Some(index)
+        }
+    }
+    if ram < MINIMUM_RAM {
+        return None
+    }
+    var core: Option[usize] = None
+    var free_frames: u64 = 0
+    for index in 0..<regions.len() {
+        let region = regions[index]
+        if pools[usize.widen(node_of[index])] == Some(index) {
+            continue
+        }
+        let fits = chunk_bytes(region) >= core_pool_bytes(cpus)
+        let smaller = match core {
+            Some(other) => region.end - region.base < regions[other].end - regions[other].base
+            None => true
+        }
+        if fits and smaller {
+            core = Some(index)
+        }
+    }
+    for index in 0..<regions.len() {
+        if pools[usize.widen(node_of[index])] != Some(index) and core != Some(index) {
+            free_frames += page_count(regions[index])
+        }
+    }
+    let Some(core_region) = core else {
+        return None
+    }
+    if free_frames < TABLE_FRAMES {
+        return None
+    }
+    return Some(Plan(ram: ram, nodes: take node_of, core: core_region, pools: take pools))
+} Plan.of
+
+/// The bytes of the 64 KiB-aligned chunks lying wholly inside `region`, which a store over it supplies.
+fn chunk_bytes(region: Extent) -> u64 {
+    let start = align_up(region.base, to: 65_536)
+    let end = region.end / 65_536 * 65_536
+    if end <= start {
+        return 0
+    }
+    return end - start
+} chunk_bytes
+
+/// The 4 KiB frames lying wholly inside `region`.
+fn page_count(region: Extent) -> u64 {
+    let start = align_up(region.base, to: SMALL_FRAME)
+    let end = region.end / SMALL_FRAME * SMALL_FRAME
+    if end <= start {
+        return 0
+    }
+    return (end - start) / SMALL_FRAME
+} page_count
+
+fn align_up(value: u64, to: u64) -> u64
+    requires to > 0
+{
+    return (value + to - 1) / to * to
+} align_up
+
+/// The memory of `regions` laid out as `plan` gives: the core pool over its region, each node's pool over its own, and every other region's frames in the frame allocator, which then sets aside the core reserve's frames for page tables. The frame allocator keeps its records in the core pool, and draws the lists it splits regions into through `scratch`.
+pkg fn Memory.build(take regions: mem::List[hw::Region], plan: Plan, scratch: mem::Alloc) -> Memory {
+    var rest = regions
+    let core = mem::Heap.over(mut rest.remove(plan.core))
+    let alloc = core.alloc()
+    var nodes = mem::List[NodeFrames].empty(alloc)
+    for _ in 0..<plan.pools.len() {
+        mut nodes.push(NodeFrames(small: mem::List.empty(alloc), large: mem::List.empty(alloc), huge: mem::List.empty(alloc)))
+    }
+    var pools = mem::List[mem::Heap].empty(alloc)
+    var pool_bytes: u64 = 0
+    var index: usize = 0
+    for region in take rest {
+        if index == plan.core {
+            index += 1
+        }
+        let node = usize.widen(plan.nodes[index])
+        if plan.pools[node] == Some(index) {
+            pool_bytes += chunk_bytes(Extent(base: region.base(), end: region.base() + region.byte_len()))
+            mut pools.push(mem::Heap.over(take region))
+        } else {
+            mut nodes[node].add(take region, scratch)
+        }
+        index += 1
+    }
+    var frames = Frames(nodes: take nodes, tables: mem::List.empty(alloc))
+    for _ in 0..<TABLE_FRAMES {
+        let Some(frame) = mut frames.take_small() else {
+            break
+        }
+        mut frames.tables.push(take frame)
+    }
+    return Memory(frames: take frames, core: core, pools: take pools, pool_bytes: pool_bytes)
+} Memory.build
+
+/// Adds the frames of `region` to the node's: whole 1 GiB and 2 MiB frames where the region holds them, 4 KiB frames elsewhere, splitting the region through `scratch`.
+fn NodeFrames.add(mut self, take region: hw::Region, scratch: mem::Alloc) {
+    var small = mem::List[hw::PhysFrame[4_096]].empty(scratch)
+    take region.frames(mut small)
+    var run = mem::List[hw::PhysFrame[4_096]].empty(scratch)
+    for frame in take small {
+        let contiguous = match run.get(run.len().saturating_sub(1)) {
+            Some(previous) => previous.base() + SMALL_FRAME == frame.base()
+            None => frame.base() % LARGE_FRAME == 0
+        }
+        if not contiguous {
+            mut self.keep_small(take run)
+            run = mem::List.empty(scratch)
+        }
+        if run.len() == 0 and frame.base() % LARGE_FRAME != 0 {
+            mut self.small.push(take frame)
+            continue
+        }
+        mut run.push(take frame)
+        if u64.widen(run.len()) == LARGE_FRAME / SMALL_FRAME {
+            match hw::PhysFrame[2_097_152].merge(take run) {
+                Ok(large) => mut self.add_large(take large, scratch)
+                Err(parts) => mut self.keep_small(take parts)
+            }
+            run = mem::List.empty(scratch)
+        }
+    }
+    mut self.keep_small(take run)
+} NodeFrames.add
+
+fn NodeFrames.keep_small(mut self, take frames: mem::List[hw::PhysFrame[4_096]]) {
+    for frame in take frames {
+        mut self.small.push(take frame)
+    }
+} NodeFrames.keep_small
+
+/// Adds a 2 MiB frame, merging the node's last 512 into a 1 GiB frame when they span one: frames arrive in address order, so 512 of them spanning an aligned GiB are contiguous.
+fn NodeFrames.add_large(mut self, take frame: hw::PhysFrame[2_097_152], scratch: mem::Alloc) {
+    let end = frame.base() + LARGE_FRAME
+    mut self.large.push(take frame)
+    let parts = usize.widen(HUGE_FRAME / LARGE_FRAME)
+    if self.large.len() < parts {
+        return
+    }
+    let start = self.large.len() - parts
+    let Some(earliest) = self.large.get(start) else {
+        return
+    }
+    if earliest.base() % HUGE_FRAME != 0 or earliest.base() + HUGE_FRAME != end {
+        return
+    }
+    var run = mem::List[hw::PhysFrame[2_097_152]].empty(scratch)
+    for _ in 0..<parts {
+        mut run.push(mut self.large.remove(start))
+    }
+    match hw::PhysFrame[1_073_741_824].merge(take run) {
+        Ok(huge) => mut self.huge.push(take huge)
+        Err(back) => {
+            for part in take back {
+                mut self.large.push(take part)
+            }
+        }
+    }
+} NodeFrames.add_large
+
+/// A free 4 KiB frame of any node, splitting a larger one when no node has one, `None` when no free memory is left.
+fn Frames.take_small(mut self) -> Option[hw::PhysFrame[4_096]] {
+    for node in mut self.nodes {
+        let taken = mut node.take_small()
+        match taken {
+            Some(frame) => return Some(take frame)
+            None => {
+            }
+        }
+    }
+    return None
+} Frames.take_small
+
+fn NodeFrames.take_small(mut self) -> Option[hw::PhysFrame[4_096]] {
+    if self.small.len() == 0 {
+        if self.large.len() == 0 {
+            let Some(huge) = mut self.huge.pop() else {
+                return None
+            }
+            take huge.split(mut self.large)
+        }
+        let Some(large) = mut self.large.pop() else {
+            return None
+        }
+        take large.split(mut self.small)
+    }
+    return mut self.small.pop()
+} NodeFrames.take_small
+
+/// A zeroed 4 KiB frame for a page table: one of the core reserve's while it has any, else one of the free memory's, `None` when neither has one.
+pkg fn Frames.table(mut self) -> Option[hw::PhysFrame[4_096]] {
+    let reserved = mut self.tables.pop()
+    let found = match reserved {
+        Some(frame) => Some(take frame)
+        None => mut self.take_small()
+    }
+    match found {
+        Some(frame) => {
+            var zeroed = frame
+            clear(mut zeroed)
+            return Some(take zeroed)
+        }
+        None => return None
+    }
+} Frames.table
+
+fn clear(mut frame: hw::PhysFrame[4_096]) {
+    for index in 0u64..<512 {
+        set(mut frame.contents_mut(hw::Offset[u64](bytes: 8 * index)), value: 0)
+    }
+} clear
+
+fn set(mut slot: u64, value: u64) {
+    slot = value
+} set
+
+/// Gives a frame back to the core reserve's frames for page tables.
+pkg fn Frames.release(mut self, take frame: hw::PhysFrame[4_096]) {
+    mut self.tables.push(take frame)
+} Frames.release
+
+/// The bytes of the frames free for any use, the core reserve's excepted.
+pkg fn Frames.free_bytes(self) -> u64 {
+    var bytes: u64 = 0
+    for node in self.nodes {
+        bytes += u64.widen(node.small.len()) * SMALL_FRAME + u64.widen(node.large.len()) * LARGE_FRAME + u64.widen(node.huge.len()) * HUGE_FRAME
+    }
+    return bytes
+} Frames.free_bytes
+
+/// Extents shaped like the sandbox's: a 398 MiB region among smaller ones.
+fn sandbox_extents(alloc: mem::Alloc) -> mem::List[Extent] {
+    var extents = mem::List[Extent].empty(alloc)
+    mut extents.push(Extent(base: 0x14_2000, end: 0x80_0000))
+    mut extents.push(Extent(base: 0x90_0000, end: 0x178_0000))
+    mut extents.push(Extent(base: 0x308_1000, end: 0x1BF3_C000))
+    mut extents.push(Extent(base: 0x1CBC_9000, end: 0x1E54_E000))
+    mut extents.push(Extent(base: 0x1F50_A000, end: 0x1FB5_3000))
+    return extents
+} sandbox_extents
+
+test start_memory_is_planned for Plan.of {
+    let alloc = testing::world().alloc
+    let one_node = cpu::Nodes.of(None, alloc)
+    let extents = sandbox_extents(alloc)
+    let Some(plan) = Plan.of(extents.view(), nodes: one_node, cpus: 4, alloc) else {
+        expect false
+        return
+    }
+    expect plan.pools.len() == 1
+    expect plan.pools[0] == Some(2)
+    expect plan.core == 4
+    expect plan.ram == 0x1C3C_7000
+    var little = mem::List[Extent].empty(alloc)
+    mut little.push(Extent(base: 0x10_0000, end: 0x3C0_0000))
+    let small = Plan.of(little.view(), nodes: one_node, cpus: 4, alloc)
+    expect small.is_none()
+    var single = mem::List[Extent].empty(alloc)
+    mut single.push(Extent(base: 0x10_0000, end: 0x2000_0000))
+    mut single.push(Extent(base: 0x2010_0000, end: 0x2020_0000))
+    let no_core = Plan.of(single.view(), nodes: one_node, cpus: 4, alloc)
+    expect no_core.is_none()
+} start_memory_is_planned
+
+test each_node_gets_its_largest_region for Plan.of {
+    let alloc = testing::world().alloc
+    var ranges = mem::List[acpi::MemoryAffinity].empty(alloc)
+    mut ranges.push(acpi::MemoryAffinity(base: 0, byte_len: 0x1000_0000, domain: 7))
+    mut ranges.push(acpi::MemoryAffinity(base: 0x1000_0000, byte_len: 0x1000_0000, domain: 3))
+    let srat = acpi::Srat(memory: take ranges, processors: mem::List.empty(alloc))
+    let two_nodes = cpu::Nodes.of(Some(take srat), alloc)
+    let extents = sandbox_extents(alloc)
+    let Some(plan) = Plan.of(extents.view(), nodes: two_nodes, cpus: 4, alloc) else {
+        expect false
+        return
+    }
+    expect two_nodes.count() == 2
+    expect plan.pools[0] == Some(3)
+    expect plan.pools[1] == Some(2)
+    expect plan.core == 4
+} each_node_gets_its_largest_region
