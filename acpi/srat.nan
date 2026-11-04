@@ -1,0 +1,126 @@
+//! The SRAT, the table placing memory and processors in proximity domains.
+
+const SRAT_ENTRIES: usize = 48
+
+const APIC_AFFINITY: u8 = 0
+
+const MEMORY_AFFINITY: u8 = 1
+
+const X2APIC_AFFINITY: u8 = 2
+
+const ENTRY_ENABLED: u32 = 1
+
+/// The proximity domains of the SRAT's enabled memory ranges and processors.
+pub closed struct Srat {
+    pub memory: mem::List[MemoryAffinity]
+    pub processors: mem::List[ProcessorAffinity]
+} Srat
+
+/// A range of memory in a proximity domain.
+pub closed struct MemoryAffinity derives Copy, Eq {
+    pub base: u64
+    pub byte_len: u64
+    pub domain: u32
+} MemoryAffinity
+
+/// A processor, named by its local APIC or x2APIC id, in a proximity domain.
+pub closed struct ProcessorAffinity derives Copy, Eq {
+    pub apic_id: u32
+    pub domain: u32
+} ProcessorAffinity
+
+/// The SRAT when each of its entries lies inside it, its processor and memory affinity entries with their lengths and its memory ranges below 2^64.
+pub validator fn Srat.read(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Srat fails TableError {
+    let bytes = raw.inspect()
+    try check_header(bytes, signature: Signature.Srat, minimum: SRAT_ENTRIES)
+    var memory = mem::List[MemoryAffinity].empty(alloc)
+    var processors = mem::List[ProcessorAffinity].empty(alloc)
+    var at = SRAT_ENTRIES
+    while at < bytes.len() {
+        if bytes.len() - at < 2 {
+            fail TableError.Entry
+        }
+        let kind = bytes[at]
+        let length = usize.widen(bytes[at + 1])
+        if length < 2 or length > bytes.len() - at or length < entry_bytes(kind) {
+            fail TableError.Entry
+        }
+        if kind == MEMORY_AFFINITY and (bytes.u32_le(at + 28) & ENTRY_ENABLED) != 0 {
+            let base = bytes.u64_le(at + 8)
+            let byte_len = bytes.u64_le(at + 16)
+            if base.checked_add(byte_len).is_none() {
+                fail TableError.Entry
+            }
+            mut memory.push(MemoryAffinity(base: base, byte_len: byte_len, domain: bytes.u32_le(at + 2)))
+        } else if kind == APIC_AFFINITY and (bytes.u32_le(at + 4) & ENTRY_ENABLED) != 0 {
+            let high = u32.widen(bytes[at + 9]) | (u32.widen(bytes[at + 10]) << 8) | (u32.widen(bytes[at + 11]) << 16)
+            mut processors.push(ProcessorAffinity(apic_id: u32.widen(bytes[at + 3]), domain: u32.widen(bytes[at + 2]) | (high << 8)))
+        } else if kind == X2APIC_AFFINITY and (bytes.u32_le(at + 12) & ENTRY_ENABLED) != 0 {
+            mut processors.push(ProcessorAffinity(apic_id: bytes.u32_le(at + 8), domain: bytes.u32_le(at + 4)))
+        }
+        at += length
+    }
+    return Srat(memory: take memory, processors: take processors)
+} Srat.read
+
+/// The length an entry of type `kind` has, 2 for a type the core does not read.
+fn entry_bytes(kind: u8) -> usize {
+    return match kind {
+        APIC_AFFINITY => 16
+        MEMORY_AFFINITY => 40
+        X2APIC_AFFINITY => 24
+        else => 2
+    }
+} entry_bytes
+
+/// A memory affinity entry for `byte_len` bytes from `base` in `domain`, enabled or not.
+fn memory_entry(base: u64, byte_len: u64, domain: u32, enabled: bool) -> Array[u8, 40] {
+    var entry = Array[u8, 40].filled(0)
+    entry[0] = MEMORY_AFFINITY
+    entry[1] = 40
+    mut entry.view_mut().write_u32_le(2, value: domain)
+    mut entry.view_mut().write_u64_le(8, value: base)
+    mut entry.view_mut().write_u64_le(16, value: byte_len)
+    if enabled {
+        mut entry.view_mut().write_u32_le(28, value: ENTRY_ENABLED)
+    }
+    return entry
+} memory_entry
+
+/// An SRAT holding `entries` after its reserved fields.
+fn sample_srat(entries: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var body = mem::Bytes.zeroed(12, alloc)
+    mut body.view_mut().write_u32_le(0, value: 1)
+    mut body.append(entries)
+    return sample_table(Signature.Srat, body: body.view(), alloc)
+} sample_srat
+
+fn srat_outcome(table: mem::Bytes, alloc: mem::Alloc) -> Result[Srat, TableError] {
+    return attempt Srat.read(Untrusted.of(table.view()), alloc)
+} srat_outcome
+
+test srat_places_memory_and_processors for Srat.read {
+    let alloc = testing::world().alloc
+    var entries = mem::Bytes.empty(alloc)
+    mut entries.append(memory_entry(base: 0, byte_len: 0x8000_0000, domain: 0, enabled: true).view())
+    mut entries.append(memory_entry(base: 0x1_0000_0000, byte_len: 0x4000_0000, domain: 0x0102_0304, enabled: true).view())
+    mut entries.append(memory_entry(base: 0x2_0000_0000, byte_len: 0x1000, domain: 5, enabled: false).view())
+    mut entries.append(b"\x00\x10\x07\x03\x01\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+    mut entries.append(b"\x00\x10\x01\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+    mut entries.append(b"\x02\x18\x00\x00\x09\x00\x00\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+    mut entries.append(b"\x05\x03\x00")
+    let Ok(srat) = srat_outcome(sample_srat(entries: entries.view(), alloc), alloc) else {
+        expect false
+        return
+    }
+    expect srat.memory.len() == 2
+    expect srat.memory[1] == MemoryAffinity(base: 0x1_0000_0000, byte_len: 0x4000_0000, domain: 0x0102_0304)
+    expect srat.processors.len() == 2
+    expect srat.processors[0] == ProcessorAffinity(apic_id: 3, domain: 0x0107)
+    expect srat.processors[1] == ProcessorAffinity(apic_id: 0x100, domain: 9)
+    let short = srat_outcome(sample_srat(entries: b"\x01\x10\x00\x00", alloc), alloc)
+    expect short.is_err()
+    let overflow = memory_entry(base: 0xFFFF_FFFF_FFFF_0000, byte_len: 0x1_0000, domain: 0, enabled: true)
+    let wrapped = srat_outcome(sample_srat(entries: overflow.view(), alloc), alloc)
+    expect wrapped.is_err()
+} srat_places_memory_and_processors

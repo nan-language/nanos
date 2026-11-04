@@ -47,13 +47,13 @@ The kernel starts in these steps. A step that fails halts the kernel with its co
 6. **Clock.** The core calibrates the [monotonic clock](08-scheduling.md#monotonic-clock). Failure: none.
 7. **Watchdog.** On a machine with `watchdog`, the core arms the [watchdog](#watchdog). Failure: none; a watchdog that does not respond counts as absent.
 8. **IOMMU.** On a machine with `iommu`, the core enables every IOMMU unit with all DMA blocked and interrupt remapping on; `devices` gives each device group a domain of its own when it binds a driver ([DMA and IOMMU](15-devices.md#dma-and-iommu)). Failure: the boot continues as on a machine without `iommu`, `/live/security` reports `dma: unconfined`, and the core emits `fault.iommu-failed`.
-9. **Anchor.** The core calls `take k.anchor(take state, run: first)` with the [anchor](#anchor) ([NaN 24 §Anchor](https://github.com/nan-language/nan/blob/main/docs/spec/24-kernel.md#anchor)). NaN starts every CPU, and each CPU enables its features ([CPUs](#cpus)) and loads the shared space's tables. Failure: NaN's halts.
-10. **First task.** The first task starts `supervisor`, which starts the base instances in the [start order](20-base.md#start-order), in parallel where independent and lazily where marked, and then reconciles `/sys/instances` ([lifecycle](06-execution.md#lifecycle)). The first task never returns; its end halts the kernel with NaN's cause `first-task-ended`.
+9. **Anchor.** The core calls `take k.anchor(take state, run: first)` with the [anchor](#anchor) ([NaN 24 §Anchor](https://github.com/nan-language/nan/blob/main/docs/spec/24-kernel.md#anchor)). NaN starts every CPU, and each CPU enables its features ([CPUs](#cpus)) and loads the shared space's tables before it runs any other work. Failure: NaN's halts.
+10. **First task.** Once every CPU has started, the first task prints on the serial console the line `kernel: started` followed by [measured facts](01-machines.md#measured-facts) and the core's memory: the CPUs, NUMA nodes and RAM, the node pools and the free frames, the level, `smt` when it holds, and the [machine conditions](01-machines.md#machine-conditions) that hold among those the loader and steps 2 to 8 detect. It then starts `supervisor`, which starts the base instances in the [start order](20-base.md#start-order), in parallel where independent and lazily where marked, and then reconciles `/sys/instances` ([lifecycle](06-execution.md#lifecycle)). The first task never returns; its end halts the kernel with NaN's cause `first-task-ended`.
 
 ## CPUs
 
 - The machine's CPUs are those the MADT or the device tree reports usable. NaN numbers them from 0, the boot CPU being 0. The set is fixed for the boot.
-- As the anchor starts it, each CPU enables no-execute pages, write protection in kernel mode, SMEP, SMAP and UMIP when it has them, PCIDs on a machine with `pcid`, and x2APIC mode when it has it (requires [N11](22-nan.md#n11), [N21](22-nan.md#n21)); on AArch64, privileged access never and privileged execute never for user pages.
+- Before it runs any other work, each CPU enables no-execute pages, write protection in kernel mode, SMEP, SMAP and UMIP when it has them, PCIDs on a machine with `pcid`, and x2APIC mode when it has it (requires [N11](22-nan.md#n11), [N21](22-nan.md#n21)); on AArch64, privileged access never and privileged execute never for user pages.
 - The core records each CPU's package, core, sibling hardware threads, last-level cache and NUMA node, from CPUID leaves 4, 0xB and 0x1F and the SRAT, or from the device tree's `cpu-map`, cache nodes and `numa-node-id` properties. [Wake placement](08-scheduling.md#wake-placement) uses them, and `/live/cpus` publishes them ([`/live`](13-tree.md#live)).
 - Wake IPIs and TLB-shootdown IPIs are services of NaN's runtime (requires [N8](22-nan.md#n8), [N11](22-nan.md#n11)); the core sends no other IPI.
 
@@ -102,6 +102,7 @@ A **space** is an address space: the **shared space**, whose code runs in ring 0
 | holes between ranges | nothing | — |
 
 - The shared space maps every frame and region at its physical address ([NaN 24 §Physical memory](https://github.com/nan-language/nan/blob/main/docs/spec/24-kernel.md#physical-memory)), whatever the amount of memory (requires [N12](22-nan.md#n12)).
+- On x86_64 the shared space also maps the first MiB, where NaN starts the other CPUs, read-write and non-executable until every CPU has started; the first task then removes it.
 - A **code area** holds the code and read-only data of a loaded bundle ([loading](10-code.md#loading)); every space that loads the bundle maps the same frames. Loading writes them through the usable-memory mapping, shoots down every CPU's translations of them, then maps them as the table gives, so no writable mapping of them remains. Unloading maps them read-write and non-executable again after a shootdown.
 
 ### Isolated spaces

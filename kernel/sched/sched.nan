@@ -1,0 +1,536 @@
+//! Run queues, CPU classes, wake placement, accounting and idle: the policy through which NaN's runtime runs the kernel's tasks.
+
+/// The class of the root executor's share, and so of the core's tasks.
+const CORE: u8 = 0
+
+const LATENCY: u8 = 1
+
+const NORMAL: u8 = 2
+
+const BACKGROUND: u8 = 3
+
+/// The class of core work for one CPU alone, the CPU being its share's `reserve_ppm`.
+const PINNED: u8 = 4
+
+/// The slice of `normal` and `background` work.
+const SLICE_NS: u64 = 3_000_000
+
+/// The weight at which virtual time counts real nanoseconds.
+const UNIT_WEIGHT: u64 = 100
+
+/// The bits of a key below its class's rank.
+const RANK_SHIFT: u32 = 62
+
+const VALUE_MASK: u64 = 0x3FFF_FFFF_FFFF_FFFF
+
+/// The accounts with ready work that each CPU keeps the virtual time of.
+const ENTITIES: usize = 64
+
+/// Where a CPU lies: its last-level cache and NUMA node.
+pkg struct Place derives Copy, Eq {
+    pkg cache: u64
+    pkg node: u32
+} Place
+
+/// What the policy and the core's tasks share: each CPU's state behind its lock, where each CPU lies, the running CPU's number and the clock.
+pkg struct State {
+    cpus: mem::List[hw::SpinLock[Cpu]]
+    places: mem::List[Place]
+    here: hw::PerCpu[u32]
+    clock: sys::Clock
+    started: core::atomic::AtomicBool
+} State
+
+/// The kernel's policy, whose hooks NaN's runtime calls with the CPU's interrupts disabled.
+pkg struct Scheduler {
+    state: mem::Shared[State]
+} Scheduler
+
+/// A CPU's run queue as the policy sees it.
+struct Cpu {
+    started: bool
+    idle: bool
+    queued: u32
+    pinned: u32
+    virtual_ns: u64
+    running: Running
+    entities: mem::Bounded[Entity, ENTITIES]
+} Cpu
+
+/// The work a CPU runs: its account, weight and class, since when, and whether it runs any.
+struct Running derives Copy {
+    executor: u64
+    weight: u64
+    class: u8
+    since_ns: u64
+    active: bool
+} Running
+
+/// An account with ready work on a CPU: its virtual runtime and its tasks placed there that have not started.
+struct Entity derives Copy {
+    executor: u64
+    virtual_ns: u64
+    ready: u32
+} Entity
+
+/// The share of the executors whose tasks run on CPU `cpu` alone.
+pkg fn pinned_share(cpu: u32) -> task::Share
+    requires cpu <= 1_000_000
+{
+    return task::Share(weight: 1, class: PINNED, reserve_ppm: cpu)
+} pinned_share
+
+/// The rank of a class in every run queue: `latency` work first, then the core's, then `normal` and `background` work.
+fn rank(class: u8) -> u64 {
+    return match class {
+        LATENCY => 0
+        CORE or PINNED => 1
+        NORMAL => 2
+        else => 3
+    }
+} rank
+
+/// The key placing work of `class` with `value` in a run queue: by rank, then by value.
+fn key(class: u8, value: u64) -> u64 {
+    return (rank(class) << RANK_SHIFT) | (value & VALUE_MASK)
+} key
+
+/// The virtual time `ns` of running is worth at `weight`.
+fn virtual_of(ns: u64, weight: u64) -> u64 {
+    if weight == 0 {
+        return ns.saturating_mul(UNIT_WEIGHT)
+    }
+    return ns.saturating_mul(UNIT_WEIGHT) / weight
+} virtual_of
+
+/// The state for `places.len()` CPUs, every CPU but the boot CPU not yet started.
+pkg fn State.of(take places: mem::List[Place], clock: sys::Clock, alloc: mem::Alloc) -> State {
+    var cpus = mem::List[hw::SpinLock[Cpu]].empty(alloc)
+    for index in 0..<places.len() {
+        let idle = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
+        mut cpus.push(hw::SpinLock.of(Cpu(started: index == 0, idle: false, queued: 0, pinned: 0, virtual_ns: 0, running: idle, entities: mem::Bounded.empty())))
+    }
+    return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false))
+} State.of
+
+/// Marks CPU `cpu` started: it runs on the shared space with its features enabled, so work may go to it.
+pkg fn State.start(self, cpu: u32) {
+    let Some(lock) = self.cpus.get(usize.widen(cpu)) else {
+        return
+    }
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        lock.with(t, body: fn(mut state: Cpu) limits notrap, terminates, noalloc {
+            state.started = true
+        })
+    })
+} State.start
+
+/// Marks every CPU started, from which on idle CPUs take work from others.
+pkg fn State.all_started(self) {
+    self.started.store(true)
+} State.all_started
+
+fn State.now(self) -> u64 limits notrap, terminates, noalloc {
+    return match attempt self.clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} State.now
+
+/// The running CPU's number.
+fn State.running_cpu(self, t: hw::IrqsDisabled) -> u32 limits notrap, terminates, noalloc {
+    return self.here.with(t, body: fn(mut cpu: u32) -> u32 limits notrap, terminates, noalloc {
+        return cpu
+    })
+} State.running_cpu
+
+/// Whether CPU `cpu` has started and idles.
+fn State.is_idle(self, t: hw::IrqsDisabled, cpu: u32) -> bool limits notrap, terminates, noalloc {
+    let Some(lock) = self.cpus.get(usize.widen(cpu)) else {
+        return false
+    }
+    return lock.with(t, body: fn(mut state: Cpu) -> bool limits notrap, terminates, noalloc {
+        return state.started and state.idle
+    })
+} State.is_idle
+
+/// Whether CPU `cpu` has started.
+fn State.is_started(self, t: hw::IrqsDisabled, cpu: u32) -> bool limits notrap, terminates, noalloc {
+    let Some(lock) = self.cpus.get(usize.widen(cpu)) else {
+        return false
+    }
+    return lock.with(t, body: fn(mut state: Cpu) -> bool limits notrap, terminates, noalloc {
+        return state.started
+    })
+} State.is_started
+
+/// The CPU a woken task goes to: the CPU it last ran on when that CPU idles, else an idle CPU sharing that CPU's last-level cache, else the waker's CPU, which also stands as the last CPU of a task that never ran.
+fn State.wake_cpu(self, t: hw::IrqsDisabled, previous: Option[u32], waker: u32) -> u32 limits notrap, terminates, noalloc {
+    let last = previous.value_or(waker)
+    if self.is_idle(t, cpu: last) {
+        return last
+    }
+    let Some(place) = self.places.get(usize.widen(last)) else {
+        return waker
+    }
+    for index in 0..<self.places.len() {
+        let Some(other) = self.places.get(index) else {
+            continue
+        }
+        let cpu = u32.truncate(index)
+        if other.cache == place.cache and self.is_idle(t, cpu) {
+            return cpu
+        }
+    }
+    return waker
+} State.wake_cpu
+
+/// Charges the running work of the running CPU when it is of `task`'s account, as when `task` is preempted.
+fn State.charge_running(self, t: hw::IrqsDisabled, task: hw::TaskView) limits notrap, terminates, noalloc {
+    let Some(lock) = self.cpus.get(usize.widen(self.running_cpu(t))) else {
+        return
+    }
+    let now = self.now()
+    lock.with(t, body: fn(mut state: Cpu) limits notrap, terminates, noalloc {
+        if state.running.active and state.running.executor == task.executor {
+            mut state.charge(now_ns: now)
+        }
+    })
+} State.charge_running
+
+/// Adds `task` to CPU `cpu`'s queue and gives its key.
+fn State.enqueue(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc {
+    let Some(lock) = self.cpus.get(usize.widen(cpu)) else {
+        return key(task.share.class, value: 0)
+    }
+    let now = self.now()
+    return lock.with(t, body: fn(mut state: Cpu) -> u64 limits notrap, terminates, noalloc {
+        return mut state.enqueue(task, now_ns: now)
+    })
+} State.enqueue
+
+impl Scheduler: hw::Policy
+
+/// The policy over `state`, which the core's tasks share.
+pkg fn Scheduler.of(take state: mem::Shared[State]) -> Scheduler = Scheduler(state: take state)
+
+pkg fn Scheduler.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
+    let state = self.state.contents()
+    state.charge_running(t, task)
+    var here = state.running_cpu(t)
+    if not state.is_started(t, cpu: here) {
+        here = 0
+    }
+    var target = here
+    if task.share.class == PINNED {
+        target = task.share.reserve_ppm
+    } else {
+        target = state.wake_cpu(t, previous: task.last_cpu, waker: here)
+    }
+    return hw::Placement(cpu: target, key: state.enqueue(t, cpu: target, task))
+} Scheduler.place
+
+pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] limits notrap, terminates, noalloc, stack 4_096 {
+    let state = self.state.contents()
+    if round != 0 or not state.started.load() {
+        return None
+    }
+    let Some(place) = state.places.get(usize.widen(cpu)) else {
+        return None
+    }
+    var best: Option[u32] = None
+    var best_tier: u8 = 3
+    var best_queued: u32 = 0
+    for index in 0..<state.places.len() {
+        let other = u32.truncate(index)
+        let Some(lock) = state.cpus.get(index) else {
+            continue
+        }
+        let Some(spot) = state.places.get(index) else {
+            continue
+        }
+        let queued = lock.with(t, body: fn(mut victim: Cpu) -> u32 limits notrap, terminates, noalloc {
+            if not victim.started or victim.pinned > 0 {
+                return 0
+            }
+            return victim.queued
+        })
+        var tier: u8 = 2
+        if spot.cache == place.cache {
+            tier = 0
+        } else if spot.node == place.node {
+            tier = 1
+        }
+        if other != cpu and queued > 0 and (tier < best_tier or (tier == best_tier and queued > best_queued)) {
+            best = Some(other)
+            best_tier = tier
+            best_queued = queued
+        }
+    }
+    return best
+} Scheduler.steal
+
+pkg fn Scheduler.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    let state = self.state.contents()
+    let now = state.now()
+    let Some(lock) = state.cpus.get(usize.widen(cpu)) else {
+        return 0
+    }
+    return lock.with(t, body: fn(mut current: Cpu) -> u64 limits notrap, terminates, noalloc {
+        return mut current.switch_to(task, now_ns: now)
+    })
+} Scheduler.slice
+
+pkg fn Scheduler.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
+    let state = self.state.contents()
+    let now = state.now()
+    let Some(lock) = state.cpus.get(usize.widen(cpu)) else {
+        return hw::Idle.Halt
+    }
+    lock.with(t, body: fn(mut current: Cpu) limits notrap, terminates, noalloc {
+        mut current.go_idle(now_ns: now)
+    })
+    return hw::Idle.Halt
+} Scheduler.idle
+
+/// Charges the running work for the time since it started or was last charged: `normal` and `background` work to its account's virtual runtime.
+fn Cpu.charge(mut self, now_ns: u64) limits notrap, terminates, noalloc {
+    if not self.running.active {
+        return
+    }
+    let ran = now_ns.saturating_sub(self.running.since_ns)
+    self.running.since_ns = now_ns
+    if self.running.class != NORMAL and self.running.class != BACKGROUND {
+        return
+    }
+    let added = virtual_of(ran, weight: self.running.weight)
+    let executor = self.running.executor
+    for entity in mut self.entities {
+        if entity.executor == executor {
+            entity.virtual_ns = entity.virtual_ns.saturating_add(added)
+        }
+    }
+} Cpu.charge
+
+/// Adds `task` to this CPU's queue at `now_ns` and gives its key: `latency` work by deadline, `normal` and `background` work by its account's virtual deadline, the core's work in the order it arrives.
+fn Cpu.enqueue(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, terminates, noalloc {
+    self.queued = self.queued.saturating_add(1)
+    self.idle = false
+    let class = task.share.class
+    if class == PINNED {
+        self.pinned = self.pinned.saturating_add(1)
+    }
+    if class == LATENCY {
+        return key(class, value: task.deadline_ns.value_or(now_ns))
+    }
+    if class == NORMAL or class == BACKGROUND {
+        let start = mut self.ready_entity(task.executor)
+        return key(class, value: start.saturating_add(virtual_of(SLICE_NS, weight: u64.widen(task.share.weight))))
+    }
+    return key(class, value: 0)
+} Cpu.enqueue
+
+/// The virtual runtime of account `executor` on this CPU, counting one more ready task of it: an account this CPU keeps none for starts at the CPU's virtual time, in the place of one without ready work when the CPU keeps as many as it can.
+fn Cpu.ready_entity(mut self, executor: u64) -> u64 limits notrap, terminates, noalloc {
+    let floor = self.virtual_ns
+    for entity in mut self.entities {
+        if entity.executor == executor {
+            entity.ready = entity.ready.saturating_add(1)
+            if entity.virtual_ns < floor {
+                entity.virtual_ns = floor
+            }
+            return entity.virtual_ns
+        }
+    }
+    let fresh = Entity(executor: executor, virtual_ns: floor, ready: 1)
+    if (attempt mut self.entities.try_push(fresh)).is_ok() {
+        return floor
+    }
+    let running = self.running
+    for entity in mut self.entities {
+        if entity.ready == 0 and not (running.active and running.executor == entity.executor) {
+            entity.executor = executor
+            entity.virtual_ns = floor
+            entity.ready = 1
+            return floor
+        }
+    }
+    return floor
+} Cpu.ready_entity
+
+/// Switches this CPU to `task` at `now_ns` and gives its slice: `normal` and `background` work gets one while other work waits on the CPU, other work none.
+fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, terminates, noalloc {
+    mut self.charge(now_ns)
+    self.queued = self.queued.saturating_sub(1)
+    let class = task.share.class
+    if class == PINNED {
+        self.pinned = self.pinned.saturating_sub(1)
+    }
+    self.idle = false
+    self.running = Running(executor: task.executor, weight: u64.widen(task.share.weight), class: class, since_ns: now_ns, active: true)
+    var floor = self.virtual_ns
+    for entity in mut self.entities {
+        if entity.executor == task.executor {
+            entity.ready = entity.ready.saturating_sub(1)
+            if entity.virtual_ns > floor {
+                floor = entity.virtual_ns
+            }
+        }
+    }
+    self.virtual_ns = floor
+    if (class == NORMAL or class == BACKGROUND) and self.queued > 0 {
+        return SLICE_NS
+    }
+    return 0
+} Cpu.switch_to
+
+/// Makes this CPU idle at `now_ns`: its queue is empty.
+fn Cpu.go_idle(mut self, now_ns: u64) limits notrap, terminates, noalloc {
+    mut self.charge(now_ns)
+    self.running.active = false
+    self.idle = true
+    self.queued = 0
+    self.pinned = 0
+    for entity in mut self.entities {
+        entity.ready = 0
+    }
+} Cpu.go_idle
+
+fn view(executor: u64, class: u8, weight: u32) -> hw::TaskView {
+    return hw::TaskView(task: executor, executor: executor, share: task::Share(weight: weight, class: class, reserve_ppm: 0), last_cpu: None, ran_ns: 0, deadline_ns: None)
+} view
+
+fn idle_cpu() -> Cpu {
+    let nothing = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
+    return Cpu(started: true, idle: true, queued: 0, pinned: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty())
+} idle_cpu
+
+test classes_order_every_queue for key {
+    expect key(LATENCY, value: 1_000_000_000_000_000) < key(CORE, value: 0)
+    expect key(CORE, value: 0) == key(PINNED, value: 0)
+    expect key(PINNED, value: 0) < key(NORMAL, value: 0)
+    expect key(NORMAL, value: 1_000_000_000_000_000) < key(BACKGROUND, value: 0)
+    expect key(NORMAL, value: 5) < key(NORMAL, value: 6)
+} classes_order_every_queue
+
+/// Two `normal` accounts weighing 300 and 100 share a CPU, each running a slice whenever its key is the queue's smallest, the earlier queued first among equal keys: they run in the ratio of their weights.
+test weights_divide_a_cpu for Cpu.enqueue {
+    var cpu = idle_cpu()
+    let heavy = view(executor: 1, class: NORMAL, weight: 300)
+    let light = view(executor: 2, class: NORMAL, weight: 100)
+    var now: u64 = 0
+    var heavy_key = mut cpu.enqueue(heavy, now_ns: now)
+    var light_key = mut cpu.enqueue(light, now_ns: now)
+    var heavy_first = false
+    var heavy_runs: u32 = 0
+    var light_runs: u32 = 0
+    for _ in 0..<40u32 {
+        let pick_heavy = heavy_key < light_key or (heavy_key == light_key and heavy_first)
+        var running = light
+        if pick_heavy {
+            running = heavy
+        }
+        discard mut cpu.switch_to(running, now_ns: now)
+        now += SLICE_NS
+        mut cpu.charge(now_ns: now)
+        if pick_heavy {
+            heavy_runs += 1
+            heavy_key = mut cpu.enqueue(heavy, now_ns: now)
+            heavy_first = false
+        } else {
+            light_runs += 1
+            light_key = mut cpu.enqueue(light, now_ns: now)
+            heavy_first = true
+        }
+    }
+    expect heavy_runs == 30
+    expect light_runs == 10
+} weights_divide_a_cpu
+
+test slices_end_only_shared_work for Cpu.switch_to {
+    var cpu = idle_cpu()
+    let alone = view(executor: 1, class: NORMAL, weight: 100)
+    discard mut cpu.enqueue(alone, now_ns: 0)
+    let solo = mut cpu.switch_to(alone, now_ns: 0)
+    expect solo == 0
+    discard mut cpu.enqueue(alone, now_ns: 10)
+    discard mut cpu.enqueue(view(executor: 2, class: BACKGROUND, weight: 100), now_ns: 10)
+    let shared = mut cpu.switch_to(alone, now_ns: 10)
+    expect shared == SLICE_NS
+    let core_work = mut cpu.switch_to(view(executor: 0, class: CORE, weight: 1), now_ns: 20)
+    expect core_work == 0
+    mut cpu.go_idle(now_ns: 30)
+    expect cpu.idle and cpu.queued == 0
+} slices_end_only_shared_work
+
+/// A policy over four started CPUs: CPUs 0 and 1 share a cache, CPUs 2 and 3 another, all on node 0.
+fn four_cpus(clock: sys::Clock, alloc: mem::Alloc) -> Scheduler {
+    var places = mem::List[Place].empty(alloc)
+    for cpu in 0u64..<4 {
+        mut places.push(Place(cache: cpu / 2, node: 0))
+    }
+    let state = mem::Shared.of(State.of(take places, clock, alloc), alloc)
+    for cpu in 1u32..<4 {
+        state.contents().start(cpu)
+    }
+    state.contents().all_started()
+    return Scheduler.of(take state)
+} four_cpus
+
+fn last_on(cpu: u32, executor: u64) -> hw::TaskView {
+    var task = view(executor, class: NORMAL, weight: 100)
+    task.last_cpu = Some(cpu)
+    return task
+} last_on
+
+/// The CPUs the policy gives four wakes while CPU 0 runs a task and the others idle: back to idle CPU 2, then from busy CPU 0 to its idle cache sibling 1, then, with no idle CPU left in that cache, to the waker's CPU 0, and a pinned task to its CPU.
+fn placements(policy: Scheduler) -> Array[u32, 4] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Array[u32, 4] limits notrap, terminates {
+        discard policy.slice(t, cpu: 0, task: view(executor: 0, class: CORE, weight: 1))
+        for cpu in 1u32..<4 {
+            discard policy.idle(t, cpu, until_ns: None)
+        }
+        var cpus = Array[u32, 4].filled(9)
+        cpus[0] = policy.place(t, task: last_on(cpu: 2, executor: 5)).cpu
+        cpus[1] = policy.place(t, task: last_on(cpu: 0, executor: 6)).cpu
+        cpus[2] = policy.place(t, task: last_on(cpu: 0, executor: 7)).cpu
+        let fixed = hw::TaskView(task: 8, executor: 8, share: pinned_share(3), last_cpu: None, ran_ns: 0, deadline_ns: None)
+        cpus[3] = policy.place(t, task: fixed).cpu
+        return cpus
+    })
+} placements
+
+test wakes_go_to_idle_cpus_near_their_last for Scheduler.place {
+    let world = testing::world()
+    let cpus = placements(four_cpus(clock: world.clock, alloc: world.alloc))
+    expect cpus[0] == 2
+    expect cpus[1] == 1
+    expect cpus[2] == 0
+    expect cpus[3] == 3
+} wakes_go_to_idle_cpus_near_their_last
+
+/// The CPUs that idle CPUs 3 and 1 steal from once work waits on CPUs 0 and 2, and CPU 1's second round.
+fn steals(policy: Scheduler) -> Array[Option[u32], 3] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Array[Option[u32], 3] limits notrap, terminates {
+        for cpu in 0u32..<4 {
+            discard policy.idle(t, cpu, until_ns: None)
+        }
+        let state = policy.state.contents()
+        discard state.enqueue(t, cpu: 0, task: view(executor: 5, class: NORMAL, weight: 100))
+        discard state.enqueue(t, cpu: 0, task: view(executor: 6, class: NORMAL, weight: 100))
+        discard state.enqueue(t, cpu: 2, task: view(executor: 7, class: NORMAL, weight: 100))
+        var victims = Array[Option[u32], 3].filled(None)
+        victims[0] = policy.steal(t, cpu: 3, round: 0)
+        victims[1] = policy.steal(t, cpu: 1, round: 0)
+        victims[2] = policy.steal(t, cpu: 1, round: 1)
+        return victims
+    })
+} steals
+
+test idle_cpus_steal_nearest_work_first for Scheduler.steal {
+    let world = testing::world()
+    let victims = steals(four_cpus(clock: world.clock, alloc: world.alloc))
+    expect victims[0] == Some(2)
+    expect victims[1] == Some(0)
+    expect victims[2] == None
+} idle_cpus_steal_nearest_work_first

@@ -1,0 +1,281 @@
+//! Page tables, the shared space and shootdowns.
+
+const PRESENT: u64 = 0x1
+
+const WRITABLE: u64 = 0x2
+
+const WRITE_THROUGH: u64 = 0x8
+
+const UNCACHED: u64 = 0x10
+
+const LARGE_PAGE: u64 = 0x80
+
+const GLOBAL: u64 = 0x100
+
+const NO_EXECUTE: u64 = 0x8000_0000_0000_0000
+
+const ADDRESS_BITS: u64 = 0x000F_FFFF_FFFF_F000
+
+const PAGE_BYTES: u64 = 4_096
+
+const LARGE_BYTES: u64 = 2_097_152
+
+const HUGE_BYTES: u64 = 1_073_741_824
+
+/// The end of the first MiB, which NaN's start of the CPUs uses and the shared space maps only until every CPU has started.
+const LOW_MEMORY: u64 = 1_048_576
+
+const FOUR_GIB: u64 = 0x1_0000_0000
+
+/// The local APIC's registers, which the runtime reaches there when the boot CPU has no x2APIC mode.
+const LOCAL_APIC: u64 = 0xFEE0_0000
+
+/// What a mapping of the shared space allows.
+enum Access derives Copy, Eq {
+    Data
+    Code
+    Device
+} Access
+
+/// The shared space before the CPUs install it: the root of each CPU in order, every root reaching the same tables, and the page table mapping the first 2 MiB.
+pkg linear struct Shared {
+    roots: mem::List[hw::PageTableRoot]
+    low: u64
+} Shared
+
+/// The low memory a started machine no longer maps: the page table that mapped it, whose entries for the first MiB are cleared.
+pkg struct LowMemory derives Copy {
+    table: u64
+} LowMemory
+
+fn Access.flags(self) -> u64 {
+    return match self {
+        Access.Data => PRESENT | WRITABLE | GLOBAL | NO_EXECUTE
+        Access.Code => PRESENT | WRITABLE | GLOBAL
+        Access.Device => PRESENT | WRITABLE | WRITE_THROUGH | UNCACHED | GLOBAL | NO_EXECUTE
+    }
+} Access.flags
+
+/// The shared space for `cpus` CPUs over usable memory, `extents` being the regions `k.regions()` gave, in address order. Below 4 GiB it maps everything from 4 KiB to the end of the last region there, for the gaps between regions hold the image, the boot area and the start information, and maps the image, from 1 MiB to the first region above it, executable; above 4 GiB it maps the regions alone; and without x2APIC it maps the local APIC uncached. `None` when the frames run out.
+pkg fn Shared.build(
+    extents: Slice[frames::Extent],
+    features: cpu::Features,
+    cpus: u32,
+    mut frames: frames::Frames,
+    alloc: mem::Alloc,
+    ) -> Option[Shared] {
+    let Some(root_frame) = mut frames.table() else {
+        return None
+    }
+    var top = root_frame
+    let code_end = image_end(extents)
+    var low_end = code_end
+    for extent in extents {
+        let below = align_up(min(extent.end, b: FOUR_GIB), to: PAGE_BYTES)
+        if extent.base < FOUR_GIB and below > low_end {
+            low_end = below
+        }
+    }
+    var mapped = map(mut top, base: PAGE_BYTES, end: LOW_MEMORY, access: Access.Data, huge: false, mut frames)
+    mapped = mapped and map(mut top, base: LOW_MEMORY, end: code_end, access: Access.Code, huge: false, mut frames)
+    mapped = mapped and map(mut top, base: code_end, end: low_end, access: Access.Data, huge: features.pages_1g, mut frames)
+    for extent in extents {
+        if mapped and extent.end > FOUR_GIB {
+            let base = max(extent.base, b: FOUR_GIB) / PAGE_BYTES * PAGE_BYTES
+            mapped = map(mut top, base, end: align_up(extent.end, to: PAGE_BYTES), access: Access.Data, huge: features.pages_1g, mut frames)
+        }
+    }
+    if mapped and not features.x2apic {
+        mapped = map(mut top, base: LOCAL_APIC, end: LOCAL_APIC + PAGE_BYTES, access: Access.Device, huge: false, mut frames)
+    }
+    var roots = mem::List[hw::PageTableRoot].empty(alloc)
+    for _ in 1..<cpus {
+        if not mapped {
+            break
+        }
+        match mut frames.table() {
+            Some(frame) => {
+                var copy = frame
+                for index in 0u64..<512 {
+                    let value = entry(mut top, index)
+                    set(mut copy.contents_mut(hw::Offset[u64](bytes: 8 * index)), value)
+                }
+                mut roots.push(hw::PageTableRoot.of(take copy))
+            }
+            None => {
+                mapped = false
+            }
+        }
+    }
+    let first_entry = entry(mut top, index: 0)
+    mut roots.insert(0, value: hw::PageTableRoot.of(take top))
+    if not mapped {
+        for root in take roots {
+            mut frames.release(take root.into_frame())
+        }
+        return None
+    }
+    let low = table_at(table_at(first_entry & ADDRESS_BITS, index: 0), index: 0)
+    return Some(Shared(roots: take roots, low: low))
+} Shared.build
+
+/// The end of the image's pages: the image lies from 1 MiB to the first region above it.
+fn image_end(extents: Slice[frames::Extent]) -> u64 {
+    for extent in extents {
+        if extent.base >= LOW_MEMORY {
+            return align_up(extent.base, to: PAGE_BYTES)
+        }
+    }
+    return LOW_MEMORY
+} image_end
+
+/// Maps the pages from `base` to `end`, both 4 KiB-aligned, at their physical addresses with `access`: in 1 GiB pages where `huge` allows them, else in 2 MiB and 4 KiB pages. False when the frames run out.
+fn map(
+    mut top: hw::PhysFrame[4_096],
+    base: u64,
+    end: u64,
+    access: Access,
+    huge: bool,
+    mut frames: frames::Frames,
+    ) -> bool {
+    var at = base
+    while at < end {
+        let Some(directory_pointers) = top_child(mut top, index: (at >> 39) & 511, mut frames) else {
+            return false
+        }
+        if huge and at % HUGE_BYTES == 0 and end - at >= HUGE_BYTES {
+            write_entry(directory_pointers, index: (at >> 30) & 511, value: at | access.flags() | LARGE_PAGE)
+            at += HUGE_BYTES
+            continue
+        }
+        let Some(directory) = child(directory_pointers, index: (at >> 30) & 511, mut frames) else {
+            return false
+        }
+        if at % LARGE_BYTES == 0 and end - at >= LARGE_BYTES {
+            write_entry(directory, index: (at >> 21) & 511, value: at | access.flags() | LARGE_PAGE)
+            at += LARGE_BYTES
+            continue
+        }
+        let Some(table) = child(directory, index: (at >> 21) & 511, mut frames) else {
+            return false
+        }
+        write_entry(table, index: (at >> 12) & 511, value: at | access.flags())
+        at += PAGE_BYTES
+    }
+    return true
+} map
+
+/// The table entry `index` of the root `top` refers to, made from a new frame when it refers to none.
+fn top_child(mut top: hw::PhysFrame[4_096], index: u64, mut frames: frames::Frames) -> Option[u64] {
+    let current = entry(mut top, index)
+    if (current & PRESENT) != 0 {
+        return Some(current & ADDRESS_BITS)
+    }
+    let Some(frame) = mut frames.table() else {
+        return None
+    }
+    let address = give_up(take frame)
+    set(mut top.contents_mut(hw::Offset[u64](bytes: 8 * index)), value: address | PRESENT | WRITABLE)
+    return Some(address)
+} top_child
+
+/// The table entry `index` of the table at `table` refers to, made from a new frame when it refers to none.
+fn child(table: u64, index: u64, mut frames: frames::Frames) -> Option[u64] {
+    let current = read_entry(table, index)
+    if (current & PRESENT) != 0 {
+        return Some(current & ADDRESS_BITS)
+    }
+    let Some(frame) = mut frames.table() else {
+        return None
+    }
+    let address = give_up(take frame)
+    write_entry(table, index, value: address | PRESENT | WRITABLE)
+    return Some(address)
+} child
+
+/// The address of the table entry `index` of the table at `table` refers to.
+fn table_at(table: u64, index: u64) -> u64 {
+    return read_entry(table, index) & ADDRESS_BITS
+} table_at
+
+fn entry(mut top: hw::PhysFrame[4_096], index: u64) -> u64 {
+    return mut top.contents_mut(hw::Offset[u64](bytes: 8 * index))
+} entry
+
+fn set(mut slot: u64, value: u64) {
+    slot = value
+} set
+
+/// Gives up a zeroed frame as a page table, which no value owns from now on, and gives its address.
+fn give_up(take frame: hw::PhysFrame[4_096]) -> u64 {
+    let base = frame.base()
+    trusted "a page table's frame holds the frame, which no value owns from now on" { hw::Ptr[hw::PhysFrame[4_096]].of_addr(usize.widen(base)).write(take frame) }
+    write_entry(base, index: 0, value: 0)
+    return base
+} give_up
+
+fn read_entry(table: u64, index: u64) -> u64 {
+    return trusted "the entry lies in a page table no value owns" { hw::Ptr[u64].of_addr(usize.widen(table + 8 * index)).read() }
+} read_entry
+
+fn write_entry(table: u64, index: u64, value: u64) {
+    trusted "the entry lies in a page table no value owns" { hw::Ptr[u64].of_addr(usize.widen(table + 8 * index)).write(value) }
+} write_entry
+
+fn align_up(value: u64, to: u64) -> u64
+    requires to > 0
+{
+    return (value + to - 1) / to * to
+} align_up
+
+fn min(a: u64, b: u64) -> u64 {
+    if a < b {
+        return a
+    }
+    return b
+} min
+
+fn max(a: u64, b: u64) -> u64 {
+    if a > b {
+        return a
+    }
+    return b
+} max
+
+/// Makes `root` the running CPU's root in place of the entry root, the only root a CPU replaces.
+pkg fn install(cpu: hw::Ring0, take root: hw::PageTableRoot) {
+    let replaced = trusted "the shared space maps the image, the boot area, the start information and every frame and region at their physical addresses as the entry root does, and maps nothing for user mode" { cpu.write_cr3(take root) }
+    let None = replaced else {
+        expect false
+        loop {
+        }
+    }
+} install
+
+/// The low memory this shared space maps until every CPU has started.
+pkg fn Shared.low_memory(self) -> LowMemory = LowMemory(table: self.low)
+
+/// Removes the first MiB from the shared space, which NaN used to start the CPUs, and returns once no CPU can use its translations.
+pkg fn LowMemory.release(self, cpu: hw::Ring0) fails task::Cancelled uses wait {
+    for index in 0u64..<(LOW_MEMORY / PAGE_BYTES) {
+        write_entry(self.table, index, value: 0)
+    }
+    try await cpu.invalidate_everywhere(hw::TlbScope.All)
+} LowMemory.release
+
+/// The roots of the CPUs, CPU 0's first.
+pkg fn Shared.into_roots(take self) -> mem::List[hw::PageTableRoot] {
+    let Shared(roots: roots, low: _) = self
+    return roots
+} Shared.into_roots
+
+test the_image_ends_at_the_first_region_above_1_mib for image_end {
+    let alloc = testing::world().alloc
+    var extents = mem::List[frames::Extent].empty(alloc)
+    mut extents.push(frames::Extent(base: 0x1000, end: 0x9_F000))
+    mut extents.push(frames::Extent(base: 0x14_1478, end: 0x14_2000))
+    mut extents.push(frames::Extent(base: 0x90_0000, end: 0x178_0000))
+    expect image_end(extents.view()) == 0x14_2000
+    let none = mem::List[frames::Extent].empty(alloc)
+    expect image_end(none.view()) == LOW_MEMORY
+} the_image_ends_at_the_first_region_above_1_mib

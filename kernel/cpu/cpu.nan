@@ -1,0 +1,229 @@
+//! CPU features, topology and the start of each CPU.
+
+const AMD: Slice[u8] = b"AuthenticAMD"
+
+const HYGON: Slice[u8] = b"HygonGenuine"
+
+const ARCH_CAPABILITIES: u32 = 0x10A
+
+const RDCL_NO: u64 = 1
+
+const EFER_MSR: u32 = 0xC000_0080
+
+const NO_EXECUTE_ENABLE: u64 = 0x800
+
+/// An x86-64 microarchitecture level of the System V psABI: the instruction-set extensions code of that level uses.
+pkg enum Level derives Copy, Eq, Ord {
+    X86v1
+    X86v2
+    X86v3
+    X86v4
+} Level
+
+/// What the boot CPU's identification reports, read once at start.
+pkg struct Features derives Copy, Eq {
+    pkg pages_1g: bool
+    pkg pcid: bool
+    pkg invariant_tsc: bool
+    pkg tsc_deadline: bool
+    pkg mwait: bool
+    pkg meltdown_immune: bool
+    pkg x2apic: bool
+    pkg level: Level
+    pkg smt: bool
+    pkg topology: Topology
+} Features
+
+/// How a CPU's APIC id names its last-level cache: the id shifted right by `cache_shift`.
+pkg struct Topology derives Copy, Eq {
+    pkg cache_shift: u8
+} Topology
+
+/// The leaves of the boot CPU's identification that the features come from.
+struct Leaves derives Copy, Eq {
+    basic: hw::CpuidRegs
+    features: hw::CpuidRegs
+    structured: hw::CpuidRegs
+    extended: hw::CpuidRegs
+    power: hw::CpuidRegs
+} Leaves
+
+/// Reads the boot CPU's identification.
+pkg fn Features.read(cpu: hw::Ring0) -> Features {
+    let basic = cpu.cpuid(0, subleaf: 0)
+    let top = cpu.cpuid(0x8000_0000, subleaf: 0).eax
+    let leaves = Leaves(
+        basic: basic,
+        features: basic_leaf(cpu, max: basic.eax, leaf: 1),
+        structured: basic_leaf(cpu, max: basic.eax, leaf: 7),
+        extended: extended_leaf(cpu, max: top, leaf: 0x8000_0001),
+        power: extended_leaf(cpu, max: top, leaf: 0x8000_0007),
+    )
+    var capabilities: u64 = 0
+    if bit(leaves.structured.edx, at: 29) {
+        capabilities = trusted "CPUID leaf 7 enumerates IA32_ARCH_CAPABILITIES, which reading changes nothing" { cpu.read_msr(ARCH_CAPABILITIES) }
+    }
+    return Features(
+        pages_1g: bit(leaves.extended.edx, at: 26),
+        pcid: bit(leaves.features.ecx, at: 17),
+        invariant_tsc: bit(leaves.power.edx, at: 8),
+        tsc_deadline: bit(leaves.features.ecx, at: 24),
+        mwait: bit(leaves.features.ecx, at: 3),
+        meltdown_immune: (capabilities & RDCL_NO) != 0 or vendor_of(leaves.basic, is: AMD) or vendor_of(leaves.basic, is: HYGON),
+        x2apic: bit(leaves.features.ecx, at: 21),
+        level: level(leaves),
+        smt: threads_per_core(cpu, max: basic.eax) > 1,
+        topology: Topology(cache_shift: cache_shift(cpu, max: basic.eax)),
+    )
+} Features.read
+
+/// Leaf `leaf` of the basic range, all zero beyond its highest leaf `max`.
+fn basic_leaf(cpu: hw::Ring0, max: u32, leaf: u32) -> hw::CpuidRegs {
+    if leaf > max {
+        return hw::CpuidRegs(eax: 0, ebx: 0, ecx: 0, edx: 0)
+    }
+    return cpu.cpuid(leaf, subleaf: 0)
+} basic_leaf
+
+/// Leaf `leaf` of the extended range, all zero beyond its highest leaf `max`.
+fn extended_leaf(cpu: hw::Ring0, max: u32, leaf: u32) -> hw::CpuidRegs {
+    if max < 0x8000_0000 or leaf > max {
+        return hw::CpuidRegs(eax: 0, ebx: 0, ecx: 0, edx: 0)
+    }
+    return cpu.cpuid(leaf, subleaf: 0)
+} extended_leaf
+
+fn bit(value: u32, at: u32) -> bool
+    requires at < 32
+{
+    return ((value >> at) & 1) != 0
+} bit
+
+/// Whether leaf 0 names the vendor `name`, its 12 bytes in EBX, EDX and ECX.
+fn vendor_of(basic: hw::CpuidRegs, is: Slice[u8]) -> bool {
+    var name = Array[u8, 12].filled(0)
+    mut name.view_mut().write_u32_le(0, value: basic.ebx)
+    mut name.view_mut().write_u32_le(4, value: basic.edx)
+    mut name.view_mut().write_u32_le(8, value: basic.ecx)
+    return name.view() == is
+} vendor_of
+
+/// The highest level whose features leaves 1, 7 and `0x8000_0001` report.
+fn level(leaves: Leaves) -> Level {
+    let f = leaves.features
+    let s = leaves.structured
+    let e = leaves.extended
+    let v2 = all_bits(f.ecx, mask: 0x0098_2201) and bit(e.ecx, at: 0)
+    let v3 = v2 and all_bits(f.ecx, mask: 0x3C40_1000) and all_bits(s.ebx, mask: 0x0000_0128) and bit(e.ecx, at: 5)
+    let v4 = v3 and all_bits(s.ebx, mask: 0xD003_0000)
+    if v4 {
+        return Level.X86v4
+    }
+    if v3 {
+        return Level.X86v3
+    }
+    if v2 {
+        return Level.X86v2
+    }
+    return Level.X86v1
+} level
+
+fn all_bits(value: u32, mask: u32) -> bool = (value & mask) == mask
+
+/// The hardware threads of a core, from the SMT level of leaf 0x1F, or of leaf 0xB where the CPU has no leaf 0x1F reporting levels; 1 without either.
+fn threads_per_core(cpu: hw::Ring0, max: u32) -> u32 {
+    var leaf: u32 = 0xB
+    if max >= 0x1F and cpu.cpuid(0x1F, subleaf: 0).ebx != 0 {
+        leaf = 0x1F
+    } else if max < 0xB {
+        return 1
+    }
+    let smt_level = cpu.cpuid(leaf, subleaf: 0)
+    if ((smt_level.ecx >> 8) & 0xFF) != 1 {
+        return 1
+    }
+    return smt_level.ebx & 0xFFFF
+} threads_per_core
+
+/// The bits of the APIC id below the id of the last-level cache, from the highest cache level of leaf 4; 0 without it, each CPU then counting as having a cache of its own.
+fn cache_shift(cpu: hw::Ring0, max: u32) -> u8 {
+    var shift: u8 = 0
+    if max < 4 {
+        return shift
+    }
+    for subleaf in 0u32..<8 {
+        let cache = cpu.cpuid(4, subleaf)
+        if (cache.eax & 0x1F) == 0 {
+            break
+        }
+        shift = sharing_shift(cache.eax)
+    }
+    return shift
+} cache_shift
+
+/// The bits of the APIC id below the id of the cache leaf 4's `eax` describes: the logarithm of the number of ids sharing it, rounded up.
+fn sharing_shift(eax: u32) -> u8 {
+    let sharing = ((eax >> 14) & 0xFFF) + 1
+    var shift: u8 = 0
+    while (1u32 << u32.widen(shift)) < sharing {
+        shift += 1
+    }
+    return shift
+} sharing_shift
+
+/// Enables on the running CPU what every CPU runs the shared space with: no-execute pages, then SMEP, SMAP and UMIP where it has them, and PCIDs on a machine with `pcid`.
+pkg fn enable(cpu: hw::Ring0, features: Features) {
+    let efer = trusted "EFER exists on every x86-64 CPU, and reading it changes nothing" { cpu.read_msr(EFER_MSR) }
+    if (efer & NO_EXECUTE_ENABLE) == 0 {
+        trusted "setting EFER.NXE leaves every translation as it is, no table of the entry root setting the bit it gives meaning to" { cpu.write_msr(EFER_MSR, value: efer | NO_EXECUTE_ENABLE) }
+    }
+    discard cpu.enable_protection(hw::Protection.Smep)
+    discard cpu.enable_protection(hw::Protection.Smap)
+    discard cpu.enable_protection(hw::Protection.Umip)
+    if features.pcid {
+        discard cpu.enable_protection(hw::Protection.Pcid)
+    }
+} enable
+
+fn regs(eax: u32, ebx: u32, ecx: u32, edx: u32) -> hw::CpuidRegs = hw::CpuidRegs(eax: eax, ebx: ebx, ecx: ecx, edx: edx)
+
+/// The leaves QEMU's `max` model reports under TCG.
+fn qemu_max() -> Leaves {
+    return Leaves(
+        basic: regs(eax: 0xD, ebx: 0x6874_7541, ecx: 0x444D_4163, edx: 0x6974_6E65),
+        features: regs(eax: 0x663, ebx: 0x4_0800, ecx: 0xFEF8_320B, edx: 0x1FCB_FBFD),
+        structured: regs(eax: 1, ebx: 0x219C_43A9, ecx: 0x8041_020C, edx: 0x10),
+        extended: regs(eax: 0x663, ebx: 0, ecx: 0x177, edx: 0xEDD3_FBFD),
+        power: regs(eax: 0, ebx: 0, ecx: 0, edx: 0),
+    )
+} qemu_max
+
+test levels_follow_reported_features for level {
+    let max = qemu_max()
+    expect level(max) == Level.X86v3
+    var no_avx2 = max
+    no_avx2.structured.ebx = no_avx2.structured.ebx & ~0x20u32
+    expect level(no_avx2) == Level.X86v2
+    var no_popcnt = max
+    no_popcnt.features.ecx = no_popcnt.features.ecx & ~0x80_0000u32
+    expect level(no_popcnt) == Level.X86v1
+    var avx512 = max
+    avx512.structured.ebx = avx512.structured.ebx | 0xD003_0000
+    expect level(avx512) == Level.X86v4
+} levels_follow_reported_features
+
+test vendors_are_read_from_leaf_0 for vendor_of {
+    let max = qemu_max()
+    expect vendor_of(max.basic, is: AMD)
+    expect not vendor_of(max.basic, is: HYGON)
+    let intel = regs(eax: 0x16, ebx: 0x756E_6547, ecx: 0x6C65_746E, edx: 0x4965_6E69)
+    expect not vendor_of(intel, is: AMD)
+} vendors_are_read_from_leaf_0
+
+test cache_sharing_rounds_up_to_a_power_of_two for sharing_shift {
+    expect sharing_shift(0x121) == 0
+    expect sharing_shift(0x4163) == 1
+    expect sharing_shift(0x8163) == 2
+    expect sharing_shift(0xC163) == 2
+    expect sharing_shift(0x3_C163) == 4
+} cache_sharing_rounds_up_to_a_power_of_two
