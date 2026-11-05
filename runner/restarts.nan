@@ -1,0 +1,90 @@
+//! Restarts: the backoff before an abandoned instance starts again, and the intensity past which it does not.
+
+const BACKOFF_NS: u64 = 10_000_000
+
+const MAX_BACKOFF_NS: u64 = 30_000_000_000
+
+const NS_PER_S: u64 = 1_000_000_000
+
+/// An instance's restarts: when each of the recent ones happened, and how many followed one another without the instance running a whole period.
+struct Restarts {
+    times: mem::List[u64]
+    streak: u32
+} Restarts
+
+/// What follows an abandonment.
+enum Next derives Copy, Eq {
+    After(ns: u64)
+    Fail
+} Next
+
+fn Restarts.none(alloc: mem::Alloc) -> Restarts = Restarts(times: mem::List.empty(alloc), streak: 0)
+
+/// What follows the abandonment at `now_ns` of an instance whose last start was at `started_ns`: a restart after the backoff, unless the instance restarted `restart.intensity` times within the period and `bounded` holds. A restart is recorded.
+fn Restarts.next(
+    mut self,
+    restart: os::Restart,
+    bounded: bool,
+    started_ns: u64,
+    now_ns: u64,
+    ) -> Next {
+    let period_ns = u64.widen(restart.period_s).saturating_mul(NS_PER_S)
+    var at: usize = 0
+    while at < self.times.len() {
+        if now_ns.saturating_sub(self.times[at]) > period_ns {
+            discard mut self.times.remove(at)
+        } else {
+            at += 1
+        }
+    }
+    if bounded and u64.widen(self.times.len()) >= u64.widen(restart.intensity) {
+        return Next.Fail
+    }
+    if now_ns.saturating_sub(started_ns) >= period_ns {
+        self.streak = 0
+    }
+    let backoff = backoff_after(self.streak)
+    self.streak = self.streak.saturating_add(1)
+    mut self.times.push(now_ns)
+    return Next.After(ns: backoff)
+} Restarts.next
+
+/// 10 ms doubled per restart in the streak, at most 30 s.
+fn backoff_after(streak: u32) -> u64 {
+    var ns = BACKOFF_NS
+    for _ in 0..<streak {
+        if ns >= MAX_BACKOFF_NS {
+            return MAX_BACKOFF_NS
+        }
+        ns = ns * 2
+    }
+    if ns > MAX_BACKOFF_NS {
+        return MAX_BACKOFF_NS
+    }
+    return ns
+} backoff_after
+
+test backoffs_double_up_to_30_s for backoff_after {
+    expect backoff_after(0) == 10_000_000
+    expect backoff_after(1) == 20_000_000
+    expect backoff_after(11) == 20_480_000_000
+    expect backoff_after(12) == 30_000_000_000
+    expect backoff_after(4_000) == 30_000_000_000
+} backoffs_double_up_to_30_s
+
+test intensity_bounds_restarts_within_the_period for Restarts.next {
+    let alloc = testing::world().alloc
+    let restart = os::Restart(policy: os::RestartPolicy.Permanent, intensity: 2, period_s: 60)
+    var restarts = Restarts.none(alloc)
+    let second: u64 = 1_000_000_000
+    let one = mut restarts.next(restart, bounded: true, started_ns: 0, now_ns: second)
+    let two = mut restarts.next(restart, bounded: true, started_ns: second, now_ns: 2 * second)
+    let three = mut restarts.next(restart, bounded: true, started_ns: 2 * second, now_ns: 3 * second)
+    let unbounded = mut restarts.next(restart, bounded: false, started_ns: 2 * second, now_ns: 3 * second)
+    let later = mut restarts.next(restart, bounded: true, started_ns: 3 * second, now_ns: 200 * second)
+    expect one == Next.After(ns: 10_000_000)
+    expect two == Next.After(ns: 20_000_000)
+    expect three == Next.Fail
+    expect unbounded == Next.After(ns: 40_000_000)
+    expect later == Next.After(ns: 10_000_000)
+} intensity_bounds_restarts_within_the_period

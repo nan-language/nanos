@@ -1,0 +1,145 @@
+//! The wall clock the core starts from: the CMOS RTC, read once at start.
+
+/// The CMOS index port; the data port follows it.
+const CMOS_PORT: u16 = 0x70
+
+const SECONDS: u8 = 0x00
+
+const MINUTES: u8 = 0x02
+
+const HOURS: u8 = 0x04
+
+const DAY: u8 = 0x07
+
+const MONTH: u8 = 0x08
+
+const YEAR: u8 = 0x09
+
+/// Status register A, whose bit 7 is set while the RTC updates its registers.
+const STATUS_A: u8 = 0x0A
+
+/// Status register B, whose bit 1 is set when hours count to 24 and bit 2 when registers hold binary rather than BCD.
+const STATUS_B: u8 = 0x0B
+
+/// The uncertainty of a reading: the RTC counts whole seconds.
+const READING_UNCERTAINTY_NS: u64 = 1_000_000_000
+
+/// How many pairs of readings the start takes to find two equal ones, and how often a reading polls an update in progress.
+const READINGS: u32 = 8
+
+const POLLS: u32 = 100_000
+
+registers Cmos {
+    index: u8 at 0x0 write
+    data: u8 at 0x1 read
+} Cmos
+
+/// The RTC's registers as one reading gives them: the time of day, the date, the century when the FADT names its register, and status register B.
+struct Reading derives Copy, Eq {
+    second: u8
+    minute: u8
+    hour: u8
+    day: u8
+    month: u8
+    year: u8
+    century: Option[u8]
+    status: u8
+} Reading
+
+/// The wall clock from the RTC's reading now, its century register being the one `fadt` names; an unknown time when the RTC gives none.
+fn start_wall(fadt: Option[Untrusted[mem::Bytes]], clock: sys::Clock) -> runner::Wall {
+    var century: u8 = 0
+    match fadt {
+        Some(bytes) => {
+            match attempt acpi::rtc_century(bytes.view()) {
+                Ok(index) => {
+                    century = index
+                }
+                Err(_) => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    let at = read_rtc(century).value_or(ident::WallTime.unknown())
+    let since_ns = match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+    return runner::Wall(at: at, since_ns: since_ns)
+} start_wall
+
+/// The wall time two equal readings of the RTC give, its century register being at the CMOS index `century` when not 0; `None` when no two readings agree or they give no valid time.
+fn read_rtc(century: u8) -> Option[ident::WallTime] {
+    var cmos = trusted "the CMOS index and data ports are I/O ports 0x70 and 0x71, which the core maps nowhere else and reads only at start, before any instance runs" { hw::Ports[Cmos].map(port: CMOS_PORT) }
+    var settled: Option[Reading] = None
+    for _ in 0..<READINGS {
+        let earlier = sample(mut cmos, century)
+        let later = sample(mut cmos, century)
+        if earlier == later {
+            settled = Some(later)
+            break
+        }
+    }
+    take cmos.unmap()
+    let Some(reading) = settled else {
+        return None
+    }
+    return reading.wall_time()
+} read_rtc
+
+/// Reads the RTC's registers once no update is in progress.
+fn sample(mut cmos: hw::Ports[Cmos], century: u8) -> Reading {
+    for _ in 0..<POLLS {
+        if (register(mut cmos, index: STATUS_A) & 0x80) == 0 {
+            break
+        }
+    }
+    var reading = Reading(second: register(mut cmos, index: SECONDS), minute: register(mut cmos, index: MINUTES), hour: register(mut cmos, index: HOURS), day: register(mut cmos, index: DAY), month: register(mut cmos, index: MONTH), year: register(mut cmos, index: YEAR), century: None, status: register(mut cmos, index: STATUS_B))
+    if century != 0 {
+        reading.century = Some(register(mut cmos, index: century))
+    }
+    return reading
+} sample
+
+fn register(mut cmos: hw::Ports[Cmos], index: u8) -> u8 {
+    mut cmos.write(Cmos.index, value: index)
+    return mut cmos.read(Cmos.data)
+} register
+
+/// The wall time a reading gives: its fields in BCD unless status bit 2 says binary, its hour from 1 to 12 with bit 7 set after noon unless status bit 1 says it counts to 24, and its century 20 when the FADT names no register.
+fn Reading.wall_time(self) -> Option[ident::WallTime] {
+    let binary = (self.status & 0x04) != 0
+    var hour = decoded(self.hour & 0x7F, binary)
+    if (self.status & 0x02) == 0 {
+        hour = hour.mod_floor(12)
+        if (self.hour & 0x80) != 0 {
+            hour += 12
+        }
+    }
+    let century = match self.century {
+        Some(raw) => decoded(raw, binary)
+        None => 20
+    }
+    return ident::WallTime.of_utc(century * 100 + decoded(self.year, binary), month: decoded(self.month, binary), day: decoded(self.day, binary), hour, minute: decoded(self.minute, binary), second: decoded(self.second, binary), uncertainty_ns: READING_UNCERTAINTY_NS)
+} Reading.wall_time
+
+/// A register's value, read as BCD unless `binary`.
+fn decoded(raw: u8, binary: bool) -> i64 {
+    if binary {
+        return i64.widen(raw)
+    }
+    return i64.widen(raw >> 4) * 10 + i64.widen(raw & 0x0F)
+} decoded
+
+test rtc_readings_give_utc for Reading.wall_time {
+    let bcd = Reading(second: 0x30, minute: 0x45, hour: 0x12, day: 0x05, month: 0x11, year: 0x26, century: Some(0x20), status: 0x02)
+    expect bcd.wall_time() == Some(ident::WallTime(utc_ns: 1_793_882_730_000_000_000, uncertainty_ns: READING_UNCERTAINTY_NS))
+    let afternoon = Reading(second: 0x30, minute: 0x45, hour: 0x80 | 0x12, day: 0x05, month: 0x11, year: 0x26, century: None, status: 0x00)
+    expect afternoon.wall_time() == bcd.wall_time()
+    let binary = Reading(second: 59, minute: 59, hour: 23, day: 29, month: 2, year: 0, century: Some(20), status: 0x06)
+    expect binary.wall_time() == Some(ident::WallTime(utc_ns: 951_868_799_000_000_000, uncertainty_ns: READING_UNCERTAINTY_NS))
+    let invalid = Reading(second: 0x00, minute: 0x00, hour: 0x00, day: 0x31, month: 0x02, year: 0x26, century: None, status: 0x02)
+    expect invalid.wall_time().is_none()
+} rtc_readings_give_utc

@@ -1,0 +1,653 @@
+//! Drivers: the task carrying out one instance's lifecycle, holding its intake, its minted capabilities and the domain of each of its incarnations.
+
+/// How long stopping waits for an instance's keyed tasks before abandoning its domain.
+const STOP_GRACE_MS: u64 = 5_000
+
+/// The stack of the first task of an instance's domain, on which its component's handlers run.
+const INSTANCE_STACK: usize = 262_144
+
+const NS_PER_MS: u64 = 1_000_000
+
+/// What reaches an instance's driver.
+enum Input {
+    Order(os::Order)
+    Call(os::Call)
+    Report(incarnation: u64, report: Report)
+    Ended(incarnation: u64, outcome: Result[Ended, sys::Trap])
+    Elapsed(incarnation: u64)
+    Overran(incarnation: u64)
+    Slow(ns: u64)
+    Lingered(incarnation: u64)
+    Revoke(grants: mem::Set[u64], done: task::Sender[Unit])
+} Input
+
+/// An instance as its driver holds it.
+linear struct Driver {
+    moniker: ident::Moniker
+    slot: u32
+    spec: os::InstanceSpec
+    lifecycle: Option[os::Lifecycle]
+    gate: os::Gate
+    incarnation: u64
+    started_ns: u64
+    queue: mem::List[os::Call]
+    domain: Option[Domain]
+    then: Then
+    cause: Cause
+    restarts: Restarts
+    waiters: mem::List[Waiter]
+    minted: Minted
+    reserved: Option[mem::Heap]
+} Driver
+
+/// The running incarnation's domain: where its calls go, what abandons it, and the call delivered to it whose handler call has not ended.
+struct Domain {
+    deliveries: task::Sender[Delivery]
+    abandoner: mem::Shared[sys::Abandoner]
+    outstanding: Option[Outstanding]
+    next_id: u64
+} Domain
+
+struct Outstanding {
+    id: u64
+    reply: Option[task::Sender[os::Answer]]
+    lease: os::Lease
+} Outstanding
+
+/// What follows the stop of the running incarnation.
+enum Then derives Copy, Eq {
+    Stop
+    Restart
+} Then
+
+/// Why the runner abandoned the running incarnation's domain from outside.
+enum Cause derives Copy, Eq {
+    Inside
+    HandlerLimit
+    Lingered
+} Cause
+
+/// An order waiting for its instance to settle: to run, hibernate or fail, or to stop.
+struct Waiter {
+    done: task::Sender[Result[os::Lifecycle, os::ControlError]]
+    stop: bool
+} Waiter
+
+/// What the tasks a driver spawns need from the runner.
+struct Shared[C: Components and Copy and Send, R: Reservations and Send] {
+    components: C
+    reservations: R
+    config: Config
+    directory: task::Cown[Directory]
+    orders: task::Sender[os::Order]
+    withheld: Withheld
+} Shared
+
+/// Carries out the lifecycle of the instance `driver` holds, as its inputs come, until they end; the tasks of its incarnations run in the driver's own scope.
+fn Shared.drive[J: Journal and Send](
+    self,
+    take driver: Driver,
+    take inputs: task::Receiver[Input],
+    sender: task::Sender[Input],
+    journal: J,
+    ) fails task::Cancelled uses wait {
+    var held = driver
+    defer take held.abandon()
+    var receiver = inputs
+    try await task::scope(self.config.exec, body: fn[mut held, mut receiver](s: task::Scope) fails task::Cancelled uses wait {
+        loop {
+            let Some(input) = try await mut receiver.receive() else {
+                s.cancel()
+                return
+            }
+            try await self.take_input(mut held, take input, sender, journal, s)
+        }
+    })
+} Shared.drive
+
+fn Shared.take_input[J: Journal](
+    self,
+    mut driver: Driver,
+    take input: Input,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    match input {
+        Input.Order(order) => try await self.order(mut driver, take order, sender, journal, s)
+        Input.Call(call) => {
+            if not driver.takes_calls() {
+                try await refuse(take call, answer: os::Answer.Stopped)
+                return
+            }
+            mut driver.queue.push(take call)
+            if driver.lifecycle == Some(os::Lifecycle.Hibernated) {
+                try await self.start(mut driver, sender, journal, s)
+            }
+            try await mut driver.deliver()
+        }
+        Input.Report(incarnation: incarnation, report: report) => {
+            if incarnation != driver.incarnation {
+                return
+            }
+            let ending = match report {
+                Report.Ending => true
+                else => false
+            }
+            if ending {
+                self.linger(s, inputs: sender.split(), incarnation)
+            } else {
+                try await mut driver.report(take report, journal)
+            }
+        }
+        Input.Ended(incarnation: incarnation, outcome: outcome) => {
+            if incarnation == driver.incarnation {
+                try await self.ended(mut driver, take outcome, sender, journal, s)
+            }
+        }
+        Input.Elapsed(incarnation: incarnation) => {
+            if incarnation == driver.incarnation and driver.domain.is_none() and driver.lifecycle == Some(os::Lifecycle.Starting) {
+                try await self.start(mut driver, sender, journal, s)
+            }
+        }
+        Input.Overran(incarnation: incarnation) => {
+            if incarnation == driver.incarnation {
+                driver.cause = Cause.HandlerLimit
+            }
+        }
+        Input.Slow(ns: ns) => journal.record(driver.slot, event: Event.SlowHandler(ns: ns))
+        Input.Lingered(incarnation: incarnation) => {
+            if incarnation == driver.incarnation and driver.lifecycle == Some(os::Lifecycle.Stopping) {
+                driver.cause = Cause.Lingered
+                driver.trigger()
+            }
+        }
+        Input.Revoke(grants: grants, done: done) => {
+            mut driver.minted.revoke(grants)
+            discard attempt await done.send(Unit)
+        }
+    }
+} Shared.take_input
+
+/// Carries out a `Control` order.
+fn Shared.order[J: Journal](
+    self,
+    mut driver: Driver,
+    take order: os::Order,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    let os::Order(action: action, moniker: _, done: done) = order
+    match action {
+        os::Action.Read => {
+            let answer: Result[os::Lifecycle, os::ControlError] = match driver.lifecycle {
+                Some(lifecycle) => Ok(lifecycle)
+                None => Err(os::ControlError.Missing)
+            }
+            discard attempt await done.send(take answer)
+        }
+        os::Action.Start => {
+            mut driver.waiters.push(Waiter(done: take done, stop: false))
+            try await self.create_or_start(mut driver, sender, journal, s)
+        }
+        os::Action.Stop => {
+            mut driver.waiters.push(Waiter(done: take done, stop: true))
+            try await self.stop(mut driver, then: Then.Stop, journal)
+        }
+        os::Action.Restart => {
+            mut driver.waiters.push(Waiter(done: take done, stop: false))
+            try await self.stop(mut driver, then: Then.Restart, journal)
+            if driver.lifecycle == Some(os::Lifecycle.Failed) or driver.lifecycle == Some(os::Lifecycle.Stopped) or driver.lifecycle.is_none() {
+                try await self.create_or_start(mut driver, sender, journal, s)
+            }
+        }
+    }
+    try await mut driver.settle()
+} Shared.order
+
+/// Creates the instance from its specification, or starts it from `stopped` or `failed`: it hibernates when lazy, and starts at once otherwise.
+fn Shared.create_or_start[J: Journal](
+    self,
+    mut driver: Driver,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    match driver.lifecycle {
+        None or Some(os::Lifecycle.Stopped) or Some(os::Lifecycle.Failed) => {
+        }
+        else => return
+    }
+    if driver.lifecycle == Some(os::Lifecycle.Failed) {
+        driver.restarts = Restarts.none(self.config.alloc)
+    }
+    driver.spec.stopped = false
+    driver.gate.set(open: true)
+    if driver.spec.lazy {
+        driver.lifecycle = Some(os::Lifecycle.Hibernated)
+        return
+    }
+    try await self.start(mut driver, sender, journal, s)
+} Shared.create_or_start
+
+/// Starts a new incarnation: draws its cell and account, builds its world, and runs its domain.
+fn Shared.start[J: Journal](
+    self,
+    mut driver: Driver,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    driver.incarnation += 1
+    driver.lifecycle = Some(os::Lifecycle.Starting)
+    driver.cause = Cause.Inside
+    driver.started_ns = now(self.config.clock)
+    let Some(budget) = try await self.cell(mut driver) else {
+        try await self.give_up(mut driver, journal)
+        return
+    }
+    let account = self.config.exec.split(self.config.share(driver.spec.share))
+    let request = Request(moniker: ident::Moniker(text: driver.moniker.text), cell: budget.alloc(), exec: account.executor(), clock: self.config.clock, withheld: self.withheld, orders: self.orders.split(), alloc: self.config.alloc)
+    let directory = self.directory.share()
+    let built = await when directory => directory.world(driver.spec, minted: mut driver.minted, request)
+    let Some(world) = built else {
+        take account.close()
+        take budget.close()
+        try await self.give_up(mut driver, journal)
+        return
+    }
+    let task::Channel(sender: deliveries, receiver: delivered) = task::Channel[Delivery].bounded(2, alloc: self.config.alloc)
+    let task::Channel(sender: marks, receiver: marked) = task::Channel[Mark].bounded(2, alloc: self.config.alloc)
+    let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: self.config.alloc)
+    let serving = Serving(deliveries: take delivered, reports: sender.split(), marks: take marks, incarnation: driver.incarnation, clock: self.config.clock)
+    self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, take budget, take account, abandoner: abandoner.share(), ended: sender.split(), incarnation: driver.incarnation)
+    self.watch(s, marks: take marked, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers)
+    driver.domain = Some(Domain(deliveries: take deliveries, abandoner: take abandoner, outstanding: None, next_id: 0))
+} Shared.start
+
+/// The cell of a new incarnation: split from the node pool at the specification's limit, or for a reserved instance from the store over its region, which its first start takes and later starts reuse; `None` when no free range holds the region.
+fn Shared.cell(self, mut driver: Driver) -> Option[mem::Budget] fails task::Cancelled uses wait {
+    let limit = driver.spec.budget.limit
+    if not driver.spec.budget.reserved {
+        return Some(self.config.pool.split(usize.widen(limit)))
+    }
+    if driver.reserved.is_none() {
+        driver.reserved = try await self.reservations.reserve(limit)
+    }
+    let Some(store) = driver.reserved else {
+        return None
+    }
+    return Some(store.alloc().split(usize.widen(limit)))
+} Shared.cell
+
+/// Runs an incarnation's domain on a task of `s`, which closes its account and cell once the domain has ended and tells the driver how.
+fn Shared.launch(
+    self,
+    s: task::Scope,
+    take component: text::String,
+    take world: nanos::World,
+    take serving: Serving,
+    take budget: mem::Budget,
+    take account: task::Account,
+    take abandoner: mem::Shared[sys::Abandoner],
+    take ended: task::Sender[Input],
+    incarnation: u64,
+    ) {
+    let components = self.components
+    discard s.spawn(fn[take component, take world, take serving, take budget, take account, take abandoner, take ended]() fails task::Cancelled uses wait limits stack 16_384 {
+        let ran = attempt await abandoner.contents().run_sized(fn[take component, take world, take serving]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+            return try await components.serve(component.as_str(), take world, take serving)
+        }, stack: INSTANCE_STACK, exec: account.executor(), alloc: budget.alloc())
+        take account.close()
+        take budget.close()
+        let outcome = match ran {
+            Ok(result) => result
+            Err(cancelled) => fail cancelled
+        }
+        discard attempt await ended.send(Input.Ended(incarnation: incarnation, outcome: take outcome))
+    })
+} Shared.launch
+
+/// Watches an incarnation's handlers on a task of `s`: a handler call past `handlers.handler_s` abandons the domain, and one of `handlers.slow_ms` or more is reported slow.
+fn Shared.watch(
+    self,
+    s: task::Scope,
+    take marks: task::Receiver[Mark],
+    take abandoner: mem::Shared[sys::Abandoner],
+    take inputs: task::Sender[Input],
+    incarnation: u64,
+    handlers: os::Limits,
+    ) {
+    let clock = self.config.clock
+    discard s.spawn(fn[take marks, take abandoner, take inputs]() fails task::Cancelled uses wait limits stack 16_384 {
+        var receiver = marks
+        loop {
+            let Some(Mark.Began) = try await mut receiver.receive() else {
+                return
+            }
+            let ended = try await task::within(clock, ms: u64.widen(handlers.handler_s) * 1_000, body: fn[mut receiver]() -> Option[Mark] fails task::Cancelled uses wait {
+                return try await mut receiver.receive()
+            })
+            match ended {
+                None => {
+                    discard attempt await inputs.send(Input.Overran(incarnation: incarnation))
+                    abandoner.contents().trigger()
+                    return
+                }
+                Some(Some(Mark.Took(ns: ns))) => {
+                    if ns >= u64.widen(handlers.slow_ms) * NS_PER_MS {
+                        discard attempt await inputs.send(Input.Slow(ns: ns))
+                    }
+                }
+                else => return
+            }
+        }
+    })
+} Shared.watch
+
+/// Stops the instance, or has it start again once stopped when `then` is `Restart`: queued calls stay for a restart and are dropped or failed for a stop, and an instance not yet created is created `stopped`.
+fn Shared.stop[J: Journal](self, mut driver: Driver, then: Then, journal: J) fails task::Cancelled uses wait {
+    if then == Then.Stop {
+        driver.spec.stopped = true
+        driver.gate.set(open: false)
+        try await mut driver.refuse_queued()
+    }
+    match driver.lifecycle {
+        Some(os::Lifecycle.Running) => {
+        }
+        Some(os::Lifecycle.Stopping) => {
+            driver.then = then
+            return
+        }
+        Some(os::Lifecycle.Starting) or Some(os::Lifecycle.Hibernated) => {
+            if driver.domain.is_none() {
+                mut driver.stopped(journal, abandoned: false)
+                return
+            }
+        }
+        None => {
+            if then == Then.Stop {
+                driver.lifecycle = Some(os::Lifecycle.Stopped)
+            }
+            return
+        }
+        else => return
+    }
+    driver.lifecycle = Some(os::Lifecycle.Stopping)
+    driver.then = then
+    let Some(domain) = driver.domain else {
+        return
+    }
+    discard attempt await domain.deliveries.send(Delivery.Stop)
+} Shared.stop
+
+/// Handles the end of the running incarnation's domain: a stop it was asked for, or an abandonment and the restart policy.
+fn Shared.ended[J: Journal](
+    self,
+    mut driver: Driver,
+    take outcome: Result[Ended, sys::Trap],
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    try await mut driver.end_domain()
+    match outcome {
+        Ok(Ended.Stopped) => {
+            mut driver.stopped(journal, abandoned: false)
+            if driver.then == Then.Restart {
+                try await self.create_or_start(mut driver, sender, journal, s)
+            }
+        }
+        Ok(Ended.EnvIncomplete) => try await self.give_up(mut driver, journal)
+        Err(trap) => {
+            if driver.cause == Cause.Lingered {
+                mut driver.stopped(journal, abandoned: true)
+                if driver.then == Then.Restart {
+                    try await self.create_or_start(mut driver, sender, journal, s)
+                }
+            } else {
+                try await self.abandoned(mut driver, kind: trap.kind(), sender, journal, s)
+            }
+        }
+    }
+    try await mut driver.settle()
+} Shared.ended
+
+/// Applies the restart policy after an abandonment of kind `kind`: a restart after the backoff, or `failed`.
+fn Shared.abandoned[J: Journal](
+    self,
+    mut driver: Driver,
+    kind: sys::TrapKind,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    if kind == sys::TrapKind.Exception {
+        journal.record(driver.slot, event: Event.Integrity(incarnation: driver.incarnation))
+    }
+    journal.record(driver.slot, event: Event.Trapped(incarnation: driver.incarnation, kind: kind, limit: driver.cause == Cause.HandlerLimit))
+    let supervisor = driver.moniker.text.as_str() == "supervisor"
+    let policy = driver.spec.restart.policy
+    if policy == os::RestartPolicy.Temporary and not supervisor {
+        try await self.give_up(mut driver, journal)
+        return
+    }
+    match mut driver.restarts.next(driver.spec.restart, bounded: not supervisor, started_ns: driver.started_ns, now_ns: now(self.config.clock)) {
+        Next.Fail => try await self.give_up(mut driver, journal)
+        Next.After(ns: ns) => {
+            driver.lifecycle = Some(os::Lifecycle.Starting)
+            self.elapse(s, ns, inputs: sender.split(), incarnation: driver.incarnation)
+        }
+    }
+} Shared.abandoned
+
+/// Tells the driver on a task of `s` when incarnation `incarnation` has spent the grace that ending its keyed tasks has, after which the driver abandons its domain.
+fn Shared.linger(self, s: task::Scope, take inputs: task::Sender[Input], incarnation: u64) {
+    let clock = self.config.clock
+    discard s.spawn(fn[take inputs]() fails task::Cancelled uses wait limits stack 8_192 {
+        try await clock.sleep(STOP_GRACE_MS)
+        discard attempt await inputs.send(Input.Lingered(incarnation: incarnation))
+    })
+} Shared.linger
+
+/// Tells the driver on a task of `s` that the backoff of `ns` before the restart of incarnation `incarnation` has elapsed.
+fn Shared.elapse(
+    self,
+    s: task::Scope,
+    ns: u64,
+    take inputs: task::Sender[Input],
+    incarnation: u64,
+    ) {
+    let clock = self.config.clock
+    discard s.spawn(fn[take inputs]() fails task::Cancelled uses wait limits stack 8_192 {
+        try await clock.sleep_ns(ns)
+        discard attempt await inputs.send(Input.Elapsed(incarnation: incarnation))
+    })
+} Shared.elapse
+
+/// Sends the instance to `failed`: its queued calls are dropped or failed, and its gate closes.
+fn Shared.give_up[J: Journal](self, mut driver: Driver, journal: J) fails task::Cancelled uses wait {
+    driver.lifecycle = Some(os::Lifecycle.Failed)
+    driver.gate.set(open: false)
+    try await mut driver.refuse_queued()
+    journal.record(driver.slot, event: Event.Failed(restarts: u32.fit(driver.restarts.times.len())))
+} Shared.give_up
+
+/// Records the instance stopped.
+fn Driver.stopped[J: Journal](mut self, journal: J, abandoned: bool) {
+    self.lifecycle = Some(os::Lifecycle.Stopped)
+    journal.record(self.slot, event: Event.Stopped(abandoned: abandoned))
+} Driver.stopped
+
+/// Handles what the domain reports: that it runs, that it took a call, or a request's answer.
+fn Driver.report[J: Journal](mut self, take report: Report, journal: J) fails task::Cancelled uses wait {
+    match report {
+        Report.Running => {
+            if self.lifecycle == Some(os::Lifecycle.Starting) {
+                self.lifecycle = Some(os::Lifecycle.Running)
+                journal.record(self.slot, event: Event.Started(incarnation: self.incarnation))
+            }
+        }
+        Report.Taken(id: id) => {
+            let taken = mut self.take_outstanding(id, request: false)
+            match taken {
+                Some(outstanding) => try await take outstanding.lease.release()
+                None => {
+                }
+            }
+        }
+        Report.Ending => {
+        }
+        Report.Answered(id: id, answer: answer) => {
+            let answered = mut self.take_outstanding(id, request: true)
+            match answered {
+                Some(outstanding) => {
+                    match outstanding.reply {
+                        Some(reply) => {
+                            discard attempt await reply.send(take answer)
+                        }
+                        None => {
+                        }
+                    }
+                    try await take outstanding.lease.release()
+                }
+                None => {
+                }
+            }
+        }
+    }
+    try await mut self.deliver()
+    try await mut self.settle()
+} Driver.report
+
+/// The outstanding call `id` when it ends now: a one-way call once taken, a request once answered.
+fn Driver.take_outstanding(mut self, id: u64, request: bool) -> Option[Outstanding] {
+    let Some(domain) = mut self.domain.extract() else {
+        return None
+    }
+    var current = domain
+    var ended: Option[Outstanding] = None
+    if current.ends(id, request) {
+        ended = mut current.outstanding.extract()
+    }
+    self.domain = Some(take current)
+    return ended
+} Driver.take_outstanding
+
+/// Whether the call `id` is outstanding and of the kind `request` says.
+fn Domain.ends(self, id: u64, request: bool) -> bool {
+    let Some(outstanding) = self.outstanding else {
+        return false
+    }
+    return outstanding.id == id and outstanding.reply.is_some() == request
+} Domain.ends
+
+/// Delivers the next queued call to a running domain with no call outstanding.
+fn Driver.deliver(mut self) fails task::Cancelled uses wait {
+    if self.lifecycle != Some(os::Lifecycle.Running) or self.queue.len() == 0 {
+        return
+    }
+    let Some(domain) = mut self.domain.extract() else {
+        return
+    }
+    var current = domain
+    if current.outstanding.is_some() {
+        self.domain = Some(take current)
+        return
+    }
+    let os::Call(hash: hash, encoded: encoded, reply: reply, lease: lease) = mut self.queue.remove(0)
+    let id = current.next_id
+    current.next_id += 1
+    let request = reply.is_some()
+    current.outstanding = Some(Outstanding(id: id, reply: take reply, lease: take lease))
+    let deliveries = current.deliveries.split()
+    self.domain = Some(take current)
+    discard attempt await deliveries.send(Delivery.Call(id: id, hash: hash, encoded: take encoded, request: request))
+} Driver.deliver
+
+/// Ends the running incarnation's domain: its outstanding call ends with `port.server-stopped`, and its deliveries close.
+fn Driver.end_domain(mut self) fails task::Cancelled uses wait {
+    let Some(domain) = mut self.domain.extract() else {
+        return
+    }
+    let Domain(deliveries: _, abandoner: _, outstanding: outstanding, next_id: _) = domain
+    let Some(ended) = outstanding else {
+        return
+    }
+    match ended.reply {
+        Some(reply) => {
+            discard attempt await reply.send(os::Answer.ServerStopped)
+        }
+        None => {
+        }
+    }
+    try await take ended.lease.release()
+} Driver.end_domain
+
+/// Drops the queued one-way calls and fails the queued requests with `port.server-stopped`.
+fn Driver.refuse_queued(mut self) fails task::Cancelled uses wait {
+    while self.queue.len() > 0 {
+        try await refuse(mut self.queue.remove(0), answer: os::Answer.ServerStopped)
+    }
+} Driver.refuse_queued
+
+/// Whether a call reaching the instance waits in its intake: it is not refused while the instance exists and is not `stopped`, `failed` or stopping for good.
+fn Driver.takes_calls(self) -> bool {
+    return match self.lifecycle {
+        Some(os::Lifecycle.Starting) or Some(os::Lifecycle.Running) or Some(os::Lifecycle.Hibernated) => true
+        Some(os::Lifecycle.Stopping) => self.then == Then.Restart
+        else => false
+    }
+} Driver.takes_calls
+
+/// Ends a call without delivering it: a one-way call is dropped, a request answered with `answer`, and its credit returns.
+fn refuse(take call: os::Call, take answer: os::Answer) fails task::Cancelled uses wait {
+    let os::Call(hash: _, encoded: _, reply: reply, lease: lease) = call
+    match reply {
+        Some(sender) => {
+            discard attempt await sender.send(take answer)
+        }
+        None => {
+        }
+    }
+    try await take lease.release()
+} refuse
+
+/// Answers the orders waiting for the instance to settle.
+fn Driver.settle(mut self) fails task::Cancelled uses wait {
+    let Some(lifecycle) = self.lifecycle else {
+        return
+    }
+    var at: usize = 0
+    while at < self.waiters.len() {
+        let waiter = self.waiters[at]
+        let settled = match lifecycle {
+            os::Lifecycle.Stopped => waiter.stop
+            os::Lifecycle.Running or os::Lifecycle.Hibernated => not waiter.stop
+            os::Lifecycle.Failed => true
+            else => false
+        }
+        if settled {
+            let Waiter(done: done, stop: _) = mut self.waiters.remove(at)
+            discard attempt await done.send(Ok(lifecycle))
+        } else {
+            at += 1
+        }
+    }
+} Driver.settle
+
+/// Abandons the running incarnation's domain from outside.
+fn Driver.trigger(self) {
+    let Some(domain) = self.domain else {
+        return
+    }
+    domain.abandoner.contents().trigger()
+} Driver.trigger
+
+/// Releases what the driver holds once its inputs have ended.
+fn Driver.abandon(take self) {
+    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, started_ns: _, queue: _, domain: _, then: _, cause: _, restarts: _, waiters: _, minted: minted, reserved: _) = self
+    gate.set(open: false)
+    take minted.close()
+} Driver.abandon

@@ -1,0 +1,161 @@
+//! The supervisor: the base instance that starts the base instances in their order and stops and restarts instances.
+
+/// The key of the keyed task that starts the base instances.
+const STARTING: u64 = 1
+
+/// The base instances `supervisor` starts after itself, one step per line, those of a step in parallel: chapter 20's start order, the lazy ones last. A moniker without a specification is passed over.
+const START_ORDER: Str = "devices\nfat\nkeys\nstore\njournal\npolicy\nboot\nnet link console\nadmission clock power infer\n"
+
+pub protocol Supervisor {
+    /// Stops the instance `moniker`.
+    pub fn stop(moniker: ident::Moniker) limits restorable
+    /// Restarts the instance `moniker`.
+    pub fn restart(moniker: ident::Moniker) limits restorable
+} Supervisor
+
+pub closed struct Env {
+    pub control: os::Control
+    pub exec: task::Executor
+    pub alloc: mem::Alloc
+} Env
+
+impl Env: nanos::Environment
+
+/// The supervisor's state: it keeps none.
+pub closed struct Supervision derives Encode {
+} Supervision
+
+impl Supervision: sys::Component[Env, Supervisor]
+
+impl Supervision: sys::Resume[Env, Supervisor]
+
+pub fn Env.build(take world: nanos::World) -> Env fails nanos::CapError {
+    return Env(control: try nanos::Cap[os::Control].get(world.caps, key: "control"), exec: world.exec, alloc: world.alloc)
+} Env.build
+
+pub fn Supervision.start(mut env: Env) -> Supervision = Supervision()
+
+/// Once started, starts the base instances in their order.
+pub fn Supervision.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Supervisor]) {
+    if reason != sys::ResumeReason.Started {
+        return
+    }
+    let control = env.control
+    let exec = env.exec
+    let alloc = env.alloc
+    mut cx.spawn(key: STARTING, run: fn(out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
+        try await start_in_order(control, exec, alloc)
+    })
+} Supervision.resume
+
+pub fn Supervision.stop(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
+    carry_out(mut cx, control: env.control, take moniker, action: os::Action.Stop, alloc: env.alloc)
+} Supervision.stop
+
+pub fn Supervision.restart(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
+    carry_out(mut cx, control: env.control, take moniker, action: os::Action.Restart, alloc: env.alloc)
+} Supervision.restart
+
+/// Has the runner carry out `action` on the instance `moniker` from a keyed task of its own, which a later order for the same instance does not cancel.
+fn carry_out(
+    mut cx: sys::Cx[Supervisor],
+    control: os::Control,
+    take moniker: ident::Moniker,
+    action: os::Action,
+    alloc: mem::Alloc,
+    ) {
+    var key = STARTING
+    for byte in moniker.text.as_bytes() {
+        key = key.wrapping_mul(31).wrapping_add(u64.widen(byte))
+    }
+    mut cx.spawn(key: key | 0x8000_0000_0000_0000, run: fn[take moniker](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
+        let ordered = match action {
+            os::Action.Stop => attempt await control.stop(take moniker, alloc)
+            else => attempt await control.restart(take moniker, alloc)
+        }
+        match ordered {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    })
+} carry_out
+
+/// Starts the base instances in their order, each step once every instance of the step before runs, hibernates or has failed.
+fn start_in_order(control: os::Control, exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var step = mem::List[ident::Moniker].empty(alloc)
+    var name = text::Fixed[59].empty()
+    for byte in START_ORDER.as_bytes() {
+        if byte != b' ' and byte != b'\n' {
+            mut name.push(char.checked_from_bits(u32.widen(byte)).value_or(' '))
+            continue
+        }
+        mut step.push(ident::Moniker(text: name))
+        name = text::Fixed[59].empty()
+        if byte == b'\n' {
+            try await start_all(control, monikers: take step, exec, alloc)
+            step = mem::List.empty(alloc)
+        }
+    }
+} start_in_order
+
+/// Starts the instances `monikers` names in parallel and returns once each runs, hibernates or has failed, passing over those without a specification.
+fn start_all(control: os::Control, take monikers: mem::List[ident::Moniker], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var given = Some(take monikers)
+    try await task::scope(exec, body: fn[mut given](s: task::Scope) {
+        let Some(names) = mut given.extract() else {
+            return
+        }
+        for moniker in take names {
+            discard s.spawn(fn[take moniker]() fails task::Cancelled uses wait limits stack 16_384 {
+                match attempt await control.start(take moniker, alloc) {
+                    Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+                    else => {
+                    }
+                }
+            })
+        }
+    })
+} start_all
+
+/// Answers `count` orders from `orders` as a runner whose only instances are `fat` and `store`, and gives the monikers of the orders, in the order they came.
+fn answered(take orders: task::Receiver[os::Order], count: usize, alloc: mem::Alloc) -> mem::List[text::String] fails task::Cancelled uses wait {
+    var receiver = orders
+    var names = mem::List[text::String].empty(alloc)
+    while names.len() < count {
+        let Some(order) = try await mut receiver.receive() else {
+            break
+        }
+        let name = order.moniker.text.as_str()
+        mut names.push(text::String.of(name, alloc))
+        var outcome: Result[os::Lifecycle, os::ControlError] = Err(os::ControlError.Missing)
+        if name == "fat" or name == "store" {
+            outcome = Ok(os::Lifecycle.Running)
+        }
+        discard attempt await order.done.send(take outcome)
+    }
+    return names
+} answered
+
+test base_instances_start_step_by_step for start_in_order {
+    let world = testing::world()
+    let alloc = world.alloc
+    let task::Channel(sender: orders, receiver: ordered) = task::Channel[os::Order].bounded(4, alloc)
+    let minted = os::MintedControl.of(orders, prefix: None, alloc)
+    defer take minted.close()
+    let control = minted.mint(os::ControlRights(read: false, lifecycle: true, reserved: 0))
+    var names = mem::List[text::String].empty(alloc)
+    var given = Some(take ordered)
+    try await task::scope(world.exec, body: fn[mut names, mut given](s: task::Scope) fails task::Cancelled uses wait {
+        discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
+            try await start_in_order(control, exec: world.exec, alloc)
+        })
+        let Some(receiver) = mut given.extract() else {
+            return
+        }
+        names = try await answered(take receiver, count: 14, alloc)
+    })
+    expect names.len() == 14
+    expect names[0].as_str() == "devices" and names[1].as_str() == "fat" and names[2].as_str() == "keys" and names[3].as_str() == "store"
+    expect names[4].as_str() == "journal" and names[5].as_str() == "policy" and names[6].as_str() == "boot"
+} base_instances_start_step_by_step

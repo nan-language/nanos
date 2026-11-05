@@ -1,0 +1,574 @@
+//! Tests of the runner, running instances of a tally that serves the Counter protocol.
+
+enum Refused derives Render, Encode {
+    TooLarge
+} Refused
+
+protocol Counter {
+    pub fn add(amount: u32) -> u64 fails Refused limits pure
+    pub fn note(amount: u32) limits pure
+    pub fn divide(by: u32) limits pure
+} Counter
+
+struct TallyEnv {
+} TallyEnv
+
+impl TallyEnv: nanos::Environment
+
+struct Tally derives Encode {
+    total: u64
+} Tally
+
+impl Tally: sys::Component[TallyEnv, Counter]
+
+/// A component of the runner's tests, which runs only `runner::Tally`.
+struct Tallies derives Copy {
+} Tallies
+
+impl Tallies: Components
+
+/// The memory the tests set aside for reserved instances: a store over the world's allocator, or none when it does not hold any.
+struct Spare {
+    alloc: mem::Alloc
+    holds: bool
+} Spare
+
+impl Spare: Reservations
+
+/// A journal counting each kind of event.
+struct Counts {
+    started: mem::Shared[core::atomic::AtomicU64]
+    stopped: mem::Shared[core::atomic::AtomicU64]
+    trapped: mem::Shared[core::atomic::AtomicU64]
+    failed: mem::Shared[core::atomic::AtomicU64]
+    revoked: mem::Shared[core::atomic::AtomicU64]
+} Counts
+
+impl Counts: Journal
+
+enum Failure derives Render {
+    Port(os::PortError[Refused]) from
+    Post(os::PortError[Never]) from
+    Control(os::ControlError) from
+    Cancelled(task::Cancelled) from
+} Failure
+
+fn TallyEnv.build(take world: nanos::World) -> TallyEnv = TallyEnv()
+
+fn Tally.start(mut env: TallyEnv) -> Tally = Tally(total: 0)
+
+fn Tally.add(mut self, take amount: u32, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 fails Refused {
+    if amount > 1_000 {
+        fail Refused.TooLarge
+    }
+    self.total += u64.widen(amount)
+    return self.total
+} Tally.add
+
+fn Tally.note(mut self, take amount: u32, mut env: TallyEnv, mut cx: sys::Cx[Counter]) {
+    self.total += u64.widen(amount)
+} Tally.note
+
+fn Tally.divide(mut self, take by: u32, mut env: TallyEnv, mut cx: sys::Cx[Counter]) {
+    self.total = self.total / u64.widen(by)
+} Tally.divide
+
+fn Tallies.protocol(self, component: Str) -> Option[sys::ProtocolHash] {
+    if component == "runner::Tally" {
+        return Some(sys::Wire[Counter].hash())
+    }
+    return None
+} Tallies.protocol
+
+fn Tallies.serve(self, component: Str, take world: nanos::World, take serving: Serving) -> Ended fails task::Cancelled uses wait {
+    return try await Served[Tally, TallyEnv, Counter].run(take world, take serving)
+} Tallies.serve
+
+fn Spare.reserve(self, bytes: u64) -> Option[mem::Heap] {
+    if not self.holds {
+        return None
+    }
+    return Some(mem::Heap.of(self.alloc))
+} Spare.reserve
+
+fn Counts.of(alloc: mem::Alloc) -> Counts {
+    return Counts(started: counter(alloc), stopped: counter(alloc), trapped: counter(alloc), failed: counter(alloc), revoked: counter(alloc))
+} Counts.of
+
+fn Counts.record(self, slot: u32, event: Event) {
+    let count = match event {
+        Event.Started(incarnation: _) => self.started.share()
+        Event.Stopped(abandoned: _) => self.stopped.share()
+        Event.Trapped(incarnation: _, kind: _, limit: _) => self.trapped.share()
+        Event.Failed(restarts: _) => self.failed.share()
+        Event.Revoked(grant: _, reason: _) => self.revoked.share()
+        else => return
+    }
+    discard count.contents().fetch_add(1)
+} Counts.record
+
+fn counter(alloc: mem::Alloc) -> mem::Shared[core::atomic::AtomicU64] {
+    return mem::Shared.of(core::atomic::AtomicU64.of(0), alloc)
+} counter
+
+fn named(text: Str) -> ident::Moniker {
+    return ident::Moniker(text: text::Fixed[59].of(text))
+} named
+
+fn system() -> ident::Principal {
+    return ident::Principal(text: text::Fixed[64].of("system"))
+} system
+
+/// The wall time the tests' runners start at: noon UTC on 2026-11-05.
+const NOON_NS: i64 = 1_793_880_000_000_000_000
+
+/// A runner configuration over a test's world.
+fn configured(world: host::World) -> Config {
+    var classes = Array[u8, 4].filled(0)
+    classes[0] = 1
+    classes[1] = 2
+    classes[2] = 3
+    classes[3] = 4
+    return Config(exec: world.exec, pool: world.alloc, alloc: world.alloc, clock: world.clock, wall: Wall(at: ident::WallTime(utc_ns: NOON_NS, uncertainty_ns: 1_000_000_000), since_ns: 0), classes: classes)
+} configured
+
+/// One tally named `tally`, whose specification `adjust` changes, and no grant.
+fn one_tally(alloc: mem::Alloc, adjust: fn(mut spec: os::InstanceSpec)) -> Known {
+    var bundle = Array[u8, 33].filled(0)
+    bundle[0] = 0x01
+    var spec = os::InstanceSpec.of(principal: system(), bundle: ident::HashValue(bytes: bundle), component: "runner::Tally", alloc)
+    adjust(mut spec)
+    var specs = mem::Map[ident::Moniker, os::InstanceSpec].empty(alloc)
+    discard mut specs.insert(named("tally"), value: take spec)
+    return Known(specs: take specs, grants: mem::Map.empty(alloc))
+} one_tally
+
+fn add(port: os::Port[Counter], amount: u32, alloc: mem::Alloc) -> u64 fails os::PortError[Refused] uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Counter].add(mut call, amount)
+    return try await port.call(take call, reply, alloc)
+} add
+
+fn note(port: os::Port[Counter], amount: u32, alloc: mem::Alloc) fails os::PortError[Never] uses wait {
+    var call = sys::Encoded.empty(alloc)
+    sys::Wire[Counter].note(mut call, amount)
+    try await port.post(take call)
+} note
+
+fn divide(port: os::Port[Counter], by: u32, alloc: mem::Alloc) fails os::PortError[Never] uses wait {
+    var call = sys::Encoded.empty(alloc)
+    sys::Wire[Counter].divide(mut call, by)
+    try await port.post(take call)
+} divide
+
+/// What a test body saw.
+struct Seen derives Copy, Eq {
+    started: os::Lifecycle
+    totals: Array[u64, 3]
+    last: os::Lifecycle
+    refused: bool
+} Seen
+
+fn unchanged(mut spec: os::InstanceSpec) {
+} unchanged
+
+/// Starts the tally, calls and posts to it, stops it, then calls it once more.
+fn exercised(core: Core, alloc: mem::Alloc) -> Seen fails Failure uses wait {
+    let started = try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    var totals = Array[u64, 3].filled(0)
+    totals[0] = try await add(port, amount: 5, alloc)
+    try await note(port, amount: 3, alloc)
+    totals[1] = try await add(port, amount: 7, alloc)
+    let large = attempt await add(port, amount: 5_000, alloc)
+    totals[2] = try await add(port, amount: 0, alloc)
+    let last = try await core.control.stop(named("tally"), alloc)
+    let stopped = attempt await add(port, amount: 1, alloc)
+    let refused = match large {
+        Err(os::PortError.Failed(Refused.TooLarge)) => true
+        else => false
+    }
+    let closed = match stopped {
+        Err(os::PortError.Stopped) => true
+        else => false
+    }
+    return Seen(started: started, totals: totals, last: last, refused: refused and closed)
+} exercised
+
+test instances_serve_calls_in_order_until_stopped for run {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), body: fn(core: Core) -> Seen fails Failure uses wait {
+        return try await exercised(core, alloc: world.alloc)
+    })
+    var totals = Array[u64, 3].filled(0)
+    totals[0] = 5
+    totals[1] = 15
+    totals[2] = 15
+    expect seen == Some(Seen(started: os::Lifecycle.Running, totals: totals, last: os::Lifecycle.Stopped, refused: true))
+    let started = counts.started.contents().load()
+    let stopped = counts.stopped.contents().load()
+    expect started == 1 and stopped == 1
+} instances_serve_calls_in_order_until_stopped
+
+/// Calls the tally across a trap: the call queued behind the trapping one reaches the restarted incarnation.
+fn restarted(core: Core, alloc: mem::Alloc) -> Array[u64, 2] fails Failure uses wait {
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    var totals = Array[u64, 2].filled(0)
+    totals[0] = try await add(port, amount: 5, alloc)
+    try await divide(port, by: 0, alloc)
+    totals[1] = try await add(port, amount: 1, alloc)
+    return totals
+} restarted
+
+test trapped_instances_restart_and_keep_their_intake for run {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let totals = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), body: fn(core: Core) -> Array[u64, 2] fails Failure uses wait {
+        return try await restarted(core, alloc: world.alloc)
+    })
+    let started = counts.started.contents().load()
+    let trapped = counts.trapped.contents().load()
+    let Some(seen) = totals else {
+        expect false
+        return
+    }
+    expect seen[0] == 5 and seen[1] == 1
+    expect started == 2 and trapped == 1
+} trapped_instances_restart_and_keep_their_intake
+
+fn fragile(mut spec: os::InstanceSpec) {
+    spec.restart.intensity = 1
+} fragile
+
+/// Traps the tally twice within its period, then restarts it.
+fn exhausted(core: Core, alloc: mem::Alloc) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    try await divide(port, by: 0, alloc)
+    discard try await add(port, amount: 1, alloc)
+    try await divide(port, by: 0, alloc)
+    let refused = attempt await add(port, amount: 1, alloc)
+    var states = Array[os::Lifecycle, 2].filled(os::Lifecycle.Stopped)
+    states[0] = try await core.control.lifecycle(named("tally"), alloc)
+    states[1] = try await core.control.restart(named("tally"), alloc)
+    let again = try await add(port, amount: 2, alloc)
+    let failed_calls = match refused {
+        Err(os::PortError.Stopped) or Err(os::PortError.ServerStopped) => true
+        else => false
+    }
+    if not failed_calls or again != 2 {
+        fail Failure.Control(os::ControlError.Denied)
+    }
+    return states
+} exhausted
+
+test intensity_sends_instances_to_failed for run {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let states = try await run(one_tally(world.alloc, adjust: fragile), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+        return try await exhausted(core, alloc: world.alloc)
+    })
+    let failed = counts.failed.contents().load()
+    let Some(seen) = states else {
+        expect false
+        return
+    }
+    expect seen[0] == os::Lifecycle.Failed and seen[1] == os::Lifecycle.Running
+    expect failed == 1
+} intensity_sends_instances_to_failed
+
+fn lazy(mut spec: os::InstanceSpec) {
+    spec.lazy = true
+} lazy
+
+/// Starts the lazy tally, then calls it.
+fn woken(core: Core, alloc: mem::Alloc) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+    var states = Array[os::Lifecycle, 2].filled(os::Lifecycle.Stopped)
+    states[0] = try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    if try await add(port, amount: 3, alloc) != 3 {
+        fail Failure.Control(os::ControlError.Denied)
+    }
+    states[1] = try await core.control.lifecycle(named("tally"), alloc)
+    return states
+} woken
+
+test lazy_instances_start_at_their_first_call for run {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let states = try await run(one_tally(world.alloc, adjust: lazy), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+        return try await woken(core, alloc: world.alloc)
+    })
+    let started = counts.started.contents().load()
+    let Some(seen) = states else {
+        expect false
+        return
+    }
+    expect seen[0] == os::Lifecycle.Hibernated and seen[1] == os::Lifecycle.Running
+    expect started == 1
+} lazy_instances_start_at_their_first_call
+
+protocol Probed {
+    pub fn ping() limits recorded
+} Probed
+
+/// A client of the tally, whose Env holds a port to it.
+struct ClientEnv {
+    counter: os::Port[Counter]
+    alloc: mem::Alloc
+} ClientEnv
+
+impl ClientEnv: nanos::Environment
+
+struct Client derives Encode {
+} Client
+
+impl Client: sys::Component[ClientEnv, Probed]
+
+/// The tally and a client, both components of these tests.
+struct Pair derives Copy {
+} Pair
+
+impl Pair: Components
+
+fn ClientEnv.build(take world: nanos::World) -> ClientEnv fails nanos::CapError {
+    let handle = try nanos::Cap[os::PortHandle].get(world.caps, key: "counter")
+    let Some(port) = os::Port[Counter].of(handle) else {
+        fail nanos::CapError.Missing
+    }
+    return ClientEnv(counter: port, alloc: world.alloc)
+} ClientEnv.build
+
+fn Client.start(mut env: ClientEnv) -> Client = Client()
+
+/// Notes 1 on the tally from a keyed task.
+fn Client.ping(mut self, mut env: ClientEnv, mut cx: sys::Cx[Probed]) {
+    let tally = env.counter
+    let alloc = env.alloc
+    mut cx.spawn(key: 1, run: fn(out: sys::Outbox[Probed]) fails task::Cancelled uses wait limits stack 16_384 {
+        discard attempt await note(tally, amount: 1, alloc)
+    })
+} Client.ping
+
+fn Pair.protocol(self, component: Str) -> Option[sys::ProtocolHash] {
+    if component == "runner::Client" {
+        return Some(sys::Wire[Probed].hash())
+    }
+    return Tallies().protocol(component)
+} Pair.protocol
+
+fn Pair.serve(self, component: Str, take world: nanos::World, take serving: Serving) -> Ended fails task::Cancelled uses wait {
+    if component == "runner::Client" {
+        return try await Served[Client, ClientEnv, Probed].run(take world, take serving)
+    }
+    return try await Tallies().serve(component, take world, take serving)
+} Pair.serve
+
+/// A tally, and a client wired to it acting for `principal`, under the root grant held by `system`.
+fn tally_and_client(take principal: ident::Principal, alloc: mem::Alloc) -> Known {
+    var known = one_tally(alloc, adjust: unchanged)
+    var bundle = Array[u8, 33].filled(0)
+    bundle[0] = 0x01
+    var client = os::InstanceSpec.of(take principal, bundle: ident::HashValue(bytes: bundle), component: "runner::Client", alloc)
+    discard mut client.wiring.insert(text::String.of("counter", alloc), value: os::Wire.to(named("tally")))
+    discard mut known.specs.insert(named("client"), value: take client)
+    var rights = mem::Set[os::Right].empty(alloc)
+    discard mut rights.insert(os::Right.Read)
+    discard mut known.grants.insert(0, value: os::Grant(holder: system(), object: os::Object.Machine, rights: take rights, caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
+    return known
+} tally_and_client
+
+test wires_need_a_covering_grant for Directory.world {
+    let world = testing::world()
+    let alloc = world.alloc
+    let covered = try await run(tally_and_client(system(), alloc), components: Pair(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), body: fn(core: Core) -> os::Lifecycle fails os::ControlError uses wait {
+        let started = try await core.control.start(named("client"), alloc)
+        let Some(minted) = try await core.port(named("client"), credit: os::Credit(messages: 1, calls: 1)) else {
+            return started
+        }
+        let Some(client) = os::Port[Probed].of(minted.handle()) else {
+            take minted.close()
+            return started
+        }
+        var call = sys::Encoded.empty(alloc)
+        sys::Wire[Probed].ping(mut call)
+        discard attempt await client.post(take call)
+        take minted.close()
+        return started
+    })
+    let stranger = ident::Principal(text: text::Fixed[64].of("agent.stranger"))
+    let uncovered = try await run(tally_and_client(take stranger, alloc), components: Pair(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), body: fn(core: Core) -> os::Lifecycle fails os::ControlError uses wait {
+        return try await core.control.start(named("client"), alloc)
+    })
+    expect covered == Some(os::Lifecycle.Running)
+    expect uncovered == Some(os::Lifecycle.Failed)
+} wires_need_a_covering_grant
+
+fn reserved(mut spec: os::InstanceSpec) {
+    spec.budget.reserved = true
+} reserved
+
+/// Starts the reserved tally and calls it, giving its lifecycle, or the lifecycle its start gave when it does not run.
+fn reserved_call(core: Core, alloc: mem::Alloc) -> os::Lifecycle fails Failure uses wait {
+    let started = try await core.control.start(named("tally"), alloc)
+    if started != os::Lifecycle.Running {
+        return started
+    }
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 1, calls: 1)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    if try await add(port, amount: 4, alloc) != 4 {
+        fail Failure.Control(os::ControlError.Denied)
+    }
+    return started
+} reserved_call
+
+test reserved_instances_need_a_region for Shared.cell {
+    let world = testing::world()
+    let alloc = world.alloc
+    let held = try await run(one_tally(alloc, adjust: reserved), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), body: fn(core: Core) -> os::Lifecycle fails Failure uses wait {
+        return try await reserved_call(core, alloc)
+    })
+    let missing = try await run(one_tally(alloc, adjust: reserved), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: false), config: configured(world), body: fn(core: Core) -> os::Lifecycle fails Failure uses wait {
+        return try await reserved_call(core, alloc)
+    })
+    expect held == Some(os::Lifecycle.Running)
+    expect missing == Some(os::Lifecycle.Failed)
+} reserved_instances_need_a_region
+
+/// What the client's lifecycle was at each step of `revoke_root`, and whether revoking `g0` took `g1` with it, once.
+struct Outcomes derives Copy, Eq {
+    started: os::Lifecycle
+    descendants: bool
+    kept: os::Lifecycle
+    restarted: os::Lifecycle
+} Outcomes
+
+/// Starts the client, revokes the root grant its wire derives from twice, then restarts it.
+fn revoke_root(core: Core, alloc: mem::Alloc) -> Outcomes fails os::ControlError uses wait {
+    let started = try await core.control.start(named("client"), alloc)
+    let revoked = try await core.revoke(0)
+    let again = try await core.revoke(0)
+    let kept = try await core.control.lifecycle(named("client"), alloc)
+    let later = try await core.control.restart(named("client"), alloc)
+    let descendants = revoked.len() == 2 and revoked.contains(0) and revoked.contains(1) and again.len() == 0
+    return Outcomes(started: started, descendants: descendants, kept: kept, restarted: later)
+} revoke_root
+
+test revoking_a_grant_takes_its_descendants_and_fails_later_starts for Core.revoke {
+    let world = testing::world()
+    let alloc = world.alloc
+    var known = tally_and_client(system(), alloc)
+    discard mut known.grants.insert(1, value: os::Grant(holder: system(), object: os::Object.Instance(prefix: named("tally")), rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 2)))
+    let counts = Counts.of(alloc)
+    let seen = try await run(take known, components: Pair(), journal: counts, reservations: Spare(alloc: alloc, holds: true), config: configured(world), body: fn(core: Core) -> Outcomes fails os::ControlError uses wait {
+        return try await revoke_root(core, alloc)
+    })
+    let revoked = counts.revoked.contents().load()
+    expect seen == Some(Outcomes(started: os::Lifecycle.Running, descendants: true, kept: os::Lifecycle.Running, restarted: os::Lifecycle.Failed))
+    expect revoked == 2
+} revoking_a_grant_takes_its_descendants_and_fails_later_starts
+
+test revoked_root_entries_make_their_copies_stale for Minted.revoke {
+    let alloc = testing::world().alloc
+    let task::Channel(sender: orders, receiver: ordered) = task::Channel[os::Order].bounded(1, alloc)
+    let task::Channel(sender: intake, receiver: calls) = task::Channel[os::Call].bounded(1, alloc)
+    var minted = Minted.none(alloc)
+    mut minted.controls.push(GrantedControl(grant: 1, control: os::MintedControl.of(orders, prefix: None, alloc)))
+    mut minted.controls.push(GrantedControl(grant: 2, control: os::MintedControl.of(orders, prefix: None, alloc)))
+    mut minted.ports.push(WiredPort(field: text::String.of("counter", alloc), grant: 1, port: os::MintedPort.of(intake, gate: os::Gate.of(alloc), hash: sys::Wire[Counter].hash(), operations: None, credit: os::Credit(messages: 1, calls: 1), alloc)))
+    let control = minted.controls[0].control.mint(os::ControlRights(read: true, lifecycle: false, reserved: 0))
+    let port = os::Port[Counter].of(minted.ports[0].port.handle())
+    var grants = mem::Set[u64].empty(alloc)
+    discard mut grants.insert(1)
+    mut minted.revoke(grants)
+    let kept = minted.controls.len() == 1 and minted.controls[0].grant == 2 and minted.ports.len() == 0
+    take minted.close()
+    let read = attempt await control.lifecycle(named("tally"), alloc)
+    let Some(tally) = port else {
+        expect false
+        return
+    }
+    let posted = attempt await note(tally, amount: 1, alloc)
+    expect kept
+    expect match read {
+        Err(os::ControlError.Revoked) => true
+        else => false
+    }
+    expect match posted {
+        Err(os::PortError.Revoked) => true
+        else => false
+    }
+    discard ordered
+    discard calls
+} revoked_root_entries_make_their_copies_stale
+
+/// A grant held by `holder` reaching every instance, under `parent`, that expires `seconds` after the tests' wall time.
+fn expiring(take holder: ident::Principal, parent: u64, seconds: i64, alloc: mem::Alloc) -> os::Grant {
+    var caveats = os::Caveats.none()
+    caveats.expires_utc_ns = Some(NOON_NS + seconds * 1_000_000_000)
+    return os::Grant(holder: take holder, object: os::Object.Machine, rights: mem::Set.empty(alloc), caveats: take caveats, parent: Some(parent), granted_by: ident::CommitId(number: 2))
+} expiring
+
+fn child() -> ident::Principal {
+    return ident::Principal(text: text::Fixed[64].of("agent.child"))
+} child
+
+/// Starts the client, whose wire derives from a grant expiring in 10 s, waits 12 s, then restarts it, giving each lifecycle.
+fn outlived(core: Core, clock: sys::Clock, alloc: mem::Alloc) -> Array[os::Lifecycle, 2] fails os::ControlError uses wait {
+    var states = Array[os::Lifecycle, 2].filled(os::Lifecycle.Stopped)
+    states[0] = try await core.control.start(named("client"), alloc)
+    try await clock.sleep(12_000)
+    states[1] = try await core.control.restart(named("client"), alloc)
+    return states
+} outlived
+
+test grants_expire_at_start_and_once_their_expiry_passes for expire {
+    let world = testing::world()
+    let alloc = world.alloc
+    var known = tally_and_client(child(), alloc)
+    discard mut known.grants.insert(1, value: expiring(child(), parent: 0, seconds: 10, alloc))
+    discard mut known.grants.insert(2, value: expiring(system(), parent: 0, seconds: -1, alloc))
+    discard mut known.grants.insert(3, value: os::Grant(holder: system(), object: os::Object.Clock, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(2), granted_by: ident::CommitId(number: 3)))
+    let counts = Counts.of(alloc)
+    let seen = try await run(take known, components: Pair(), journal: counts, reservations: Spare(alloc: alloc, holds: true), config: configured(world), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails os::ControlError uses wait {
+        return try await outlived(core, clock: world.clock, alloc)
+    })
+    let revoked = counts.revoked.contents().load()
+    let Some(states) = seen else {
+        expect false
+        return
+    }
+    expect states[0] == os::Lifecycle.Running and states[1] == os::Lifecycle.Failed
+    expect revoked == 3
+} grants_expire_at_start_and_once_their_expiry_passes

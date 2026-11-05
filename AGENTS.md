@@ -17,6 +17,9 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `ident/` | The `ident` package: the names, identifiers, hashes and times of NaN OS records |
 | `bootfmt/` | The `bootfmt` package: the boot record, the handoff record and the kernel image |
 | `acpi/` | The `acpi` package: the ACPI tables NaN OS reads |
+| `os/` | The `os` package: the records instances and the core share, and the capability kinds `Port` and `Control` |
+| `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts and Envs |
+| `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install` and `sandbox` scripts |

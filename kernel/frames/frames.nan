@@ -20,12 +20,14 @@ pkg struct Extent derives Copy, Eq {
     pkg end: u64
 } Extent
 
-/// Where start step 3 puts each region `k.regions()` gives: the node of each, and those holding the core pool and each node's pool, which every other region leaves to the frame allocator.
+/// Where start step 3 puts each region `k.regions()` gives: the node of each, and those holding the core pool and each node's pool, which every other region leaves to the frame allocator; the pool of the node with the most memory, `richest`, leaves it the top `set_aside` bytes of its region, for reserved instances.
 pkg struct Plan {
     pkg ram: u64
     nodes: mem::List[u32]
     core: usize
     pools: mem::List[Option[usize]]
+    richest: Option[usize]
+    set_aside: u64
 } Plan
 
 /// The memory the core holds after start step 3: the frame allocator, the core pool, and the pool of each node with memory, holding `pool_bytes` together.
@@ -43,10 +45,11 @@ linear struct NodeFrames {
     huge: mem::List[hw::PhysFrame[1_073_741_824]]
 } NodeFrames
 
-/// The frame allocator: the free frames of each node, and the core reserve's frames for page tables.
+/// The frame allocator: the free frames of each node, the core reserve's frames for page tables, and the ranges reserved instances take their regions from.
 pkg linear struct Frames {
     nodes: mem::List[NodeFrames]
     tables: mem::List[hw::PhysFrame[4_096]]
+    reservable: mem::List[hw::Region]
 } Frames
 
 /// The core pool's size: 4 MiB and 256 KiB per CPU.
@@ -104,8 +107,28 @@ pkg fn Plan.of(regions: Slice[Extent], nodes: cpu::Nodes, cpus: u32, alloc: mem:
     if free_frames < TABLE_FRAMES {
         return None
     }
-    return Some(Plan(ram: ram, nodes: take node_of, core: core_region, pools: take pools))
+    let richest = richest_pool(regions, nodes: node_of.view(), pools: pools.view(), alloc)
+    return Some(Plan(ram: ram, nodes: take node_of, core: core_region, pools: take pools, richest: richest, set_aside: ram / 16 / LARGE_FRAME * LARGE_FRAME))
 } Plan.of
+
+/// The pool region of the node holding the most of `regions`.
+fn richest_pool(regions: Slice[Extent], nodes: Slice[u32], pools: Slice[Option[usize]], alloc: mem::Alloc) -> Option[usize] {
+    var held = mem::List[u64].empty(alloc)
+    for _ in 0..<pools.len() {
+        mut held.push(0)
+    }
+    for index in 0..<regions.len() {
+        let node = usize.widen(nodes[index])
+        held[node] = held[node] + (regions[index].end - regions[index].base)
+    }
+    var best: usize = 0
+    for node in 0..<held.len() {
+        if held[node] > held[best] {
+            best = node
+        }
+    }
+    return pools[best]
+} richest_pool
 
 /// The bytes of the 64 KiB-aligned chunks lying wholly inside `region`, which a store over it supplies.
 fn chunk_bytes(region: Extent) -> u64 {
@@ -143,6 +166,7 @@ pkg fn Memory.build(take regions: mem::List[hw::Region], plan: Plan, scratch: me
         mut nodes.push(NodeFrames(small: mem::List.empty(alloc), large: mem::List.empty(alloc), huge: mem::List.empty(alloc)))
     }
     var pools = mem::List[mem::Heap].empty(alloc)
+    var reservable = mem::List[hw::Region].empty(alloc)
     var pool_bytes: u64 = 0
     var index: usize = 0
     for region in take rest {
@@ -151,14 +175,18 @@ pkg fn Memory.build(take regions: mem::List[hw::Region], plan: Plan, scratch: me
         }
         let node = usize.widen(plan.nodes[index])
         if plan.pools[node] == Some(index) {
-            pool_bytes += chunk_bytes(Extent(base: region.base(), end: region.base() + region.byte_len()))
-            mut pools.push(mem::Heap.over(take region))
+            var pooled = region
+            if plan.richest == Some(index) {
+                set_aside(mut pooled, bytes: plan.set_aside, into: mut reservable)
+            }
+            pool_bytes += chunk_bytes(Extent(base: pooled.base(), end: pooled.base() + pooled.byte_len()))
+            mut pools.push(mem::Heap.over(take pooled))
         } else {
             mut nodes[node].add(take region, scratch)
         }
         index += 1
     }
-    var frames = Frames(nodes: take nodes, tables: mem::List.empty(alloc))
+    var frames = Frames(nodes: take nodes, tables: mem::List.empty(alloc), reservable: take reservable)
     for _ in 0..<TABLE_FRAMES {
         let Some(frame) = mut frames.take_small() else {
             break
@@ -294,14 +322,73 @@ pkg fn Frames.release(mut self, take frame: hw::PhysFrame[4_096]) {
     mut self.tables.push(take frame)
 } Frames.release
 
-/// The bytes of the frames free for any use, the core reserve's excepted.
+/// The bytes of the frames and ranges free for any use, the core reserve's excepted.
 pkg fn Frames.free_bytes(self) -> u64 {
     var bytes: u64 = 0
     for node in self.nodes {
         bytes += u64.widen(node.small.len()) * SMALL_FRAME + u64.widen(node.large.len()) * LARGE_FRAME + u64.widen(node.huge.len()) * HUGE_FRAME
     }
+    for range in self.reservable {
+        bytes += range.byte_len()
+    }
     return bytes
 } Frames.free_bytes
+
+/// Moves the top `bytes` of `region`, from a 2 MiB boundary, into `into`, when that leaves `region` some memory.
+fn set_aside(mut region: hw::Region, bytes: u64, mut into: mem::List[hw::Region]) {
+    let end = region.base() + region.byte_len()
+    if bytes == 0 or bytes >= end {
+        return
+    }
+    let cut = (end - bytes) / LARGE_FRAME * LARGE_FRAME
+    if cut <= region.base() {
+        return
+    }
+    match mut region.split(at: cut) {
+        Some(top) => mut into.push(take top)
+        None => {
+        }
+    }
+} set_aside
+
+/// A region of the reservable ranges of whole 2 MiB frames, at least one, holding `bytes` from a 2 MiB boundary, `None` when no range holds one.
+pkg fn Frames.reserve(mut self, bytes: u64) -> Option[hw::Region] {
+    for at in 0..<self.reservable.len() {
+        let Some(span) = carve(Extent(base: self.reservable[at].base(), end: self.reservable[at].base() + self.reservable[at].byte_len()), bytes) else {
+            continue
+        }
+        var whole = mut self.reservable.remove(at)
+        if span.base > whole.base() {
+            match mut whole.split(at: span.base) {
+                Some(upper) => {
+                    mut self.reservable.push(take whole)
+                    whole = upper
+                }
+                None => {
+                }
+            }
+        }
+        set_aside(mut whole, bytes: whole.byte_len() - (span.end - span.base), into: mut self.reservable)
+        return Some(take whole)
+    }
+    return None
+} Frames.reserve
+
+/// The extent of whole 2 MiB frames, at least one, holding `bytes` from the first 2 MiB boundary of `range`, when the range holds it.
+fn carve(range: Extent, bytes: u64) -> Option[Extent] {
+    let base = align_up(range.base, to: LARGE_FRAME)
+    if base >= range.end or range.end - base < bytes {
+        return None
+    }
+    var size = align_up(bytes, to: LARGE_FRAME)
+    if size == 0 {
+        size = LARGE_FRAME
+    }
+    if range.end - base < size {
+        return None
+    }
+    return Some(Extent(base: base, end: base + size))
+} carve
 
 /// Extents shaped like the sandbox's: a 398 MiB region among smaller ones.
 fn sandbox_extents(alloc: mem::Alloc) -> mem::List[Extent] {
@@ -326,6 +413,7 @@ test start_memory_is_planned for Plan.of {
     expect plan.pools[0] == Some(2)
     expect plan.core == 4
     expect plan.ram == 0x1C3C_7000
+    expect plan.richest == Some(2) and plan.set_aside == 0x1C0_0000
     var little = mem::List[Extent].empty(alloc)
     mut little.push(Extent(base: 0x10_0000, end: 0x3C0_0000))
     let small = Plan.of(little.view(), nodes: one_node, cpus: 4, alloc)
@@ -354,3 +442,13 @@ test each_node_gets_its_largest_region for Plan.of {
     expect plan.pools[1] == Some(2)
     expect plan.core == 4
 } each_node_gets_its_largest_region
+
+test reservations_take_whole_aligned_2_mib_frames for carve {
+    let range = Extent(base: 0x30_1000, end: 0x100_0000)
+    expect carve(range, bytes: 0x40_0000) == Some(Extent(base: 0x40_0000, end: 0x80_0000))
+    expect carve(range, bytes: 0x20_0001) == Some(Extent(base: 0x40_0000, end: 0x80_0000))
+    expect carve(range, bytes: 0) == Some(Extent(base: 0x40_0000, end: 0x60_0000))
+    expect carve(range, bytes: 0xC0_0000) == Some(Extent(base: 0x40_0000, end: 0x100_0000))
+    expect carve(range, bytes: 0xE0_0000) == None
+    expect carve(range, bytes: 0xFFFF_FFFF_FFFF_0000) == None
+} reservations_take_whole_aligned_2_mib_frames

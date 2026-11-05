@@ -13,9 +13,9 @@ The **kernel image** is `kernel.elf`: one NaN final build of the program `kernel
 
 ## Core
 
-The **core** is the kernel code that is not a component: the `kernel` package. Its tasks, interrupt fns and landing fns run in NaN's kernel domain, so a trap anywhere in the core is a [kernel halt](#kernel-halts).
+The **core** is the kernel code that is not a component: the `kernel` package, and the `os` and `runner` packages it links. Its tasks, interrupt fns and landing fns run in NaN's kernel domain, so a trap anywhere in the core is a [kernel halt](#kernel-halts).
 
-| Module | Holds | Rules |
+| Module or package | Holds | Rules |
 | --- | --- | --- |
 | `cpu` | per-CPU records, CPU features, topology, idle entry | [CPUs](#cpus), [idle](08-scheduling.md#idle) |
 | `frames` | the frame allocator, the core reserve, the pools | [frames](05-memory.md#frames), [pools](05-memory.md#pools) |
@@ -24,9 +24,8 @@ The **core** is the kernel code that is not a component: the `kernel` package. I
 | `iommu` | IOMMU units, device domains, interrupt remapping | [DMA and IOMMU](15-devices.md#dma-and-iommu) |
 | `time` | clock sources, timer heaps, the watchdog | [clocks](08-scheduling.md#clocks), [timers](08-scheduling.md#timers), [Watchdog](#watchdog) |
 | `sched` | run queues, classes, accounts, policy calls | [08-scheduling](08-scheduling.md) |
-| `domains` | domain runs, settlement, abandonment from outside | [Faults](#faults) |
-| `caps` | capability tables, the OS capability kinds, revocation | [capability kinds](09-authority.md#capability-kinds) |
-| `runner` | intakes, handler calls, quiescence, checkpoints, hibernation, forks | [runner](06-execution.md#runner) |
+| `os` package | the OS capability kinds and the records the core shares with instances | [capability kinds](09-authority.md#capability-kinds) |
+| `runner` package | intakes, handler calls, domain runs and abandonment from outside, quiescence, revocation, checkpoints, hibernation, forks | [runner](06-execution.md#runner), [Faults](#faults) |
 | `load` | loading and unloading bundles, registry entries | [loading](10-code.md#loading) |
 | `journal` | per-CPU event rings | [events](17-observability.md#events) |
 | `entry` | the system call and user-exception landing fns | [User entry](#user-entry) |

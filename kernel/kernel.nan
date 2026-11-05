@@ -5,9 +5,10 @@ struct Tables {
     madt: Option[Untrusted[mem::Bytes]]
     fadt: Option[Untrusted[mem::Bytes]]
     srat: Option[Untrusted[mem::Bytes]]
+    hpet: Option[Untrusted[mem::Bytes]]
 } Tables
 
-/// The start sequence: each step that fails halts the kernel with its code. The first task starts every other CPU, then waits.
+/// The start sequence: each step that fails halts the kernel with its code. The first task starts every other CPU, prints the start line, then runs the base instances of the image's genesis record.
 fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     let Some(cpu) = mut k.ring0() else {
         expect false
@@ -20,7 +21,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
         halt(code: "fault.handoff-invalid", subject: "handoff")
     }
     let features = cpu::Features.read(cpu)
-    let tables = Tables(madt: k.acpi_table(acpi::Signature.Madt.bytes(), alloc), fadt: k.acpi_table(acpi::Signature.Fadt.bytes(), alloc), srat: k.acpi_table(acpi::Signature.Srat.bytes(), alloc))
+    let tables = Tables(madt: k.acpi_table(acpi::Signature.Madt.bytes(), alloc), fadt: k.acpi_table(acpi::Signature.Fadt.bytes(), alloc), srat: k.acpi_table(acpi::Signature.Srat.bytes(), alloc), hpet: k.acpi_table(acpi::Signature.Hpet.bytes(), alloc))
     var regions = mut k.regions()
     for module in take modules {
         insert_region(mut regions, region: take module.into_region())
@@ -34,7 +35,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     let ram = plan.ram
     var memory = frames::Memory.build(take regions, plan, scratch: alloc)
     let core = memory.core.alloc()
-    let Some(shared) = spaces::Shared.build(extents.view(), features, cpus, frames: mut memory.frames, alloc: core) else {
+    let Some(shared) = spaces::Shared.build(extents.view(), features, cpus, clock: hpet_of(tables.hpet), frames: mut memory.frames, alloc: core) else {
         halt(code: "fault.memory-insufficient", subject: "shared-space")
     }
     let low = shared.low_memory()
@@ -47,14 +48,23 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     if not valid(tables.fadt, check: acpi::check_fadt) {
         halt(code: "fault.firmware-tables-invalid", subject: "FADT")
     }
-    let state = mem::Shared.of(sched::State.of(places_of(features, nodes, cpus, alloc: core), clock: k.clock(), alloc: core), alloc: core)
+    let clock = k.clock()
+    let wall = start_wall(tables.fadt, clock)
+    let state = mem::Shared.of(sched::State.of(places_of(features, nodes, cpus, alloc: core), clock, alloc: core), alloc: core)
     mut k.policy(sched::Scheduler.of(state.share()))
     let facts = Facts(cpus: cpus, nodes: nodes.count(), ram_bytes: ram, features: features, conditions: handoff.conditions)
-    take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+    let known = image_genesis(ident::HashValue(bytes: handoff.kernel_hash), alloc: core)
+    let rings = journal::Rings.of(cpus, clock, alloc: core)
+    take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state, take known, take rings](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         discard attempt await start_cpus(cpu, take roots, features, state, frames: mut memory.frames, exec)
         state.contents().all_started()
         discard attempt await low.release(cpu)
         report_start(facts, memory)
+        let Some(pool) = memory.pools.get(0) else {
+            halt(code: "fault.memory-insufficient", subject: "pools")
+        }
+        let config = runner::Config(exec: exec, pool: pool.alloc(), alloc: core, clock: clock, wall: wall, classes: sched::classes())
+        discard attempt await run_base(take known, config, rings, frames: mut memory.frames)
         let parked = hw::Signal[Unit].empty()
         loop {
             discard attempt await parked.wait()
@@ -101,6 +111,17 @@ fn srat_of(raw: Option[Untrusted[mem::Bytes]], alloc: mem::Alloc) -> Option[acpi
     }
     return Some(take srat)
 } srat_of
+
+/// The address of the HPET's registers when the firmware has an HPET table and it passes its validator.
+fn hpet_of(raw: Option[Untrusted[mem::Bytes]]) -> Option[u64] {
+    let Some(bytes) = raw else {
+        return None
+    }
+    let Ok(base) = attempt acpi::hpet_base(bytes.view()) else {
+        return None
+    }
+    return Some(base)
+} hpet_of
 
 /// Whether a table is present and passes `check`.
 fn valid(raw: Option[Untrusted[mem::Bytes]], check: fn(raw: Untrusted[Slice[u8]]) fails acpi::TableError) -> bool {

@@ -35,7 +35,7 @@ The **supervisor** of an instance is the instance its moniker's prefix names (`a
 | `placement` | `auto` or `isolated` | `auto` | `isolated` runs the instance in an isolated space even when admission places its bundle in the shared space |
 | `durability` | `Durability` | `volatile` | [Durability](#durability) |
 | `restart` | `Restart` | `permanent` | [Restarts](#restarts) |
-| `limits` | `Limits` | per field | [Handler limits](#handler-limits) |
+| `handlers` | `Limits` | per field | [Handler limits](#handler-limits) |
 | `lazy` | `bool` | `false` | [Lazy start](#lazy-start) |
 | `stopped` | `bool` | `false` | `true` keeps the instance stopped |
 
@@ -47,7 +47,7 @@ The plan steps `start <moniker>` and `stop <moniker>` write `stopped`, and `upda
 | `principal`, `component`, `placement`, `InstanceSpec.budget.reserved` | a restart |
 | `wiring`, `grants`, or the record at `/sys/config/<moniker>` | an Env rebuild |
 | `InstanceSpec.budget.limit` | applied at the next start, revival or update ([cells and limits](05-memory.md#cells-and-limits)) |
-| `share`, `durability`, `restart`, `limits` | applied at the next quiescence |
+| `share`, `durability`, `restart`, `handlers` | applied at the next quiescence |
 | `stopped` | a start or a stop |
 | `lazy` | applied at the next start |
 
@@ -290,7 +290,7 @@ A job's bundle holds one program, whose entry has one of two forms (requires [N1
 | `input` | `mem::Bytes` | empty | the `mem::wire` encoding of `I`; one that does not decode as `I` is refused (`instance.input-mismatch`) |
 | `args`, `environment` | `mem::List[mem::Bytes]`, `mem::Map[mem::Bytes, mem::Bytes]` | empty | a host-compatible entry's arguments and environment, which its `host::World` holds as `Untrusted` |
 | `stdin` | `Option[HashValue]` | none | the blob the runner places at `/state/<moniker>/stdin`, which the job reads as its standard input, then end of input |
-| `wiring`, `grants`, `budget`, `share`, `placement`, `limits` | as `InstanceSpec` | as `InstanceSpec` | |
+| `wiring`, `grants`, `budget`, `share`, `placement`, `handlers` | as `InstanceSpec` | as `InstanceSpec` | |
 | `restart` | `Restart` | `temporary` | |
 | `branch` | `text::String` | `main` | the branch its writes commit to |
 | `deadline_s` | `Option[u32]` | none | the job is cancelled this many seconds after its start |

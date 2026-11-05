@@ -1,6 +1,6 @@
 # 0015. Kernel core on NaN's runtime
 
-Status: accepted
+Status: superseded by 0017
 
 ## Context
 

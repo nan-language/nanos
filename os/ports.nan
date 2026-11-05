@@ -1,0 +1,309 @@
+//! Ports: capabilities sending the calls of one protocol to one instance, within the credit of the port minted for their sender.
+
+/// A port of protocol P.
+pub open struct Port[P: sys::Protocol] derives Copy, Send {
+    handle: PortHandle
+} Port
+
+/// The capability behind every port, whatever its protocol.
+pub open struct PortHandle {
+} PortHandle
+
+impl PortHandle: sys::Kind[Route, u8]
+
+/// A minted port: the root entry its ports derive from, revoked when it closes.
+pub open linear struct MintedPort derives Send {
+    minter: sys::Minter[PortHandle, Route, u8]
+    root: PortHandle
+} MintedPort
+
+/// Whether an instance takes calls: closed while it is stopped, failed, removed or stopping other than to restart.
+pub open struct Gate derives Send {
+    open: mem::Shared[core::atomic::AtomicU8]
+} Gate
+
+/// A call on its way to an instance's handlers.
+pub closed struct Call {
+    pub hash: sys::ProtocolHash
+    pub encoded: sys::Encoded
+    pub reply: Option[task::Sender[Answer]]
+    pub lease: Lease
+} Call
+
+/// How an instance's runner answers a request.
+pub closed enum Answer {
+    Replied(sys::Encoded)
+    Malformed
+    Stopped
+    ServerStopped
+} Answer
+
+/// The credit a call holds until its runner releases it.
+pub open struct Lease derives Send {
+    credits: task::Cown[Credits]
+    request: bool
+} Lease
+
+pub closed enum PortError[E: Send] derives Render {
+    Failed(E)
+    Revoked
+    Stopped
+    ServerStopped
+    Malformed
+    Cancelled(task::Cancelled) from
+} PortError
+
+/// Where a minted port's calls go: the target's intake, gate and protocol hash, the operations it may call, every one when `None`, and its credit.
+struct Route {
+    intake: task::Sender[Call]
+    gate: Gate
+    hash: sys::ProtocolHash
+    operations: Option[mem::Set[text::String]]
+    credits: task::Cown[Credits]
+    alloc: mem::Alloc
+} Route
+
+/// The credit a minted port has left, and the senders waiting for some.
+struct Credits {
+    messages: u16
+    calls: u16
+    waiting_messages: mem::List[task::Sender[Unit]]
+    waiting_calls: mem::List[task::Sender[Unit]]
+} Credits
+
+/// What a call through a port needs from its minted port.
+struct Reached {
+    intake: task::Sender[Call]
+    hash: sys::ProtocolHash
+    credits: task::Cown[Credits]
+    alloc: mem::Alloc
+} Reached
+
+enum Refusal {
+    Revoked
+    Stopped
+} Refusal
+
+/// A gate, closed.
+pub fn Gate.of(alloc: mem::Alloc) -> Gate {
+    return Gate(open: mem::Shared.of(core::atomic::AtomicU8.of(0), alloc))
+} Gate.of
+
+pub fn Gate.share(self) -> Gate {
+    return Gate(open: self.open.share())
+} Gate.share
+
+pub fn Gate.set(self, open: bool) {
+    if open {
+        self.open.contents().store(1)
+    } else {
+        self.open.contents().store(0)
+    }
+} Gate.set
+
+pub fn Gate.is_open(self) -> bool {
+    return self.open.contents().load() == 1
+} Gate.is_open
+
+/// A port minted for one sender: its calls of the operations `operations` names, all when `None`, go to `intake` while `gate` is open, under `credit`, to an instance serving the protocol `hash`.
+pub fn MintedPort.of(
+    intake: task::Sender[Call],
+    gate: Gate,
+    hash: sys::ProtocolHash,
+    take operations: Option[mem::Set[text::String]],
+    credit: Credit,
+    alloc: mem::Alloc,
+    ) -> MintedPort {
+    let credits = task::Cown.of(Credits(messages: credit.messages, calls: credit.calls, waiting_messages: mem::List.empty(alloc), waiting_calls: mem::List.empty(alloc)), alloc)
+    let route = Route(intake: intake.split(), gate: gate.share(), hash: hash, operations: take operations, credits: take credits, alloc: alloc)
+    let minter = sys::Minter[PortHandle, Route, u8].of(take route, alloc)
+    let root = minter.mint(0)
+    return MintedPort(minter: take minter, root: root)
+} MintedPort.of
+
+pub fn MintedPort.handle(self) -> PortHandle = self.root
+
+/// Revokes every port of this minted port.
+pub fn MintedPort.close(take self) {
+    let MintedPort(minter: minter, root: _) = self
+    take minter.close()
+} MintedPort.close
+
+/// The port of protocol P a handle gives, `None` when it is stale or its instance serves another protocol.
+pub fn Port.of(handle: PortHandle) -> Option[Port[P]] {
+    let wanted = sys::Wire[P].hash()
+    let serves = sys::reach(handle, body: fn(state: Route, record: u8) => state.hash == wanted)
+    if serves != Some(true) {
+        return None
+    }
+    return Some(Port[P](handle: handle))
+} Port.of
+
+/// Posts the one-way call `call`, waiting for credit, and returns once it is in the instance's intake.
+pub fn Port.post(self, take call: sys::Encoded) fails PortError[Never] uses wait {
+    let reached = match self.reach(call.bytes.view()) {
+        Ok(reached) => reached
+        Err(Refusal.Revoked) => fail PortError.Revoked
+        Err(Refusal.Stopped) => fail PortError.Stopped
+    }
+    let lease = try await Lease.acquire(reached.credits, request: false, alloc: reached.alloc)
+    let sent = attempt await reached.intake.send(Call(hash: reached.hash, encoded: take call, reply: None, lease: take lease))
+    match sent {
+        Ok(_) => {
+        }
+        Err(task::SendError.Closed) => fail PortError.Stopped
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+    }
+} Port.post
+
+/// Calls the request `call`, waiting for credit, and gives its reply, which `reply` decodes.
+pub fn Port.call[R: Send, E: Send](self, take call: sys::Encoded, reply: sys::Reply[R, E], alloc: mem::Alloc) -> R fails PortError[E] uses wait {
+    let reached = match self.reach(call.bytes.view()) {
+        Ok(reached) => reached
+        Err(Refusal.Revoked) => fail PortError.Revoked
+        Err(Refusal.Stopped) => fail PortError.Stopped
+    }
+    let lease = try await Lease.acquire(reached.credits, request: true, alloc)
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Answer].bounded(1, alloc)
+    let sent = attempt await reached.intake.send(Call(hash: reached.hash, encoded: take call, reply: Some(take answer), lease: take lease))
+    match sent {
+        Ok(_) => {
+        }
+        Err(task::SendError.Closed) => fail PortError.Stopped
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+    }
+    var receiver = answers
+    let Some(answered) = try await mut receiver.receive() else {
+        fail PortError.ServerStopped
+    }
+    let encoded = match answered {
+        Answer.Replied(encoded) => encoded
+        Answer.Malformed => fail PortError.Malformed
+        Answer.Stopped => fail PortError.Stopped
+        Answer.ServerStopped => fail PortError.ServerStopped
+    }
+    return match attempt reply.decode(Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc) {
+        Ok(result) => result
+        Err(sys::CallError.Failed(failure)) => fail PortError.Failed(take failure)
+        else => fail PortError.Malformed
+    }
+} Port.call
+
+/// What a call `encoded` through this port needs, refused when the port is stale or lacks its operation, or when the instance takes no calls.
+fn Port.reach(self, encoded: Slice[u8]) -> Result[Reached, Refusal] {
+    let reached = sys::reach(self.handle, body: fn(state: Route, record: u8) -> Result[Reached, Refusal] {
+        if not allows(state.operations, encoded) {
+            return Err(Refusal.Revoked)
+        }
+        if not state.gate.is_open() {
+            return Err(Refusal.Stopped)
+        }
+        return Ok(Reached(intake: state.intake.split(), hash: state.hash, credits: state.credits.share(), alloc: state.alloc))
+    })
+    let Some(outcome) = reached else {
+        return Err(Refusal.Revoked)
+    }
+    return outcome
+} Port.reach
+
+/// Whether `operations` holds the operation whose call `encoded` is, every operation when `None`: a call's encoding is a `mem::wire` variant keyed by its operation's name, after the name's length in one byte.
+fn allows(operations: Option[mem::Set[text::String]], encoded: Slice[u8]) -> bool {
+    let Some(names) = operations else {
+        return true
+    }
+    if encoded.len() == 0 or encoded[0] >= 0x80 {
+        return false
+    }
+    let Some(parts) = encoded.split_at(1) else {
+        return false
+    }
+    let Some(name) = parts.tail.prefix(usize.widen(encoded[0])) else {
+        return false
+    }
+    for allowed in names {
+        if allowed.as_bytes() == name {
+            return true
+        }
+    }
+    return false
+} allows
+
+/// Waits until the minted port has a message's credit left, or a call's when `request`, and takes it.
+fn Lease.acquire(credits: task::Cown[Credits], request: bool, alloc: mem::Alloc) -> Lease fails task::Cancelled uses wait {
+    var granted = false
+    await when mut credits {
+        granted = mut credits.take_one(request)
+    }
+    if not granted {
+        let task::Channel(sender: waiter, receiver: wakes) = task::Channel[Unit].bounded(1, alloc)
+        var held = Some(take waiter)
+        await when mut credits {
+            granted = mut credits.take_one(request)
+            if not granted {
+                match mut held.extract() {
+                    Some(registered) => mut credits.wait(request, waiter: take registered)
+                    None => {
+                    }
+                }
+            }
+        }
+        if not granted {
+            var woken = wakes
+            discard try await mut woken.receive()
+        }
+    }
+    return Lease(credits: credits.share(), request: request)
+} Lease.acquire
+
+/// Gives the credit back to the minted port: to the first sender still waiting for it, else to the port.
+pub fn Lease.release(take self) fails task::Cancelled uses wait {
+    let Lease(credits: credits, request: request) = self
+    loop {
+        var next: Option[task::Sender[Unit]] = None
+        await when mut credits {
+            next = mut credits.hand_over(request)
+        }
+        let Some(waiter) = next else {
+            return
+        }
+        if (attempt await waiter.send(Unit)).is_ok() {
+            return
+        }
+    }
+} Lease.release
+
+fn Credits.take_one(mut self, request: bool) -> bool {
+    if request and self.calls > 0 {
+        self.calls -= 1
+        return true
+    }
+    if not request and self.messages > 0 {
+        self.messages -= 1
+        return true
+    }
+    return false
+} Credits.take_one
+
+fn Credits.wait(mut self, request: bool, take waiter: task::Sender[Unit]) {
+    if request {
+        mut self.waiting_calls.push(take waiter)
+    } else {
+        mut self.waiting_messages.push(take waiter)
+    }
+} Credits.wait
+
+/// The first sender waiting for this credit, which takes it, or `None` once the credit has returned to the port.
+fn Credits.hand_over(mut self, request: bool) -> Option[task::Sender[Unit]] {
+    if request {
+        if self.waiting_calls.len() > 0 {
+            return Some(mut self.waiting_calls.remove(0))
+        }
+        self.calls += 1
+        return None
+    }
+    if self.waiting_messages.len() > 0 {
+        return Some(mut self.waiting_messages.remove(0))
+    }
+    self.messages += 1
+    return None
+} Credits.hand_over

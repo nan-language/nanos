@@ -1,0 +1,209 @@
+//! The task of an instance's domain: it builds the Env, starts the component and serves the calls its driver delivers, one at a time.
+
+/// What an instance's driver gives the task of its domain: the calls it delivers, and where the domain reports what it takes and answers and when its handlers run.
+pub open struct Serving {
+    deliveries: task::Receiver[Delivery]
+    reports: task::Sender[Input]
+    marks: task::Sender[Mark]
+    incarnation: u64
+    clock: sys::Clock
+} Serving
+
+/// What a driver delivers to its instance's domain: a call, or the order to stop once the handler running returns.
+enum Delivery {
+    Call(id: u64, hash: sys::ProtocolHash, encoded: sys::Encoded, request: bool)
+    Stop
+} Delivery
+
+/// What the task of an instance's domain tells its driver.
+enum Report {
+    Running
+    Taken(id: u64)
+    Answered(id: u64, answer: os::Answer)
+    Ending
+} Report
+
+/// When the handlers of an instance run, which its watchdog bounds: their start, then how long they took.
+enum Mark {
+    Began
+    Took(ns: u64)
+} Mark
+
+/// How an instance's domain ended other than by abandonment.
+pub closed enum Ended derives Copy, Eq {
+    Stopped
+    EnvIncomplete
+} Ended
+
+/// The instances of a component of state S serving P whose Env is Env.
+pub open struct Served[S: sys::Component[Env, P] and Encode, Env: nanos::Environment and Send, P: sys::Protocol and Send] {
+} Served
+
+/// The end of the delivery loop: the driver asked to stop, or released its deliveries.
+enum Stopping {
+    Asked
+    Cancelled(task::Cancelled) from
+} Stopping
+
+/// Runs an instance: builds its Env from `world`, starts the component, then serves what `serving` delivers until it is told to stop, letting the handler running return and handling every message that waits, and ends the component.
+pub fn Served.run(take world: nanos::World, take serving: Serving) -> Ended fails task::Cancelled uses wait {
+    let exec = world.exec
+    let alloc = world.alloc
+    let Ok(env) = attempt Env.build(take world) else {
+        return Ended.EnvIncomplete
+    }
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock) = serving
+    var stepper = try sys::Stepper[S, Env, P].start(take env, exec, alloc)
+    defer take stepper.abandon()
+    mut stepper.resumed(sys::ResumeReason.Started)
+    discard mut stepper.start_keyed()
+    try await tell(reports, incarnation, report: Report.Running)
+    let out = stepper.outbox()
+    let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0)), alloc)
+    let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
+    var given = Some(Given(deliveries: take deliveries, finishes: take finishes))
+    let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given](s: task::Scope) fails Stopping uses wait {
+        let Some(Given(deliveries: receiver, finishes: finishing)) = mut given.extract() else {
+            return
+        }
+        let sending = reports.split()
+        let counted = steps.share()
+        discard s.spawn(fn[take receiver, take finishing, take sending, take counted]() fails Stopping uses wait limits stack 16_384 {
+            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, alloc)
+        })
+        loop {
+            try await stepper.incoming()
+            try await call_handlers(mut stepper, marks, steps, finished, clock)
+        }
+    })
+    match looped {
+        Ok(_) => {
+        }
+        Err(Stopping.Asked) => {
+        }
+        Err(Stopping.Cancelled(cancelled)) => fail cancelled
+    }
+    try await call_handlers(mut stepper, marks, steps, finished, clock)
+    try await tell(reports, incarnation, report: Report.Ending)
+    undefer stepper
+    discard try await take stepper.end()
+    return Ended.Stopped
+} Served.run
+
+/// The steps of an instance's holder: how many it began and finished, and the count of finished steps the dispatcher waits for, 0 when it waits for none.
+struct Steps {
+    begun: core::atomic::AtomicU64
+    done: core::atomic::AtomicU64
+    wanted: core::atomic::AtomicU64
+} Steps
+
+/// What the dispatcher of an instance's domain takes: the calls its driver delivers, and the counts of finished steps the holder signals.
+struct Given {
+    deliveries: task::Receiver[Delivery]
+    finishes: task::Receiver[u64]
+} Given
+
+/// Serves each call delivered through the protocol P on the component behind `out`, one at a time and in order, until told to stop: a request is answered once its handler returns, and a one-way call is reported taken once the handler call that took it has returned.
+fn dispatch[P: sys::Protocol and Send](
+    out: sys::Outbox[P],
+    take deliveries: task::Receiver[Delivery],
+    steps: mem::Shared[Steps],
+    take finishes: task::Receiver[u64],
+    reports: task::Sender[Input],
+    incarnation: u64,
+    alloc: mem::Alloc,
+    ) fails Stopping uses wait {
+    var receiver = deliveries
+    var signals = finishes
+    loop {
+        let Some(Delivery.Call(id: id, hash: hash, encoded: encoded, request: request)) = try await mut receiver.receive() else {
+            fail Stopping.Asked
+        }
+        let outcome = attempt await sys::Wire[P].serve(out, hash, raw: Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc)
+        if not request {
+            if outcome.is_ok() {
+                try await finish_step(steps.contents(), mut signals)
+            }
+            try await tell(reports, incarnation, report: Report.Taken(id: id))
+            continue
+        }
+        let answer = match outcome {
+            Ok(reply) => os::Answer.Replied(take reply)
+            Err(sys::CallError.Malformed(_)) => os::Answer.Malformed
+            else => os::Answer.ServerStopped
+        }
+        try await tell(reports, incarnation, report: Report.Answered(id: id, answer: take answer))
+    }
+} dispatch
+
+/// Waits until the step that took the call just posted has finished: every step begun by now. The holder signals the count it waits for when it reaches it, unless the count is already reached and the dispatcher withdraws its wait first.
+fn finish_step(steps: Steps, mut signals: task::Receiver[u64]) fails Stopping uses wait {
+    let target = steps.begun.load()
+    steps.wanted.store(target)
+    if steps.done.load() >= target and steps.wanted.compare_swap(expected: target, replacement: 0).is_ok() {
+        return
+    }
+    loop {
+        let Some(through) = try await mut signals.receive() else {
+            fail Stopping.Asked
+        }
+        if through >= target {
+            return
+        }
+    }
+} finish_step
+
+/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took.
+fn call_handlers[S, Env: Any, P: Any](
+    mut stepper: sys::Stepper[S, Env, P],
+    marks: task::Sender[Mark],
+    steps: mem::Shared[Steps],
+    finished: task::Sender[u64],
+    clock: sys::Clock,
+    ) fails task::Cancelled uses wait {
+    try await mark(marks, marked: Mark.Began)
+    let started = now(clock)
+    let counts = steps.contents()
+    loop {
+        discard counts.begun.fetch_add(1)
+        let stepped = mut stepper.step()
+        let done = counts.done.fetch_add(1).value_or(0) + 1
+        if counts.wanted.compare_swap(expected: done, replacement: 0).is_ok() {
+            match attempt await finished.send(done) {
+                Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+                else => {
+                }
+            }
+        }
+        if not stepped {
+            break
+        }
+        discard mut stepper.start_keyed()
+    }
+    try await mark(marks, marked: Mark.Took(ns: now(clock).saturating_sub(started)))
+} call_handlers
+
+/// Sends a report of the incarnation `incarnation` to the driver, which a driver that has stopped listening no longer needs.
+fn tell(reports: task::Sender[Input], incarnation: u64, take report: Report) fails task::Cancelled uses wait {
+    match attempt await reports.send(Input.Report(incarnation: incarnation, report: take report)) {
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} tell
+
+fn mark(marks: task::Sender[Mark], take marked: Mark) fails task::Cancelled uses wait {
+    match attempt await marks.send(take marked) {
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} mark
+
+/// The monotonic time in nanoseconds, 0 through a revoked clock.
+fn now(clock: sys::Clock) -> u64 {
+    return match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} now

@@ -12,6 +12,19 @@ const BACKGROUND: u8 = 3
 /// The class of core work for one CPU alone, the CPU being its share's `reserve_ppm`.
 const PINNED: u8 = 4
 
+/// The class of core work whose deadlines never wake an idle machine: each passes with the next firing of another deadline, slice or pacing tick after it.
+const DEFERRABLE: u8 = 5
+
+/// The slack of a deadline of deferrable work: long enough that its window never ends first.
+const DEFERRED_SLACK_NS: u64 = 0x7FFF_FFFF_FFFF_FFFF
+
+/// The bounds of the slack of `normal` work's deadlines, 1% of their delay, and the bound of `background` work's, 10%.
+const NORMAL_SLACK_MIN_NS: u64 = 50_000
+
+const NORMAL_SLACK_MAX_NS: u64 = 100_000_000
+
+const BACKGROUND_SLACK_MAX_NS: u64 = 1_000_000_000
+
 /// The slice of `normal` and `background` work.
 const SLICE_NS: u64 = 3_000_000
 
@@ -51,7 +64,7 @@ struct Cpu {
     started: bool
     idle: bool
     queued: u32
-    pinned: u32
+    bound: u32
     virtual_ns: u64
     running: Running
     entities: mem::Bounded[Entity, ENTITIES]
@@ -73,6 +86,15 @@ struct Entity derives Copy {
     ready: u32
 } Entity
 
+/// The classes of the executors of `latency`, `normal` and `background` accounts, then of deferrable core work, in that order.
+pkg fn classes() -> Array[u8, 4] {
+    var table = Array[u8, 4].filled(LATENCY)
+    table[1] = NORMAL
+    table[2] = BACKGROUND
+    table[3] = DEFERRABLE
+    return table
+} classes
+
 /// The share of the executors whose tasks run on CPU `cpu` alone.
 pkg fn pinned_share(cpu: u32) -> task::Share
     requires cpu <= 1_000_000
@@ -80,11 +102,14 @@ pkg fn pinned_share(cpu: u32) -> task::Share
     return task::Share(weight: 1, class: PINNED, reserve_ppm: cpu)
 } pinned_share
 
+/// Whether work of `class` stays on the CPU it is placed on, where no steal takes it: `latency` work and core work for one CPU.
+fn binds(class: u8) -> bool = class == LATENCY or class == PINNED
+
 /// The rank of a class in every run queue: `latency` work first, then the core's, then `normal` and `background` work.
 fn rank(class: u8) -> u64 {
     return match class {
         LATENCY => 0
-        CORE or PINNED => 1
+        CORE or PINNED or DEFERRABLE => 1
         NORMAL => 2
         else => 3
     }
@@ -108,7 +133,7 @@ pkg fn State.of(take places: mem::List[Place], clock: sys::Clock, alloc: mem::Al
     var cpus = mem::List[hw::SpinLock[Cpu]].empty(alloc)
     for index in 0..<places.len() {
         let idle = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-        mut cpus.push(hw::SpinLock.of(Cpu(started: index == 0, idle: false, queued: 0, pinned: 0, virtual_ns: 0, running: idle, entities: mem::Bounded.empty())))
+        mut cpus.push(hw::SpinLock.of(Cpu(started: index == 0, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: idle, entities: mem::Bounded.empty())))
     }
     return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false))
 } State.of
@@ -227,10 +252,10 @@ pkg fn Scheduler.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Pla
     } else {
         target = state.wake_cpu(t, previous: task.last_cpu, waker: here)
     }
-    return hw::Placement(cpu: target, key: state.enqueue(t, cpu: target, task))
+    return hw::Placement(cpu: target, key: state.enqueue(t, cpu: target, task), bound: binds(task.share.class))
 } Scheduler.place
 
-pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[u32] limits notrap, terminates, noalloc, stack 4_096 {
+pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] limits notrap, terminates, noalloc, stack 4_096 {
     let state = self.state.contents()
     if round != 0 or not state.started.load() {
         return None
@@ -238,9 +263,8 @@ pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Optio
     let Some(place) = state.places.get(usize.widen(cpu)) else {
         return None
     }
-    var best: Option[u32] = None
+    var best: Option[hw::Steal] = None
     var best_tier: u8 = 3
-    var best_queued: u32 = 0
     for index in 0..<state.places.len() {
         let other = u32.truncate(index)
         let Some(lock) = state.cpus.get(index) else {
@@ -249,11 +273,11 @@ pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Optio
         let Some(spot) = state.places.get(index) else {
             continue
         }
-        let queued = lock.with(t, body: fn(mut victim: Cpu) -> u32 limits notrap, terminates, noalloc {
-            if not victim.started or victim.pinned > 0 {
+        let unbound = lock.with(t, body: fn(mut victim: Cpu) -> u32 limits notrap, terminates, noalloc {
+            if not victim.started {
                 return 0
             }
-            return victim.queued
+            return victim.queued.saturating_sub(victim.bound)
         })
         var tier: u8 = 2
         if spot.cache == place.cache {
@@ -261,10 +285,13 @@ pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Optio
         } else if spot.node == place.node {
             tier = 1
         }
-        if other != cpu and queued > 0 and (tier < best_tier or (tier == best_tier and queued > best_queued)) {
-            best = Some(other)
+        let busier = match best {
+            Some(steal) => tier < best_tier or (tier == best_tier and unbound > steal.tasks)
+            None => true
+        }
+        if other != cpu and unbound > 0 and busier {
+            best = Some(hw::Steal(cpu: other, tasks: unbound))
             best_tier = tier
-            best_queued = queued
         }
     }
     return best
@@ -280,6 +307,27 @@ pkg fn Scheduler.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) 
         return mut current.switch_to(task, now_ns: now)
     })
 } Scheduler.slice
+
+/// The slack of a deadline `delay_ns` ahead by the class of the work arming it: 1% of the delay, from 50 µs to 100 ms, for `normal` work, 10% up to 1 s for `background` work, a window that never ends first for deferrable work, and none for the rest.
+pkg fn Scheduler.slack(self, t: hw::IrqsDisabled, task: hw::TaskView, delay_ns: u64) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    return match task.share.class {
+        NORMAL => bounded(delay_ns / 100, low: NORMAL_SLACK_MIN_NS, high: NORMAL_SLACK_MAX_NS)
+        BACKGROUND => bounded(delay_ns / 10, low: 0, high: BACKGROUND_SLACK_MAX_NS)
+        DEFERRABLE => DEFERRED_SLACK_NS
+        else => 0
+    }
+} Scheduler.slack
+
+/// `value` held between `low` and `high`.
+fn bounded(value: u64, low: u64, high: u64) -> u64 limits notrap, terminates, noalloc {
+    if value < low {
+        return low
+    }
+    if value > high {
+        return high
+    }
+    return value
+} bounded
 
 pkg fn Scheduler.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
     let state = self.state.contents()
@@ -317,8 +365,8 @@ fn Cpu.enqueue(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, 
     self.queued = self.queued.saturating_add(1)
     self.idle = false
     let class = task.share.class
-    if class == PINNED {
-        self.pinned = self.pinned.saturating_add(1)
+    if binds(class) {
+        self.bound = self.bound.saturating_add(1)
     }
     if class == LATENCY {
         return key(class, value: task.deadline_ns.value_or(now_ns))
@@ -363,8 +411,8 @@ fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap
     mut self.charge(now_ns)
     self.queued = self.queued.saturating_sub(1)
     let class = task.share.class
-    if class == PINNED {
-        self.pinned = self.pinned.saturating_sub(1)
+    if binds(class) {
+        self.bound = self.bound.saturating_sub(1)
     }
     self.idle = false
     self.running = Running(executor: task.executor, weight: u64.widen(task.share.weight), class: class, since_ns: now_ns, active: true)
@@ -390,7 +438,7 @@ fn Cpu.go_idle(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     self.running.active = false
     self.idle = true
     self.queued = 0
-    self.pinned = 0
+    self.bound = 0
     for entity in mut self.entities {
         entity.ready = 0
     }
@@ -402,7 +450,7 @@ fn view(executor: u64, class: u8, weight: u32) -> hw::TaskView {
 
 fn idle_cpu() -> Cpu {
     let nothing = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-    return Cpu(started: true, idle: true, queued: 0, pinned: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty())
+    return Cpu(started: true, idle: true, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty())
 } idle_cpu
 
 test classes_order_every_queue for key {
@@ -509,9 +557,9 @@ test wakes_go_to_idle_cpus_near_their_last for Scheduler.place {
     expect cpus[3] == 3
 } wakes_go_to_idle_cpus_near_their_last
 
-/// The CPUs that idle CPUs 3 and 1 steal from once work waits on CPUs 0 and 2, and CPU 1's second round.
-fn steals(policy: Scheduler) -> Array[Option[u32], 3] {
-    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Array[Option[u32], 3] limits notrap, terminates {
+/// What idle CPUs 3 and 1 steal once work waits on CPUs 0 and 2, CPU 2's pinned task never counting, and CPU 1's second round.
+fn steals(policy: Scheduler) -> Array[Option[hw::Steal], 3] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Array[Option[hw::Steal], 3] limits notrap, terminates {
         for cpu in 0u32..<4 {
             discard policy.idle(t, cpu, until_ns: None)
         }
@@ -519,7 +567,8 @@ fn steals(policy: Scheduler) -> Array[Option[u32], 3] {
         discard state.enqueue(t, cpu: 0, task: view(executor: 5, class: NORMAL, weight: 100))
         discard state.enqueue(t, cpu: 0, task: view(executor: 6, class: NORMAL, weight: 100))
         discard state.enqueue(t, cpu: 2, task: view(executor: 7, class: NORMAL, weight: 100))
-        var victims = Array[Option[u32], 3].filled(None)
+        discard state.enqueue(t, cpu: 2, task: hw::TaskView(task: 8, executor: 8, share: pinned_share(2), last_cpu: None, ran_ns: 0, deadline_ns: None))
+        var victims = Array[Option[hw::Steal], 3].filled(None)
         victims[0] = policy.steal(t, cpu: 3, round: 0)
         victims[1] = policy.steal(t, cpu: 1, round: 0)
         victims[2] = policy.steal(t, cpu: 1, round: 1)
@@ -530,7 +579,26 @@ fn steals(policy: Scheduler) -> Array[Option[u32], 3] {
 test idle_cpus_steal_nearest_work_first for Scheduler.steal {
     let world = testing::world()
     let victims = steals(four_cpus(clock: world.clock, alloc: world.alloc))
-    expect victims[0] == Some(2)
-    expect victims[1] == Some(0)
+    expect victims[0] == Some(hw::Steal(cpu: 2, tasks: 1))
+    expect victims[1] == Some(hw::Steal(cpu: 0, tasks: 2))
     expect victims[2] == None
 } idle_cpus_steal_nearest_work_first
+
+test slack_follows_the_class_arming_the_deadline for Scheduler.slack {
+    let world = testing::world()
+    let policy = four_cpus(clock: world.clock, alloc: world.alloc)
+    let slacks = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Array[u64, 7] limits notrap, terminates {
+        var given = Array[u64, 7].filled(0)
+        given[0] = policy.slack(t, task: view(executor: 1, class: NORMAL, weight: 100), delay_ns: 1_000_000)
+        given[1] = policy.slack(t, task: view(executor: 1, class: NORMAL, weight: 100), delay_ns: 1_000_000_000)
+        given[2] = policy.slack(t, task: view(executor: 1, class: NORMAL, weight: 100), delay_ns: 60_000_000_000)
+        given[3] = policy.slack(t, task: view(executor: 2, class: BACKGROUND, weight: 100), delay_ns: 1_000_000_000)
+        given[4] = policy.slack(t, task: view(executor: 2, class: BACKGROUND, weight: 100), delay_ns: 60_000_000_000)
+        given[5] = policy.slack(t, task: view(executor: 3, class: LATENCY, weight: 100), delay_ns: 1_000_000_000)
+        given[6] = policy.slack(t, task: view(executor: 4, class: DEFERRABLE, weight: 1), delay_ns: 1_000)
+        return given
+    })
+    expect slacks[0] == 50_000 and slacks[1] == 10_000_000 and slacks[2] == 100_000_000
+    expect slacks[3] == 100_000_000 and slacks[4] == 1_000_000_000
+    expect slacks[5] == 0 and slacks[6] == DEFERRED_SLACK_NS
+} slack_follows_the_class_arming_the_deadline
