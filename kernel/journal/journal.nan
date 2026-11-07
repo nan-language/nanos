@@ -55,10 +55,25 @@ pkg fn Rings.of(cpus: u32, clock: sys::Clock, alloc: mem::Alloc) -> Rings {
 
 /// Writes the record of an event, and its continuation when it has one, in the running CPU's ring, counting the event lost when the ring has no room for it, and posts the signal when the journal must look at the ring.
 pkg fn Rings.record(self, slot: u32, event: runner::Event) {
-    let continuation = continuation_of(event)
-    var record = Record(time: elapsed(self.clock), cause: 0, source: slot, kind: kind_of(event), severity: severity_of(event), flags: 0, argument: argument_of(event))
+    self.write(Record(time: elapsed(self.clock), cause: 0, source: slot, kind: kind_of(event), severity: severity_of(event), flags: 0, argument: argument_of(event)), continuation: continuation_of(event))
+} Rings.record
+
+/// Writes the record of a device event as the core's, its continuation holding the device's bus path.
+pkg fn Rings.record_device(self, event: devices::Event) {
+    var payload = Array[u8, 32].filled(0)
+    let path = event.path.text()
+    var at: usize = 0
+    for byte in path.as_bytes() {
+        payload[at] = byte
+        at += 1
+    }
+    self.write(Record(time: elapsed(self.clock), cause: 0, source: 0, kind: device_kind(event.kind), severity: device_severity(event.kind), flags: 0, argument: event.argument), continuation: Some(Record.from_bits(payload)))
+} Rings.record_device
+
+fn Rings.write(self, record: Record, continuation: Option[Record]) {
+    var written = record
     if continuation.is_some() {
-        record.flags = CONTINUED
+        written.flags = CONTINUED
     }
     hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
         let cpu = self.here.with(t, body: fn(mut number: u32) -> u32 limits notrap, terminates, noalloc {
@@ -68,13 +83,13 @@ pkg fn Rings.record(self, slot: u32, event: runner::Event) {
             return
         }
         let wake = ring.with(t, body: fn(mut held: Ring) -> bool limits notrap, terminates, noalloc {
-            return mut held.write(record, continuation)
+            return mut held.write(written, continuation)
         })
         if wake {
             self.signal.contents().post(t, value: Unit)
         }
     })
-} Rings.record
+} Rings.write
 
 /// Waits until a ring is due, a quarter full, holding a critical record or holding a record 1 s old, and gives its CPU's number; while every ring is empty it waits for a write alone. The tasks of `exec` race the signal against the clock.
 pkg fn Rings.due(self, exec: task::Executor) -> u32 fails task::Cancelled uses wait {
@@ -244,6 +259,25 @@ const INTEGRITY: u16 = 5
 
 const REVOKED: u16 = 6
 
+/// The kinds of device events follow, in the order of `devices::EventKind`, their continuation holding the device's bus path.
+const DEVICE_ADDED: u16 = 7
+
+const DEVICE_REMOVED: u16 = 8
+
+const DEVICE_TABLE_INVALID: u16 = 9
+
+const DEVICE_BOUND: u16 = 10
+
+const DEVICE_UNBOUND: u16 = 11
+
+const DEVICE_CUT_OFF: u16 = 12
+
+const DEVICE_FAILED: u16 = 13
+
+const DEVICE_SUSPENDED: u16 = 14
+
+const DEVICE_RESUMED: u16 = 15
+
 /// The continuation of an event that has more payload than its record holds: the reason of an `auth.revoked`.
 fn continuation_of(event: runner::Event) -> Option[Record] {
     let runner::Event.Revoked(grant: _, reason: reason) = event else {
@@ -267,6 +301,15 @@ pkg fn kind_name(kind: u16) -> text::Fixed[24] {
         SLOW_HANDLER => "instance.slow-handler"
         INTEGRITY => "fault.integrity"
         REVOKED => "auth.revoked"
+        DEVICE_ADDED => "device.added"
+        DEVICE_REMOVED => "device.removed"
+        DEVICE_TABLE_INVALID => "device.table-invalid"
+        DEVICE_BOUND => "device.bound"
+        DEVICE_UNBOUND => "device.unbound"
+        DEVICE_CUT_OFF => "device.cut-off"
+        DEVICE_FAILED => "device.failed"
+        DEVICE_SUSPENDED => "device.suspended"
+        DEVICE_RESUMED => "device.resumed"
         else => "unknown"
     })
 } kind_name
@@ -286,17 +329,51 @@ pkg fn severity_name(severity: u8) -> text::Fixed[8] {
 /// Whether a record has a continuation after it.
 pkg fn Record.continued(self) -> bool = (self.flags & CONTINUED) != 0
 
-/// What the continuation of a record of kind `kind` adds: the reason of an `auth.revoked`.
-pkg fn detail(kind: u16, continuation: Record) -> text::Fixed[16] {
-    if kind != REVOKED {
-        return text::Fixed[16].empty()
+/// What the continuation of a record of kind `kind` adds: the reason of an `auth.revoked`, the bus path of a device event.
+pkg fn detail(kind: u16, continuation: Record) -> text::Fixed[40] {
+    if kind >= DEVICE_ADDED and kind <= DEVICE_RESUMED {
+        var path = text::Fixed[40].of("path ")
+        for byte in continuation.to_bits() {
+            if byte == 0 {
+                break
+            }
+            mut path.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+        }
+        return path
     }
-    return text::Fixed[16].of(match continuation.to_bits()[0] {
+    if kind != REVOKED {
+        return text::Fixed[40].empty()
+    }
+    return text::Fixed[40].of(match continuation.to_bits()[0] {
         0 => "reason revoke"
         1 => "reason expiry"
         else => "reason unknown"
     })
 } detail
+
+fn device_kind(kind: devices::EventKind) -> u16 {
+    return match kind {
+        devices::EventKind.Added => DEVICE_ADDED
+        devices::EventKind.Removed => DEVICE_REMOVED
+        devices::EventKind.TableInvalid => DEVICE_TABLE_INVALID
+        devices::EventKind.Bound => DEVICE_BOUND
+        devices::EventKind.Unbound => DEVICE_UNBOUND
+        devices::EventKind.CutOff => DEVICE_CUT_OFF
+        devices::EventKind.Failed => DEVICE_FAILED
+        devices::EventKind.Suspended => DEVICE_SUSPENDED
+        devices::EventKind.Resumed => DEVICE_RESUMED
+    }
+} device_kind
+
+/// A device event's severity: `info` for the topology and bindings, `notice` for cut-offs, `warn` for invalid tables, `error` for failures.
+fn device_severity(kind: devices::EventKind) -> u8 {
+    return match kind {
+        devices::EventKind.CutOff => 2
+        devices::EventKind.TableInvalid => 3
+        devices::EventKind.Failed => 4
+        else => 1
+    }
+} device_severity
 
 /// The clock's reading in nanoseconds, 0 once it is revoked.
 fn elapsed(clock: sys::Clock) -> u64 {

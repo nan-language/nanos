@@ -1,0 +1,277 @@
+//! The core's keeper of the machine's devices: its PCI functions with their keepers, its PCI ports, the platform devices `devices` declares and copies of the firmware tables `devices` reads, which it serves through the device root.
+
+/// The I/O ports of the 16550 the core writes its event log to.
+const LOG_UART: u16 = 0x3F8
+
+const LOG_UART_PORTS: u16 = 8
+
+/// The capability ids of MSI and MSI-X.
+const MSI: u32 = 0x05
+
+const MSIX: u32 = 0x11
+
+/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports, the devices it lists, the firmware tables, the topology's generation and the orders waiting for it to change.
+pkg linear struct Keeper {
+    idle: mem::List[hw::PciFunction]
+    keepers: mem::List[hw::PciKeeper]
+    ports: mem::List[hw::PciPort]
+    found: mem::List[devices::Found]
+    tables: mem::List[Table]
+    generation: u64
+    watchers: mem::List[Watcher]
+} Keeper
+
+/// A copy of a firmware table.
+pkg struct Table {
+    signature: Array[u8, 4]
+    bytes: Untrusted[mem::Bytes]
+} Table
+
+/// An order waiting for the topology to pass the generation `seen`.
+struct Watcher {
+    seen: u64
+    done: task::Sender[u64]
+} Watcher
+
+pkg fn Table.of(signature: Array[u8, 4], take bytes: Untrusted[mem::Bytes]) -> Table = Table(signature: signature, bytes: take bytes)
+
+/// The keeper of `functions` and `ports`, giving each function a keeper and listing it, and of `tables`.
+pkg fn Keeper.of(take functions: mem::List[hw::PciFunction], take ports: mem::List[hw::PciPort], take tables: mem::List[Table], alloc: mem::Alloc) -> Keeper {
+    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, found: mem::List.empty(alloc), tables: take tables, generation: 0, watchers: mem::List.empty(alloc))
+    for function in take functions {
+        var held = function
+        match mut held.keeper() {
+            Some(keeper) => mut kept.keepers.push(take keeper)
+            None => {
+            }
+        }
+        mut kept.found.push(found_of(held, alloc))
+        mut kept.idle.push(take held)
+    }
+    return kept
+} Keeper.of
+
+/// Releases what the keeper holds.
+pkg fn Keeper.release(take self) {
+    let Keeper(idle: idle, keepers: keepers, ports: ports, found: _, tables: _, generation: _, watchers: _) = self
+    for function in take idle {
+        take function.release()
+    }
+    for keeper in take keepers {
+        take keeper.release()
+    }
+    for port in take ports {
+        take port.release()
+    }
+} Keeper.release
+
+/// Carries out the device root's orders as they come, recording device events in `rings`, until they end.
+pkg fn Keeper.serve(mut self, take orders: task::Receiver[devices::RootOrder], rings: journal::Rings, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var receiver = orders
+    loop {
+        let Some(order) = try await mut receiver.receive() else {
+            return
+        }
+        match order {
+            devices::RootOrder.Devices(done: done) => {
+                discard attempt await done.send(self.listed(alloc))
+            }
+            devices::RootOrder.Table(signature: signature, index: index, done: done) => {
+                discard attempt await done.send(self.table(signature, index, alloc))
+            }
+            devices::RootOrder.Declare(path: path, ids: ids, resources: resources, done: done) => {
+                let declared = mut self.declare(path, ids, take resources)
+                discard attempt await done.send(declared)
+            }
+            devices::RootOrder.Claim(path: path, done: done) => {
+                let claimed = mut self.claim(path, alloc)
+                discard attempt await done.send(take claimed)
+            }
+            devices::RootOrder.Cut(path: path, reset: reset, done: done) => {
+                let cut = mut self.cut(path, reset)
+                discard attempt await done.send(cut)
+            }
+            devices::RootOrder.Changes(seen: seen, done: done) => {
+                if self.generation > seen {
+                    discard attempt await done.send(self.generation)
+                } else {
+                    mut self.watchers.push(Watcher(seen: seen, done: take done))
+                }
+            }
+            devices::RootOrder.Emit(event: event) => rings.record_device(event)
+        }
+    }
+} Keeper.serve
+
+/// A copy of every device the keeper lists.
+fn Keeper.listed(self, alloc: mem::Alloc) -> mem::List[devices::Found] {
+    var listed = mem::List[devices::Found].empty(alloc)
+    for each in self.found {
+        mut listed.push(copy_found(each, alloc))
+    }
+    return listed
+} Keeper.listed
+
+fn copy_found(found: devices::Found, alloc: mem::Alloc) -> devices::Found {
+    var resources = mem::List[devices::Resource].empty(alloc)
+    for resource in found.resources {
+        mut resources.push(resource)
+    }
+    return devices::Found(path: found.path, ids: found.ids, resources: take resources, core: found.core)
+} copy_found
+
+/// A copy of the `index`th table of `signature`.
+fn Keeper.table(self, signature: Array[u8, 4], index: u32, alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]] {
+    var seen: u32 = 0
+    for table in self.tables {
+        if table.signature != signature {
+            continue
+        }
+        if seen == index {
+            return Some(table.bytes.copy_prefix(table.bytes.byte_len(), alloc))
+        }
+        seen += 1
+    }
+    return None
+} Keeper.table
+
+/// Lists a platform device, refused when its bus path is listed or its port windows overlap another device's; one overlapping the core's log UART is the core's.
+fn Keeper.declare(mut self, path: devices::BusPath, ids: devices::DeviceIds, take resources: mem::List[devices::Resource]) -> bool {
+    for each in self.found {
+        if each.path == path or overlaps(each.resources, wanted: resources) {
+            return false
+        }
+    }
+    let core = overlaps_ports(resources, base: LOG_UART, count: LOG_UART_PORTS)
+    mut self.found.push(devices::Found(path: path, ids: ids, resources: take resources, core: core))
+    return true
+} Keeper.declare
+
+/// The hardware of the device at `path`: a PCI function the keeper holds, or one its keeper reclaims; a platform device's windows unless the core keeps it.
+fn Keeper.claim(mut self, path: devices::BusPath, alloc: mem::Alloc) -> Option[devices::Claimed] {
+    match path {
+        devices::BusPath.Pci(address) => {
+            let Some(function) = mut self.take_function(address) else {
+                return None
+            }
+            return Some(devices::Claimed.Pci(take function))
+        }
+        devices::BusPath.Acpi(hid: _, uid: _) => {
+            for each in self.found {
+                if each.path == path and not each.core {
+                    return Some(devices::Claimed.Platform(copy_found(each, alloc).resources))
+                }
+            }
+            return None
+        }
+    }
+} Keeper.claim
+
+/// Cuts the device at `path` off once its driver has handed it back, then resets it when `reset`; false while a driver holds it, or when its reset fails.
+fn Keeper.cut(mut self, path: devices::BusPath, reset: bool) -> bool {
+    let devices::BusPath.Pci(address) = path else {
+        return true
+    }
+    let Some(function) = mut self.take_function(address) else {
+        return false
+    }
+    var held = function
+    var answered = true
+    if reset {
+        answered = (attempt mut held.reset()).is_ok()
+    }
+    mut self.idle.push(take held)
+    return answered
+} Keeper.cut
+
+/// The function at `address`, held by the keeper or reclaimed from the driver that released it.
+fn Keeper.take_function(mut self, address: devices::PciAddress) -> Option[hw::PciFunction] {
+    for at in 0..<self.idle.len() {
+        if devices::PciAddress.of(self.idle[at].address()) == address {
+            return Some(mut self.idle.remove(at))
+        }
+    }
+    for at in 0..<self.keepers.len() {
+        if devices::PciAddress.of(self.keepers[at].address()) == address {
+            return mut self.keepers.at_mut(at).reclaim()
+        }
+    }
+    return None
+} Keeper.take_function
+
+/// The listing of a PCI function: its identifiers from its configuration space, its memory BARs, its MSI and MSI-X capabilities and its INTx pin.
+fn found_of(function: hw::PciFunction, alloc: mem::Alloc) -> devices::Found {
+    let identifiers = function.config_read(0)
+    let class = function.config_read(0x08)
+    let subsystem = function.config_read(0x2C)
+    let ids = devices::DeviceIds.Pci(vendor: u16.truncate(identifiers), device: u16.truncate(identifiers >> 16), subsystem_vendor: u16.truncate(subsystem), subsystem: u16.truncate(subsystem >> 16), class: class >> 8, revision: u8.truncate(class))
+    var resources = mem::List[devices::Resource].empty(alloc)
+    var bar: u8 = 0
+    while bar < 6 {
+        let low = function.config_read(0x10 + 4 * bar)
+        var base = u64.widen(low & 0xFFFF_FFF0)
+        let wide = (low & 0x7) == 0x4
+        if wide and bar < 5 {
+            base = base | (u64.widen(function.config_read(0x14 + 4 * bar)) << 32)
+        }
+        if (low & 1) == 0 and base != 0 {
+            mut resources.push(devices::Resource.Memory(bar: bar, base: base))
+        }
+        bar += match wide {
+            true => 2
+            false => 1
+        }
+    }
+    capabilities(function, mut resources)
+    let pin = u8.truncate(function.config_read(0x3C) >> 8)
+    if pin != 0 {
+        mut resources.push(devices::Resource.Intx(pin: pin))
+    }
+    return devices::Found(path: devices::BusPath.Pci(devices::PciAddress.of(function.address())), ids: ids, resources: take resources, core: false)
+} found_of
+
+/// Appends the function's MSI and MSI-X capabilities to `resources`.
+fn capabilities(function: hw::PciFunction, mut resources: mem::List[devices::Resource]) {
+    if ((function.config_read(0x04) >> 20) & 1) == 0 {
+        return
+    }
+    var at = function.config_read(0x34) & 0xFC
+    var seen: u32 = 0
+    while at != 0 and seen < 48 {
+        let head = function.config_read(u8.truncate(at))
+        match head & 0xFF {
+            MSI => mut resources.push(devices::Resource.Msi)
+            MSIX => mut resources.push(devices::Resource.Msix(vectors: u16.truncate((head >> 16) & 0x7FF) + 1))
+            else => {
+            }
+        }
+        at = (head >> 8) & 0xFC
+        seen += 1
+    }
+} capabilities
+
+fn overlaps(held: mem::List[devices::Resource], wanted: mem::List[devices::Resource]) -> bool {
+    for resource in wanted {
+        let devices::Resource.Ports(base: base, count: count) = resource else {
+            continue
+        }
+        if overlaps_ports(held, base, count) {
+            return true
+        }
+    }
+    return false
+} overlaps
+
+/// Whether a port window of `resources` overlaps the `count` ports from `base`.
+fn overlaps_ports(resources: mem::List[devices::Resource], base: u16, count: u16) -> bool {
+    for resource in resources {
+        let devices::Resource.Ports(base: start, count: length) = resource else {
+            continue
+        }
+        let end = u32.widen(start) + u32.widen(length)
+        if u32.widen(base) < end and u32.widen(start) < u32.widen(base) + u32.widen(count) {
+            return true
+        }
+    }
+    return false
+} overlaps_ports

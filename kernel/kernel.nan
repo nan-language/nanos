@@ -1,10 +1,11 @@
 //! The NaN OS kernel: the core's entry and start sequence.
 
-/// Copies of the firmware tables the start reads, taken before the shared space replaces the entry root that maps them.
+/// Copies of the firmware tables the start reads and of those holding the AML namespace, taken before the shared space replaces the entry root that maps them.
 struct Tables {
     madt: Option[Untrusted[mem::Bytes]]
     fadt: Option[Untrusted[mem::Bytes]]
     srat: Option[Untrusted[mem::Bytes]]
+    aml: mem::List[keeper::Table]
 } Tables
 
 /// The start sequence: each step that fails halts the kernel with its code. The first task starts every other CPU, prints the start line, then runs the base instances of the image's genesis record.
@@ -20,7 +21,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
         halt(code: "fault.handoff-invalid", subject: "handoff")
     }
     let features = cpu::Features.read(cpu)
-    let tables = Tables(madt: k.acpi_table(acpi::Signature.Madt.bytes(), alloc), fadt: k.acpi_table(acpi::Signature.Fadt.bytes(), alloc), srat: k.acpi_table(acpi::Signature.Srat.bytes(), alloc))
+    let tables = Tables(madt: k.acpi_table(acpi::Signature.Madt.bytes(), alloc), fadt: k.acpi_table(acpi::Signature.Fadt.bytes(), alloc), srat: k.acpi_table(acpi::Signature.Srat.bytes(), alloc), aml: aml_tables(k, alloc))
     var regions = mut k.regions()
     for module in take modules {
         insert_region(mut regions, region: take module.into_region())
@@ -52,9 +53,14 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     let state = mem::Shared.of(sched::State.of(places_of(features, nodes, cpus, alloc: core), clock, alloc: core), alloc: core)
     mut k.policy(sched::Scheduler.of(state.share()))
     let facts = Facts(cpus: cpus, nodes: nodes.count(), ram_bytes: ram, features: features, conditions: handoff.conditions)
-    let known = image_genesis(ident::HashValue(bytes: handoff.kernel_hash), alloc: core)
+    let bundle = ident::HashValue(bytes: handoff.kernel_hash)
+    let known = image_genesis(bundle, alloc: core)
+    let functions = mut k.pci_functions()
+    let ports = mut k.pci_ports()
+    let Tables(madt: _, fadt: _, srat: _, aml: aml) = tables
+    let keeper = keeper::Keeper.of(take functions, take ports, tables: take aml, alloc: core)
     let rings = journal::Rings.of(cpus, clock, alloc: core)
-    take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state, take known, take rings](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+    take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state, take known, take keeper, take rings](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         discard attempt await start_cpus(cpu, take roots, features, state, frames: mut memory.frames, exec)
         state.contents().all_started()
         discard attempt await low.release(cpu)
@@ -63,13 +69,29 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
             halt(code: "fault.memory-insufficient", subject: "pools")
         }
         let config = runner::Config(exec: exec, pool: pool.alloc(), alloc: core, clock: clock, wall: wall, classes: sched::classes())
-        discard attempt await run_base(take known, config, rings, frames: mut memory.frames)
+        discard attempt await run_base(take known, take keeper, bundle, config, rings, frames: mut memory.frames)
         let parked = hw::Signal[Unit].empty()
         loop {
             discard attempt await parked.wait()
         }
     })
 } main
+
+/// Copies of the DSDT and the SSDT, which hold the AML namespace.
+fn aml_tables(k: boot::Kernel, alloc: mem::Alloc) -> mem::List[keeper::Table] {
+    var tables = mem::List[keeper::Table].empty(alloc)
+    match k.acpi_table(acpi::Signature.Dsdt.bytes(), alloc) {
+        Some(bytes) => mut tables.push(keeper::Table.of(acpi::Signature.Dsdt.bytes(), take bytes))
+        None => {
+        }
+    }
+    match k.acpi_table(acpi::Signature.Ssdt.bytes(), alloc) {
+        Some(bytes) => mut tables.push(keeper::Table.of(acpi::Signature.Ssdt.bytes(), take bytes))
+        None => {
+        }
+    }
+    return tables
+} aml_tables
 
 /// The handoff record, module 0 of the start information, decoded through its validator.
 fn read_handoff(modules: mem::List[boot::Module]) -> Option[bootfmt::Handoff] {

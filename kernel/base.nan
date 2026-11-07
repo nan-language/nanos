@@ -1,10 +1,17 @@
 //! The base instances: the components the kernel image holds, and its genesis record of their specifications and grants.
 
-/// The canonical path of `supervisor`'s component.
+/// The canonical paths of the base components.
 const SUPERVISOR: Str = "supervisor::Supervision"
 
-/// The base components, by the canonical path of their state type.
+const DEVICES: Str = "devices::Manager"
+
+const VIRTIO_RNG: Str = "drivers::virtio::Rng"
+
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, and the bundle the image's instances run.
 struct Base derives Copy {
+    root: devices::Root
+    claims: devices::Root
+    bundle: ident::HashValue
 } Base
 
 impl Base: runner::Components
@@ -13,39 +20,133 @@ fn Base.protocol(self, component: Str) -> Option[sys::ProtocolHash] {
     if component == SUPERVISOR {
         return Some(sys::Wire[supervisor::Supervisor].hash())
     }
+    if component == DEVICES {
+        return Some(sys::Wire[devices::Devices].hash())
+    }
+    for entry in devices::drivers {
+        if entry.component == component {
+            return Some(entry.class.protocol())
+        }
+    }
     return None
 } Base.protocol
 
 fn Base.serve(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    if component == DEVICES {
+        let Ok(control) = attempt nanos::Cap[os::Control].get(world.caps, key: "control") else {
+            return runner::Ended.EnvIncomplete
+        }
+        let env = devices::Env(root: self.root, control: control, bundle: self.bundle, clock: world.clock, exec: world.exec, alloc: world.alloc)
+        return try await runner::Driven[devices::Manager, devices::Env, devices::Devices].run(take env, exec: world.exec, alloc: world.alloc, take serving, peers: mem::List.empty(world.alloc), release: fn(take ended: devices::Env) limits stack 512 {
+        })
+    }
+    if component == VIRTIO_RNG {
+        return try await self.serve_rng(take world, take serving)
+    }
     return try await runner::Served[supervisor::Supervision, supervisor::Env, supervisor::Supervisor].run(take world, take serving)
 } Base.serve
+
+/// Serves `virtio-rng` on the function its claim names.
+fn Base.serve_rng(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    match try await self.claimed(world) {
+        Some(devices::Claimed.Pci(function)) => {
+            let Some(env) = drivers::virtio::RngEnv.of(take function, alloc) else {
+                return runner::Ended.EnvIncomplete
+            }
+            var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+            mut peers.push(sys::Wire[devices::Entropy].schema(alloc))
+            return try await runner::Driven[drivers::virtio::Rng, drivers::virtio::RngEnv, drivers::virtio::RngDevice].run(take env, exec: world.exec, alloc, take serving, take peers, release: drivers::virtio::RngEnv.abandon)
+        }
+        Some(devices::Claimed.Platform(_)) or None => return runner::Ended.EnvIncomplete
+    }
+} Base.serve_rng
+
+/// The hardware of the device a driver's world claims, `None` when it holds no live claim or a driver holds the device.
+fn Base.claimed(self, world: nanos::World) -> Option[devices::Claimed] fails task::Cancelled uses wait {
+    let Ok(claim) = attempt nanos::Cap[os::Device].get(world.caps, key: "device") else {
+        return None
+    }
+    let Some(named) = claim.path(world.alloc) else {
+        return None
+    }
+    let Some(path) = devices::BusPath.parse(named.as_str()) else {
+        return None
+    }
+    let ordered = match first attempt await self.claims.claim(path, alloc: world.alloc, release: release_claimed) {
+        Ok(receiver) => receiver
+        Err(devices::RootError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    var receiver = ordered
+    let received = attempt await mut receiver.receive()
+    let drained = attempt await take receiver.drain(visit: release_claimed)
+    let claimed = match received {
+        Ok(Some(given)) => given
+        Ok(None) => None
+        Err(cancelled) => fail cancelled
+    }
+    match drained {
+        Ok(_) => return claimed
+        Err(cancelled) => {
+            release_claimed(take claimed)
+            fail cancelled
+        }
+    }
+} Base.claimed
+
+/// Hands claimed hardware no Env took back to the keeper: a function returns, cut off.
+fn release_claimed(take claimed: Option[devices::Claimed]) {
+    match claimed {
+        Some(devices::Claimed.Pci(function)) => take function.release()
+        Some(devices::Claimed.Platform(_)) or None => {
+        }
+    }
+} release_claimed
 
 /// The genesis record the kernel image holds: the specification of each base instance, acting for `system` and running the image's bundle `bundle`, the root grant `g0` and the base instances' grants.
 fn image_genesis(bundle: ident::HashValue, alloc: mem::Alloc) -> runner::Known {
     var supervising = os::InstanceSpec.of(principal: principal("system"), bundle, component: SUPERVISOR, alloc)
     discard mut supervising.grants.insert(text::String.of("control", alloc), value: 1)
+    discard mut supervising.wiring.insert(text::String.of("devices", alloc), value: os::Wire.to(moniker("devices")))
+    var managing = os::InstanceSpec.of(principal: principal("system"), bundle, component: DEVICES, alloc)
+    discard mut managing.grants.insert(text::String.of("control", alloc), value: 2)
+    discard mut managing.grants.insert(text::String.of("clock", alloc), value: 3)
     var specs = mem::Map[ident::Moniker, os::InstanceSpec].empty(alloc)
     discard mut specs.insert(moniker("supervisor"), value: take supervising)
+    discard mut specs.insert(moniker("devices"), value: take managing)
     var grants = mem::Map[u64, os::Grant].empty(alloc)
     discard mut grants.insert(0, value: os::Grant(holder: principal("system"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
     discard mut grants.insert(1, value: os::Grant(holder: principal("inst.supervisor"), object: os::Object.Machine, rights: rights(every: false, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    discard mut grants.insert(2, value: os::Grant(holder: principal("inst.devices"), object: os::Object.Instance(prefix: moniker("devices")), rights: rights(every: false, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    discard mut grants.insert(3, value: os::Grant(holder: principal("inst.devices"), object: os::Object.Clock, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
     return runner::Known(specs: take specs, grants: take grants)
 } image_genesis
 
-/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while it carves the regions of reserved instances from `frames` and prints each event `rings` record; it never ends unless cancelled.
-fn run_base(take known: runner::Known, config: runner::Config, rings: journal::Rings, mut frames: frames::Frames) fails task::Cancelled uses wait {
+/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames` and prints each event `rings` record; it never ends unless cancelled.
+fn run_base(take known: runner::Known, take keeper: keeper::Keeper, bundle: ident::HashValue, config: runner::Config, rings: journal::Rings, mut frames: frames::Frames) fails task::Cancelled uses wait {
     let task::Channel(sender: requests, receiver: incoming) = task::Channel[Reservation].bounded(1, alloc: config.alloc)
+    let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
+    let minted = devices::MintedRoot.of(orders, alloc: config.alloc)
+    defer take minted.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle)
     var requested = incoming
-    var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc)))
+    var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered))
+    defer abandon_given(take given)
     try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Given(known: genesis, reservations: reserver)) = mut given.extract() else {
+        let Some(Given(known: genesis, reservations: reserver, keeper: held, orders: root_orders)) = mut given.extract() else {
             return
         }
         discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
             try await print_events(rings, exec: config.exec, alloc: config.alloc)
         })
+        discard s.spawn(fn[take held, take root_orders]() fails task::Cancelled uses wait limits stack 65_536 {
+            var keeping = held
+            defer take keeping.release()
+            try await mut keeping.serve(take root_orders, rings, alloc: config.alloc)
+        })
         discard s.spawn(fn[take genesis, take reserver]() fails task::Cancelled uses wait limits stack 65_536 {
-            discard try await runner::run(take genesis, components: Base(), journal: rings, reservations: take reserver, config, body: fn(core: runner::Core) fails task::Cancelled uses wait {
+            discard try await runner::run(take genesis, components: base, journal: rings, reservations: take reserver, config, body: fn(core: runner::Core) fails task::Cancelled uses wait {
                 discard attempt await core.control.start(moniker("supervisor"), alloc: config.alloc)
                 let parked = hw::Signal[Unit].empty()
                 loop {
@@ -57,10 +158,24 @@ fn run_base(take known: runner::Known, config: runner::Config, rings: journal::R
     })
 } run_base
 
-/// What the runner's task takes from `run_base`: the genesis record, and the reservations it makes.
-struct Given {
+/// Releases the keeper when the scope never took it.
+fn abandon_given(take given: Option[Given]) {
+    match given {
+        Some(left) => {
+            let Given(known: _, reservations: _, keeper: kept, orders: _) = left
+            take kept.release()
+        }
+        None => {
+        }
+    }
+} abandon_given
+
+/// What the tasks of `run_base` take: the genesis record and the reservations the runner makes, and the keeper with the device root's orders.
+linear struct Given {
     known: runner::Known
     reservations: Reserver
+    keeper: keeper::Keeper
+    orders: task::Receiver[devices::RootOrder]
 } Given
 
 /// A reserved instance's request for a region of `bytes`, and where the store over it goes, `None` when no free range holds one.
@@ -141,7 +256,12 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     let rings = journal::Rings.of(cpus: hw::cpu_count(), clock: world.clock, alloc)
     let task::Channel(sender: requests, receiver: unanswered) = task::Channel[Reservation].bounded(1, alloc)
     discard unanswered
-    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: Base(), journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
+    let task::Channel(sender: orders, receiver: unserved) = task::Channel[devices::RootOrder].bounded(1, alloc)
+    discard unserved
+    let minted = devices::MintedRoot.of(orders, alloc)
+    defer take minted.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle))
+    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)
         return started
