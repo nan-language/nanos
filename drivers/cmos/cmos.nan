@@ -1,0 +1,261 @@
+//! The `cmos` driver: the CMOS RTC serving `Rtc`, reading and writing UTC in its BCD or binary registers, 12- or 24-hour as status register B says, in the century 2000 to 2099.
+
+/// The register indices.
+const SECONDS_INDEX: u8 = 0x00
+
+const MINUTES_INDEX: u8 = 0x02
+
+const HOURS_INDEX: u8 = 0x04
+
+const DAY_INDEX: u8 = 0x07
+
+const MONTH_INDEX: u8 = 0x08
+
+const YEAR_INDEX: u8 = 0x09
+
+/// Status register A, whose bit 7 is set while the RTC updates its registers, and status register B, whose bit 1 is set when hours count to 24, bit 2 when registers hold binary, and bit 7 while the time is set.
+const STATUS_A: u8 = 0x0A
+
+const STATUS_B: u8 = 0x0B
+
+/// How many pairs of readings a read takes to find two equal ones, and how often a reading polls an update in progress.
+const READINGS: u32 = 8
+
+const POLLS: u32 = 100_000
+
+/// The days from 0000-03-01 to 1970-01-01 in the proleptic Gregorian calendar.
+const EPOCH_DAYS: i64 = 719_468
+
+const DAY_SECONDS: i64 = 86_400
+
+contribute devices::drivers cmos = devices::Registration(name: "cmos", matches: devices::matches(devices::DeviceMatch.AcpiId(devices::acpi_id("PNP0B00")), rest: devices::DeviceMatch.None), class: devices::Class.Rtc, component: "drivers::cmos::Cmos", priority: 0)
+
+/// The CMOS index and data ports.
+pub registers Regs {
+    index: u8 at 0 write
+    data: u8 at 1 read write
+} Regs
+
+/// What the driver serves: `Rtc`'s operations.
+pub protocol CmosDevice {
+    pub fn read() -> i64 fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn set(utc_s: i64) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+} CmosDevice
+
+/// The driver's Env: the CMOS ports.
+pub open linear struct CmosEnv derives Send {
+    regs: hw::Ports[Regs]
+} CmosEnv
+
+/// The driver keeps no state.
+pub closed struct Cmos derives Encode {
+} Cmos
+
+impl Cmos: sys::Component[CmosEnv, CmosDevice]
+
+/// The RTC's registers as one reading gives them: the time of day, the date and status register B.
+pub closed struct Reading derives Copy, Eq {
+    pub second: u8
+    pub minute: u8
+    pub hour: u8
+    pub day: u8
+    pub month: u8
+    pub year: u8
+    pub status: u8
+} Reading
+
+pub fn CmosEnv.of(take regs: hw::Ports[Regs]) -> CmosEnv = CmosEnv(regs: take regs)
+
+pub fn CmosEnv.abandon(take self) {
+    let CmosEnv(regs: regs) = self
+    take regs.unmap()
+} CmosEnv.abandon
+
+pub fn Cmos.start(mut env: CmosEnv) -> Cmos = Cmos()
+
+/// UTC in seconds from two equal readings of the RTC.
+pub fn Cmos.read(mut self, mut env: CmosEnv, mut cx: sys::Cx[CmosDevice]) -> i64 fails devices::DeviceError {
+    for _ in 0..<READINGS {
+        let earlier = sample(mut env.regs)
+        let later = sample(mut env.regs)
+        if earlier == later {
+            let Some(seconds) = later.utc_seconds() else {
+                fail devices::DeviceError.Io
+            }
+            return seconds
+        }
+    }
+    fail devices::DeviceError.Io
+} Cmos.read
+
+/// Sets the RTC to UTC `utc_s`, in the format status register B gives, its updates held meanwhile.
+pub fn Cmos.set(mut self, take utc_s: i64, mut env: CmosEnv, mut cx: sys::Cx[CmosDevice]) fails devices::DeviceError {
+    let status = register(mut env.regs, index: STATUS_B)
+    let Some(reading) = Reading.of_utc(utc_s, status) else {
+        fail devices::DeviceError.OutOfRange
+    }
+    write_register(mut env.regs, index: STATUS_B, value: status | 0x80)
+    write_register(mut env.regs, index: SECONDS_INDEX, value: reading.second)
+    write_register(mut env.regs, index: MINUTES_INDEX, value: reading.minute)
+    write_register(mut env.regs, index: HOURS_INDEX, value: reading.hour)
+    write_register(mut env.regs, index: DAY_INDEX, value: reading.day)
+    write_register(mut env.regs, index: MONTH_INDEX, value: reading.month)
+    write_register(mut env.regs, index: YEAR_INDEX, value: reading.year)
+    write_register(mut env.regs, index: STATUS_B, value: status & 0x7F)
+} Cmos.set
+
+/// Reads the RTC's registers once no update is in progress.
+fn sample(mut regs: hw::Ports[Regs]) -> Reading {
+    for _ in 0..<POLLS {
+        if (register(mut regs, index: STATUS_A) & 0x80) == 0 {
+            break
+        }
+    }
+    return Reading(second: register(mut regs, index: SECONDS_INDEX), minute: register(mut regs, index: MINUTES_INDEX), hour: register(mut regs, index: HOURS_INDEX), day: register(mut regs, index: DAY_INDEX), month: register(mut regs, index: MONTH_INDEX), year: register(mut regs, index: YEAR_INDEX), status: register(mut regs, index: STATUS_B))
+} sample
+
+fn register(mut regs: hw::Ports[Regs], index: u8) -> u8 {
+    mut regs.write(Regs.index, value: index)
+    return mut regs.read(Regs.data)
+} register
+
+fn write_register(mut regs: hw::Ports[Regs], index: u8, value: u8) {
+    mut regs.write(Regs.index, value: index)
+    mut regs.write(Regs.data, value: value)
+} write_register
+
+/// UTC in seconds a reading gives, `None` when it is no valid time.
+pub fn Reading.utc_seconds(self) -> Option[i64]
+    example Reading(second: 0x30, minute: 0x45, hour: 0x12, day: 0x05, month: 0x11, year: 0x26, status: 0x02).utc_seconds() == Some(1_793_882_730)
+    example Reading(second: 0x30, minute: 0x45, hour: 0x92, day: 0x05, month: 0x11, year: 0x26, status: 0x00).utc_seconds() == Some(1_793_882_730)
+    example Reading(second: 0, minute: 0, hour: 0, day: 31, month: 2, year: 26, status: 0x06).utc_seconds() == None
+{
+    let binary = (self.status & 0x04) != 0
+    var hour = decoded(self.hour & 0x7F, binary)
+    if (self.status & 0x02) == 0 {
+        hour = hour.mod_floor(12)
+        if (self.hour & 0x80) != 0 {
+            hour += 12
+        }
+    }
+    let year = 2_000 + decoded(self.year, binary)
+    let month = decoded(self.month, binary)
+    let day = decoded(self.day, binary)
+    let minute = decoded(self.minute, binary)
+    let second = decoded(self.second, binary)
+    if month < 1 or month > 12 or day < 1 or day > month_days(year, month) or hour > 23 or minute > 59 or second > 59 {
+        return None
+    }
+    return Some(days_from_civil(year, month, day) * DAY_SECONDS + hour * 3_600 + minute * 60 + second)
+} Reading.utc_seconds
+
+/// The reading that holds UTC `utc_s` in the format of status register B `status`, `None` outside 2000 to 2099.
+pub fn Reading.of_utc(utc_s: i64, status: u8) -> Option[Reading]
+    example Reading.of_utc(1_793_882_730, status: 0x02) == Some(Reading(second: 0x30, minute: 0x45, hour: 0x12, day: 0x05, month: 0x11, year: 0x26, status: 0x02))
+    example Reading.of_utc(1_793_882_730, status: 0x04) == Some(Reading(second: 30, minute: 45, hour: 0x80 | 12, day: 5, month: 11, year: 26, status: 0x04))
+{
+    let days = utc_s.div_floor(DAY_SECONDS)
+    let within = utc_s.mod_floor(DAY_SECONDS)
+    let civil = civil_from_days(days)
+    if civil.year < 2_000 or civil.year > 2_099 {
+        return None
+    }
+    let binary = (status & 0x04) != 0
+    let hour = within.div_trunc(3_600)
+    var hour_register = encoded(hour, binary)
+    if (status & 0x02) == 0 {
+        var twelve = hour.mod_floor(12)
+        if twelve == 0 {
+            twelve = 12
+        }
+        hour_register = encoded(twelve, binary)
+        if hour >= 12 {
+            hour_register = hour_register | 0x80
+        }
+    }
+    return Some(Reading(second: encoded(within.mod_floor(60), binary), minute: encoded(within.div_trunc(60).mod_floor(60), binary), hour: hour_register, day: encoded(civil.day, binary), month: encoded(civil.month, binary), year: encoded(civil.year - 2_000, binary), status: status))
+} Reading.of_utc
+
+/// A register's value, read as BCD unless `binary`.
+fn decoded(raw: u8, binary: bool) -> i64 {
+    if binary {
+        return i64.widen(raw)
+    }
+    return i64.widen(raw >> 4) * 10 + i64.widen(raw & 0x0F)
+} decoded
+
+/// A value from 0 to 99 as a register holds it: BCD unless `binary`.
+fn encoded(value: i64, binary: bool) -> u8 {
+    let byte = u8.truncate(value)
+    if binary {
+        return byte
+    }
+    return ((byte / 10) << 4) | (byte % 10)
+} encoded
+
+fn is_leap(year: i64) -> bool = (year.mod_floor(4) == 0 and year.mod_floor(100) != 0) or year.mod_floor(400) == 0
+
+fn month_days(year: i64, month: i64) -> i64 {
+    return match month {
+        2 => match is_leap(year) {
+            true => 29
+            false => 28
+        }
+        4 or 6 or 9 or 11 => 30
+        else => 31
+    }
+} month_days
+
+/// The days from 1970-01-01 to the date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    var shifted = year
+    if month <= 2 {
+        shifted -= 1
+    }
+    let era = shifted.div_floor(400)
+    let year_of_era = shifted - era * 400
+    let march_month = match month > 2 {
+        true => month - 3
+        false => month + 9
+    }
+    let day_of_year = (153 * march_month + 2).div_trunc(5) + day - 1
+    let day_of_era = year_of_era * 365 + year_of_era.div_trunc(4) - year_of_era.div_trunc(100) + day_of_year
+    return era * 146_097 + day_of_era - EPOCH_DAYS
+} days_from_civil
+
+/// A calendar date.
+struct Civil derives Copy {
+    year: i64
+    month: i64
+    day: i64
+} Civil
+
+/// The date `days` after 1970-01-01.
+fn civil_from_days(days: i64) -> Civil {
+    let shifted = days + EPOCH_DAYS
+    let era = shifted.div_floor(146_097)
+    let day_of_era = shifted - era * 146_097
+    let year_of_era = (day_of_era - day_of_era.div_trunc(1_460) + day_of_era.div_trunc(36_524) - day_of_era.div_trunc(146_096)).div_trunc(365)
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era.div_trunc(4) - year_of_era.div_trunc(100))
+    let march_month = (5 * day_of_year + 2).div_trunc(153)
+    let day = day_of_year - (153 * march_month + 2).div_trunc(5) + 1
+    let month = match march_month < 10 {
+        true => march_month + 3
+        false => march_month - 9
+    }
+    var year = year_of_era + era * 400
+    if month <= 2 {
+        year += 1
+    }
+    return Civil(year: year, month: month, day: day)
+} civil_from_days
+
+test readings_and_utc_seconds_convert_both_ways for Reading.of_utc (seconds: u32) {
+    let utc = 946_684_800 + i64.widen(seconds % 3_155_673_600)
+    let reading = Reading.of_utc(utc, status: 0x02)
+    let back = match reading {
+        Some(held) => held.utc_seconds()
+        None => None
+    }
+    expect back == Some(utc)
+} readings_and_utc_seconds_convert_both_ways

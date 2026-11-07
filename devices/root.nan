@@ -16,15 +16,17 @@ pub open linear struct MintedRoot derives Send {
     minter: sys::Minter[Root, Keeper, RootRights]
 } MintedRoot
 
-/// Where a root's orders go.
+/// Where a root's orders go, and the clock its waits for their outcomes run on.
 struct Keeper {
     orders: task::Sender[RootOrder]
+    clock: sys::Clock
 } Keeper
 
-/// A resource of a device: a memory BAR, a window of I/O ports, its MSI-X vectors, its MSI capability, the INTx pin it raises, or a platform interrupt line.
+/// A resource of a device: a memory BAR, a window of I/O ports or of memory, its MSI-X vectors, its MSI capability, the INTx pin it raises, or a platform interrupt line.
 pub closed enum Resource derives Copy, Eq, Encode {
     Memory(bar: u8, base: u64)
     Ports(base: u16, count: u16)
+    Window(base: u64, size: u64)
     Msix(vectors: u16)
     Msi
     Intx(pin: u8)
@@ -55,10 +57,6 @@ pub closed enum RootOrder {
     Declare(path: BusPath, ids: DeviceIds, resources: mem::List[Resource], done: task::Sender[bool])
     /// The device's hardware, for its driver's Env, `None` while a driver holds it.
     Claim(path: BusPath, done: task::Sender[Option[Claimed]])
-    /// Cuts the device off, then resets it when `reset`: false when the keeper holds no such device or the reset failed.
-    Cut(path: BusPath, reset: bool, done: task::Sender[bool])
-    /// The topology's generation once it passes `seen`: each hot-plug change counts one.
-    Changes(seen: u64, done: task::Sender[u64])
     /// An event of a device to record.
     Emit(event: Event)
 } RootOrder
@@ -83,9 +81,9 @@ pub closed struct Event derives Copy, Eq, Encode {
     pub argument: u64
 } Event
 
-/// A root entry over the keeper `orders` reach.
-pub fn MintedRoot.of(orders: task::Sender[RootOrder], alloc: mem::Alloc) -> MintedRoot {
-    return MintedRoot(minter: sys::Minter[Root, Keeper, RootRights].of(Keeper(orders: orders.split()), alloc))
+/// A root entry over the keeper `orders` reach, waiting for outcomes on `clock`.
+pub fn MintedRoot.of(orders: task::Sender[RootOrder], clock: sys::Clock, alloc: mem::Alloc) -> MintedRoot {
+    return MintedRoot(minter: sys::Minter[Root, Keeper, RootRights].of(Keeper(orders: orders.split(), clock: clock), alloc))
 } MintedRoot.of
 
 /// A copy of the root, claiming devices when `claim`.
@@ -121,6 +119,16 @@ fn Root.orders(self, claiming: bool) -> task::Sender[RootOrder] fails RootError 
     return orders
 } Root.orders
 
+/// The clock the root's waits run on.
+fn Root.clock(self) -> sys::Clock fails RootError {
+    let Some(clock) = sys::reach(self, body: fn(state: Keeper, record: RootRights) -> sys::Clock {
+        return state.clock
+    }) else {
+        fail RootError.Revoked
+    }
+    return clock
+} Root.clock
+
 /// Sends `order` to the keeper.
 fn Root.send(self, take order: RootOrder, claiming: bool) fails RootError uses wait {
     let orders = try self.orders(claiming)
@@ -132,34 +140,49 @@ fn Root.send(self, take order: RootOrder, claiming: bool) fails RootError uses w
     }
 } Root.send
 
-/// Waits for an outcome from `outcome`, revoked when the keeper drops it.
-fn awaited[T: Send](take outcome: task::Receiver[T]) -> T fails RootError uses wait {
+/// Waits for an outcome from `outcome`, revoked when the keeper drops it. The wait starts again every `RECHECK_MS`, which takes an outcome already queued whose wake-up was lost.
+fn awaited[T: Send](take outcome: task::Receiver[T], clock: sys::Clock) -> T fails RootError uses wait {
     var receiver = outcome
-    let Some(given) = try await mut receiver.receive() else {
-        fail RootError.Revoked
+    loop {
+        let given = try await task::within(clock, ms: RECHECK_MS, body: fn[mut receiver]() -> Option[T] fails task::Cancelled uses wait limits stack 4_096 {
+            return try await mut receiver.receive()
+        })
+        match given {
+            Some(Some(value)) => return value
+            Some(None) => fail RootError.Revoked
+            None => {
+            }
+        }
     }
-    return given
 } awaited
+
+const RECHECK_MS: u64 = 1_000
 
 /// The devices the keeper holds.
 pub fn Root.devices(self, alloc: mem::Alloc) -> mem::List[Found] fails RootError uses wait {
     let task::Channel(sender: done, receiver: outcome) = task::Channel[mem::List[Found]].bounded(1, alloc)
     try await self.send(RootOrder.Devices(done: take done), claiming: false)
-    return try await awaited(take outcome)
+    return try await awaited(take outcome, clock: try self.clock())
 } Root.devices
 
 /// The `index`th firmware table of `signature`, `None` when the firmware has no such table.
 pub fn Root.table(self, signature: Array[u8, 4], index: u32, alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]] fails RootError uses wait {
     let task::Channel(sender: done, receiver: outcome) = task::Channel[Option[Untrusted[mem::Bytes]]].bounded(1, alloc)
     try await self.send(RootOrder.Table(signature: signature, index: index, done: take done), claiming: false)
-    return try await awaited(take outcome)
+    return try await awaited(take outcome, clock: try self.clock())
 } Root.table
 
 /// Adds the platform device at `path`, false when the keeper refuses it.
-pub fn Root.declare(self, path: BusPath, ids: DeviceIds, take resources: mem::List[Resource], alloc: mem::Alloc) -> bool fails RootError uses wait {
+pub fn Root.declare(
+    self,
+    path: BusPath,
+    ids: DeviceIds,
+    take resources: mem::List[Resource],
+    alloc: mem::Alloc,
+    ) -> bool fails RootError uses wait {
     let task::Channel(sender: done, receiver: outcome) = task::Channel[bool].bounded(1, alloc)
     try await self.send(RootOrder.Declare(path: path, ids: ids, resources: take resources, done: take done), claiming: false)
-    return try await awaited(take outcome)
+    return try await awaited(take outcome, clock: try self.clock())
 } Root.declare
 
 /// Orders the hardware of the device at `path` for its driver's Env, giving where it comes: `None` while a driver holds it or the keeper holds no such device. Only the core's root claims; `release` takes what comes when the order cannot be sent.
@@ -173,20 +196,6 @@ pub fn Root.claim(self, path: BusPath, alloc: mem::Alloc, release: fn(take left:
         }
     }
 } Root.claim
-
-/// Cuts the device at `path` off, then resets it when `reset`; false when the keeper holds no such device or its reset failed.
-pub fn Root.cut(self, path: BusPath, reset: bool, alloc: mem::Alloc) -> bool fails RootError uses wait {
-    let task::Channel(sender: done, receiver: outcome) = task::Channel[bool].bounded(1, alloc)
-    try await self.send(RootOrder.Cut(path: path, reset: reset, done: take done), claiming: false)
-    return try await awaited(take outcome)
-} Root.cut
-
-/// The topology's generation once it passes `seen`.
-pub fn Root.changes(self, seen: u64, alloc: mem::Alloc) -> u64 fails RootError uses wait {
-    let task::Channel(sender: done, receiver: outcome) = task::Channel[u64].bounded(1, alloc)
-    try await self.send(RootOrder.Changes(seen: seen, done: take done), claiming: false)
-    return try await awaited(take outcome)
-} Root.changes
 
 /// Records a device event.
 pub fn Root.emit(self, event: Event) fails RootError uses wait {

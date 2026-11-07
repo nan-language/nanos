@@ -1,0 +1,291 @@
+//! The `fat` component: the boot volume through the `boot-volume` role, its requests served one at a time by a keyed task holding the mounted volume. Each operation reaches the volume's device, so it declares the class NaN gives a register access.
+
+/// The keys of the keyed tasks: the mount, and the one serving the request under way.
+const MOUNTING: u64 = 1
+
+const SERVING: u64 = 2
+
+/// The operations of `fat` on boot volume paths, and the messages its keyed tasks post.
+pub protocol Fat {
+    pub fn list(path: text::String) -> mem::List[FatEntry] fails FatError limits irreversible(emit, actuate, erase, spend)
+    pub fn read(path: text::String, offset: u64, count: u32) -> Untrusted[mem::Bytes] fails FatError limits irreversible(emit, actuate, erase, spend)
+    pub fn write(path: text::String, data: mem::Bytes) fails FatError limits irreversible(emit, actuate, erase, spend)
+    pub fn overwrite(path: text::String, offset: u64, data: mem::Bytes) fails FatError limits irreversible(emit, actuate, erase, spend)
+    pub fn remove(path: text::String) fails FatError limits irreversible(emit, actuate, erase, spend)
+    pub fn allocate(path: text::String, bytes: u64) fails FatError limits irreversible(emit, actuate, erase, spend)
+    pub fn extent(path: text::String) -> Extent fails FatError limits irreversible(emit, actuate, erase, spend)
+    fn mounted(volume: Option[Volume]) limits irreversible(emit, actuate, erase, spend)
+    fn served(request: u64, reply: mem::Bytes, volume: Volume) limits irreversible(emit, actuate, erase, spend)
+} Fat
+
+/// The Env of `fat`: the port of the `boot-volume` role, and its cell.
+pub closed struct Env {
+    pub volume: os::Port[devices::Block]
+    pub alloc: mem::Alloc
+} Env
+
+impl Env: nanos::Environment
+
+/// A request waiting for the volume.
+pub closed enum Job derives Encode {
+    List(path: text::String)
+    Read(path: text::String, offset: u64, count: u32)
+    Write(path: text::String, data: mem::Bytes)
+    Overwrite(path: text::String, offset: u64, data: mem::Bytes)
+    Remove(path: text::String)
+    Allocate(path: text::String, bytes: u64)
+    Extent(path: text::String)
+} Job
+
+pub closed struct Queued derives Encode {
+    pub request: u64
+    pub job: Job
+} Queued
+
+/// The state of `fat`: the mounted volume while no request holds it, the requests waiting, whether one is under way, and whether the volume failed validation.
+pub closed struct Files derives Encode {
+    pub volume: Option[Volume]
+    pub queued: mem::List[Queued]
+    pub serving: bool
+    pub bad: bool
+} Files
+
+impl Files: sys::Component[Env, Fat]
+
+impl Files: sys::Resume[Env, Fat]
+
+/// The storage behind the `boot-volume` role's port, its unit 0.
+pub closed struct Wired derives Copy {
+    pub disk: os::Port[devices::Block]
+} Wired
+
+impl Wired: Storage
+
+pub fn Env.build(take world: nanos::World) -> Env fails nanos::CapError {
+    let handle = try nanos::Cap[os::PortHandle].get(world.caps, key: "volume")
+    let Some(port) = os::Port[devices::Block].of(handle) else {
+        fail nanos::CapError.Missing
+    }
+    return Env(volume: port, alloc: world.alloc)
+} Env.build
+
+pub fn Wired.geometry(self, alloc: mem::Alloc) -> devices::BlockInfo fails Failure uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Block].info(mut call, unit: 0)
+    return match first attempt await self.disk.call(take call, reply, alloc) {
+        Ok(info) => info
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail FatError.Io
+    }
+} Wired.geometry
+
+pub fn Wired.read(self, block: u64, count: u32, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails Failure uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Block].read(mut call, unit: 0, block, count)
+    return match first attempt await self.disk.call(take call, reply, alloc) {
+        Ok(bytes) => bytes
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail FatError.Io
+    }
+} Wired.read
+
+pub fn Wired.write(self, block: u64, take data: mem::Bytes, alloc: mem::Alloc) fails Failure uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Block].write(mut call, unit: 0, block, take data, fua: false)
+    match first attempt await self.disk.call(take call, reply, alloc) {
+        Ok(_) => {
+        }
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail FatError.Io
+    }
+} Wired.write
+
+pub fn Wired.flush(self, alloc: mem::Alloc) fails Failure uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Block].flush(mut call, unit: 0)
+    match first attempt await self.disk.call(take call, reply, alloc) {
+        Ok(_) => {
+        }
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail FatError.Io
+    }
+} Wired.flush
+
+pub fn Files.start(mut env: Env) -> Files = Files(volume: None, queued: mem::List.empty(env.alloc), serving: true, bad: false)
+
+/// Once started, mounts the volume: validates its geometry and frees the clusters no entry reaches.
+pub fn Files.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Fat]) {
+    let disk = Wired(disk: env.volume)
+    let alloc = env.alloc
+    mut cx.spawn(key: MOUNTING, run: fn(out: sys::Outbox[Fat]) fails task::Cancelled uses wait limits stack 32_768 {
+        let mounted = match first attempt await mount(disk, alloc) {
+            Ok(volume) => Some(take volume)
+            Err(Failure.Cancelled(cancelled)) => fail cancelled
+            Err(_) => None
+        }
+        discard attempt await out.mounted(volume: take mounted)
+    })
+} Files.resume
+
+fn Files.mounted(mut self, take volume: Option[Volume], mut env: Env, mut cx: sys::Cx[Fat]) {
+    self.serving = false
+    self.bad = volume.is_none()
+    self.volume = volume
+    mut self.next_job(mut env, mut cx)
+} Files.mounted
+
+pub fn Files.list(mut self, take path: text::String, mut env: Env, mut cx: sys::Cx[Fat]) -> mem::List[FatEntry] fails FatError {
+    try mut self.queue(Job.List(path: take path), mut env, mut cx)
+    return mem::List.empty(env.alloc)
+} Files.list
+
+pub fn Files.read(
+    mut self,
+    take path: text::String,
+    take offset: u64,
+    take count: u32,
+    mut env: Env,
+    mut cx: sys::Cx[Fat],
+    ) -> Untrusted[mem::Bytes] fails FatError {
+    try mut self.queue(Job.Read(path: take path, offset: offset, count: count), mut env, mut cx)
+    return Untrusted.of(mem::Bytes.empty(env.alloc))
+} Files.read
+
+pub fn Files.write(
+    mut self,
+    take path: text::String,
+    take data: mem::Bytes,
+    mut env: Env,
+    mut cx: sys::Cx[Fat],
+    ) fails FatError {
+    try mut self.queue(Job.Write(path: take path, data: take data), mut env, mut cx)
+} Files.write
+
+pub fn Files.overwrite(
+    mut self,
+    take path: text::String,
+    take offset: u64,
+    take data: mem::Bytes,
+    mut env: Env,
+    mut cx: sys::Cx[Fat],
+    ) fails FatError {
+    try mut self.queue(Job.Overwrite(path: take path, offset: offset, data: take data), mut env, mut cx)
+} Files.overwrite
+
+pub fn Files.remove(mut self, take path: text::String, mut env: Env, mut cx: sys::Cx[Fat]) fails FatError {
+    try mut self.queue(Job.Remove(path: take path), mut env, mut cx)
+} Files.remove
+
+pub fn Files.allocate(
+    mut self,
+    take path: text::String,
+    take bytes: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Fat],
+    ) fails FatError {
+    try mut self.queue(Job.Allocate(path: take path, bytes: bytes), mut env, mut cx)
+} Files.allocate
+
+pub fn Files.extent(mut self, take path: text::String, mut env: Env, mut cx: sys::Cx[Fat]) -> Extent fails FatError {
+    try mut self.queue(Job.Extent(path: take path), mut env, mut cx)
+    return Extent(start: 0, blocks: 0)
+} Files.extent
+
+/// Answers the request served, takes the volume back and serves the next.
+fn Files.served(
+    mut self,
+    take request: u64,
+    take reply: mem::Bytes,
+    take volume: Volume,
+    mut env: Env,
+    mut cx: sys::Cx[Fat],
+    ) {
+    discard attempt mut cx.reply(request, reply: sys::Encoded(bytes: take reply, handles: mem::List.empty(env.alloc)))
+    self.volume = Some(take volume)
+    self.serving = false
+    mut self.next_job(mut env, mut cx)
+} Files.served
+
+/// Postpones a request until a keyed task has served it; fails at once on a volume that failed validation.
+fn Files.queue(mut self, take job: Job, mut env: Env, mut cx: sys::Cx[Fat]) fails FatError {
+    if self.bad {
+        fail FatError.BadVolume
+    }
+    let Some(request) = mut cx.postpone() else {
+        fail FatError.Io
+    }
+    mut self.queued.push(Queued(request: request, job: take job))
+    mut self.next_job(mut env, mut cx)
+} Files.queue
+
+/// Hands the volume and the first waiting request to a keyed task while none is under way.
+fn Files.next_job(mut self, mut env: Env, mut cx: sys::Cx[Fat]) {
+    if self.serving or self.queued.len() == 0 {
+        return
+    }
+    let Some(volume) = mut self.volume.extract() else {
+        return
+    }
+    let Queued(request: request, job: job) = mut self.queued.remove(0)
+    self.serving = true
+    let disk = Wired(disk: env.volume)
+    let alloc = env.alloc
+    mut cx.spawn(key: SERVING, run: fn[take volume, take job](out: sys::Outbox[Fat]) fails task::Cancelled uses wait limits stack 32_768 {
+        var held = volume
+        let reply = try await serve(mut held, disk, take job, alloc)
+        discard attempt await out.served(request, take reply, volume: take held)
+    })
+} Files.next_job
+
+/// Mounts the volume behind `disk`'s unit 0 and frees its lost clusters.
+pub fn mount[D: Storage](disk: D, alloc: mem::Alloc) -> Volume fails Failure uses wait {
+    let info = try await disk.geometry(alloc)
+    var volume = try await Volume.mount(disk, block_bytes: info.block_bytes, blocks: info.blocks, alloc)
+    try await mut volume.free_lost(disk, alloc)
+    return volume
+} mount
+
+/// Serves one request on the volume, giving the encoding of its reply.
+pub fn serve[D: Storage](mut volume: Volume, disk: D, take job: Job, alloc: mem::Alloc) -> mem::Bytes fails task::Cancelled uses wait {
+    var bytes = mem::Bytes.empty(alloc)
+    match job {
+        Job.List(path: path) => {
+            let outcome = attempt await mut volume.list(disk, path: path.as_str(), alloc)
+            mem::wire::Codec[Result[mem::List[FatEntry], FatError]].encode(try settled(take outcome), out: mut bytes)
+        }
+        Job.Read(path: path, offset: offset, count: count) => {
+            let outcome = attempt await mut volume.read_file(disk, path: path.as_str(), offset, count, alloc)
+            mem::wire::Codec[Result[Untrusted[mem::Bytes], FatError]].encode(try settled(take outcome), out: mut bytes)
+        }
+        Job.Write(path: path, data: data) => {
+            let outcome = attempt await mut volume.write_file(disk, path: path.as_str(), data: data.view(), alloc)
+            mem::wire::Codec[Result[Unit, FatError]].encode(try settled(take outcome), out: mut bytes)
+        }
+        Job.Overwrite(path: path, offset: offset, data: data) => {
+            let outcome = attempt await mut volume.overwrite_file(disk, path: path.as_str(), offset, data: data.view(), alloc)
+            mem::wire::Codec[Result[Unit, FatError]].encode(try settled(take outcome), out: mut bytes)
+        }
+        Job.Remove(path: path) => {
+            let outcome = attempt await mut volume.remove_file(disk, path: path.as_str(), alloc)
+            mem::wire::Codec[Result[Unit, FatError]].encode(try settled(take outcome), out: mut bytes)
+        }
+        Job.Allocate(path: path, bytes: size) => {
+            let outcome = attempt await mut volume.allocate_file(disk, path: path.as_str(), bytes: size, alloc)
+            mem::wire::Codec[Result[Unit, FatError]].encode(try settled(take outcome), out: mut bytes)
+        }
+        Job.Extent(path: path) => {
+            let outcome = attempt await mut volume.extent_of(disk, path: path.as_str(), alloc)
+            mem::wire::Codec[Result[Extent, FatError]].encode(try settled(take outcome), out: mut bytes)
+        }
+    }
+    return bytes
+} serve
+
+/// A step's outcome as a reply: its result, or the operation's failure; a cancellation stays one.
+fn settled[T](take outcome: Result[T, Failure]) -> Result[T, FatError] fails task::Cancelled {
+    return match outcome {
+        Ok(value) => Ok(take value)
+        Err(Failure.Fat(error)) => Err(error)
+        Err(Failure.Cancelled(cancelled)) => fail cancelled
+    }
+} settled

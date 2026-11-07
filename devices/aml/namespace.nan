@@ -1,0 +1,414 @@
+//! The namespace the definition blocks build: each scope, device, named object, method, operation region and field unit, by its absolute path.
+
+/// The deepest path the namespace holds.
+const MOST_SEGMENTS: usize = 12
+
+/// An absolute path of the namespace: its name segments from the root, each four bytes read little-endian.
+pub closed struct Path derives Copy, Eq, Encode {
+    pub segments: Array[u32, 12]
+    pub count: u8
+} Path
+
+/// What an object of the namespace is.
+pub closed enum Kind derives Copy, Eq, Encode {
+    Scope
+    Device
+    Name
+    Method
+    Region
+    Field
+} Kind
+
+/// An object of the namespace: its path and kind, and for a name its data object's offset in the code, for a method its body's extent and argument count.
+pub closed struct Object derives Copy, Eq, Encode {
+    pub path: Path
+    pub kind: Kind
+    pub start: u32
+    pub end: u32
+    pub args: u8
+} Object
+
+/// A name string read from the code: the path it gives against the scope it is read in, whether it is one segment that lookup searches for in enclosing scopes, and the offset after it. A null name gives the scope.
+struct Named derives Copy {
+    path: Path
+    search: bool
+    next: usize
+} Named
+
+/// A package length read from the code, and the offset after it.
+struct Sized derives Copy {
+    length: usize
+    next: usize
+} Sized
+
+/// A scope the walk is in, and where its definitions end.
+struct Open derives Copy {
+    path: Path
+    end: usize
+} Open
+
+pub fn Path.root() -> Path = Path(segments: Array[u32, 12].filled(0), count: 0)
+
+/// The path one segment below this one, `None` past the deepest path.
+pub fn Path.child(self, name: u32) -> Option[Path] {
+    if usize.widen(self.count) >= MOST_SEGMENTS {
+        return None
+    }
+    var path = self
+    path.segments[usize.widen(self.count)] = name
+    path.count += 1
+    return Some(path)
+} Path.child
+
+/// The path this one lies in, the root for itself.
+pub fn Path.parent(self) -> Path {
+    if self.count == 0 {
+        return self
+    }
+    var path = self
+    path.count -= 1
+    path.segments[usize.widen(path.count)] = 0
+    return path
+} Path.parent
+
+/// The last segment, 0 for the root.
+pub fn Path.last(self) -> u32 {
+    if self.count == 0 {
+        return 0
+    }
+    return self.segments[usize.widen(self.count) - 1]
+} Path.last
+
+/// The segment of four characters `name`.
+pub fn segment(name: Slice[u8]) -> u32
+    example segment(b"_HID") == 0x4449_485F
+{
+    return u32.widen(name[0]) | (u32.widen(name[1]) << 8) | (u32.widen(name[2]) << 16) | (u32.widen(name[3]) << 24)
+} segment
+
+/// The package length at `at`.
+fn package_length(code: Slice[u8], at: usize) -> Option[Sized] {
+    if at >= code.len() {
+        return None
+    }
+    let lead = code[at]
+    let follow = usize.widen(lead >> 6)
+    if follow == 0 {
+        return Some(Sized(length: usize.widen(lead & 0x3F), next: at + 1))
+    }
+    if at + follow >= code.len() {
+        return None
+    }
+    var length = usize.widen(lead & 0x0F)
+    for index in 0..<follow {
+        length = length | (usize.widen(code[at + 1 + index]) << u32.fit(4 + 8 * index))
+    }
+    return Some(Sized(length: length, next: at + 1 + follow))
+} package_length
+
+/// The end of the package whose length starts at `at`, and the offset after its length; `None` when it runs past `limit`.
+fn package_end(code: Slice[u8], at: usize, limit: usize) -> Option[Sized] {
+    let Some(sized) = package_length(code, at) else {
+        return None
+    }
+    let end = at + sized.length
+    if end > limit or end < sized.next {
+        return None
+    }
+    return Some(Sized(length: end, next: sized.next))
+} package_end
+
+/// Whether `byte` starts a name string.
+fn starts_name(byte: u8) -> bool {
+    return byte == b'\\' or byte == b'^' or byte == b'_' or (byte >= b'A' and byte <= b'Z') or byte == 0x2E or byte == 0x2F
+} starts_name
+
+fn is_lead(byte: u8) -> bool = byte == b'_' or (byte >= b'A' and byte <= b'Z')
+
+fn is_name_char(byte: u8) -> bool = is_lead(byte) or (byte >= b'0' and byte <= b'9')
+
+/// The name string at `at` read in `scope`.
+fn read_name(code: Slice[u8], at: usize, scope: Path) -> Option[Named] {
+    var pc = at
+    var path = scope
+    var prefixed = false
+    if pc < code.len() and code[pc] == b'\\' {
+        path = Path.root()
+        prefixed = true
+        pc += 1
+    } else {
+        while pc < code.len() and code[pc] == b'^' {
+            path = path.parent()
+            prefixed = true
+            pc += 1
+        }
+    }
+    if pc >= code.len() {
+        return None
+    }
+    var count: usize = 1
+    if code[pc] == 0 {
+        return Some(Named(path: path, search: false, next: pc + 1))
+    }
+    if code[pc] == 0x2E {
+        count = 2
+        pc += 1
+    } else if code[pc] == 0x2F {
+        if pc + 1 >= code.len() {
+            return None
+        }
+        count = usize.widen(code[pc + 1])
+        pc += 2
+    }
+    if pc + 4 * count > code.len() {
+        return None
+    }
+    for index in 0..<count {
+        let at_segment = pc + 4 * index
+        if not is_lead(code[at_segment]) or not is_name_char(code[at_segment + 1]) or not is_name_char(code[at_segment + 2]) or not is_name_char(code[at_segment + 3]) {
+            return None
+        }
+        let Some(longer) = path.child(u32.widen(code[at_segment]) | (u32.widen(code[at_segment + 1]) << 8) | (u32.widen(code[at_segment + 2]) << 16) | (u32.widen(code[at_segment + 3]) << 24)) else {
+            return None
+        }
+        path = longer
+    }
+    return Some(Named(path: path, search: count == 1 and not prefixed, next: pc + 4 * count))
+} read_name
+
+/// The namespace the code's definition blocks build, failing when a block holds a definition the walk does not know.
+pub fn namespace(code: Code, alloc: mem::Alloc) -> mem::List[Object] fails AmlError {
+    var objects = mem::List[Object].empty(alloc)
+    let bytes = code.bytes.view()
+    for block in code.blocks {
+        try walk(bytes, from: usize.widen(block.start), to: usize.widen(block.end), mut objects, alloc)
+    }
+    return objects
+} namespace
+
+/// Adds the definitions from `from` to `to` to `objects`, entering scopes, devices and other containers and passing over method bodies.
+fn walk(
+    code: Slice[u8],
+    from: usize,
+    to: usize,
+    mut objects: mem::List[Object],
+    alloc: mem::Alloc,
+    ) fails AmlError
+    waive length "one arm per definition the namespace holds"
+{
+    var open = mem::List[Open].empty(alloc)
+    mut open.push(Open(path: Path.root(), end: to))
+    var pc = from
+    while pc < to {
+        while open.len() > 1 and pc >= open[open.len() - 1].end {
+            discard mut open.pop()
+        }
+        let scope = open[open.len() - 1].path
+        let op = code[pc]
+        let extended = match op == 0x5B and pc + 1 < to {
+            true => code[pc + 1]
+            false => 0
+        }
+        if op == 0x10 or (op == 0x5B and (extended == 0x82 or extended == 0x83 or extended == 0x84 or extended == 0x85)) {
+            let at = match op == 0x10 {
+                true => pc + 1
+                false => pc + 2
+            }
+            let Some(sized) = package_end(code, at, limit: to) else {
+                fail AmlError.Malformed
+            }
+            let Some(named) = read_name(code, at: sized.next, scope) else {
+                fail AmlError.Malformed
+            }
+            let kind = match op == 0x5B and extended == 0x82 {
+                true => Kind.Device
+                false => Kind.Scope
+            }
+            mut objects.push(Object(path: named.path, kind: kind, start: 0, end: 0, args: 0))
+            mut open.push(Open(path: named.path, end: sized.length))
+            pc = named.next
+            if extended == 0x83 {
+                pc += 6
+            } else if extended == 0x84 {
+                pc += 3
+            }
+            continue
+        }
+        if op == 0x14 {
+            let Some(sized) = package_end(code, at: pc + 1, limit: to) else {
+                fail AmlError.Malformed
+            }
+            let Some(named) = read_name(code, at: sized.next, scope) else {
+                fail AmlError.Malformed
+            }
+            if named.next >= sized.length {
+                fail AmlError.Malformed
+            }
+            mut objects.push(Object(path: named.path, kind: Kind.Method, start: u32.fit(named.next + 1), end: u32.fit(sized.length), args: code[named.next] & 0x07))
+            pc = sized.length
+            continue
+        }
+        if op == 0x08 {
+            let Some(named) = read_name(code, at: pc + 1, scope) else {
+                fail AmlError.Malformed
+            }
+            mut objects.push(Object(path: named.path, kind: Kind.Name, start: u32.fit(named.next), end: 0, args: 0))
+            let Some(next) = term_end(code, at: named.next, limit: to, scope) else {
+                fail AmlError.Malformed
+            }
+            pc = next
+            continue
+        }
+        if op == 0xA0 or op == 0xA1 or op == 0xA2 {
+            let Some(sized) = package_end(code, at: pc + 1, limit: to) else {
+                fail AmlError.Malformed
+            }
+            pc = sized.length
+            continue
+        }
+        if op == 0x06 {
+            let Some(source) = read_name(code, at: pc + 1, scope) else {
+                fail AmlError.Malformed
+            }
+            let Some(alias) = read_name(code, at: source.next, scope) else {
+                fail AmlError.Malformed
+            }
+            pc = alias.next
+            continue
+        }
+        if op == 0x15 {
+            let Some(named) = read_name(code, at: pc + 1, scope) else {
+                fail AmlError.Malformed
+            }
+            pc = named.next + 2
+            continue
+        }
+        if op != 0x5B {
+            fail AmlError.Malformed
+        }
+        pc = try mut extended_definition(code, at: pc, limit: to, scope, mut objects)
+    }
+} walk
+
+/// Adds the extended definition at `at` (an operation region, a field, a mutex or an event) and gives the offset after it.
+fn extended_definition(
+    code: Slice[u8],
+    at: usize,
+    limit: usize,
+    scope: Path,
+    mut objects: mem::List[Object],
+    ) -> usize fails AmlError {
+    if at + 1 >= limit {
+        fail AmlError.Malformed
+    }
+    let op = code[at + 1]
+    if op == 0x80 {
+        let Some(named) = read_name(code, at: at + 2, scope) else {
+            fail AmlError.Malformed
+        }
+        mut objects.push(Object(path: named.path, kind: Kind.Region, start: 0, end: 0, args: 0))
+        let Some(offset) = term_end(code, at: named.next + 1, limit, scope) else {
+            fail AmlError.Malformed
+        }
+        let Some(length) = term_end(code, at: offset, limit, scope) else {
+            fail AmlError.Malformed
+        }
+        return length
+    }
+    if op == 0x81 or op == 0x86 or op == 0x87 {
+        let Some(sized) = package_end(code, at: at + 2, limit) else {
+            fail AmlError.Malformed
+        }
+        let Some(region) = read_name(code, at: sized.next, scope) else {
+            fail AmlError.Malformed
+        }
+        var pc = region.next
+        if op == 0x86 or op == 0x87 {
+            let Some(other) = read_name(code, at: pc, scope) else {
+                fail AmlError.Malformed
+            }
+            pc = other.next
+        }
+        if op == 0x87 {
+            let Some(next) = term_end(code, at: pc, limit: sized.length, scope) else {
+                fail AmlError.Malformed
+            }
+            pc = next
+        }
+        try field_units(code, from: pc + 1, to: sized.length, scope, mut objects)
+        return sized.length
+    }
+    if op == 0x01 {
+        let Some(named) = read_name(code, at: at + 2, scope) else {
+            fail AmlError.Malformed
+        }
+        return named.next + 1
+    }
+    if op == 0x02 {
+        let Some(named) = read_name(code, at: at + 2, scope) else {
+            fail AmlError.Malformed
+        }
+        return named.next
+    }
+    fail AmlError.Malformed
+} extended_definition
+
+/// Adds the field units a field list from `from` to `to` names.
+fn field_units(
+    code: Slice[u8],
+    from: usize,
+    to: usize,
+    scope: Path,
+    mut objects: mem::List[Object],
+    ) fails AmlError {
+    var pc = from
+    while pc < to {
+        let lead = code[pc]
+        if lead == 0x00 {
+            let Some(sized) = package_length(code, at: pc + 1) else {
+                fail AmlError.Malformed
+            }
+            pc = sized.next
+        } else if lead == 0x01 {
+            pc += 3
+        } else if lead == 0x03 {
+            pc += 4
+        } else if lead == 0x02 {
+            let Some(named) = read_name(code, at: pc + 1, scope) else {
+                fail AmlError.Malformed
+            }
+            pc = named.next
+        } else {
+            if pc + 4 > to or not is_lead(lead) {
+                fail AmlError.Malformed
+            }
+            let Some(path) = scope.child(u32.widen(code[pc]) | (u32.widen(code[pc + 1]) << 8) | (u32.widen(code[pc + 2]) << 16) | (u32.widen(code[pc + 3]) << 24)) else {
+                fail AmlError.Malformed
+            }
+            mut objects.push(Object(path: path, kind: Kind.Field, start: 0, end: 0, args: 0))
+            let Some(sized) = package_length(code, at: pc + 4) else {
+                fail AmlError.Malformed
+            }
+            pc = sized.next
+        }
+    }
+} field_units
+
+/// The object at `path`, or for a searchable name the nearest one of its last segment in `path`'s scope and those enclosing it.
+pub fn lookup(objects: mem::List[Object], path: Path, search: bool) -> Option[Object] {
+    var wanted = path
+    loop {
+        for object in objects {
+            if object.path == wanted {
+                return Some(object)
+            }
+        }
+        if not search or wanted.count <= 1 {
+            return None
+        }
+        let Some(higher) = wanted.parent().parent().child(path.last()) else {
+            return None
+        }
+        wanted = higher
+    }
+} lookup

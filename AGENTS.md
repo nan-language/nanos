@@ -20,6 +20,9 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `os/` | The `os` package: the records instances and the core share, and the capability kinds `Port` and `Control` |
 | `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts and Envs |
 | `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |
+| `devices/` | The `devices` package: the device protocols, the `drivers` registry, the AML evaluator, partition tables, volume views and the device manager |
+| `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries |
+| `fat/` | The `fat` package: the boot volume's file system |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install` and `sandbox` scripts |

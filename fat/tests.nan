@@ -1,0 +1,182 @@
+//! Tests of the file system on an in-memory FAT16 volume.
+
+/// A volume in memory: 8,192 blocks of 512 bytes.
+struct MemoryDisk {
+    bytes: task::Cown[mem::Bytes]
+} MemoryDisk
+
+impl MemoryDisk: Storage
+
+const TEST_BLOCKS: u64 = 8_192
+
+fn MemoryDisk.geometry(self, alloc: mem::Alloc) -> devices::BlockInfo {
+    return devices::BlockInfo(units: 1, block_bytes: 512, blocks: TEST_BLOCKS, max_transfer_bytes: 65_536, zone_blocks: 0, cache: false, fua: false, discards: false, read_only: false)
+} MemoryDisk.geometry
+
+fn MemoryDisk.read(self, block: u64, count: u32, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails Failure uses wait {
+    let held = self.bytes.share()
+    let start = usize.widen(block) * 512
+    let length = usize.widen(count) * 512
+    let copied = await when held => slice_of(held, start, length, alloc)
+    return Untrusted.of(take copied)
+} MemoryDisk.read
+
+fn MemoryDisk.write(self, block: u64, take data: mem::Bytes, alloc: mem::Alloc) fails Failure uses wait {
+    let held = self.bytes.share()
+    let start = usize.widen(block) * 512
+    await when mut held {
+        var at = start
+        for byte in data.view() {
+            held[at] = byte
+            at += 1
+        }
+    }
+} MemoryDisk.write
+
+fn MemoryDisk.flush(self, alloc: mem::Alloc) {
+} MemoryDisk.flush
+
+fn slice_of(bytes: mem::Bytes, start: usize, length: usize, alloc: mem::Alloc) -> mem::Bytes {
+    var copied = mem::Bytes.empty(alloc)
+    for at in start..<(start + length) {
+        mut copied.push(bytes[at])
+    }
+    return copied
+} slice_of
+
+/// A blank FAT16 volume: 1 reserved block, two FATs of 32 blocks, 512 root entries and a block per cluster.
+fn formatted(alloc: mem::Alloc) -> MemoryDisk {
+    var bytes = mem::Bytes.zeroed(usize.widen(TEST_BLOCKS) * 512, alloc)
+    bytes[0] = 0xEB
+    bytes[1] = 0x3C
+    bytes[2] = 0x90
+    mut bytes.view_mut().write_u16_le(11, value: 512)
+    bytes[13] = 1
+    mut bytes.view_mut().write_u16_le(14, value: 1)
+    bytes[16] = 2
+    mut bytes.view_mut().write_u16_le(17, value: 512)
+    mut bytes.view_mut().write_u16_le(19, value: u16.fit(TEST_BLOCKS))
+    bytes[21] = 0xF8
+    mut bytes.view_mut().write_u16_le(22, value: 32)
+    bytes[510] = 0x55
+    bytes[511] = 0xAA
+    for fat in 0..<2usize {
+        let at = 512 + fat * 32 * 512
+        mut bytes.view_mut().write_u16_le(at, value: 0xFFF8)
+        mut bytes.view_mut().write_u16_le(at + 2, value: 0xFFFF)
+    }
+    return MemoryDisk(bytes: task::Cown.of(take bytes, alloc))
+} formatted
+
+fn pattern(length: usize, seed: u8, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    for at in 0..<length {
+        mut bytes.push(u8.truncate(at).wrapping_mul(7).wrapping_add(seed))
+    }
+    return bytes
+} pattern
+
+validator fn plain(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect())
+    return bytes
+} plain
+
+validator fn plain_name(raw: Untrusted[text::String], alloc: mem::Alloc) -> text::String {
+    return text::String.of(raw.inspect().as_str(), alloc)
+} plain_name
+
+/// What the write test saw.
+struct Written derives Copy, Eq {
+    read_back: bool
+    across_case: bool
+    long_listed: bool
+    replaced: bool
+    overwritten: bool
+} Written
+
+fn written(disk: MemoryDisk, alloc: mem::Alloc) -> Written fails Failure uses wait {
+    var volume = try await mount(disk, alloc)
+    let data = pattern(1_500, seed: 3, alloc)
+    try await mut volume.write_file(disk, path: "/nanos/boot.rec", data: data.view(), alloc)
+    let back = try await mut volume.read_file(disk, path: "/nanos/boot.rec", offset: 0, count: 4_000, alloc)
+    let upper = try await mut volume.read_file(disk, path: "/NANOS/BOOT.REC", offset: 1_000, count: 10, alloc)
+    try await mut volume.write_file(disk, path: "/A Long File Name.txt", data: b"long", alloc)
+    let listed = try await mut volume.list(disk, path: "/", alloc)
+    var long_listed = false
+    for entry in listed {
+        if plain_name(entry.name, alloc).as_str() == "A Long File Name.txt" and entry.size == 4 {
+            long_listed = true
+        }
+    }
+    let shorter = pattern(600, seed: 9, alloc)
+    try await mut volume.write_file(disk, path: "/nanos/boot.rec", data: shorter.view(), alloc)
+    let replaced = try await mut volume.read_file(disk, path: "/nanos/boot.rec", offset: 0, count: 4_000, alloc)
+    try await mut volume.overwrite_file(disk, path: "/nanos/boot.rec", offset: 510, data: b"abcd", alloc)
+    let patched = try await mut volume.read_file(disk, path: "/nanos/boot.rec", offset: 508, count: 8, alloc)
+    var expected = slice_of(shorter, start: 508, length: 8, alloc)
+    expected[2] = b'a'
+    expected[3] = b'b'
+    expected[4] = b'c'
+    expected[5] = b'd'
+    return Written(read_back: plain(back.view(), alloc) == data, across_case: plain(upper.view(), alloc) == slice_of(data, start: 1_000, length: 10, alloc), long_listed: long_listed, replaced: plain(replaced.view(), alloc) == shorter, overwritten: plain(patched.view(), alloc) == expected)
+} written
+
+test files_are_written_whole_and_read_back_by_any_case for Volume.write_file {
+    let world = testing::world()
+    let alloc = world.alloc
+    let seen = try await written(formatted(alloc), alloc)
+    expect seen == Written(read_back: true, across_case: true, long_listed: true, replaced: true, overwritten: true)
+} files_are_written_whole_and_read_back_by_any_case
+
+/// What the allocation test saw: the allocated file's extent, whether a second allocation found it, whether removing it freed the path, and whether a missing file was not found.
+struct Allocated derives Copy, Eq {
+    extent: Extent
+    exists: bool
+    removed: bool
+    missing: bool
+} Allocated
+
+fn allocated(disk: MemoryDisk, alloc: mem::Alloc) -> Allocated fails Failure uses wait {
+    var volume = try await mount(disk, alloc)
+    try await mut volume.write_file(disk, path: "/first.bin", data: pattern(700, seed: 1, alloc).view(), alloc)
+    try await mut volume.allocate_file(disk, path: "/nanos/store.img", bytes: 20_480, alloc)
+    let extent = try await mut volume.extent_of(disk, path: "/nanos/store.img", alloc)
+    let again = attempt await mut volume.allocate_file(disk, path: "/nanos/store.img", bytes: 512, alloc)
+    try await mut volume.remove_file(disk, path: "/nanos/store.img", alloc)
+    let gone = attempt await mut volume.read_file(disk, path: "/nanos/store.img", offset: 0, count: 1, alloc)
+    let missing = attempt await mut volume.read_file(disk, path: "/nothing", offset: 0, count: 1, alloc)
+    return Allocated(extent: extent, exists: is_failure(again, wanted: FatError.Exists), removed: is_failure(gone, wanted: FatError.NotFound), missing: is_failure(missing, wanted: FatError.NotFound))
+} allocated
+
+fn is_failure[T](outcome: Result[T, Failure], wanted: FatError) -> bool {
+    return match outcome {
+        Err(Failure.Fat(error)) => error == wanted
+        else => false
+    }
+} is_failure
+
+test allocated_files_are_contiguous for Volume.allocate_file {
+    let world = testing::world()
+    let alloc = world.alloc
+    let seen = try await allocated(formatted(alloc), alloc)
+    expect seen.extent.blocks == 40 and seen.exists and seen.removed and seen.missing
+} allocated_files_are_contiguous
+
+/// Leaves cluster 50 used with no entry reaching it, then mounts again: the mount frees it.
+fn lost(disk: MemoryDisk, alloc: mem::Alloc) -> Array[u32, 2] fails Failure uses wait {
+    var volume = try await mount(disk, alloc)
+    try await mut volume.set_next(disk, cluster: 50, value: END, alloc)
+    var before = Array[u32, 2].filled(0)
+    before[0] = try await mut volume.next(disk, cluster: 50, alloc)
+    var again = try await mount(disk, alloc)
+    before[1] = try await mut again.next(disk, cluster: 50, alloc)
+    return before
+} lost
+
+test mounting_frees_clusters_no_entry_reaches for Volume.free_lost {
+    let world = testing::world()
+    let alloc = world.alloc
+    let seen = try await lost(formatted(alloc), alloc)
+    expect seen[0] == END and seen[1] == 0
+} mounting_frees_clusters_no_entry_reaches

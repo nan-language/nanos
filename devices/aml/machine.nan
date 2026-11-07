@@ -1,0 +1,732 @@
+//! The evaluation of named objects and methods: a machine running AML on stacks of its own, of operands, of operators waiting for theirs, of frames and of control blocks, so that no evaluation nests calls, within 100,000 opcodes and 1 MiB.
+
+const MOST_OPCODES: u32 = 100_000
+
+const MOST_BYTES: u64 = 1_048_576
+
+/// The bytes counted for each value, frame and block the machine holds.
+const VALUE_BYTES: u64 = 64
+
+const FRAME_BYTES: u64 = 1_024
+
+/// The integer logical operators give for true.
+const ONES: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// A value: an integer, a string or buffer lying in the code, a package whose elements lie in the machine's elements, a reference to an object, or no value.
+pub closed enum Value derives Copy, Eq {
+    Integer(u64)
+    Text(start: u32, length: u32)
+    Buffer(start: u32, length: u32)
+    Package(head: u32, count: u32)
+    Reference(Path)
+    Uninitialized
+} Value
+
+/// What an evaluation gives: its value, and the elements its packages hold.
+pub closed struct Evaluated {
+    pub value: Value
+    pub elements: mem::List[Value]
+} Evaluated
+
+/// The kinds of control blocks.
+enum Flow derives Copy, Eq {
+    If
+    Else
+    While
+} Flow
+
+/// A control block a method runs in: its kind, where its opcode starts and where it ends.
+struct Control derives Copy {
+    flow: Flow
+    start: u32
+    end: u32
+} Control
+
+/// What an operator waiting for operands does with them.
+enum Waiting derives Copy, Eq {
+    Operator(u8)
+    Predicate(flow: Flow, start: u32, end: u32)
+    Return
+    Call(Object)
+    Buffer(end: u32)
+    Count(end: u32)
+    Package(count: u32, end: u32)
+} Waiting
+
+/// An operator waiting for `needed` operands, which lie from `base` on the operand stack.
+struct Pending derives Copy {
+    waiting: Waiting
+    needed: u32
+    base: u32
+} Pending
+
+/// A frame: a method's, or a named object's whose one term it evaluates; where it runs and ends, the scope its names resolve in, where its eight locals and seven arguments start in the machine's slots, and the heights of the stacks when it was entered.
+struct Frame derives Copy {
+    data: bool
+    pc: u32
+    end: u32
+    scope: Path
+    slots: u32
+    operands: u32
+    pendings: u32
+    blocks: u32
+} Frame
+
+/// The slots a frame holds: its locals, then its arguments.
+const FRAME_SLOTS: usize = 15
+
+const ARGUMENT_SLOT: usize = 8
+
+struct Machine {
+    slots: mem::List[Value]
+    operands: mem::List[Value]
+    pending: mem::List[Pending]
+    frames: mem::List[Frame]
+    blocks: mem::List[Control]
+    elements: mem::List[Value]
+    opcodes: u32
+    undelivered: bool
+    result: Value
+} Machine
+
+/// The value of the named object or method `object` of `objects`, built over `code`.
+pub fn evaluate(code: Slice[u8], objects: mem::List[Object], object: Object, alloc: mem::Alloc) -> Evaluated fails AmlError {
+    var machine = Machine(slots: mem::List.empty(alloc), operands: mem::List.empty(alloc), pending: mem::List.empty(alloc), frames: mem::List.empty(alloc), blocks: mem::List.empty(alloc), elements: mem::List.empty(alloc), opcodes: 0, undelivered: false, result: Value.Uninitialized)
+    let slots = mut machine.new_slots()
+    try mut machine.enter(object, slots, code_end: code.len())
+    while machine.frames.len() > 0 {
+        try mut machine.step(code, objects)
+    }
+    return Evaluated(value: machine.result, elements: take machine.elements)
+} evaluate
+
+/// The first of fifteen new slots, uninitialized.
+fn Machine.new_slots(mut self) -> u32 {
+    let start = u32.fit(self.slots.len())
+    for _ in 0..<FRAME_SLOTS {
+        mut self.slots.push(Value.Uninitialized)
+    }
+    return start
+} Machine.new_slots
+
+/// Enters a frame evaluating `object`, a named object's term or a method's body, its locals and arguments in the slots from `slots`.
+fn Machine.enter(mut self, object: Object, slots: u32, code_end: usize) fails AmlError {
+    let base = Frame(data: true, pc: object.start, end: u32.fit(code_end), scope: object.path.parent(), slots: slots, operands: u32.fit(self.operands.len()), pendings: u32.fit(self.pending.len()), blocks: u32.fit(self.blocks.len()))
+    var frame = base
+    match object.kind {
+        Kind.Name => {
+        }
+        Kind.Method => {
+            frame.data = false
+            frame.end = object.end
+            frame.scope = object.path
+        }
+        Kind.Region or Kind.Field => fail AmlError.Region
+        else => fail AmlError.Unsupported
+    }
+    mut self.frames.push(frame)
+} Machine.enter
+
+/// Fails once the values, frames and blocks the machine holds pass 1 MiB.
+fn Machine.within_memory(self) fails AmlError {
+    let values = u64.widen(self.slots.len() + self.elements.len() + self.operands.len() + self.pending.len() + self.blocks.len())
+    let held = values * VALUE_BYTES + u64.widen(self.frames.len()) * FRAME_BYTES
+    if held > MOST_BYTES {
+        fail AmlError.Memory
+    }
+} Machine.within_memory
+
+fn Machine.top(self) -> Frame {
+    return self.frames[self.frames.len() - 1]
+} Machine.top
+
+fn Machine.set_pc(mut self, pc: usize) {
+    let at = self.frames.len() - 1
+    self.frames[at].pc = u32.fit(pc)
+} Machine.set_pc
+
+/// Runs one step: hands a frame's result to its caller, runs a statement of a method, or reads the next term.
+fn Machine.step(mut self, code: Slice[u8], objects: mem::List[Object]) fails AmlError {
+    self.opcodes += 1
+    if self.opcodes > MOST_OPCODES {
+        fail AmlError.Opcodes
+    }
+    try self.within_memory()
+    if self.undelivered {
+        self.undelivered = false
+        try mut self.deliver(code, objects)
+        return
+    }
+    let frame = self.top()
+    if self.pending.len() > usize.widen(frame.pendings) {
+        try mut self.term(code, objects)
+        return
+    }
+    if frame.data {
+        if self.operands.len() > usize.widen(frame.operands) {
+            let Some(value) = mut self.operands.pop() else {
+                fail AmlError.Malformed
+            }
+            mut self.finish(value)
+            return
+        }
+        try mut self.term(code, objects)
+        return
+    }
+    mut self.operands.truncate(usize.widen(frame.operands))
+    let pc = usize.widen(frame.pc)
+    if self.blocks.len() > usize.widen(frame.blocks) {
+        let block = self.blocks[self.blocks.len() - 1]
+        if pc >= usize.widen(block.end) {
+            discard mut self.blocks.pop()
+            try mut self.close(block, code)
+            return
+        }
+    }
+    if pc >= usize.widen(frame.end) {
+        mut self.finish(Value.Uninitialized)
+        return
+    }
+    try mut self.statement(code, objects, pc, frame)
+} Machine.step
+
+/// Leaves a control block at its end: a loop starts over, and an `If` whose body ran passes over its `Else`.
+fn Machine.close(mut self, block: Control, code: Slice[u8]) fails AmlError {
+    match block.flow {
+        Flow.While => mut self.set_pc(usize.widen(block.start))
+        Flow.If => {
+            let pc = usize.widen(self.top().pc)
+            if pc < usize.widen(self.top().end) and code[pc] == 0xA1 {
+                let Some(sized) = package_end(code, at: pc + 1, limit: usize.widen(self.top().end)) else {
+                    fail AmlError.Malformed
+                }
+                mut self.set_pc(sized.length)
+            }
+        }
+        Flow.Else => {
+        }
+    }
+} Machine.close
+
+/// Starts the statement at `pc` of a method: a control opcode, else a term whose value is dropped.
+fn Machine.statement(
+    mut self,
+    code: Slice[u8],
+    objects: mem::List[Object],
+    pc: usize,
+    frame: Frame,
+    ) fails AmlError {
+    let op = code[pc]
+    let end = usize.widen(frame.end)
+    if op == 0xA0 or op == 0xA2 {
+        let Some(sized) = package_end(code, at: pc + 1, limit: end) else {
+            fail AmlError.Malformed
+        }
+        let flow = match op == 0xA0 {
+            true => Flow.If
+            false => Flow.While
+        }
+        mut self.pending.push(Pending(waiting: Waiting.Predicate(flow: flow, start: u32.fit(pc), end: u32.fit(sized.length)), needed: 1, base: u32.fit(self.operands.len())))
+        mut self.set_pc(sized.next)
+        return
+    }
+    if op == 0xA4 {
+        mut self.pending.push(Pending(waiting: Waiting.Return, needed: 1, base: u32.fit(self.operands.len())))
+        mut self.set_pc(pc + 1)
+        return
+    }
+    if op == 0xA3 {
+        mut self.set_pc(pc + 1)
+        return
+    }
+    if op == 0xA1 {
+        let Some(sized) = package_end(code, at: pc + 1, limit: end) else {
+            fail AmlError.Malformed
+        }
+        mut self.set_pc(sized.length)
+        return
+    }
+    if op == 0xA5 or op == 0x9F {
+        while self.blocks.len() > usize.widen(frame.blocks) {
+            let Some(block) = mut self.blocks.pop() else {
+                fail AmlError.Malformed
+            }
+            if block.flow == Flow.While {
+                let next = match op == 0xA5 {
+                    true => block.end
+                    false => block.start
+                }
+                mut self.set_pc(usize.widen(next))
+                return
+            }
+        }
+        fail AmlError.Malformed
+    }
+    try mut self.term(code, objects)
+} Machine.statement
+
+/// Reads the term at the frame's offset: a value it hands on, or an operator it waits with.
+fn Machine.term(mut self, code: Slice[u8], objects: mem::List[Object]) fails AmlError
+    waive length "one branch per kind of term"
+{
+    let frame = self.top()
+    let pc = usize.widen(frame.pc)
+    let end = usize.widen(frame.end)
+    if pc >= end {
+        fail AmlError.Malformed
+    }
+    let op = code[pc]
+    if op == 0x00 or op == 0x01 or op == 0xFF {
+        let value = match op {
+            0x00 => 0u64
+            0x01 => 1u64
+            else => ONES
+        }
+        try mut self.give(Value.Integer(value), next: pc + 1, code, objects)
+        return
+    }
+    if op == 0x0A or op == 0x0B or op == 0x0C or op == 0x0E {
+        let width: usize = match op {
+            0x0A => 1
+            0x0B => 2
+            0x0C => 4
+            else => 8
+        }
+        if pc + width >= end {
+            fail AmlError.Malformed
+        }
+        var value: u64 = 0
+        for index in 0..<width {
+            value = value | (u64.widen(code[pc + 1 + index]) << u32.fit(8 * index))
+        }
+        try mut self.give(Value.Integer(value), next: pc + 1 + width, code, objects)
+        return
+    }
+    if op == 0x0D {
+        var stop = pc + 1
+        while stop < end and code[stop] != 0 {
+            stop += 1
+        }
+        if stop >= end {
+            fail AmlError.Malformed
+        }
+        try mut self.give(Value.Text(start: u32.fit(pc + 1), length: u32.fit(stop - pc - 1)), next: stop + 1, code, objects)
+        return
+    }
+    if op >= 0x60 and op <= 0x67 {
+        try mut self.give(self.slots[usize.widen(frame.slots) + usize.widen(op - 0x60)], next: pc + 1, code, objects)
+        return
+    }
+    if op >= 0x68 and op <= 0x6E {
+        try mut self.give(self.slots[usize.widen(frame.slots) + ARGUMENT_SLOT + usize.widen(op - 0x68)], next: pc + 1, code, objects)
+        return
+    }
+    if op == 0x11 or op == 0x12 or op == 0x13 {
+        let Some(sized) = package_end(code, at: pc + 1, limit: end) else {
+            fail AmlError.Malformed
+        }
+        let base = u32.fit(self.operands.len())
+        if op == 0x11 {
+            mut self.pending.push(Pending(waiting: Waiting.Buffer(end: u32.fit(sized.length)), needed: 1, base: base))
+            mut self.set_pc(sized.next)
+        } else if op == 0x13 {
+            mut self.pending.push(Pending(waiting: Waiting.Count(end: u32.fit(sized.length)), needed: 1, base: base))
+            mut self.set_pc(sized.next)
+        } else {
+            if sized.next >= sized.length {
+                fail AmlError.Malformed
+            }
+            mut self.pending.push(Pending(waiting: Waiting.Package(count: u32.widen(code[sized.next]), end: u32.fit(sized.length)), needed: 0, base: base))
+            mut self.set_pc(sized.next + 1)
+            try mut self.deliver(code, objects)
+        }
+        return
+    }
+    if op == 0x5B {
+        if pc + 1 < end and code[pc + 1] == 0x30 {
+            try mut self.give(Value.Integer(2), next: pc + 2, code, objects)
+            return
+        }
+        fail AmlError.Unsupported
+    }
+    if starts_name(op) {
+        try mut self.name(code, objects, pc)
+        return
+    }
+    if op == 0x75 or op == 0x76 {
+        try mut self.step_local(code, objects, pc, increment: op == 0x75)
+        return
+    }
+    let Some(operands) = arity(op) else {
+        fail AmlError.Unsupported
+    }
+    if not supported(op) {
+        fail AmlError.Unsupported
+    }
+    mut self.pending.push(Pending(waiting: Waiting.Operator(op), needed: u32.widen(operands - targets(op)), base: u32.fit(self.operands.len())))
+    mut self.set_pc(pc + 1)
+} Machine.term
+
+/// Reads the name string at `pc`: a package element is a reference; any other names a value, a method to call, or a device.
+fn Machine.name(mut self, code: Slice[u8], objects: mem::List[Object], pc: usize) fails AmlError {
+    let frame = self.top()
+    let Some(named) = read_name(code, at: pc, scope: frame.scope) else {
+        fail AmlError.Malformed
+    }
+    let found = lookup(objects, path: named.path, search: named.search)
+    if self.in_package() {
+        let path = match found {
+            Some(object) => object.path
+            None => named.path
+        }
+        try mut self.give(Value.Reference(path), next: named.next, code, objects)
+        return
+    }
+    let Some(object) = found else {
+        fail AmlError.Missing
+    }
+    mut self.set_pc(named.next)
+    match object.kind {
+        Kind.Name => {
+            let slots = mut self.new_slots()
+            try mut self.enter(object, slots, code_end: code.len())
+        }
+        Kind.Method => {
+            if object.args == 0 {
+                let slots = mut self.new_slots()
+                try mut self.enter(object, slots, code_end: code.len())
+            } else {
+                mut self.pending.push(Pending(waiting: Waiting.Call(object), needed: u32.widen(object.args), base: u32.fit(self.operands.len())))
+            }
+        }
+        Kind.Region or Kind.Field => fail AmlError.Region
+        Kind.Device or Kind.Scope => try mut self.give(Value.Reference(object.path), next: named.next, code, objects)
+    }
+} Machine.name
+
+/// Whether the operator waiting nearest is a package, whose name elements are references.
+fn Machine.in_package(self) -> bool {
+    if self.pending.len() <= usize.widen(self.top().pendings) {
+        return false
+    }
+    return match self.pending[self.pending.len() - 1].waiting {
+        Waiting.Package(count: _, end: _) => true
+        else => false
+    }
+} Machine.in_package
+
+/// Increments or decrements the local or argument at `pc + 1`, giving its new value.
+fn Machine.step_local(
+    mut self,
+    code: Slice[u8],
+    objects: mem::List[Object],
+    pc: usize,
+    increment: bool,
+    ) fails AmlError {
+    if pc + 1 >= usize.widen(self.top().end) {
+        fail AmlError.Malformed
+    }
+    let slot = code[pc + 1]
+    let current = try integer(try self.read_slot(slot))
+    let changed = match increment {
+        true => current.wrapping_add(1)
+        false => current.wrapping_sub(1)
+    }
+    try mut self.write_slot(slot, value: Value.Integer(changed))
+    try mut self.give(Value.Integer(changed), next: pc + 2, code, objects)
+} Machine.step_local
+
+fn Machine.read_slot(self, slot: u8) -> Value fails AmlError {
+    let start = usize.widen(self.top().slots)
+    if slot >= 0x60 and slot <= 0x67 {
+        return self.slots[start + usize.widen(slot - 0x60)]
+    }
+    if slot >= 0x68 and slot <= 0x6E {
+        return self.slots[start + ARGUMENT_SLOT + usize.widen(slot - 0x68)]
+    }
+    fail AmlError.Unsupported
+} Machine.read_slot
+
+fn Machine.write_slot(mut self, slot: u8, value: Value) fails AmlError {
+    let start = usize.widen(self.top().slots)
+    if slot >= 0x60 and slot <= 0x67 {
+        self.slots[start + usize.widen(slot - 0x60)] = value
+        return
+    }
+    if slot >= 0x68 and slot <= 0x6E {
+        self.slots[start + ARGUMENT_SLOT + usize.widen(slot - 0x68)] = value
+        return
+    }
+    fail AmlError.Unsupported
+} Machine.write_slot
+
+/// Pushes `value`, moves the frame to `next` and hands the value to the operators waiting.
+fn Machine.give(
+    mut self,
+    value: Value,
+    next: usize,
+    code: Slice[u8],
+    objects: mem::List[Object],
+    ) fails AmlError {
+    mut self.set_pc(next)
+    mut self.operands.push(value)
+    try mut self.deliver(code, objects)
+} Machine.give
+
+/// Completes the operators waiting whose operands are all there, innermost first.
+fn Machine.deliver(mut self, code: Slice[u8], objects: mem::List[Object]) fails AmlError
+    waive length "one arm per kind of waiting operator"
+{
+    loop {
+        if self.frames.len() == 0 {
+            return
+        }
+        let frame = self.top()
+        if self.pending.len() <= usize.widen(frame.pendings) {
+            return
+        }
+        let waiting = self.pending[self.pending.len() - 1]
+        let have = u32.fit(self.operands.len()) - waiting.base
+        match waiting.waiting {
+            Waiting.Package(count: _, end: end) => {
+                if frame.pc < end {
+                    return
+                }
+            }
+            else => {
+                if have < waiting.needed {
+                    return
+                }
+            }
+        }
+        discard mut self.pending.pop()
+        match waiting.waiting {
+            Waiting.Operator(op) => {
+                let result = try self.compute(op, base: usize.widen(waiting.base), code)
+                mut self.operands.truncate(usize.widen(waiting.base))
+                if targets(op) > 0 {
+                    try mut self.store(result, code)
+                }
+                mut self.operands.push(result)
+            }
+            Waiting.Predicate(flow: flow, start: start, end: end) => {
+                let Some(value) = mut self.operands.pop() else {
+                    fail AmlError.Malformed
+                }
+                try mut self.branch(flow, start, end, holds: try integer(value) != 0, code)
+                return
+            }
+            Waiting.Return => {
+                let Some(value) = mut self.operands.pop() else {
+                    fail AmlError.Malformed
+                }
+                mut self.finish(value)
+                return
+            }
+            Waiting.Call(object) => {
+                let slots = mut self.new_slots()
+                for index in 0..<usize.widen(waiting.needed) {
+                    self.slots[usize.widen(slots) + ARGUMENT_SLOT + index] = self.operands[usize.widen(waiting.base) + index]
+                }
+                mut self.operands.truncate(usize.widen(waiting.base))
+                try mut self.enter(object, slots, code_end: code.len())
+                return
+            }
+            Waiting.Buffer(end: end) => {
+                mut self.operands.truncate(usize.widen(waiting.base))
+                let start = frame.pc
+                mut self.set_pc(usize.widen(end))
+                mut self.operands.push(Value.Buffer(start: start, length: end - start))
+            }
+            Waiting.Count(end: end) => {
+                let Some(value) = mut self.operands.pop() else {
+                    fail AmlError.Malformed
+                }
+                mut self.pending.push(Pending(waiting: Waiting.Package(count: u32.saturate(try integer(value)), end: end), needed: 0, base: waiting.base))
+            }
+            Waiting.Package(count: count, end: _) => {
+                let head = u32.fit(self.elements.len())
+                for index in usize.widen(waiting.base)..<self.operands.len() {
+                    mut self.elements.push(self.operands[index])
+                }
+                var listed = have
+                while listed < count {
+                    mut self.elements.push(Value.Uninitialized)
+                    listed += 1
+                }
+                mut self.operands.truncate(usize.widen(waiting.base))
+                mut self.operands.push(Value.Package(head: head, count: listed))
+            }
+        }
+    }
+} Machine.deliver
+
+/// Enters or passes over a control block once its predicate is known.
+fn Machine.branch(
+    mut self,
+    flow: Flow,
+    start: u32,
+    end: u32,
+    holds: bool,
+    code: Slice[u8],
+    ) fails AmlError {
+    if holds {
+        mut self.blocks.push(Control(flow: flow, start: start, end: end))
+        return
+    }
+    let pc = usize.widen(end)
+    mut self.set_pc(pc)
+    if flow == Flow.If and pc < usize.widen(self.top().end) and code[pc] == 0xA1 {
+        let Some(sized) = package_end(code, at: pc + 1, limit: usize.widen(self.top().end)) else {
+            fail AmlError.Malformed
+        }
+        mut self.blocks.push(Control(flow: Flow.Else, start: u32.fit(pc), end: u32.fit(sized.length)))
+        mut self.set_pc(sized.next)
+    }
+} Machine.branch
+
+/// Stores `value` in the target at the frame's offset: none, a local or an argument.
+fn Machine.store(mut self, value: Value, code: Slice[u8]) fails AmlError {
+    let pc = usize.widen(self.top().pc)
+    if pc >= usize.widen(self.top().end) {
+        fail AmlError.Malformed
+    }
+    let slot = code[pc]
+    if slot == 0x00 {
+        mut self.set_pc(pc + 1)
+        return
+    }
+    if slot == 0x5B and pc + 1 < code.len() and code[pc + 1] == 0x31 {
+        mut self.set_pc(pc + 2)
+        return
+    }
+    try mut self.write_slot(slot, value)
+    mut self.set_pc(pc + 1)
+} Machine.store
+
+/// Leaves the running frame with `value`, which goes to its caller, or is the evaluation's result.
+fn Machine.finish(mut self, value: Value) {
+    let Some(frame) = mut self.frames.pop() else {
+        return
+    }
+    mut self.slots.truncate(usize.widen(frame.slots))
+    mut self.operands.truncate(usize.widen(frame.operands))
+    mut self.pending.truncate(usize.widen(frame.pendings))
+    mut self.blocks.truncate(usize.widen(frame.blocks))
+    if self.frames.len() == 0 {
+        self.result = value
+        return
+    }
+    mut self.operands.push(value)
+    self.undelivered = true
+} Machine.finish
+
+/// The result of the operator `op` over the operands from `base`.
+fn Machine.compute(self, op: u8, base: usize, code: Slice[u8]) -> Value fails AmlError {
+    let left = self.operands[base]
+    if op == 0x70 or op == 0x99 {
+        return left
+    }
+    if op == 0x87 {
+        return Value.Integer(u64.widen(match left {
+            Value.Text(start: _, length: length) or Value.Buffer(start: _, length: length) => length
+            Value.Package(head: _, count: count) => count
+            else => fail AmlError.Unsupported
+        }))
+    }
+    if op == 0x92 {
+        return truth(try integer(left) == 0)
+    }
+    if op == 0x80 {
+        return Value.Integer(~try integer(left))
+    }
+    let right = self.operands[base + 1]
+    if op == 0x93 {
+        return truth(try equal(left, right, code))
+    }
+    let a = try integer(left)
+    let b = try integer(right)
+    return match op {
+        0x72 => Value.Integer(a.wrapping_add(b))
+        0x74 => Value.Integer(a.wrapping_sub(b))
+        0x77 => Value.Integer(a.wrapping_mul(b))
+        0x79 => Value.Integer(match b < 64 {
+            true => a << u32.fit(b)
+            false => 0
+        })
+        0x7A => Value.Integer(match b < 64 {
+            true => a >> u32.fit(b)
+            false => 0
+        })
+        0x7B => Value.Integer(a & b)
+        0x7D => Value.Integer(a | b)
+        0x7F => Value.Integer(a ^ b)
+        0x90 => truth(a != 0 and b != 0)
+        0x91 => truth(a != 0 or b != 0)
+        0x94 => truth(a > b)
+        0x95 => truth(a < b)
+        else => fail AmlError.Unsupported
+    }
+} Machine.compute
+
+fn truth(holds: bool) -> Value {
+    if holds {
+        return Value.Integer(ONES)
+    }
+    return Value.Integer(0)
+} truth
+
+/// Whether two values are equal: integers by value, strings and buffers by their bytes.
+fn equal(left: Value, right: Value, code: Slice[u8]) -> bool fails AmlError {
+    return match left {
+        Value.Integer(a) => a == try integer(right)
+        Value.Text(start: a, length: length) or Value.Buffer(start: a, length: length) => match right {
+            Value.Text(start: b, length: other) or Value.Buffer(start: b, length: other) => same_bytes(code, a, b, length, other)
+            else => fail AmlError.Unsupported
+        }
+        else => fail AmlError.Unsupported
+    }
+} equal
+
+fn same_bytes(
+    code: Slice[u8],
+    a: u32,
+    b: u32,
+    length: u32,
+    other: u32,
+    ) -> bool {
+    if length != other {
+        return false
+    }
+    for index in 0..<usize.widen(length) {
+        if code[usize.widen(a) + index] != code[usize.widen(b) + index] {
+            return false
+        }
+    }
+    return true
+} same_bytes
+
+/// The integer `value` holds.
+pub fn integer(value: Value) -> u64 fails AmlError {
+    let Value.Integer(number) = value else {
+        fail AmlError.Unsupported
+    }
+    return number
+} integer
+
+/// How many of an operator's operands are targets.
+fn targets(op: u8) -> u8 {
+    return match op {
+        0x70 or 0x72 or 0x73 or 0x74 or 0x77 or 0x79 or 0x7A or 0x7B or 0x7C or 0x7D or 0x7E or 0x7F or 0x80 or 0x81 or 0x82 or 0x84 or 0x85 or 0x88 or 0x96 or 0x97 or 0x98 or 0x99 or 0x9C => 1
+        0x78 => 2
+        else => 0
+    }
+} targets
+
+/// Whether the machine computes the operator `op`.
+fn supported(op: u8) -> bool {
+    return match op {
+        0x70 or 0x72 or 0x74 or 0x77 or 0x79 or 0x7A or 0x7B or 0x7D or 0x7F or 0x80 or 0x87 or 0x90 or 0x91 or 0x92 or 0x93 or 0x94 or 0x95 or 0x99 => true
+        else => false
+    }
+} supported

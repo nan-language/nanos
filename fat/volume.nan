@@ -1,0 +1,461 @@
+//! The volume: its geometry from the boot sector, its FAT, its clusters and a cache of its blocks, read and written through a disk.
+
+/// The most bytes of blocks the cache holds.
+const CACHE_BYTES: usize = 262_144
+
+/// The cluster numbers past the last one a FAT12, FAT16 or FAT32 volume can have.
+const FAT12_CLUSTERS: u32 = 4_085
+
+const FAT16_CLUSTERS: u32 = 65_525
+
+/// The value of a FAT entry that ends a chain, as `Volume.next` reads it.
+pub const END: u32 = 0x0FFF_FFFF
+
+/// The most bytes of the FAT a scan reads at once.
+const SCAN_BYTES: u64 = 65_536
+
+/// The blocks the volume lies on, from block 0.
+pub interface Storage {
+    /// The geometry of the unit the volume lies on.
+    fn geometry(self, alloc: mem::Alloc) -> devices::BlockInfo fails Failure uses wait
+    fn read(self, block: u64, count: u32, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails Failure uses wait
+    fn write(self, block: u64, take data: mem::Bytes, alloc: mem::Alloc) fails Failure uses wait
+    fn flush(self, alloc: mem::Alloc) fails Failure uses wait
+} Storage
+
+/// Why an operation of `fat` fails, chapter 15's codes.
+pub closed enum FatError derives Copy, Eq, Render, Encode {
+    NotFound
+    OutOfRange
+    NoSpace
+    InUse
+    Exists
+    NotContiguous
+    BadVolume
+    Io
+} FatError
+
+/// Why a step of an operation fails: as the operation does, or cancelled.
+pub closed enum Failure derives Render {
+    Fat(FatError) from
+    Cancelled(task::Cancelled) from
+} Failure
+
+/// The FAT variant, by the volume's count of clusters.
+pub closed enum Variant derives Copy, Eq, Render, Encode {
+    Fat12
+    Fat16
+    Fat32
+} Variant
+
+/// The volume's geometry: its block size, the blocks of a cluster, where its FATs, root directory and data lie, its count of clusters and FATs, and its root directory: a fixed area of `root_entries` entries, or for FAT32 a chain from `root_cluster`.
+pub closed struct Geometry derives Copy, Eq, Encode {
+    pub kind: Variant
+    pub block_bytes: u32
+    pub cluster_blocks: u32
+    pub fat_start: u64
+    pub fat_blocks: u64
+    pub fats: u32
+    pub root_start: u64
+    pub root_entries: u32
+    pub root_cluster: u32
+    pub data_start: u64
+    pub clusters: u32
+} Geometry
+
+/// The mounted volume: its geometry, and the blocks its cache holds in the order they entered it.
+pub closed struct Volume derives Encode {
+    pub geometry: Geometry
+    pub cached: mem::List[Cached]
+} Volume
+
+pub closed struct Cached derives Encode {
+    pub block: u64
+    pub bytes: mem::Bytes
+} Cached
+
+/// The geometry the boot sector `sector` gives on a volume of `blocks` blocks of `block_bytes`, `None` when it fails validation.
+pub validator fn Geometry.read(sector: Untrusted[Slice[u8]], block_bytes: u32, blocks: u64) -> Option[Geometry] {
+    let bytes = sector.inspect()
+    if bytes.len() < 512 or bytes[510] != 0x55 or bytes[511] != 0xAA {
+        return None
+    }
+    let bytes_per_sector = u32.widen(bytes.u16_le(11))
+    let per_cluster = u32.widen(bytes[13])
+    let reserved = u64.widen(bytes.u16_le(14))
+    let fats = u32.widen(bytes[16])
+    let root_entries = u32.widen(bytes.u16_le(17))
+    var total = u64.widen(bytes.u16_le(19))
+    if total == 0 {
+        total = u64.widen(bytes.u32_le(32))
+    }
+    var fat_blocks = u64.widen(bytes.u16_le(22))
+    if fat_blocks == 0 {
+        fat_blocks = u64.widen(bytes.u32_le(36))
+    }
+    if bytes_per_sector != block_bytes or per_cluster == 0 or (per_cluster & (per_cluster - 1)) != 0 or per_cluster > 128 or reserved == 0 or fats == 0 or fats > 2 or fat_blocks == 0 or total > blocks {
+        return None
+    }
+    let root_blocks = (u64.widen(root_entries) * 32 + u64.widen(block_bytes) - 1) / u64.widen(block_bytes)
+    let root_start = reserved + u64.widen(fats) * fat_blocks
+    let data_start = root_start + root_blocks
+    if data_start >= total {
+        return None
+    }
+    let clusters = u32.saturate((total - data_start) / u64.widen(per_cluster))
+    let kind = match clusters < FAT12_CLUSTERS {
+        true => Variant.Fat12
+        false => match clusters < FAT16_CLUSTERS {
+            true => Variant.Fat16
+            false => Variant.Fat32
+        }
+    }
+    let entry_bits: u64 = match kind {
+        Variant.Fat12 => 12
+        Variant.Fat16 => 16
+        Variant.Fat32 => 32
+    }
+    if (u64.widen(clusters) + 2) * entry_bits > fat_blocks * u64.widen(block_bytes) * 8 {
+        return None
+    }
+    let root_cluster = match kind {
+        Variant.Fat32 => bytes.u32_le(44)
+        else => 0
+    }
+    if kind == Variant.Fat32 and (root_entries != 0 or root_cluster < 2 or root_cluster >= clusters + 2) {
+        return None
+    }
+    if kind != Variant.Fat32 and root_entries == 0 {
+        return None
+    }
+    return Some(Geometry(kind: kind, block_bytes: block_bytes, cluster_blocks: per_cluster, fat_start: reserved, fat_blocks: fat_blocks, fats: fats, root_start: root_start, root_entries: root_entries, root_cluster: root_cluster, data_start: data_start, clusters: clusters))
+} Geometry.read
+
+/// The bytes of blocks the disk gave, which every reader checks before it relies on them.
+validator fn admitted(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect())
+    return bytes
+} admitted
+
+/// The first block of data cluster `cluster`.
+pub fn Geometry.cluster_block(self, cluster: u32) -> u64 {
+    return self.data_start + u64.widen(cluster.saturating_sub(2)) * u64.widen(self.cluster_blocks)
+} Geometry.cluster_block
+
+/// The bytes of a cluster.
+pub fn Geometry.cluster_bytes(self) -> u64 = u64.widen(self.cluster_blocks) * u64.widen(self.block_bytes)
+
+/// Whether `cluster` is a data cluster of the volume.
+pub fn Geometry.holds(self, cluster: u32) -> bool = cluster >= 2 and u64.widen(cluster) < u64.widen(self.clusters) + 2
+
+/// Mounts the volume on `disk`: its boot sector validated against the volume's `blocks` blocks of `block_bytes`.
+pub fn Volume.mount[D: Storage](disk: D, block_bytes: u32, blocks: u64, alloc: mem::Alloc) -> Volume fails Failure uses wait {
+    let sector = try await disk.read(0, count: 1, alloc)
+    let Some(geometry) = Geometry.read(sector.view(), block_bytes, blocks) else {
+        fail FatError.BadVolume
+    }
+    return Volume(geometry: geometry, cached: mem::List.empty(alloc))
+} Volume.mount
+
+/// The bytes of block `block`, from the cache or the disk.
+pub fn Volume.block[D: Storage](mut self, disk: D, block: u64, alloc: mem::Alloc) -> mem::Bytes fails Failure uses wait {
+    for cached in self.cached {
+        if cached.block == block {
+            return copy(cached.bytes, alloc)
+        }
+    }
+    let raw = try await disk.read(block, count: 1, alloc)
+    let bytes = admitted(raw.view(), alloc)
+    mut self.keep(block, bytes: copy(bytes, alloc))
+    return bytes
+} Volume.block
+
+/// Writes block `block` through to the disk and the cache.
+pub fn Volume.put_block[D: Storage](
+    mut self,
+    disk: D,
+    block: u64,
+    take bytes: mem::Bytes,
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    try await disk.write(block, data: copy(bytes, alloc), alloc)
+    var at: usize = 0
+    while at < self.cached.len() {
+        if self.cached[at].block == block {
+            discard mut self.cached.remove(at)
+        } else {
+            at += 1
+        }
+    }
+    mut self.keep(block, take bytes)
+} Volume.put_block
+
+/// Keeps a block in the cache, dropping the oldest past `CACHE_BYTES`.
+fn Volume.keep(mut self, block: u64, take bytes: mem::Bytes) {
+    let most = CACHE_BYTES / usize.widen(self.geometry.block_bytes)
+    while self.cached.len() >= most and self.cached.len() > 0 {
+        discard mut self.cached.remove(0)
+    }
+    mut self.cached.push(Cached(block: block, bytes: take bytes))
+} Volume.keep
+
+/// Drops the cache, under memory pressure.
+pub fn Volume.drop_cache(mut self) {
+    mut self.cached.truncate(0)
+} Volume.drop_cache
+
+/// Where FAT entry `cluster` lies in FAT `copy`: its block and its byte offset there.
+struct FatPlace derives Copy {
+    block: u64
+    offset: usize
+} FatPlace
+
+fn Volume.entry_place(self, cluster: u32, fat_index: u32) -> FatPlace {
+    let bytes = match self.geometry.kind {
+        Variant.Fat12 => u64.widen(cluster) + u64.widen(cluster) / 2
+        Variant.Fat16 => u64.widen(cluster) * 2
+        Variant.Fat32 => u64.widen(cluster) * 4
+    }
+    let block_bytes = u64.widen(self.geometry.block_bytes)
+    return FatPlace(block: self.geometry.fat_start + u64.widen(fat_index) * self.geometry.fat_blocks + bytes / block_bytes, offset: usize.widen(bytes % block_bytes))
+} Volume.entry_place
+
+/// The FAT entry of `cluster`: the next cluster of its chain, 0 when free, `END` when it ends the chain or is bad.
+pub fn Volume.next[D: Storage](mut self, disk: D, cluster: u32, alloc: mem::Alloc) -> u32 fails Failure uses wait {
+    let place = self.entry_place(cluster, fat_index: 0)
+    let block = try await mut self.block(disk, block: place.block, alloc)
+    var raw: u32 = 0
+    match self.geometry.kind {
+        Variant.Fat12 => {
+            var high: u32 = 0
+            if place.offset + 1 < block.len() {
+                high = u32.widen(block[place.offset + 1])
+            } else {
+                let following = try await mut self.block(disk, block: place.block + 1, alloc)
+                high = u32.widen(following[0])
+            }
+            let pair = u32.widen(block[place.offset]) | (high << 8)
+            raw = pair & 0xFFF
+            if cluster % 2 == 1 {
+                raw = pair >> 4
+            }
+        }
+        Variant.Fat16 => {
+            raw = u32.widen(block.view().u16_le(place.offset))
+        }
+        Variant.Fat32 => {
+            raw = block.view().u32_le(place.offset) & 0x0FFF_FFFF
+        }
+    }
+    let last: u32 = match self.geometry.kind {
+        Variant.Fat12 => 0xFF7
+        Variant.Fat16 => 0xFFF7
+        Variant.Fat32 => 0x0FFF_FFF7
+    }
+    if raw == 0 {
+        return 0
+    }
+    if raw >= last or not self.geometry.holds(raw) {
+        return END
+    }
+    return raw
+} Volume.next
+
+/// The used clusters `reached` does not mark, read from the first FAT in runs of at most `SCAN_BYTES`; clusters marked bad stay used.
+pub fn Volume.unreached[D: Storage](self, disk: D, reached: mem::Bytes, alloc: mem::Alloc) -> mem::List[u32] fails Failure uses wait {
+    var unused = mem::List[u32].empty(alloc)
+    let geometry = self.geometry
+    let block_bytes = u64.widen(geometry.block_bytes)
+    let bits = geometry.entry_bits()
+    let entries = u64.widen(geometry.clusters) + 2
+    let needed = ((entries * bits + 7) / 8 + 1 + block_bytes - 1) / block_bytes
+    let run = match geometry.kind {
+        Variant.Fat12 => needed
+        else => SCAN_BYTES / block_bytes
+    }
+    var block: u64 = 0
+    while block < needed and block < geometry.fat_blocks {
+        let count = min_u64(run, b: min_u64(needed, b: geometry.fat_blocks) - block)
+        let raw = try await disk.read(geometry.fat_start + block, count: u32.truncate(count), alloc)
+        let bytes = admitted(raw.view(), alloc)
+        let start = block * block_bytes
+        let past = min_u64(entries, b: (start + u64.widen(bytes.len())) * 8 / bits)
+        var cluster = start * 8 / bits
+        if cluster < 2 {
+            cluster = 2
+        }
+        while cluster < past {
+            let index = u32.truncate(cluster)
+            let offset = usize.widen(cluster * bits / 8 - start)
+            let value = geometry.raw_entry(bytes.view(), offset, cluster: index)
+            if value != 0 and value != geometry.bad() and not is_reached(reached, cluster: index) {
+                mut unused.push(index)
+            }
+            cluster += 1
+        }
+        block += count
+    }
+    return unused
+} Volume.unreached
+
+/// Whether `reached` marks `cluster`.
+pub fn is_reached(reached: mem::Bytes, cluster: u32) -> bool {
+    let index = usize.widen(cluster)
+    return (reached[index / 8] & (1u8 << u32.truncate(index % 8))) != 0
+} is_reached
+
+/// The bits of a FAT entry.
+fn Geometry.entry_bits(self) -> u64 {
+    return match self.kind {
+        Variant.Fat12 => 12
+        Variant.Fat16 => 16
+        Variant.Fat32 => 32
+    }
+} Geometry.entry_bits
+
+/// The value of a FAT entry that marks its cluster bad.
+fn Geometry.bad(self) -> u32 {
+    return match self.kind {
+        Variant.Fat12 => 0xFF7
+        Variant.Fat16 => 0xFFF7
+        Variant.Fat32 => 0x0FFF_FFF7
+    }
+} Geometry.bad
+
+/// The stored FAT entry of `cluster` at `offset` in `bytes`, which hold its bytes.
+fn Geometry.raw_entry(self, bytes: Slice[u8], offset: usize, cluster: u32) -> u32 {
+    match self.kind {
+        Variant.Fat12 => {
+            let pair = u32.widen(bytes[offset]) | (u32.widen(bytes[offset + 1]) << 8)
+            if cluster % 2 == 1 {
+                return pair >> 4
+            }
+            return pair & 0xFFF
+        }
+        Variant.Fat16 => return u32.widen(bytes.u16_le(offset))
+        Variant.Fat32 => return bytes.u32_le(offset) & 0x0FFF_FFFF
+    }
+} Geometry.raw_entry
+
+/// Sets the FAT entry of `cluster` to `value` in every FAT, `END` ending its chain.
+pub fn Volume.set_next[D: Storage](
+    mut self,
+    disk: D,
+    cluster: u32,
+    value: u32,
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    let stored: u32 = match value == END {
+        true => match self.geometry.kind {
+            Variant.Fat12 => 0xFFF
+            Variant.Fat16 => 0xFFFF
+            Variant.Fat32 => 0x0FFF_FFFF
+        }
+        false => value
+    }
+    for fat_index in 0..<self.geometry.fats {
+        let place = self.entry_place(cluster, fat_index)
+        var block = try await mut self.block(disk, block: place.block, alloc)
+        match self.geometry.kind {
+            Variant.Fat12 => {
+                if place.offset + 1 >= block.len() {
+                    var next = try await mut self.block(disk, block: place.block + 1, alloc)
+                    set_fat12(cluster, stored, low: mut block, high_block: mut next, place)
+                    try await mut self.put_block(disk, block: place.block + 1, bytes: take next, alloc)
+                } else {
+                    let pair = u32.widen(block[place.offset]) | (u32.widen(block[place.offset + 1]) << 8)
+                    let merged = match cluster % 2 {
+                        0 => (pair & 0xF000) | stored
+                        else => (pair & 0x000F) | (stored << 4)
+                    }
+                    block[place.offset] = u8.truncate(merged)
+                    block[place.offset + 1] = u8.truncate(merged >> 8)
+                }
+            }
+            Variant.Fat16 => mut block.view_mut().write_u16_le(place.offset, value: u16.truncate(stored))
+            Variant.Fat32 => {
+                let kept = block.view().u32_le(place.offset) & 0xF000_0000
+                mut block.view_mut().write_u32_le(place.offset, value: kept | stored)
+            }
+        }
+        try await mut self.put_block(disk, block: place.block, bytes: take block, alloc)
+    }
+} Volume.set_next
+
+/// Sets a FAT12 entry whose two bytes straddle a block boundary.
+fn set_fat12(
+    cluster: u32,
+    stored: u32,
+    mut low: mem::Bytes,
+    mut high_block: mem::Bytes,
+    place: FatPlace,
+    ) {
+    let pair = u32.widen(low[place.offset]) | (u32.widen(high_block[0]) << 8)
+    let merged = match cluster % 2 {
+        0 => (pair & 0xF000) | stored
+        else => (pair & 0x000F) | (stored << 4)
+    }
+    low[place.offset] = u8.truncate(merged)
+    high_block[0] = u8.truncate(merged >> 8)
+} set_fat12
+
+/// The clusters of the chain from `start`, in order, at most the volume's count.
+pub fn Volume.chain[D: Storage](mut self, disk: D, start: u32, alloc: mem::Alloc) -> mem::List[u32] fails Failure uses wait {
+    var clusters = mem::List[u32].empty(alloc)
+    var cluster = start
+    while self.geometry.holds(cluster) and clusters.len() <= usize.widen(self.geometry.clusters) {
+        mut clusters.push(cluster)
+        cluster = try await mut self.next(disk, cluster, alloc)
+    }
+    return clusters
+} Volume.chain
+
+/// Frees every cluster of the chain from `start`.
+pub fn Volume.free_chain[D: Storage](mut self, disk: D, start: u32, alloc: mem::Alloc) fails Failure uses wait {
+    let clusters = try await mut self.chain(disk, start, alloc)
+    for cluster in clusters {
+        try await mut self.set_next(disk, cluster, value: 0, alloc)
+    }
+} Volume.free_chain
+
+/// Takes `count` free clusters, contiguous when `contiguous`, chains them and gives them in order; fails with `no-space` when the volume has not that many.
+pub fn Volume.take_clusters[D: Storage](
+    mut self,
+    disk: D,
+    count: u32,
+    contiguous: bool,
+    alloc: mem::Alloc,
+    ) -> mem::List[u32] fails Failure uses wait {
+    var taken = mem::List[u32].empty(alloc)
+    var cluster: u32 = 2
+    while taken.len() < usize.widen(count) and self.geometry.holds(cluster) {
+        let unused = try await mut self.next(disk, cluster, alloc) == 0
+        if unused {
+            if contiguous and taken.len() > 0 and taken[taken.len() - 1] + 1 != cluster {
+                mut taken.truncate(0)
+            }
+            mut taken.push(cluster)
+        } else if contiguous {
+            mut taken.truncate(0)
+        }
+        cluster += 1
+    }
+    if taken.len() < usize.widen(count) {
+        fail FatError.NoSpace
+    }
+    for at in 0..<taken.len() {
+        let next = match at + 1 < taken.len() {
+            true => taken[at + 1]
+            false => END
+        }
+        try await mut self.set_next(disk, cluster: taken[at], value: next, alloc)
+    }
+    return taken
+} Volume.take_clusters
+
+fn copy(bytes: mem::Bytes, alloc: mem::Alloc) -> mem::Bytes {
+    var copied = mem::Bytes.empty(alloc)
+    mut copied.append(bytes.view())
+    return copied
+} copy

@@ -60,7 +60,7 @@ pub closed enum Code derives Copy, Eq, Render, Encode {
 pub protocol Devices {
     /// The number of devices bound to a driver, once every binding under way has bound or failed.
     pub fn settled() -> u32 limits recorded
-    fn listed(found: mem::List[Found]) limits irreversible(emit, actuate, erase, spend)
+    fn listed(found: mem::List[Found], failed: mem::List[BusPath]) limits irreversible(emit, actuate, erase, spend)
     fn bound(index: u32, moniker: ident::Moniker, lifecycle: Option[os::Lifecycle]) limits irreversible(emit, actuate, erase, spend)
     fn volumes(index: u32, units: mem::List[UnitRecord]) limits irreversible(emit, actuate, erase, spend)
     fn viewed(moniker: ident::Moniker, held: bool) limits irreversible(emit, actuate, erase, spend)
@@ -94,17 +94,15 @@ impl Manager: sys::Resume[Env, Devices]
 
 pub fn Manager.start(mut env: Env) -> Manager = Manager(records: mem::List.empty(env.alloc), views: mem::List.empty(env.alloc), binding: 0, discovered: false, boot_resolved: false, waiting: mem::List.empty(env.alloc), events: 0)
 
-/// Once started, lists the devices the keeper holds.
+/// Once started, lists the devices the keeper holds, the platform devices of the AML namespace declared first.
 pub fn Manager.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Devices]) {
     let root = env.root
+    let control = env.control
+    let bundle = env.bundle
     let alloc = env.alloc
-    mut cx.spawn(key: DISCOVERY, run: fn(out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
-        let found = match first attempt await root.devices(alloc) {
-            Ok(listed) => listed
-            Err(RootError.Cancelled(cancelled)) => fail cancelled
-            Err(_) => mem::List.empty(alloc)
-        }
-        discard attempt await out.listed(take found)
+    mut cx.spawn(key: DISCOVERY, run: fn(out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
+        let Discovered(found: found, failed: failed) = try await discover(root, control, bundle, alloc)
+        discard attempt await out.listed(take found, take failed)
     })
 } Manager.resume
 
@@ -131,8 +129,14 @@ fn Manager.bound_count(self) -> u32 {
     return count
 } Manager.bound_count
 
-/// Records each device newly found and binds its driver.
-fn Manager.listed(mut self, take found: mem::List[Found], mut env: Env, mut cx: sys::Cx[Devices]) {
+/// Records each device newly found and binds its driver, but for a platform device whose `_CRS` evaluation failed.
+fn Manager.listed(
+    mut self,
+    take found: mem::List[Found],
+    take failed: mem::List[BusPath],
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
     for each in take found {
         let Found(path: path, ids: ids, resources: resources, core: core) = each
         if self.index_of(path).is_some() {
@@ -145,6 +149,10 @@ fn Manager.listed(mut self, take found: mem::List[Found], mut env: Env, mut cx: 
             self.records[usize.widen(index)].status = Status.Converged
             continue
         }
+        if listed_in(failed, path) {
+            self.records[usize.widen(index)].status = Status.Failed(Code.Aml)
+            continue
+        }
         mut self.bind(index, choice: DriverChoice.Automatic, mut env, mut cx)
     }
     self.discovered = true
@@ -152,7 +160,13 @@ fn Manager.listed(mut self, take found: mem::List[Found], mut env: Env, mut cx: 
 } Manager.listed
 
 /// Chooses the driver of the device at `index` and has a keyed task create and start its instance.
-fn Manager.bind(mut self, index: u32, choice: DriverChoice, mut env: Env, mut cx: sys::Cx[Devices]) {
+fn Manager.bind(
+    mut self,
+    index: u32,
+    choice: DriverChoice,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
     let at = usize.widen(index)
     let ids = self.records[at].ids
     let entries = candidates(env.alloc)
@@ -179,12 +193,19 @@ fn Manager.bind(mut self, index: u32, choice: DriverChoice, mut env: Env, mut cx
     let spec = os::InstanceSpec.of(principal: ident::Principal(text: text::Fixed[64].of("system")), bundle: env.bundle, component: entry.component.as_str(), alloc)
     mut cx.spawn(key: BINDING + u64.widen(index), run: fn[take moniker, take spec](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
         let lifecycle = try await start_driver(control, clock, moniker, take spec, path, alloc)
-        discard attempt await out.bound(index, moniker: take moniker, lifecycle: lifecycle)
+        discard attempt await out.bound(index, take moniker, lifecycle)
     })
 } Manager.bind
 
 /// Records how the driver of the device at `index` started: `converged` once it runs, else `failed`, its device cut off.
-fn Manager.bound(mut self, take index: u32, take moniker: ident::Moniker, take lifecycle: Option[os::Lifecycle], mut env: Env, mut cx: sys::Cx[Devices]) {
+fn Manager.bound(
+    mut self,
+    take index: u32,
+    take moniker: ident::Moniker,
+    take lifecycle: Option[os::Lifecycle],
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
     let at = usize.widen(index)
     if at >= self.records.len() {
         return
@@ -211,7 +232,13 @@ fn Manager.bound(mut self, take index: u32, take moniker: ident::Moniker, take l
 } Manager.bound
 
 /// What a bound driver's device protocol brings: a block device's units are read, and a device of a role class holds it when no other does.
-fn Manager.serve_class(mut self, index: u32, moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Devices]) {
+fn Manager.serve_class(
+    mut self,
+    index: u32,
+    moniker: ident::Moniker,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
     let Some(name) = self.records[usize.widen(index)].entry else {
         return
     }
@@ -243,6 +270,15 @@ fn Manager.answer_settled(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
     }
     mut self.waiting.truncate(0)
 } Manager.answer_settled
+
+fn listed_in(paths: mem::List[BusPath], path: BusPath) -> bool {
+    for each in paths {
+        if each == path {
+            return true
+        }
+    }
+    return false
+} listed_in
 
 /// The index of the record of the device at `path`.
 fn Manager.index_of(self, path: BusPath) -> Option[usize] {
@@ -332,7 +368,14 @@ fn holder_of(moniker: ident::Moniker) -> ident::Principal {
 } holder_of
 
 /// Has a keyed task of its own record a device event through the root.
-fn Manager.emit(mut self, root: Root, kind: EventKind, path: BusPath, argument: u64, mut cx: sys::Cx[Devices]) {
+fn Manager.emit(
+    mut self,
+    root: Root,
+    kind: EventKind,
+    path: BusPath,
+    argument: u64,
+    mut cx: sys::Cx[Devices],
+    ) {
     let event = Event(kind: kind, path: path, argument: argument)
     self.events += 1
     mut cx.spawn(key: EVENTS + self.events, run: fn(out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 8_192 {

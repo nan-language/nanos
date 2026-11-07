@@ -1,0 +1,618 @@
+//! The `ahci` driver: an AHCI controller serving `Block`, a unit per port holding an ATA disk, in port order, one command in flight per port, completed by MSI interrupt.
+
+/// The key of the keyed task turning interrupts into completions.
+const INTERRUPTS: u64 = 1
+
+/// The ports an HBA has at most.
+const PORTS: u32 = 32
+
+/// The global host control bits: AHCI enable, interrupt enable.
+const AHCI_ENABLE: u32 = 1 << 31
+
+const INTERRUPT_ENABLE: u32 = 1 << 1
+
+/// The port command bits: start, FIS receive enable, FIS receive running, command list running.
+const RUN: u32 = 1
+
+const RECEIVE_FIS: u32 = 1 << 4
+
+const RECEIVING: u32 = 1 << 14
+
+const RUNNING: u32 = 1 << 15
+
+/// The task file's busy, data request and error bits.
+const BUSY: u32 = 0x80
+
+const DATA_REQUEST: u32 = 0x08
+
+const TASK_ERROR: u32 = 0x01
+
+/// The port interrupts the driver enables: a device-to-host register FIS, a PIO setup FIS, and a task file error.
+const PORT_INTERRUPTS: u32 = 0x4000_0003
+
+const TASK_FILE_ERROR: u32 = 0x4000_0000
+
+/// The signature of an ATA disk, and the presence of a device with its PHY up.
+const ATA_SIGNATURE: u32 = 0x0000_0101
+
+const PRESENT: u32 = 3
+
+/// The ATA commands the driver issues.
+const IDENTIFY: u8 = 0xEC
+
+const READ_DMA_EXT: u8 = 0x25
+
+const WRITE_DMA_EXT: u8 = 0x35
+
+const FLUSH_CACHE_EXT: u8 = 0xEA
+
+/// A host-to-device register FIS, the command bit of its second byte, and the LBA mode of its device byte.
+const REGISTER_FIS: u32 = 0x27
+
+const COMMAND_BIT: u32 = 0x80
+
+const LBA_MODE: u32 = 0x40
+
+/// The bytes one command moves, in segments of `SEGMENT_BYTES`, one PRDT entry each.
+const TRANSFER_BYTES: u32 = 65_536
+
+const SEGMENT_BYTES: u32 = 8_192
+
+const SEGMENT_COUNT: u32 = 8
+
+/// The bytes of the command list and of the received-FIS area, which the hardware wants aligned to them, and the alignment of the command table.
+const LIST_BYTES: u64 = 1_024
+
+const FIS_BYTES: u64 = 256
+
+const TABLE_ALIGN: u64 = 128
+
+/// How many times setting up a port polls the hardware before giving up.
+const MOST_POLLS: u32 = 1_000_000
+
+contribute devices::drivers ahci = devices::Registration(name: "ahci", matches: devices::matches(devices::DeviceMatch.PciClass(class: 0x01_0601, mask: 0xFF_FFFF), rest: devices::DeviceMatch.None), class: devices::Class.Block, component: "drivers::ahci::Ahci", priority: 0)
+
+/// What the driver serves: `Block`'s operations, and its controller's completions.
+pub protocol AhciDevice {
+    pub fn info(unit: u16) -> devices::BlockInfo fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn read(unit: u16, block: u64, count: u32) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn write(unit: u16, block: u64, data: mem::Bytes, fua: bool) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn flush(unit: u16) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn discard_blocks(unit: u16, block: u64, count: u32) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    fn completed() limits irreversible(emit, actuate, erase, spend)
+} AhciDevice
+
+/// The HBA's generic host control.
+pub registers Hba {
+    ghc: u32 at 0x04 read write
+    is: u32 at 0x08 write_one_clear
+    pi: u32 at 0x0C read
+} Hba
+
+/// A port's registers, at 0x100 plus 0x80 per port in the ABAR.
+pub registers Port {
+    clb: u32 at 0x00 read write
+    clbu: u32 at 0x04 read write
+    fb: u32 at 0x08 read write
+    fbu: u32 at 0x0C read write
+    is: u32 at 0x10 write_one_clear
+    ie: u32 at 0x14 read write
+    cmd: u32 at 0x18 read write
+    tfd: u32 at 0x20 read
+    sig: u32 at 0x24 read
+    ssts: u32 at 0x28 read
+    serr: u32 at 0x30 write_one_clear
+    ci: u32 at 0x38 read write
+} Port
+
+const PORT_BASE: u64 = 0x100
+
+const PORT_STRIDE: u64 = 0x80
+
+/// A port's memory: its command list, received-FIS area and command table, each placed at the alignment the hardware wants within it.
+pub layout Area: bytes 8_192 le {
+    words: Array[u32, 2_048] at 0
+} Area
+
+/// A segment of the buffer a command moves.
+pub layout Segment: bytes 8_192 le {
+    data: Array[u8, 8_192] at 0
+} Segment
+
+/// A port holding a disk: its registers, the disk's geometry, its memory with the offsets of its structures in it, and the segments of its buffer.
+pub open linear struct Disk derives Send {
+    regs: hw::Mmio[Port]
+    info: devices::BlockInfo
+    area: hw::DmaShared[Area]
+    list: u64
+    table: u64
+    segments: mem::List[hw::DmaShared[Segment]]
+} Disk
+
+/// The driver's Env: its function, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, and its cell.
+pub open linear struct AhciEnv derives Send {
+    function: hw::PciFunction
+    abar: hw::Mmio[Hba]
+    disks: mem::List[Disk]
+    irq: hw::IrqShared[Interrupt]
+    signal: mem::Shared[hw::Signal[Unit]]
+    alloc: mem::Alloc
+} AhciEnv
+
+/// What the driver's interrupt fn holds: the signal its keyed task waits on.
+pub closed struct Interrupt {
+    pub signal: mem::Shared[hw::Signal[Unit]]
+} Interrupt
+
+/// What a request asks of a disk.
+pub closed enum Operation derives Copy, Eq, Encode {
+    Read(block: u64, count: u32)
+    Write(block: u64, count: u32)
+    Flush
+} Operation
+
+/// A request waiting for its unit, whether its command is on the disk, and the data a write carries.
+pub closed struct Waiting derives Encode {
+    pub request: u64
+    pub unit: u16
+    pub operation: Operation
+    pub issued: bool
+    pub data: Option[mem::Bytes]
+} Waiting
+
+/// The driver's state: the requests waiting, at most one per unit issued.
+pub closed struct Ahci derives Encode {
+    pub waiting: mem::List[Waiting]
+} Ahci
+
+impl Ahci: sys::Component[AhciEnv, AhciDevice]
+
+impl Ahci: sys::Resume[AhciEnv, AhciDevice]
+
+/// Posts the signal for each interrupt of the controller.
+pub interrupt fn Interrupt.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 512 {
+    self.signal.contents().post(irq.irqs_disabled(), value: Unit)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Interrupt.on_irq
+
+/// The Env over `function`: its ABAR mapped, AHCI mode on, attached to physical memory, each port holding an ATA disk set up and identified, and the controller's interrupt on its MSI vector of CPU 0; `None` when the controller does not allow it or holds no disk, the function then handed back.
+pub fn AhciEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[AhciEnv] {
+    var held = function
+    let Ok(window) = attempt hw::Mmio[Hba].of_bar(mut held, index: 5, offset: 0) else {
+        take held.release()
+        return None
+    }
+    var abar = window
+    if (attempt mut held.attach_physical()).is_err() {
+        take abar.unmap()
+        take held.release()
+        return None
+    }
+    mut abar.write(Hba.ghc, value: mut abar.read(Hba.ghc) | AHCI_ENABLE)
+    let implemented = mut abar.read(Hba.pi)
+    let heap = mem::Heap.of(alloc)
+    var disks = mem::List[Disk].empty(alloc)
+    for port in 0..<PORTS {
+        if ((implemented >> port) & 1) == 0 {
+            continue
+        }
+        match set_up_port(mut held, port, heap, alloc) {
+            Some(disk) => mut disks.push(take disk)
+            None => {
+            }
+        }
+    }
+    if disks.len() == 0 {
+        release(take held, take abar, take disks)
+        return None
+    }
+    let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
+    let irq = match mut held.msi(cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
+        Ok(shared) => shared
+        Err(_) => {
+            release(take held, take abar, take disks)
+            return None
+        }
+    }
+    mut abar.write(Hba.is, value: 0xFFFF_FFFF)
+    mut abar.write(Hba.ghc, value: mut abar.read(Hba.ghc) | INTERRUPT_ENABLE)
+    return Some(AhciEnv(function: take held, abar: take abar, disks: take disks, irq: take irq, signal: take signal, alloc: alloc))
+} AhciEnv.of
+
+/// Stops the ports, then releases the interrupt, the window and the buffers, and hands the function back.
+pub fn AhciEnv.abandon(take self) {
+    let AhciEnv(function: function, abar: abar, disks: disks, irq: irq, signal: _, alloc: _) = self
+    discard take irq.uninstall()
+    release(take function, take abar, take disks)
+} AhciEnv.abandon
+
+/// Stops each disk's port and frees its memory, then unmaps the window and hands the function back, cut off.
+fn release(take function: hw::PciFunction, take abar: hw::Mmio[Hba], take disks: mem::List[Disk]) {
+    var window = abar
+    for disk in take disks {
+        free_disk(take disk)
+    }
+    mut window.write(Hba.ghc, value: mut window.read(Hba.ghc) & ~INTERRUPT_ENABLE)
+    take window.unmap()
+    take function.release()
+} release
+
+fn free_disk(take disk: Disk) {
+    let Disk(regs: regs, info: _, area: area, list: _, table: _, segments: segments) = disk
+    var held = regs
+    stop(mut held)
+    take held.unmap()
+    discard take area.into_box()
+    for segment in take segments {
+        discard take segment.into_box()
+    }
+} free_disk
+
+/// Clears the port's start and FIS receive bits and waits until its command list and FIS receive stop running.
+fn stop(mut regs: hw::Mmio[Port]) {
+    mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) & ~RUN)
+    var polls: u32 = 0
+    while (mut regs.read(Port.cmd) & RUNNING) != 0 and polls < MOST_POLLS {
+        polls += 1
+    }
+    mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) & ~RECEIVE_FIS)
+    polls = 0
+    while (mut regs.read(Port.cmd) & RECEIVING) != 0 and polls < MOST_POLLS {
+        polls += 1
+    }
+} stop
+
+/// The disk on `port` of `function` when it holds an ATA disk: its registers mapped, its memory drawn from `heap`, its port started, and the disk identified; `None` otherwise, what it took released.
+fn set_up_port(mut function: hw::PciFunction, port: u32, heap: mem::Heap, alloc: mem::Alloc) -> Option[Disk] {
+    let Ok(window) = attempt hw::Mmio[Port].of_bar(mut function, index: 5, offset: PORT_BASE + PORT_STRIDE * u64.widen(port)) else {
+        return None
+    }
+    var regs = window
+    if (mut regs.read(Port.ssts) & 0xF) != PRESENT {
+        take regs.unmap()
+        return None
+    }
+    stop(mut regs)
+    let area = hw::DmaShared.of(heap.boxed(Area.from_bits(Array[u8, 8_192].filled(0))), space: hw::IoSpace.physical())
+    var segments = mem::List[hw::DmaShared[Segment]].empty(alloc)
+    for _ in 0..<SEGMENT_COUNT {
+        mut segments.push(hw::DmaShared.of(heap.boxed(Segment.from_bits(Array[u8, 8_192].filled(0))), space: hw::IoSpace.physical()))
+    }
+    let base = area.bus_addr().value
+    let list = align_up(base, to: LIST_BYTES) - base
+    let fis = list + LIST_BYTES
+    let table = align_up(base + fis + FIS_BYTES, to: TABLE_ALIGN) - base
+    mut regs.write(Port.clb, value: u32.truncate(base + list))
+    mut regs.write(Port.clbu, value: u32.truncate((base + list) >> 32))
+    mut regs.write(Port.fb, value: u32.truncate(base + fis))
+    mut regs.write(Port.fbu, value: u32.truncate((base + fis) >> 32))
+    mut regs.write(Port.serr, value: 0xFFFF_FFFF)
+    mut regs.write(Port.is, value: 0xFFFF_FFFF)
+    mut regs.write(Port.ie, value: PORT_INTERRUPTS)
+    mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) | RECEIVE_FIS)
+    var polls: u32 = 0
+    while (mut regs.read(Port.tfd) & (BUSY | DATA_REQUEST)) != 0 and polls < MOST_POLLS {
+        polls += 1
+    }
+    // The signature comes with the device's first FIS, which the port receives only once FIS receive is on.
+    if mut regs.read(Port.sig) != ATA_SIGNATURE {
+        stop(mut regs)
+        take regs.unmap()
+        discard take area.into_box()
+        for segment in take segments {
+            discard take segment.into_box()
+        }
+        return None
+    }
+    mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) | RUN)
+    var disk = Disk(regs: take regs, info: devices::BlockInfo(units: 1, block_bytes: 512, blocks: 0, max_transfer_bytes: TRANSFER_BYTES, zone_blocks: 0, cache: false, fua: false, discards: false, read_only: false), area: take area, list: list, table: table, segments: take segments)
+    issue(mut disk, command: IDENTIFY, lba: 0, sectors: 1, bytes: 512, write: false)
+    polls = 0
+    while (mut disk.regs.read(Port.ci) & 1) != 0 and polls < MOST_POLLS {
+        polls += 1
+    }
+    let failed = (mut disk.regs.read(Port.tfd) & TASK_ERROR) != 0 or polls == MOST_POLLS
+    mut disk.regs.write(Port.is, value: 0xFFFF_FFFF)
+    if failed {
+        free_disk(take disk)
+        return None
+    }
+    let Some(info) = identified(mut disk) else {
+        free_disk(take disk)
+        return None
+    }
+    disk.info = info
+    return Some(take disk)
+} set_up_port
+
+/// The geometry the IDENTIFY DEVICE data in the disk's first segment gives: its LBA48 capacity, its logical sector size and its write cache; `None` without LBA48.
+fn identified(mut disk: Disk) -> Option[devices::BlockInfo] {
+    let supported = word(mut disk, index: 83)
+    if (supported & (1 << 10)) == 0 {
+        return None
+    }
+    var sectors: u64 = 0
+    for index in 0..<4usize {
+        sectors = sectors | (u64.widen(word(mut disk, index: 100 + index)) << u32.fit(16 * index))
+    }
+    var block_bytes: u32 = 512
+    let sizing = word(mut disk, index: 106)
+    if (sizing & 0xC000) == 0x4000 and (sizing & (1 << 12)) != 0 {
+        block_bytes = (u32.widen(word(mut disk, index: 117)) | (u32.widen(word(mut disk, index: 118)) << 16)) * 2
+    }
+    if block_bytes != 512 and block_bytes != 4_096 {
+        return None
+    }
+    let cache = (word(mut disk, index: 82) & (1 << 5)) != 0
+    return Some(devices::BlockInfo(units: 1, block_bytes: block_bytes, blocks: sectors, max_transfer_bytes: TRANSFER_BYTES, zone_blocks: 0, cache: cache, fua: false, discards: false, read_only: false))
+} identified
+
+/// The 16-bit word `index` of the IDENTIFY data in the disk's first segment.
+fn word(mut disk: Disk, index: usize) -> u16 {
+    let low = mut disk.segments.at_mut(0).read_acquire_at(Segment.data, index: 2 * index)
+    let high = mut disk.segments.at_mut(0).read_acquire_at(Segment.data, index: 2 * index + 1)
+    return u16.widen(low) | (u16.widen(high) << 8)
+} word
+
+/// Writes the command into slot 0 of the disk's command list: its register FIS for `sectors` sectors from `lba`, one PRDT entry per segment of `bytes`, written to the disk when `write`, then issues it.
+fn issue(
+    mut disk: Disk,
+    command: u8,
+    lba: u64,
+    sectors: u32,
+    bytes: u32,
+    write: bool,
+    ) {
+    let table = usize.widen(disk.table / 4)
+    let list = usize.widen(disk.list / 4)
+    let base = disk.area.bus_addr().value
+    put(mut disk, at: table, bits: REGISTER_FIS | (COMMAND_BIT << 8) | (u32.widen(command) << 16))
+    put(mut disk, at: table + 1, bits: u32.truncate(lba & 0xFF_FFFF) | (LBA_MODE << 24))
+    put(mut disk, at: table + 2, bits: u32.truncate((lba >> 24) & 0xFF_FFFF))
+    put(mut disk, at: table + 3, bits: sectors & 0xFFFF)
+    put(mut disk, at: table + 4, bits: 0)
+    var entries: u32 = 0
+    var left = bytes
+    while left > 0 {
+        let length = match left > SEGMENT_BYTES {
+            true => SEGMENT_BYTES
+            false => left
+        }
+        let address = disk.segments[usize.widen(entries)].bus_addr().value
+        let entry = table + 32 + 4 * usize.widen(entries)
+        put(mut disk, at: entry, bits: u32.truncate(address))
+        put(mut disk, at: entry + 1, bits: u32.truncate(address >> 32))
+        put(mut disk, at: entry + 2, bits: 0)
+        put(mut disk, at: entry + 3, bits: length - 1)
+        left -= length
+        entries += 1
+    }
+    var header = 5u32 | (entries << 16)
+    if write {
+        header = header | (1 << 6)
+    }
+    let table_address = base + disk.table
+    put(mut disk, at: list, bits: header)
+    put(mut disk, at: list + 1, bits: 0)
+    put(mut disk, at: list + 2, bits: u32.truncate(table_address))
+    put(mut disk, at: list + 3, bits: u32.truncate(table_address >> 32))
+    hw::dma_fence()
+    mut disk.regs.write(Port.ci, value: 1)
+} issue
+
+fn put(mut disk: Disk, at: usize, bits: u32) {
+    mut disk.area.write_release_at(Area.words, index: at, value: bits)
+} put
+
+pub fn Ahci.start(mut env: AhciEnv) -> Ahci = Ahci(waiting: mem::List.empty(env.alloc))
+
+/// Once started, turns each interrupt into a completion.
+pub fn Ahci.resume(mut self, reason: sys::ResumeReason, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
+    let signal = env.signal.share()
+    mut cx.spawn(key: INTERRUPTS, run: fn[take signal](out: sys::Outbox[AhciDevice]) fails task::Cancelled uses wait limits stack 8_192 {
+        loop {
+            try await signal.contents().wait()
+            if (attempt await out.completed()).is_err() {
+                return
+            }
+        }
+    })
+} Ahci.resume
+
+pub fn Ahci.info(mut self, take unit: u16, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) -> devices::BlockInfo fails devices::DeviceError {
+    let info = try env.info_of(unit)
+    return devices::BlockInfo(units: u16.fit(env.disks.len()), block_bytes: info.block_bytes, blocks: info.blocks, max_transfer_bytes: info.max_transfer_bytes, zone_blocks: info.zone_blocks, cache: info.cache, fua: info.fua, discards: info.discards, read_only: info.read_only)
+} Ahci.info
+
+/// Queues a read of `count` blocks from `block`, answered once the disk has moved them.
+pub fn Ahci.read(
+    mut self,
+    take unit: u16,
+    take block: u64,
+    take count: u32,
+    mut env: AhciEnv,
+    mut cx: sys::Cx[AhciDevice],
+    ) -> Untrusted[mem::Bytes] fails devices::DeviceError {
+    try in_range(try env.info_of(unit), block, count)
+    mut self.queue_request(unit, operation: Operation.Read(block: block, count: count), data: None, mut env, mut cx)
+    return Untrusted.of(mem::Bytes.empty(env.alloc))
+} Ahci.read
+
+/// Queues a write of whole blocks from `block`; every write is durable once a later flush completes.
+pub fn Ahci.write(
+    mut self,
+    take unit: u16,
+    take block: u64,
+    take data: mem::Bytes,
+    take fua: bool,
+    mut env: AhciEnv,
+    mut cx: sys::Cx[AhciDevice],
+    ) fails devices::DeviceError {
+    let info = try env.info_of(unit)
+    let block_bytes = usize.widen(info.block_bytes)
+    if data.len() == 0 or data.len() % block_bytes != 0 {
+        fail devices::DeviceError.Unaligned
+    }
+    try in_range(info, block, count: u32.saturate(data.len() / block_bytes))
+    mut self.queue_request(unit, operation: Operation.Write(block: block, count: u32.fit(data.len() / block_bytes)), data: Some(take data), mut env, mut cx)
+} Ahci.write
+
+pub fn Ahci.flush(mut self, take unit: u16, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) fails devices::DeviceError {
+    let info = try env.info_of(unit)
+    if not info.cache {
+        return
+    }
+    mut self.queue_request(unit, operation: Operation.Flush, data: None, mut env, mut cx)
+} Ahci.flush
+
+pub fn Ahci.discard_blocks(
+    mut self,
+    take unit: u16,
+    take block: u64,
+    take count: u32,
+    mut env: AhciEnv,
+    mut cx: sys::Cx[AhciDevice],
+    ) fails devices::DeviceError {
+    try in_range(try env.info_of(unit), block, count)
+    fail devices::DeviceError.Unsupported
+} Ahci.discard_blocks
+
+/// The geometry of unit `unit`.
+fn AhciEnv.info_of(self, unit: u16) -> devices::BlockInfo fails devices::DeviceError {
+    let Some(disk) = self.disks.get(usize.widen(unit)) else {
+        fail devices::DeviceError.OutOfRange
+    }
+    return disk.info
+} AhciEnv.info_of
+
+/// Postpones the request and issues it once it is the first of its unit.
+fn Ahci.queue_request(
+    mut self,
+    unit: u16,
+    operation: Operation,
+    take data: Option[mem::Bytes],
+    mut env: AhciEnv,
+    mut cx: sys::Cx[AhciDevice],
+    ) {
+    let Some(request) = mut cx.postpone() else {
+        return
+    }
+    mut self.waiting.push(Waiting(request: request, unit: unit, operation: operation, issued: false, data: take data))
+    mut self.submit(mut env)
+} Ahci.queue_request
+
+/// Clears the controller's and its ports' interrupt status, answers each issued command its disk has completed, then issues the next ones.
+fn Ahci.completed(mut self, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
+    let pending = mut env.abar.read(Hba.is)
+    var errors: u32 = 0
+    for unit in 0..<env.disks.len() {
+        let status = mut env.disks.at_mut(unit).regs.read(Port.is)
+        mut env.disks.at_mut(unit).regs.write(Port.is, value: status)
+        if (status & TASK_FILE_ERROR) != 0 {
+            errors = errors | (1u32 << u32.fit(unit))
+        }
+    }
+    mut env.abar.write(Hba.is, value: pending)
+    var at: usize = 0
+    while at < self.waiting.len() {
+        let unit = usize.widen(self.waiting[at].unit)
+        if not self.waiting[at].issued or (mut env.disks.at_mut(unit).regs.read(Port.ci) & 1) != 0 {
+            at += 1
+            continue
+        }
+        let Waiting(request: request, unit: _, operation: operation, issued: _, data: _) = mut self.waiting.remove(at)
+        let failed = (errors & (1u32 << u32.fit(unit))) != 0 or (mut env.disks.at_mut(unit).regs.read(Port.tfd) & TASK_ERROR) != 0
+        var reply = sys::Encoded.empty(env.alloc)
+        match operation {
+            Operation.Read(block: _, count: blocks) => mem::wire::Codec[Result[Untrusted[mem::Bytes], devices::DeviceError]].encode(read_outcome(failed, mut env, unit, count: blocks), out: mut reply.bytes)
+            else => mem::wire::Codec[Result[Unit, devices::DeviceError]].encode(outcome(failed), out: mut reply.bytes)
+        }
+        discard attempt mut cx.reply(request, reply)
+    }
+    mut self.submit(mut env)
+} Ahci.completed
+
+/// Issues the first waiting request of each unit with no command on its disk.
+fn Ahci.submit(mut self, mut env: AhciEnv) {
+    for unit in 0..<env.disks.len() {
+        let Some(chosen) = self.next_of(unit) else {
+            continue
+        }
+        let block_bytes = env.disks[unit].info.block_bytes
+        let operation = self.waiting[chosen].operation
+        match self.waiting[chosen].data {
+            Some(bytes) => {
+                var at: usize = 0
+                for byte in bytes.view() {
+                    let segment = at / usize.widen(SEGMENT_BYTES)
+                    mut env.disks.at_mut(unit).segments.at_mut(segment).write_release_at(Segment.data, index: at % usize.widen(SEGMENT_BYTES), value: byte)
+                    at += 1
+                }
+            }
+            None => {
+            }
+        }
+        let per_block = block_bytes / 512
+        match operation {
+            Operation.Read(block: from, count: blocks) => issue(mut env.disks.at_mut(unit), command: READ_DMA_EXT, lba: from * u64.widen(per_block), sectors: blocks * per_block, bytes: blocks * block_bytes, write: false)
+            Operation.Write(block: from, count: blocks) => issue(mut env.disks.at_mut(unit), command: WRITE_DMA_EXT, lba: from * u64.widen(per_block), sectors: blocks * per_block, bytes: blocks * block_bytes, write: true)
+            Operation.Flush => issue(mut env.disks.at_mut(unit), command: FLUSH_CACHE_EXT, lba: 0, sectors: 0, bytes: 0, write: false)
+        }
+        self.waiting[chosen].issued = true
+    }
+} Ahci.submit
+
+/// The first waiting request of unit `unit` when none of its requests is issued.
+fn Ahci.next_of(self, unit: usize) -> Option[usize] {
+    var next: Option[usize] = None
+    for at in 0..<self.waiting.len() {
+        if usize.widen(self.waiting[at].unit) != unit {
+            continue
+        }
+        if self.waiting[at].issued {
+            return None
+        }
+        if next.is_none() {
+            next = Some(at)
+        }
+    }
+    return next
+} Ahci.next_of
+
+/// What a command ends with: `device.io` when its disk reported an error.
+fn outcome(failed: bool) -> Result[Unit, devices::DeviceError] {
+    if failed {
+        return Err(devices::DeviceError.Io)
+    }
+    return Ok(Unit)
+} outcome
+
+/// What a read of `count` blocks of unit `unit` ends with: the blocks it moved.
+fn read_outcome(failed: bool, mut env: AhciEnv, unit: usize, count: u32) -> Result[Untrusted[mem::Bytes], devices::DeviceError] {
+    if failed {
+        return Err(devices::DeviceError.Io)
+    }
+    var bytes = mem::Bytes.empty(env.alloc)
+    for at in 0..<usize.widen(count * env.disks[unit].info.block_bytes) {
+        let segment = at / usize.widen(SEGMENT_BYTES)
+        mut bytes.push(mut env.disks.at_mut(unit).segments.at_mut(segment).read_acquire_at(Segment.data, index: at % usize.widen(SEGMENT_BYTES)))
+    }
+    return Ok(Untrusted.of(take bytes))
+} read_outcome
+
+/// Fails a request past the unit's end or above a transfer.
+fn in_range(info: devices::BlockInfo, block: u64, count: u32) fails devices::DeviceError {
+    if count == 0 or u64.widen(count) > info.blocks or block > info.blocks - u64.widen(count) {
+        fail devices::DeviceError.OutOfRange
+    }
+    if u64.widen(count) * u64.widen(info.block_bytes) > u64.widen(info.max_transfer_bytes) {
+        fail devices::DeviceError.TooLarge
+    }
+} in_range
+
+fn align_up(value: u64, to: u64) -> u64
+    requires to > 0
+{
+    return (value + to - 1) / to * to
+} align_up

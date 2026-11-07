@@ -1,0 +1,583 @@
+//! Directories: their 32-byte entries with long names, the lookup of boot volume paths, and the slots new entries take.
+
+/// The attribute bits of an entry: a directory, and the value marking a long-name entry.
+pub const SUBDIRECTORY: u8 = 0x10
+
+const LONG_NAME: u8 = 0x0F
+
+const VOLUME_LABEL: u8 = 0x08
+
+/// The first byte of a free entry, and of the entry ending a directory.
+const FREE: u8 = 0xE5
+
+const ENDS: u8 = 0x00
+
+const ENTRY_BYTES: usize = 32
+
+/// The UTF-16 characters a long-name entry holds, and their byte offsets in it.
+const LONG_CHARS: usize = 13
+
+/// A directory: the fixed root of FAT12 and FAT16, or a chain of clusters.
+pub closed enum Folder derives Copy, Eq, Encode {
+    Root
+    Chain(u32)
+} Folder
+
+/// Where an entry lies: its block and its byte offset there.
+pub closed struct EntrySlot derives Copy, Eq, Encode {
+    pub block: u64
+    pub offset: u32
+} EntrySlot
+
+/// A file or directory a directory lists: its name, its short name, its attributes, first cluster and size, the slot of its short entry, and the slots of its long-name entries before it.
+pub closed struct Listed derives Encode {
+    pub name: text::String
+    pub short: Array[u8, 11]
+    pub attributes: u8
+    pub cluster: u32
+    pub size: u32
+    pub slot: EntrySlot
+    pub long_slots: mem::List[EntrySlot]
+} Listed
+
+pub fn Listed.is_directory(self) -> bool = (self.attributes & SUBDIRECTORY) != 0
+
+/// The directory a found directory entry is, its cluster 0 naming the root.
+pub fn Listed.directory(self) -> Folder {
+    if self.cluster == 0 {
+        return Folder.Root
+    }
+    return Folder.Chain(self.cluster)
+} Listed.directory
+
+/// The volume's root directory.
+pub fn Volume.root(self) -> Folder {
+    return match self.geometry.kind {
+        Variant.Fat32 => Folder.Chain(self.geometry.root_cluster)
+        else => Folder.Root
+    }
+} Volume.root
+
+/// The blocks of a directory, in order.
+pub fn Volume.directory_blocks[D: Storage](mut self, disk: D, directory: Folder, alloc: mem::Alloc) -> mem::List[u64] fails Failure uses wait {
+    var blocks = mem::List[u64].empty(alloc)
+    match directory {
+        Folder.Root => {
+            let count = (u64.widen(self.geometry.root_entries) * 32 + u64.widen(self.geometry.block_bytes) - 1) / u64.widen(self.geometry.block_bytes)
+            for at in 0..<count {
+                mut blocks.push(self.geometry.root_start + at)
+            }
+        }
+        Folder.Chain(start) => {
+            let clusters = try await mut self.chain(disk, start, alloc)
+            for cluster in clusters {
+                let first_block = self.geometry.cluster_block(cluster)
+                for at in 0..<u64.widen(self.geometry.cluster_blocks) {
+                    mut blocks.push(first_block + at)
+                }
+            }
+        }
+    }
+    return blocks
+} Volume.directory_blocks
+
+/// The files and directories a directory lists, `.` and `..` left out.
+pub fn Volume.entries[D: Storage](mut self, disk: D, directory: Folder, alloc: mem::Alloc) -> mem::List[Listed] fails Failure uses wait {
+    var found = mem::List[Listed].empty(alloc)
+    var long = mem::List[u16].empty(alloc)
+    var long_slots = mem::List[EntrySlot].empty(alloc)
+    var checksum: u8 = 0
+    let blocks = try await mut self.directory_blocks(disk, directory, alloc)
+    for block in blocks {
+        let bytes = try await mut self.block(disk, block, alloc)
+        var offset: usize = 0
+        while offset + ENTRY_BYTES <= bytes.len() {
+            let slot = EntrySlot(block: block, offset: u32.fit(offset))
+            let head = bytes[offset]
+            let attributes = bytes[offset + 11]
+            offset += ENTRY_BYTES
+            if head == ENDS {
+                return found
+            }
+            if head == FREE {
+                mut long.truncate(0)
+                mut long_slots.truncate(0)
+                continue
+            }
+            if attributes == LONG_NAME {
+                if (head & 0x40) != 0 {
+                    mut long.truncate(0)
+                    mut long_slots.truncate(0)
+                    checksum = bytes[offset - ENTRY_BYTES + 13]
+                }
+                prepend_long(mut long, entry: bytes.view(), at: offset - ENTRY_BYTES, alloc)
+                mut long_slots.push(slot)
+                continue
+            }
+            var short = Array[u8, 11].filled(0)
+            for at in 0..<11usize {
+                short[at] = bytes[offset - ENTRY_BYTES + at]
+            }
+            let named_long = long.len() > 0 and short_checksum(short) == checksum
+            let skipped = (attributes & VOLUME_LABEL) != 0 or short[0] == b'.'
+            if not skipped {
+                let start = offset - ENTRY_BYTES
+                let cluster = (u32.widen(bytes.view().u16_le(start + 20)) << 16) | u32.widen(bytes.view().u16_le(start + 26))
+                let name = match named_long {
+                    true => text_of(long, alloc)
+                    false => short_text(short, alloc)
+                }
+                mut found.push(Listed(name: take name, short: short, attributes: attributes, cluster: cluster, size: bytes.view().u32_le(start + 28), slot: slot, long_slots: slots_kept(long_slots, kept: named_long, alloc)))
+            }
+            mut long.truncate(0)
+            mut long_slots.truncate(0)
+        }
+    }
+    return found
+} Volume.entries
+
+/// A copy of `slots` when `kept`, else none.
+fn slots_kept(slots: mem::List[EntrySlot], kept: bool, alloc: mem::Alloc) -> mem::List[EntrySlot] {
+    var copied = mem::List[EntrySlot].empty(alloc)
+    if kept {
+        for each in slots {
+            mut copied.push(each)
+        }
+    }
+    return copied
+} slots_kept
+
+/// Puts the characters of the long-name entry at `at` in front of those of the entries after it, which a directory lists before it.
+fn prepend_long(mut long: mem::List[u16], entry: Slice[u8], at: usize, alloc: mem::Alloc) {
+    var chars = mem::List[u16].empty(alloc)
+    for offset in long_offsets() {
+        let unit = entry.u16_le(at + offset)
+        if unit == 0 or unit == 0xFFFF {
+            break
+        }
+        mut chars.push(unit)
+    }
+    for unit in long {
+        mut chars.push(unit)
+    }
+    mut long.truncate(0)
+    for unit in chars {
+        mut long.push(unit)
+    }
+} prepend_long
+
+/// The byte offsets of a long-name entry's 13 characters.
+fn long_offsets() -> Array[usize, 13] limits pure {
+    var offsets = Array[usize, 13].filled(0)
+    for at in 0..<5usize {
+        offsets[at] = 1 + 2 * at
+    }
+    for at in 0..<6usize {
+        offsets[5 + at] = 14 + 2 * at
+    }
+    offsets[11] = 28
+    offsets[12] = 30
+    return offsets
+} long_offsets
+
+/// The text of UTF-16 code units of the basic plane, `?` for a surrogate.
+fn text_of(units: mem::List[u16], alloc: mem::Alloc) -> text::String {
+    var name = text::String.empty(alloc)
+    for unit in units {
+        let shown = match unit >= 0xD800 and unit <= 0xDFFF {
+            true => '?'
+            false => char.checked_from_bits(u32.widen(unit)).value_or('?')
+        }
+        mut name.push(shown)
+    }
+    return name
+} text_of
+
+/// `NAME.EXT` of a short name, without its padding.
+fn short_text(short: Array[u8, 11], alloc: mem::Alloc) -> text::String {
+    var name = text::String.empty(alloc)
+    for at in 0..<8usize {
+        if short[at] != b' ' {
+            mut name.push(char.checked_from_bits(u32.widen(short[at])).value_or('?'))
+        }
+    }
+    if short[8] != b' ' {
+        mut name.push('.')
+        for at in 8..<11usize {
+            if short[at] != b' ' {
+                mut name.push(char.checked_from_bits(u32.widen(short[at])).value_or('?'))
+            }
+        }
+    }
+    return name
+} short_text
+
+/// The checksum a long name's entries hold of its short name.
+pub fn short_checksum(short: Array[u8, 11]) -> u8 {
+    var sum: u8 = 0
+    for byte in short {
+        sum = ((sum & 1) << 7).wrapping_add(sum >> 1).wrapping_add(byte)
+    }
+    return sum
+} short_checksum
+
+/// Whether two names are equal without regard to ASCII case.
+pub fn same_name(a: Str, b: Str) -> bool {
+    let left = a.as_bytes()
+    let right = b.as_bytes()
+    if left.len() != right.len() {
+        return false
+    }
+    for at in 0..<left.len() {
+        if folded(left[at]) != folded(right[at]) {
+            return false
+        }
+    }
+    return true
+} same_name
+
+fn folded(byte: u8) -> u8 {
+    if byte >= b'a' and byte <= b'z' {
+        return byte - 32
+    }
+    return byte
+} folded
+
+/// The entry `name` names in `directory`.
+pub fn Volume.find[D: Storage](
+    mut self,
+    disk: D,
+    directory: Folder,
+    name: Str,
+    alloc: mem::Alloc,
+    ) -> Option[Listed] fails Failure uses wait {
+    let listed = try await mut self.entries(disk, directory, alloc)
+    for each in take listed {
+        if same_name(each.name.as_str(), b: name) or same_name(short_text(each.short, alloc).as_str(), b: name) {
+            return Some(take each)
+        }
+    }
+    return None
+} Volume.find
+
+/// The components of a boot volume path such as `/nanos/boot.rec`, `None` when it is not one.
+pub fn components(path: Str, alloc: mem::Alloc) -> Option[mem::List[text::String]] {
+    let bytes = path.as_bytes()
+    if bytes.len() == 0 or bytes[0] != b'/' {
+        return None
+    }
+    var parts = mem::List[text::String].empty(alloc)
+    var part = text::String.empty(alloc)
+    for at in 1..<bytes.len() {
+        let byte = bytes[at]
+        if byte == b'/' {
+            if part.byte_len() == 0 {
+                return None
+            }
+            mut parts.push(take part)
+            part = text::String.empty(alloc)
+            continue
+        }
+        if byte < 0x20 or byte == b'\\' or byte == b':' or byte == b'*' or byte == b'?' or byte == b'"' or byte == b'<' or byte == b'>' or byte == b'|' {
+            return None
+        }
+        mut part.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+    }
+    if part.byte_len() > 0 {
+        mut parts.push(take part)
+    }
+    return Some(take parts)
+} components
+
+/// The entry a path names, `None` for the root itself and when nothing is there.
+pub fn Volume.lookup[D: Storage](mut self, disk: D, path: Str, alloc: mem::Alloc) -> Option[Listed] fails Failure uses wait {
+    let Some(parts) = components(path, alloc) else {
+        fail FatError.NotFound
+    }
+    var directory = self.root()
+    var found: Option[Listed] = None
+    for part in parts {
+        let Some(entry) = try await mut self.find(disk, directory, name: part.as_str(), alloc) else {
+            return None
+        }
+        directory = entry.directory()
+        found = Some(take entry)
+    }
+    return found
+} Volume.lookup
+
+/// The short name `name` takes in `directory`: its own when it is a valid upper-case 8.3 name, else its first six letters and digits, `~n` and its extension's first three, n the lowest no entry takes.
+pub fn Volume.short_name[D: Storage](
+    mut self,
+    disk: D,
+    directory: Folder,
+    name: Str,
+    alloc: mem::Alloc,
+    ) -> ShortName fails Failure uses wait {
+    let bytes = name.as_bytes()
+    var dot = bytes.len()
+    for at in 0..<bytes.len() {
+        if bytes[at] == b'.' {
+            dot = at
+        }
+    }
+    var base = mem::List[u8].empty(alloc)
+    var extension = mem::List[u8].empty(alloc)
+    var exact = dot <= 8 and (bytes.len() - dot) <= 4
+    for at in 0..<bytes.len() {
+        if at == dot {
+            continue
+        }
+        let byte = bytes[at]
+        let valid = (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') or byte == b'_' or byte == b'-'
+        let usable = valid or (byte >= b'a' and byte <= b'z')
+        if not valid {
+            exact = false
+        }
+        if not usable {
+            continue
+        }
+        if at < dot {
+            mut base.push(folded(byte))
+        } else {
+            mut extension.push(folded(byte))
+        }
+    }
+    let listed = try await mut self.entries(disk, directory, alloc)
+    var short = Array[u8, 11].filled(b' ')
+    for at in 0..<min(extension.len(), b: 3) {
+        short[8 + at] = extension[at]
+    }
+    if exact and base.len() > 0 {
+        for at in 0..<base.len() {
+            short[at] = base[at]
+        }
+        return ShortName(short: short, exact: true)
+    }
+    var index: u32 = 1
+    loop {
+        var candidate = short
+        let digits = decimal_digits(index)
+        let kept = min(base.len(), b: 7 - digits.len())
+        for at in 0..<kept {
+            candidate[at] = base[at]
+        }
+        candidate[kept] = b'~'
+        for at in 0..<digits.len() {
+            candidate[kept + 1 + at] = digits[at]
+        }
+        var taken = false
+        for each in listed {
+            if each.short == candidate {
+                taken = true
+            }
+        }
+        if not taken {
+            return ShortName(short: candidate, exact: false)
+        }
+        index += 1
+    }
+} Volume.short_name
+
+/// A short name, and whether it is the entry's whole name, needing no long-name entries.
+pub closed struct ShortName derives Copy, Eq {
+    pub short: Array[u8, 11]
+    pub exact: bool
+} ShortName
+
+fn decimal_digits(value: u32) -> mem::Bounded[u8, 10] {
+    var reversed = mem::Bounded[u8, 10].empty()
+    var rest = value
+    loop {
+        mut reversed.push(b'0' + u8.truncate(rest % 10))
+        rest = rest / 10
+        if rest == 0 {
+            break
+        }
+    }
+    var digits = mem::Bounded[u8, 10].empty()
+    var at = reversed.len()
+    while at > 0 {
+        at -= 1
+        mut digits.push(reversed[at])
+    }
+    return digits
+} decimal_digits
+
+fn min(a: usize, b: usize) -> usize {
+    if a < b {
+        return a
+    }
+    return b
+} min
+
+/// `count` free slots in a row in `directory`, a chained directory growing by a zeroed cluster when it has none; `no-space` when the fixed root is full.
+pub fn Volume.free_slots[D: Storage](
+    mut self,
+    disk: D,
+    directory: Folder,
+    count: usize,
+    alloc: mem::Alloc,
+    ) -> mem::List[EntrySlot] fails Failure uses wait {
+    var run = mem::List[EntrySlot].empty(alloc)
+    let blocks = try await mut self.directory_blocks(disk, directory, alloc)
+    for block in blocks {
+        let bytes = try await mut self.block(disk, block, alloc)
+        var offset: usize = 0
+        while offset + ENTRY_BYTES <= bytes.len() {
+            let head = bytes[offset]
+            if head == FREE or head == ENDS {
+                mut run.push(EntrySlot(block: block, offset: u32.fit(offset)))
+                if run.len() == count {
+                    return run
+                }
+            } else {
+                mut run.truncate(0)
+            }
+            offset += ENTRY_BYTES
+        }
+    }
+    let Folder.Chain(start) = directory else {
+        fail FatError.NoSpace
+    }
+    let clusters = try await mut self.chain(disk, start, alloc)
+    let taken = try await mut self.take_clusters(disk, count: 1, contiguous: false, alloc)
+    try await mut self.set_next(disk, cluster: clusters[clusters.len() - 1], value: taken[0], alloc)
+    try await mut self.zero_cluster(disk, cluster: taken[0], alloc)
+    let first_block = self.geometry.cluster_block(taken[0])
+    var offset: usize = 0
+    while run.len() < count {
+        let block_bytes = usize.widen(self.geometry.block_bytes)
+        mut run.push(EntrySlot(block: first_block + u64.widen(offset / block_bytes), offset: u32.fit(offset % block_bytes)))
+        offset += ENTRY_BYTES
+    }
+    return run
+} Volume.free_slots
+
+/// Writes zeros over a cluster.
+pub fn Volume.zero_cluster[D: Storage](mut self, disk: D, cluster: u32, alloc: mem::Alloc) fails Failure uses wait {
+    let first_block = self.geometry.cluster_block(cluster)
+    for at in 0..<u64.widen(self.geometry.cluster_blocks) {
+        try await mut self.put_block(disk, block: first_block + at, bytes: mem::Bytes.zeroed(usize.widen(self.geometry.block_bytes), alloc), alloc)
+    }
+} Volume.zero_cluster
+
+/// Writes the entries of `name` in `slots`: its long-name entries unless its short name is exact, then its short entry holding `attributes`, `cluster` and `size`.
+pub fn Volume.write_entries[D: Storage](
+    mut self,
+    disk: D,
+    slots: mem::List[EntrySlot],
+    name: Str,
+    short: ShortName,
+    attributes: u8,
+    cluster: u32,
+    size: u32,
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    var entries = mem::List[Array[u8, 32]].empty(alloc)
+    if not short.exact {
+        long_entries(mut entries, name, checksum: short_checksum(short.short), alloc)
+    }
+    mut entries.push(short_entry(short.short, attributes, cluster, size))
+    for at in 0..<entries.len() {
+        let slot = slots[at]
+        var block = try await mut self.block(disk, block: slot.block, alloc)
+        for byte in 0..<ENTRY_BYTES {
+            block[usize.widen(slot.offset) + byte] = entries[at][byte]
+        }
+        try await mut self.put_block(disk, block: slot.block, bytes: take block, alloc)
+    }
+} Volume.write_entries
+
+/// How many entries `name` takes: its short entry, and its long-name entries unless its short name is exact.
+pub fn entries_for(name: Str, short: ShortName) -> usize {
+    if short.exact {
+        return 1
+    }
+    return (name.char_count() + LONG_CHARS - 1) / LONG_CHARS + 1
+} entries_for
+
+/// Appends the long-name entries of `name`, last part first, as a directory holds them.
+fn long_entries(mut entries: mem::List[Array[u8, 32]], name: Str, checksum: u8, alloc: mem::Alloc) {
+    var units = mem::List[u16].empty(alloc)
+    for character in name.cursor() {
+        mut units.push(u16.truncate(character.to_bits()))
+    }
+    let count = (units.len() + LONG_CHARS - 1) / LONG_CHARS
+    var part = count
+    while part > 0 {
+        part -= 1
+        var entry = Array[u8, 32].filled(0)
+        entry[0] = u8.fit(part + 1)
+        if part + 1 == count {
+            entry[0] = entry[0] | 0x40
+        }
+        entry[11] = LONG_NAME
+        entry[13] = checksum
+        let offsets = long_offsets()
+        for at in 0..<LONG_CHARS {
+            let index = part * LONG_CHARS + at
+            let unit: u16 = match index < units.len() {
+                true => units[index]
+                false => match index == units.len() {
+                    true => 0
+                    false => 0xFFFF
+                }
+            }
+            entry[offsets[at]] = u8.truncate(unit)
+            entry[offsets[at] + 1] = u8.truncate(unit >> 8)
+        }
+        mut entries.push(entry)
+    }
+} long_entries
+
+/// A short entry.
+pub fn short_entry(short: Array[u8, 11], attributes: u8, cluster: u32, size: u32) -> Array[u8, 32] {
+    var entry = Array[u8, 32].filled(0)
+    for at in 0..<11usize {
+        entry[at] = short[at]
+    }
+    entry[11] = attributes
+    entry[20] = u8.truncate(cluster >> 16)
+    entry[21] = u8.truncate(cluster >> 24)
+    entry[26] = u8.truncate(cluster)
+    entry[27] = u8.truncate(cluster >> 8)
+    entry[28] = u8.truncate(size)
+    entry[29] = u8.truncate(size >> 8)
+    entry[30] = u8.truncate(size >> 16)
+    entry[31] = u8.truncate(size >> 24)
+    return entry
+} short_entry
+
+/// Rewrites the cluster and size of the short entry at `slot`, in one block write.
+pub fn Volume.update_entry[D: Storage](
+    mut self,
+    disk: D,
+    slot: EntrySlot,
+    cluster: u32,
+    size: u32,
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    var block = try await mut self.block(disk, block: slot.block, alloc)
+    let at = usize.widen(slot.offset)
+    block[at + 20] = u8.truncate(cluster >> 16)
+    block[at + 21] = u8.truncate(cluster >> 24)
+    block[at + 26] = u8.truncate(cluster)
+    block[at + 27] = u8.truncate(cluster >> 8)
+    mut block.view_mut().write_u32_le(at + 28, value: size)
+    try await mut self.put_block(disk, block: slot.block, bytes: take block, alloc)
+} Volume.update_entry
+
+/// Marks the entries of `found` free.
+pub fn Volume.free_entries[D: Storage](mut self, disk: D, found: Listed, alloc: mem::Alloc) fails Failure uses wait {
+    var slots = mem::List[EntrySlot].empty(alloc)
+    for each in found.long_slots {
+        mut slots.push(each)
+    }
+    mut slots.push(found.slot)
+    for slot in slots {
+        var block = try await mut self.block(disk, block: slot.block, alloc)
+        block[usize.widen(slot.offset)] = FREE
+        try await mut self.put_block(disk, block: slot.block, bytes: take block, alloc)
+    }
+} Volume.free_entries

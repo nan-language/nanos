@@ -1,0 +1,142 @@
+//! Platform devices: the AML evaluator `devices.aml` that `devices` creates and loads with the firmware's DSDT and SSDTs, and the devices of its namespace, which `devices` declares to the keeper.
+
+/// The evaluator's moniker and component.
+const EVALUATOR_MONIKER: Str = "devices.aml"
+
+const EVALUATOR_COMPONENT: Str = "devices::aml::Evaluator"
+
+/// The most SSDTs read.
+const MOST_SSDTS: u32 = 16
+
+/// What discovery found: the devices the keeper holds, and the platform devices whose `_CRS` evaluation failed.
+pub closed struct Discovered {
+    pub found: mem::List[Found]
+    pub failed: mem::List[BusPath]
+} Discovered
+
+/// Lists the devices the keeper holds once the platform devices of the AML namespace are declared to it. A table failing its checks is recorded as `device.table-invalid`, and the evaluator's failure leaves the platform devices undeclared.
+fn discover(root: Root, control: os::Control, bundle: ident::HashValue, alloc: mem::Alloc) -> Discovered fails task::Cancelled uses wait {
+    var failed = mem::List[BusPath].empty(alloc)
+    let tables = try await tables_of(root, alloc)
+    let platform_devices = try await described(control, bundle, take tables, root, alloc)
+    for each in platform_devices {
+        let path = BusPath.Acpi(hid: each.hid, uid: each.uid)
+        if each.failed {
+            mut failed.push(path)
+        }
+        var resources = mem::List[Resource].empty(alloc)
+        for window in each.windows {
+            match window {
+                aml::Window.Ports(base: base, count: count) => mut resources.push(Resource.Ports(base: base, count: count))
+                aml::Window.Memory(base: base, size: size) => mut resources.push(Resource.Window(base: base, size: size))
+                aml::Window.Line(number) => mut resources.push(Resource.Line(number: number))
+            }
+        }
+        match first attempt await root.declare(path, ids: DeviceIds.Acpi(hid: each.hid, cids: each.cids, uid: each.uid), take resources, alloc) {
+            Ok(_) => {
+            }
+            Err(RootError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => {
+            }
+        }
+    }
+    let found = match first attempt await root.devices(alloc) {
+        Ok(listed) => listed
+        Err(RootError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => mem::List.empty(alloc)
+    }
+    return Discovered(found: take found, failed: take failed)
+} discover
+
+/// The DSDT and the SSDTs the keeper holds.
+fn tables_of(root: Root, alloc: mem::Alloc) -> mem::List[Untrusted[mem::Bytes]] fails task::Cancelled uses wait {
+    var tables = mem::List[Untrusted[mem::Bytes]].empty(alloc)
+    match first attempt await root.table(signature_of(b"DSDT"), index: 0, alloc) {
+        Ok(Some(table)) => mut tables.push(take table)
+        Err(RootError.Cancelled(cancelled)) => fail cancelled
+        Ok(None) or Err(_) => {
+        }
+    }
+    for index in 0..<MOST_SSDTS {
+        match first attempt await root.table(signature_of(b"SSDT"), index, alloc) {
+            Ok(Some(table)) => mut tables.push(take table)
+            Err(RootError.Cancelled(cancelled)) => fail cancelled
+            Ok(None) or Err(_) => return tables
+        }
+    }
+    return tables
+} tables_of
+
+/// The platform devices `tables` describe, through the evaluator `devices` creates for them; none when it does not run.
+fn described(
+    control: os::Control,
+    bundle: ident::HashValue,
+    take tables: mem::List[Untrusted[mem::Bytes]],
+    root: Root,
+    alloc: mem::Alloc,
+    ) -> mem::List[aml::Platform] fails task::Cancelled uses wait {
+    let none = mem::List[aml::Platform].empty(alloc)
+    let moniker = ident::Moniker(text: text::Fixed[59].of(EVALUATOR_MONIKER))
+    let spec = os::InstanceSpec.of(principal: ident::Principal(text: text::Fixed[64].of("system")), bundle, component: EVALUATOR_COMPONENT, alloc)
+    match first attempt await control.create(ident::Moniker(text: moniker.text), take spec, grants: mem::Map.empty(alloc), alloc) {
+        Ok(_) => {
+        }
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return none
+    }
+    match first attempt await control.start(ident::Moniker(text: moniker.text), alloc) {
+        Ok(os::Lifecycle.Running) => {
+        }
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        else => return none
+    }
+    let handle = match first attempt await control.port(ident::Moniker(text: moniker.text), credit: os::Credit(messages: 1, calls: 1), alloc) {
+        Ok(found) => found
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return none
+    }
+    let Some(evaluator) = os::Port[aml::Aml].of(handle) else {
+        return none
+    }
+    var loading = sys::Encoded.empty(alloc)
+    let loaded = sys::Wire[aml::Aml].load(mut loading, take tables)
+    let invalid = match first attempt await evaluator.call(take loading, reply: loaded, alloc) {
+        Ok(signatures) => signatures
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return none
+    }
+    for refused in invalid {
+        let event = Event(kind: EventKind.TableInvalid, path: BusPath.Acpi(hid: table_name(refused), uid: 0), argument: u64.widen(refused.view().u32_le(0)))
+        match attempt await root.emit(event) {
+            Err(RootError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    }
+    var asking = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[aml::Aml].platform(mut asking)
+    return match first attempt await evaluator.call(take asking, reply, alloc) {
+        Ok(devices) => devices
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => none
+    }
+} described
+
+fn signature_of(name: Slice[u8]) -> Array[u8, 4] {
+    var signature = Array[u8, 4].filled(0)
+    for at in 0..<4usize {
+        signature[at] = name[at]
+    }
+    return signature
+} signature_of
+
+/// A table's signature as the identifier of the bus path its event names, its characters kept when they are capitals or digits.
+fn table_name(signature: Array[u8, 4]) -> text::Fixed[8] {
+    var name = text::Fixed[8].empty()
+    for byte in signature {
+        if (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') {
+            mut name.push(char.checked_from_bits(u32.widen(byte)).value_or('0'))
+        }
+    }
+    return name
+} table_name

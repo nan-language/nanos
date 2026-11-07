@@ -1,0 +1,286 @@
+//! The NVMe controller: its registers, the page-aligned memory its queues and transfers lie in, its commands, and its initialisation through the admin queue.
+
+/// The bytes of a memory page as the controller counts them.
+pub const PAGE_BYTES: u32 = 4_096
+
+/// The entries of each queue, the bytes of a submission and of a completion entry.
+pub const QUEUE_ENTRIES: u16 = 16
+
+const SUBMISSION_BYTES: u32 = 64
+
+const COMPLETION_BYTES: u32 = 16
+
+/// The controller's configuration bits: enable, and the sizes of I/O queue entries as powers of two.
+const ENABLED: u32 = 1
+
+const ENTRY_SIZES: u32 = (6u32 << 16) | (4u32 << 20)
+
+/// The status bits: ready, and fatal.
+const READY: u32 = 1
+
+const FATAL: u32 = 2
+
+/// How often initialisation polls the controller before giving up.
+const POLLS: u32 = 10_000_000
+
+/// The admin opcodes.
+const CREATE_SUBMISSION_QUEUE: u8 = 0x01
+
+const CREATE_COMPLETION_QUEUE: u8 = 0x05
+
+const IDENTIFY_OPCODE: u8 = 0x06
+
+/// The identify structures: a namespace, the controller.
+const IDENTIFY_NAMESPACE: u32 = 0
+
+const IDENTIFY_CONTROLLER: u32 = 1
+
+/// The most namespaces served as units.
+const MOST_UNITS: u32 = 4
+
+/// The controller's registers with a doorbell stride of 4 bytes: the admin submission and completion doorbells, then the I/O queue pair's.
+pub registers Controller {
+    capabilities: u64 at 0x00 read
+    configuration: u32 at 0x14 read write
+    status: u32 at 0x1C read
+    admin_attributes: u32 at 0x24 read write
+    admin_submissions: u64 at 0x28 read write
+    admin_completions: u64 at 0x30 read write
+    doorbells: Array[u32, 4] at 0x1000 stride 4 write
+} Controller
+
+/// A span of memory a page-aligned page is cut from: twice a page always holds one.
+pub layout Span: bytes 8_192 le {
+    data: Array[u8, 8_192] at 0
+} Span
+
+/// A page-aligned page of physical memory the controller reaches: its span, and the offset of the page in it.
+pub open linear struct Page derives Send {
+    span: hw::DmaShared[Span]
+    at: usize
+} Page
+
+/// A namespace served as a unit: its id, its blocks and their size.
+pub closed struct Namespace derives Copy, Eq {
+    pub id: u32
+    pub blocks: u64
+    pub block_bytes: u32
+} Namespace
+
+/// A command to submit: its opcode, namespace, data pointers and command dwords 10 to 12.
+pub closed struct Command derives Copy, Eq {
+    pub opcode: u8
+    pub namespace: u32
+    pub prp1: u64
+    pub prp2: u64
+    pub cdw10: u32
+    pub cdw11: u32
+    pub cdw12: u32
+} Command
+
+/// Where a queue pair stands: the submission tail, the completion head, and the phase the next completion carries.
+pub closed struct Pair derives Copy, Eq, Encode {
+    pub tail: u16
+    pub head: u16
+    pub phase: u8
+} Pair
+
+/// What the controller reports at initialisation: its namespaces, the most bytes a transfer moves, and whether it has a volatile write cache.
+pub closed struct Identified derives Copy, Eq {
+    pub units: Array[Namespace, 4]
+    pub count: u32
+    pub max_transfer: u32
+    pub cache: bool
+} Identified
+
+/// A zeroed page drawn through `heap`.
+pub fn Page.of(heap: mem::Heap) -> Page {
+    let span = hw::DmaShared.of(heap.boxed(Span.from_bits(Array[u8, 8_192].filled(0))), space: hw::IoSpace.physical())
+    let base = span.bus_addr().value
+    let at = usize.widen((u64.widen(PAGE_BYTES) - base % u64.widen(PAGE_BYTES)) % u64.widen(PAGE_BYTES))
+    return Page(span: take span, at: at)
+} Page.of
+
+pub fn Page.bus(self) -> u64 {
+    return self.span.bus_addr().value + u64.widen(self.at)
+} Page.bus
+
+pub fn Page.put8(mut self, offset: usize, value: u8) {
+    mut self.span.write_release_at(Span.data, index: self.at + offset, value: value)
+} Page.put8
+
+pub fn Page.get8(mut self, offset: usize) -> u8 {
+    return mut self.span.read_acquire_at(Span.data, index: self.at + offset)
+} Page.get8
+
+pub fn Page.put32(mut self, offset: usize, value: u32) {
+    for byte in 0..<4usize {
+        mut self.put8(offset + byte, value: u8.truncate(value >> u32.fit(8 * byte)))
+    }
+} Page.put32
+
+pub fn Page.put64(mut self, offset: usize, value: u64) {
+    mut self.put32(offset, value: u32.truncate(value))
+    mut self.put32(offset + 4, value: u32.truncate(value >> 32))
+} Page.put64
+
+pub fn Page.get32(mut self, offset: usize) -> u32 {
+    var value: u32 = 0
+    for byte in 0..<4usize {
+        value = value | (u32.widen(mut self.get8(offset + byte)) << u32.fit(8 * byte))
+    }
+    return value
+} Page.get32
+
+pub fn Page.get64(mut self, offset: usize) -> u64 {
+    let low = u64.widen(mut self.get32(offset))
+    return low | (u64.widen(mut self.get32(offset + 4)) << 32)
+} Page.get64
+
+pub fn Page.release(take self) {
+    let Page(span: span, at: _) = self
+    discard take span.into_box()
+} Page.release
+
+/// Writes `command` at slot `slot` of the submission queue `queue`, its command id the slot.
+pub fn Command.put(self, mut queue: Page, slot: u16) {
+    let at = usize.widen(slot) * usize.widen(SUBMISSION_BYTES)
+    for word in 0..<16usize {
+        mut queue.put32(at + 4 * word, value: 0)
+    }
+    mut queue.put32(at, value: u32.widen(self.opcode) | (u32.widen(slot) << 16))
+    mut queue.put32(at + 4, value: self.namespace)
+    mut queue.put64(at + 24, value: self.prp1)
+    mut queue.put64(at + 32, value: self.prp2)
+    mut queue.put32(at + 40, value: self.cdw10)
+    mut queue.put32(at + 44, value: self.cdw11)
+    mut queue.put32(at + 48, value: self.cdw12)
+} Command.put
+
+/// The status of the completion at the head of `completions` when its phase is the pair's, advancing the pair; `None` when the controller has posted none.
+pub fn Pair.completion(mut self, mut completions: Page) -> Option[u16] {
+    let at = usize.widen(self.head) * usize.widen(COMPLETION_BYTES)
+    let flags = mut completions.get32(at + 12)
+    if u8.truncate((flags >> 16) & 1) != self.phase {
+        return None
+    }
+    self.head += 1
+    if self.head == QUEUE_ENTRIES {
+        self.head = 0
+        self.phase ^= 1
+    }
+    return Some(u16.truncate(flags >> 17))
+} Pair.completion
+
+/// Submits `command` on the queue pair whose doorbells are `doorbell` and `doorbell + 1`, advancing its tail.
+pub fn Pair.submit(mut self, command: Command, mut regs: hw::Mmio[Controller], mut submissions: Page, doorbell: usize) {
+    command.put(mut submissions, slot: self.tail)
+    self.tail += 1
+    if self.tail == QUEUE_ENTRIES {
+        self.tail = 0
+    }
+    mut regs.write_at(Controller.doorbells, index: doorbell, value: u32.widen(self.tail))
+} Pair.submit
+
+/// Acknowledges the completions consumed, through the completion doorbell `doorbell`.
+pub fn Pair.acknowledge(self, mut regs: hw::Mmio[Controller], doorbell: usize) {
+    mut regs.write_at(Controller.doorbells, index: doorbell, value: u32.widen(self.head))
+} Pair.acknowledge
+
+pub fn Pair.fresh() -> Pair = Pair(tail: 0, head: 0, phase: 1)
+
+/// Disables the controller and waits until it is not ready; false when it does not settle.
+pub fn disable(mut regs: hw::Mmio[Controller]) -> bool {
+    mut regs.write(Controller.configuration, value: 0)
+    for _ in 0..<POLLS {
+        if (mut regs.read(Controller.status) & READY) == 0 {
+            return true
+        }
+    }
+    return false
+} disable
+
+/// Enables the controller over the admin queue pair `submissions` and `completions` and waits until it is ready; false when its doorbell stride is not 4 bytes, it does not get ready or it fails.
+pub fn enable(mut regs: hw::Mmio[Controller], submissions: Page, completions: Page) -> bool {
+    let capabilities = mut regs.read(Controller.capabilities)
+    let stride = (capabilities >> 32) & 0xF
+    let entries = (capabilities & 0xFFFF) + 1
+    if stride != 0 or entries < u64.widen(QUEUE_ENTRIES) or not disable(mut regs) {
+        return false
+    }
+    let size = u32.widen(QUEUE_ENTRIES) - 1
+    mut regs.write(Controller.admin_attributes, value: size | (size << 16))
+    mut regs.write(Controller.admin_submissions, value: submissions.bus())
+    mut regs.write(Controller.admin_completions, value: completions.bus())
+    mut regs.write(Controller.configuration, value: ENABLED | ENTRY_SIZES)
+    for _ in 0..<POLLS {
+        let reported = mut regs.read(Controller.status)
+        if (reported & FATAL) != 0 {
+            return false
+        }
+        if (reported & READY) != 0 {
+            return true
+        }
+    }
+    return false
+} enable
+
+/// Runs one admin command and waits for its completion: whether it succeeded.
+pub fn admin(mut regs: hw::Mmio[Controller], mut pair: Pair, mut submissions: Page, mut completions: Page, command: Command) -> bool {
+    mut pair.submit(command, mut regs, mut submissions, doorbell: 0)
+    for _ in 0..<POLLS {
+        match mut pair.completion(mut completions) {
+            Some(status) => {
+                pair.acknowledge(mut regs, doorbell: 1)
+                return status == 0
+            }
+            None => {
+            }
+        }
+    }
+    return false
+} admin
+
+/// Identifies the controller and its first namespaces through the admin queue, reading each structure into `scratch`; `None` when an identify fails or no namespace has 512- or 4,096-byte blocks.
+pub fn identify(mut regs: hw::Mmio[Controller], mut pair: Pair, mut submissions: Page, mut completions: Page, mut scratch: Page) -> Option[Identified] {
+    if not admin(mut regs, mut pair, mut submissions, mut completions, command: Command(opcode: IDENTIFY_OPCODE, namespace: 0, prp1: scratch.bus(), prp2: 0, cdw10: IDENTIFY_CONTROLLER, cdw11: 0, cdw12: 0)) {
+        return None
+    }
+    let limit = mut scratch.get8(77)
+    var max_transfer: u32 = 65_536
+    if limit != 0 and limit < 4 {
+        max_transfer = PAGE_BYTES << u32.widen(limit)
+    }
+    let cache = (mut scratch.get8(525) & 1) != 0
+    let namespaces = mut scratch.get32(516)
+    var units = Array[Namespace, 4].filled(Namespace(id: 0, blocks: 0, block_bytes: 0))
+    var count: u32 = 0
+    var id: u32 = 1
+    while id <= namespaces and id <= MOST_UNITS {
+        if admin(mut regs, mut pair, mut submissions, mut completions, command: Command(opcode: IDENTIFY_OPCODE, namespace: id, prp1: scratch.bus(), prp2: 0, cdw10: IDENTIFY_NAMESPACE, cdw11: 0, cdw12: 0)) {
+            let blocks = mut scratch.get64(0)
+            let format = usize.widen(mut scratch.get8(26) & 0xF)
+            let shift = mut scratch.get8(128 + 4 * format + 2)
+            if blocks > 0 and (shift == 9 or shift == 12) {
+                units[usize.widen(count)] = Namespace(id: id, blocks: blocks, block_bytes: 1u32 << u32.widen(shift))
+                count += 1
+            }
+        }
+        id += 1
+    }
+    if count == 0 {
+        return None
+    }
+    return Some(Identified(units: units, count: count, max_transfer: max_transfer, cache: cache))
+} identify
+
+/// Creates I/O queue pair 1 over `submissions` and `completions`, its completions interrupting on vector 0: whether the controller accepted both.
+pub fn create_io_pair(mut regs: hw::Mmio[Controller], mut pair: Pair, mut submissions: Page, mut completions: Page, io_submissions: Page, io_completions: Page) -> bool {
+    let size = (u32.widen(QUEUE_ENTRIES) - 1) << 16
+    let completion = Command(opcode: CREATE_COMPLETION_QUEUE, namespace: 0, prp1: io_completions.bus(), prp2: 0, cdw10: size | 1, cdw11: 0x3, cdw12: 0)
+    if not admin(mut regs, mut pair, mut submissions, mut completions, command: completion) {
+        return false
+    }
+    let submission = Command(opcode: CREATE_SUBMISSION_QUEUE, namespace: 0, prp1: io_submissions.bus(), prp2: 0, cdw10: size | 1, cdw11: (1u32 << 16) | 1, cdw12: 0)
+    return admin(mut regs, mut pair, mut submissions, mut completions, command: submission)
+} create_io_pair

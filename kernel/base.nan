@@ -7,9 +7,21 @@ const DEVICES: Str = "devices::Manager"
 
 const VIEW: Str = "devices::View"
 
+const FAT: Str = "fat::Files"
+
 const VIRTIO_RNG: Str = "drivers::virtio::Rng"
 
 const VIRTIO_BLK: Str = "drivers::virtio::Blk"
+
+const NVME: Str = "drivers::nvme::Nvme"
+
+const AML_EVALUATOR: Str = "devices::aml::Evaluator"
+
+const UART_DRIVER: Str = "drivers::uart::Uart"
+
+const CMOS_DRIVER: Str = "drivers::cmos::Cmos"
+
+const AHCI: Str = "drivers::ahci::Ahci"
 
 /// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, and the boot volume the handoff record names.
 struct Base derives Copy {
@@ -31,11 +43,29 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == VIEW {
         return Some(os::Protocols(own: sys::Wire[devices::VolumeView].hash(), serves: Some(sys::Wire[devices::Block].hash())))
     }
+    if component == FAT {
+        return Some(os::Protocols(own: sys::Wire[fat::Fat].hash(), serves: None))
+    }
     if component == VIRTIO_RNG {
         return Some(os::Protocols(own: sys::Wire[drivers::virtio::RngDevice].hash(), serves: Some(sys::Wire[devices::Entropy].hash())))
     }
     if component == VIRTIO_BLK {
         return Some(os::Protocols(own: sys::Wire[drivers::virtio::BlkDevice].hash(), serves: Some(sys::Wire[devices::Block].hash())))
+    }
+    if component == NVME {
+        return Some(os::Protocols(own: sys::Wire[drivers::nvme::NvmeDevice].hash(), serves: Some(sys::Wire[devices::Block].hash())))
+    }
+    if component == AML_EVALUATOR {
+        return Some(os::Protocols(own: sys::Wire[devices::aml::Aml].hash(), serves: None))
+    }
+    if component == UART_DRIVER {
+        return Some(os::Protocols(own: sys::Wire[drivers::uart::UartDevice].hash(), serves: Some(sys::Wire[devices::Console].hash())))
+    }
+    if component == CMOS_DRIVER {
+        return Some(os::Protocols(own: sys::Wire[drivers::cmos::CmosDevice].hash(), serves: Some(sys::Wire[devices::Rtc].hash())))
+    }
+    if component == AHCI {
+        return Some(os::Protocols(own: sys::Wire[drivers::ahci::AhciDevice].hash(), serves: Some(sys::Wire[devices::Block].hash())))
     }
     return None
 } Base.protocols
@@ -58,11 +88,26 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
         return try await runner::Driven[devices::View, devices::ViewEnv, devices::VolumeView].run(take env, exec, alloc, take serving, peers: schema_of_block(alloc), release: fn(take ended: devices::ViewEnv) limits stack 512 {
         })
     }
+    if component == FAT {
+        return try await runner::Served[fat::Files, fat::Env, fat::Fat].run(take world, take serving)
+    }
     if component == VIRTIO_RNG {
         return try await self.serve_rng(take world, take serving)
     }
     if component == VIRTIO_BLK {
         return try await self.serve_blk(take world, take serving)
+    }
+    if component == NVME {
+        return try await self.serve_nvme(take world, take serving)
+    }
+    if component == AML_EVALUATOR {
+        return try await runner::Served[devices::aml::Evaluator, devices::aml::EvaluatorEnv, devices::aml::Aml].run(take world, take serving)
+    }
+    if component == UART_DRIVER or component == CMOS_DRIVER {
+        return try await self.serve_platform(component, take world, take serving)
+    }
+    if component == AHCI {
+        return try await self.serve_ahci(take world, take serving)
     }
     return try await runner::Served[supervisor::Supervision, supervisor::Env, supervisor::Supervisor].run(take world, take serving)
 } Base.serve
@@ -96,6 +141,73 @@ fn Base.serve_blk(self, take world: nanos::World, take serving: runner::Serving)
         Some(devices::Claimed.Platform(_)) or None => return runner::Ended.EnvIncomplete
     }
 } Base.serve_blk
+
+/// Serves `nvme` on the function its claim names.
+fn Base.serve_nvme(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    match try await self.claimed(world) {
+        Some(devices::Claimed.Pci(function)) => {
+            let Some(env) = drivers::nvme::NvmeEnv.of(take function, alloc) else {
+                return runner::Ended.EnvIncomplete
+            }
+            return try await runner::Driven[drivers::nvme::Nvme, drivers::nvme::NvmeEnv, drivers::nvme::NvmeDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::nvme::NvmeEnv.abandon)
+        }
+        Some(devices::Claimed.Platform(_)) or None => return runner::Ended.EnvIncomplete
+    }
+} Base.serve_nvme
+
+/// Serves the `uart` or `cmos` driver `component` on the first port window its claimed platform device has.
+fn Base.serve_platform(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let exec = world.exec
+    var base: Option[u16] = None
+    match try await self.claimed(world) {
+        Some(devices::Claimed.Platform(resources)) => {
+            base = first_ports(resources)
+        }
+        Some(devices::Claimed.Pci(function)) => take function.release()
+        None => {
+        }
+    }
+    let Some(port) = base else {
+        return runner::Ended.EnvIncomplete
+    }
+    var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+    if component == UART_DRIVER {
+        let regs = trusted "devices declared the UART_DRIVER's I/O window as the firmware's _CRS gives it, the keeper refuses a window overlapping another device's, and devices binds one driver per device" { hw::Ports[drivers::uart::Regs].map(port: port) }
+        mut peers.push(sys::Wire[devices::Console].schema(alloc))
+        return try await runner::Driven[drivers::uart::Uart, drivers::uart::UartEnv, drivers::uart::UartDevice].run(drivers::uart::UartEnv.of(take regs, alloc), exec, alloc, take serving, take peers, release: drivers::uart::UartEnv.abandon)
+    }
+    let regs = trusted "devices declared the RTC's I/O window as the firmware's _CRS gives it, the keeper refuses a window overlapping another device's, devices binds one driver per device, and the core reads the RTC only before any instance runs" { hw::Ports[drivers::cmos::Regs].map(port: port) }
+    mut peers.push(sys::Wire[devices::Rtc].schema(alloc))
+    return try await runner::Driven[drivers::cmos::Cmos, drivers::cmos::CmosEnv, drivers::cmos::CmosDevice].run(drivers::cmos::CmosEnv.of(take regs), exec, alloc, take serving, take peers, release: drivers::cmos::CmosEnv.abandon)
+} Base.serve_platform
+
+/// The first I/O port window of `resources`.
+fn first_ports(resources: mem::List[devices::Resource]) -> Option[u16] {
+    for resource in resources {
+        match resource {
+            devices::Resource.Ports(base: base, count: _) => return Some(base)
+            else => {
+            }
+        }
+    }
+    return None
+} first_ports
+
+/// Serves `ahci` on the function its claim names.
+fn Base.serve_ahci(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    match try await self.claimed(world) {
+        Some(devices::Claimed.Pci(function)) => {
+            let Some(env) = drivers::ahci::AhciEnv.of(take function, alloc) else {
+                return runner::Ended.EnvIncomplete
+            }
+            return try await runner::Driven[drivers::ahci::Ahci, drivers::ahci::AhciEnv, drivers::ahci::AhciDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::ahci::AhciEnv.abandon)
+        }
+        Some(devices::Claimed.Platform(_)) or None => return runner::Ended.EnvIncomplete
+    }
+} Base.serve_ahci
 
 /// The schemas a block driver or view serves the calls of: `Block`'s.
 fn schema_of_block(alloc: mem::Alloc) -> mem::List[sys::ProtocolSchema] {
@@ -154,9 +266,12 @@ fn image_genesis(bundle: ident::HashValue, alloc: mem::Alloc) -> runner::Known {
     var managing = os::InstanceSpec.of(principal: principal("system"), bundle, component: DEVICES, alloc)
     discard mut managing.grants.insert(text::String.of("control", alloc), value: 2)
     discard mut managing.grants.insert(text::String.of("clock", alloc), value: 3)
+    var filing = os::InstanceSpec.of(principal: principal("system"), bundle, component: FAT, alloc)
+    discard mut filing.wiring.insert(text::String.of("volume", alloc), value: os::Wire(target: os::Target.Role(os::Role.BootVolume), operations: None, credit: os::Credit(messages: 64, calls: 64)))
     var specs = mem::Map[ident::Moniker, os::InstanceSpec].empty(alloc)
     discard mut specs.insert(moniker("supervisor"), value: take supervising)
     discard mut specs.insert(moniker("devices"), value: take managing)
+    discard mut specs.insert(moniker("fat"), value: take filing)
     var grants = mem::Map[u64, os::Grant].empty(alloc)
     discard mut grants.insert(0, value: os::Grant(holder: principal("system"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
     discard mut grants.insert(1, value: os::Grant(holder: principal("inst.supervisor"), object: os::Object.Machine, rights: rights(every: false, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
@@ -166,10 +281,18 @@ fn image_genesis(bundle: ident::HashValue, alloc: mem::Alloc) -> runner::Known {
 } image_genesis
 
 /// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames` and prints each event `rings` record; it never ends unless cancelled.
-fn run_base(take known: runner::Known, take keeper: keeper::Keeper, bundle: ident::HashValue, boot: devices::BootVolume, config: runner::Config, rings: journal::Rings, mut frames: frames::Frames) fails task::Cancelled uses wait {
+fn run_base(
+    take known: runner::Known,
+    take keeper: keeper::Keeper,
+    bundle: ident::HashValue,
+    boot: devices::BootVolume,
+    config: runner::Config,
+    rings: journal::Rings,
+    mut frames: frames::Frames,
+    ) fails task::Cancelled uses wait {
     let task::Channel(sender: requests, receiver: incoming) = task::Channel[Reservation].bounded(1, alloc: config.alloc)
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
-    let minted = devices::MintedRoot.of(orders, alloc: config.alloc)
+    let minted = devices::MintedRoot.of(orders, clock: config.clock, alloc: config.alloc)
     defer take minted.close()
     let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot)
     var requested = incoming
@@ -300,7 +423,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unanswered
     let task::Channel(sender: orders, receiver: unserved) = task::Channel[devices::RootOrder].bounded(1, alloc)
     discard unserved
-    let minted = devices::MintedRoot.of(orders, alloc)
+    let minted = devices::MintedRoot.of(orders, clock: world.clock, alloc)
     defer take minted.close()
     let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)))
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {

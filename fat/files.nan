@@ -1,0 +1,379 @@
+//! The operations on boot volume paths: listing, reading, writing whole files and bytes in place, removing, allocating contiguous files and giving their extents, and freeing at mount the clusters no entry reaches.
+
+/// A file or directory a listing gives.
+pub closed struct FatEntry derives Encode {
+    pub name: Untrusted[text::String]
+    pub dir: bool
+    pub size: u64
+} FatEntry
+
+/// Where a file's contiguous clusters lie, in volume blocks.
+pub closed struct Extent derives Copy, Eq, Encode {
+    pub start: u64
+    pub blocks: u64
+} Extent
+
+/// The entries of the directory at `path`.
+pub fn Volume.list[D: Storage](mut self, disk: D, path: Str, alloc: mem::Alloc) -> mem::List[FatEntry] fails Failure uses wait {
+    let directory = try await mut self.directory_at(disk, path, alloc)
+    let listed = try await mut self.entries(disk, directory, alloc)
+    var entries = mem::List[FatEntry].empty(alloc)
+    for each in take listed {
+        let Listed(name: name, short: _, attributes: attributes, cluster: _, size: size, slot: _, long_slots: _) = each
+        mut entries.push(FatEntry(name: Untrusted.of(take name), dir: (attributes & SUBDIRECTORY) != 0, size: u64.widen(size)))
+    }
+    return entries
+} Volume.list
+
+/// The directory `path` names, the root for `/`.
+fn Volume.directory_at[D: Storage](mut self, disk: D, path: Str, alloc: mem::Alloc) -> Folder fails Failure uses wait {
+    if path == "/" {
+        return self.root()
+    }
+    let Some(found) = try await mut self.lookup(disk, path, alloc) else {
+        fail FatError.NotFound
+    }
+    if not found.is_directory() {
+        fail FatError.NotFound
+    }
+    return found.directory()
+} Volume.directory_at
+
+/// The file `path` names.
+fn Volume.file_at[D: Storage](mut self, disk: D, path: Str, alloc: mem::Alloc) -> Listed fails Failure uses wait {
+    let Some(found) = try await mut self.lookup(disk, path, alloc) else {
+        fail FatError.NotFound
+    }
+    if found.is_directory() {
+        fail FatError.NotFound
+    }
+    return found
+} Volume.file_at
+
+/// `count` bytes of the file at `path` from `offset`, fewer at its end.
+pub fn Volume.read_file[D: Storage](
+    mut self,
+    disk: D,
+    path: Str,
+    offset: u64,
+    count: u32,
+    alloc: mem::Alloc,
+    ) -> Untrusted[mem::Bytes] fails Failure uses wait {
+    let found = try await mut self.file_at(disk, path, alloc)
+    let size = u64.widen(found.size)
+    if offset > size {
+        fail FatError.OutOfRange
+    }
+    let stop = min_u64(offset + u64.widen(count), b: size)
+    var bytes = mem::Bytes.empty(alloc)
+    let clusters = try await mut self.chain(disk, start: found.cluster, alloc)
+    let block_bytes = u64.widen(self.geometry.block_bytes)
+    var at = offset
+    while at < stop {
+        let cluster_index = at / self.geometry.cluster_bytes()
+        if cluster_index >= u64.widen(clusters.len()) {
+            fail FatError.BadVolume
+        }
+        let within = at % self.geometry.cluster_bytes()
+        let block = self.geometry.cluster_block(clusters[usize.widen(cluster_index)]) + within / block_bytes
+        let contents = try await mut self.block(disk, block, alloc)
+        let from = usize.widen(within % block_bytes)
+        let take_bytes = usize.widen(min_u64(block_bytes - u64.widen(from), b: stop - at))
+        for index in from..<(from + take_bytes) {
+            mut bytes.push(contents[index])
+        }
+        at += u64.widen(take_bytes)
+    }
+    return Untrusted.of(take bytes)
+} Volume.read_file
+
+/// Creates or replaces the whole file at `path` with `data`, creating missing directories: the data goes to free clusters, then a flush, then the entry in one block write, a flush, and the old clusters are freed.
+pub fn Volume.write_file[D: Storage](
+    mut self,
+    disk: D,
+    path: Str,
+    data: Slice[u8],
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    let Some(parts) = components(path, alloc) else {
+        fail FatError.NotFound
+    }
+    if parts.len() == 0 {
+        fail FatError.NotFound
+    }
+    let directory = try await mut self.make_directories(disk, parts, alloc)
+    let name = parts[parts.len() - 1].as_str()
+    let old = try await mut self.find(disk, directory, name, alloc)
+    if names_directory(old) {
+        fail FatError.Exists
+    }
+    let cluster_bytes = self.geometry.cluster_bytes()
+    let count = u32.fit((u64.widen(data.len()) + cluster_bytes - 1) / cluster_bytes)
+    var head_cluster: u32 = 0
+    if count > 0 {
+        let taken = try await mut self.take_clusters(disk, count, contiguous: false, alloc)
+        head_cluster = taken[0]
+        try await mut self.write_clusters(disk, clusters: taken, data, alloc)
+    }
+    try await disk.flush(alloc)
+    match old {
+        Some(found) => {
+            try await mut self.update_entry(disk, slot: found.slot, cluster: head_cluster, size: u32.fit(data.len()), alloc)
+            try await disk.flush(alloc)
+            if self.geometry.holds(found.cluster) {
+                try await mut self.free_chain(disk, start: found.cluster, alloc)
+            }
+        }
+        None => {
+            try await mut self.add_entry(disk, directory, name, attributes: 0x20, cluster: head_cluster, size: u32.fit(data.len()), alloc)
+            try await disk.flush(alloc)
+        }
+    }
+} Volume.write_file
+
+/// Writes `data` over `clusters` in order, block by block, zero-padding the last.
+fn Volume.write_clusters[D: Storage](
+    mut self,
+    disk: D,
+    clusters: mem::List[u32],
+    data: Slice[u8],
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    let block_bytes = usize.widen(self.geometry.block_bytes)
+    var at: usize = 0
+    for cluster in clusters {
+        let first_block = self.geometry.cluster_block(cluster)
+        for index in 0..<u64.widen(self.geometry.cluster_blocks) {
+            var bytes = mem::Bytes.zeroed(block_bytes, alloc)
+            var filled: usize = 0
+            while filled < block_bytes and at < data.len() {
+                bytes[filled] = data[at]
+                filled += 1
+                at += 1
+            }
+            try await mut self.put_block(disk, block: first_block + index, take bytes, alloc)
+        }
+    }
+} Volume.write_clusters
+
+/// Adds an entry for `name` in `directory`, with the long-name entries its short name needs.
+fn Volume.add_entry[D: Storage](
+    mut self,
+    disk: D,
+    directory: Folder,
+    name: Str,
+    attributes: u8,
+    cluster: u32,
+    size: u32,
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    let short = try await mut self.short_name(disk, directory, name, alloc)
+    let slots = try await mut self.free_slots(disk, directory, count: entries_for(name, short), alloc)
+    try await mut self.write_entries(disk, slots, name, short, attributes, cluster, size, alloc)
+} Volume.add_entry
+
+/// The directory holding the last of `parts`, each directory before it created when missing.
+fn Volume.make_directories[D: Storage](mut self, disk: D, parts: mem::List[text::String], alloc: mem::Alloc) -> Folder fails Failure uses wait {
+    var directory = self.root()
+    for at in 0..<(parts.len() - 1) {
+        let name = parts[at].as_str()
+        match try await mut self.find(disk, directory, name, alloc) {
+            Some(found) => {
+                if not found.is_directory() {
+                    fail FatError.NotFound
+                }
+                directory = found.directory()
+            }
+            None => {
+                let taken = try await mut self.take_clusters(disk, count: 1, contiguous: false, alloc)
+                let cluster = taken[0]
+                try await mut self.zero_cluster(disk, cluster, alloc)
+                let parent: u32 = match directory {
+                    Folder.Root => 0
+                    Folder.Chain(start) => start
+                }
+                var block = mem::Bytes.zeroed(usize.widen(self.geometry.block_bytes), alloc)
+                let dot = dot_name(dots: 1)
+                let dotdot = dot_name(dots: 2)
+                let own = short_entry(dot, attributes: SUBDIRECTORY, cluster, size: 0)
+                let up = short_entry(dotdot, attributes: SUBDIRECTORY, cluster: parent, size: 0)
+                for byte in 0..<32usize {
+                    block[byte] = own[byte]
+                    block[32 + byte] = up[byte]
+                }
+                try await mut self.put_block(disk, block: self.geometry.cluster_block(cluster), bytes: take block, alloc)
+                try await mut self.add_entry(disk, directory, name, attributes: SUBDIRECTORY, cluster, size: 0, alloc)
+                directory = Folder.Chain(cluster)
+            }
+        }
+    }
+    return directory
+} Volume.make_directories
+
+/// The short name `.` or `..`.
+fn dot_name(dots: usize) -> Array[u8, 11] {
+    var short = Array[u8, 11].filled(b' ')
+    for at in 0..<dots {
+        short[at] = b'.'
+    }
+    return short
+} dot_name
+
+/// Replaces bytes inside the file at `path` from `offset`, each block in one write.
+pub fn Volume.overwrite_file[D: Storage](
+    mut self,
+    disk: D,
+    path: Str,
+    offset: u64,
+    data: Slice[u8],
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    let found = try await mut self.file_at(disk, path, alloc)
+    if offset + u64.widen(data.len()) > u64.widen(found.size) {
+        fail FatError.OutOfRange
+    }
+    let clusters = try await mut self.chain(disk, start: found.cluster, alloc)
+    let block_bytes = u64.widen(self.geometry.block_bytes)
+    var at = offset
+    var taken: usize = 0
+    while taken < data.len() {
+        let cluster_index = usize.widen(at / self.geometry.cluster_bytes())
+        if cluster_index >= clusters.len() {
+            fail FatError.BadVolume
+        }
+        let within = at % self.geometry.cluster_bytes()
+        let block = self.geometry.cluster_block(clusters[cluster_index]) + within / block_bytes
+        var contents = try await mut self.block(disk, block, alloc)
+        var index = usize.widen(within % block_bytes)
+        while index < contents.len() and taken < data.len() {
+            contents[index] = data[taken]
+            index += 1
+            taken += 1
+            at += 1
+        }
+        try await mut self.put_block(disk, block, bytes: take contents, alloc)
+    }
+} Volume.overwrite_file
+
+/// Removes the file or empty directory at `path`.
+pub fn Volume.remove_file[D: Storage](mut self, disk: D, path: Str, alloc: mem::Alloc) fails Failure uses wait {
+    let Some(found) = try await mut self.lookup(disk, path, alloc) else {
+        fail FatError.NotFound
+    }
+    if found.is_directory() {
+        let inside = try await mut self.entries(disk, directory: found.directory(), alloc)
+        if inside.len() > 0 {
+            fail FatError.InUse
+        }
+    }
+    try await mut self.free_entries(disk, found, alloc)
+    try await disk.flush(alloc)
+    if self.geometry.holds(found.cluster) {
+        try await mut self.free_chain(disk, start: found.cluster, alloc)
+    }
+} Volume.remove_file
+
+/// Creates a file of `bytes` bytes at `path` on one run of free clusters, its contents unspecified.
+pub fn Volume.allocate_file[D: Storage](
+    mut self,
+    disk: D,
+    path: Str,
+    bytes: u64,
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    let Some(parts) = components(path, alloc) else {
+        fail FatError.NotFound
+    }
+    if parts.len() == 0 {
+        fail FatError.NotFound
+    }
+    if bytes > 0xFFFF_FFFF {
+        fail FatError.NoSpace
+    }
+    let directory = try await mut self.make_directories(disk, parts, alloc)
+    let name = parts[parts.len() - 1].as_str()
+    if (try await mut self.find(disk, directory, name, alloc)).is_some() {
+        fail FatError.Exists
+    }
+    let count = u32.fit((bytes + self.geometry.cluster_bytes() - 1) / self.geometry.cluster_bytes())
+    var head_cluster: u32 = 0
+    if count > 0 {
+        let taken = try await mut self.take_clusters(disk, count, contiguous: true, alloc)
+        head_cluster = taken[0]
+    }
+    try await disk.flush(alloc)
+    try await mut self.add_entry(disk, directory, name, attributes: 0x20, cluster: head_cluster, size: u32.fit(bytes), alloc)
+    try await disk.flush(alloc)
+} Volume.allocate_file
+
+/// The block range of the file at `path`, whose clusters are contiguous.
+pub fn Volume.extent_of[D: Storage](mut self, disk: D, path: Str, alloc: mem::Alloc) -> Extent fails Failure uses wait {
+    let found = try await mut self.file_at(disk, path, alloc)
+    if not self.geometry.holds(found.cluster) {
+        return Extent(start: 0, blocks: 0)
+    }
+    let clusters = try await mut self.chain(disk, start: found.cluster, alloc)
+    for at in 1..<clusters.len() {
+        if clusters[at] != clusters[at - 1] + 1 {
+            fail FatError.NotContiguous
+        }
+    }
+    return Extent(start: self.geometry.cluster_block(found.cluster), blocks: u64.widen(clusters.len()) * u64.widen(self.geometry.cluster_blocks))
+} Volume.extent_of
+
+/// Frees the clusters the FAT marks used that no entry reaches, as a crash during a write leaves them.
+pub fn Volume.free_lost[D: Storage](mut self, disk: D, alloc: mem::Alloc) fails Failure uses wait {
+    var reached = mem::Bytes.zeroed(usize.widen(self.geometry.clusters) / 8 + 2, alloc)
+    var pending = mem::List[Folder].empty(alloc)
+    mut pending.push(self.root())
+    match self.root() {
+        Folder.Chain(start) => try await mut self.mark(disk, start, mut reached, alloc)
+        Folder.Root => {
+        }
+    }
+    while pending.len() > 0 {
+        let directory = mut pending.remove(0)
+        let listed = try await mut self.entries(disk, directory, alloc)
+        for each in listed {
+            if not self.geometry.holds(each.cluster) or is_reached(reached, cluster: each.cluster) {
+                continue
+            }
+            try await mut self.mark(disk, start: each.cluster, mut reached, alloc)
+            if each.is_directory() {
+                mut pending.push(each.directory())
+            }
+        }
+    }
+    let unreached = try await self.unreached(disk, reached, alloc)
+    for cluster in unreached {
+        try await mut self.set_next(disk, cluster, value: 0, alloc)
+    }
+} Volume.free_lost
+
+fn Volume.mark[D: Storage](
+    mut self,
+    disk: D,
+    start: u32,
+    mut reached: mem::Bytes,
+    alloc: mem::Alloc,
+    ) fails Failure uses wait {
+    let clusters = try await mut self.chain(disk, start, alloc)
+    for cluster in clusters {
+        let index = usize.widen(cluster)
+        reached[index / 8] = reached[index / 8] | (1u8 << u32.truncate(index % 8))
+    }
+} Volume.mark
+
+fn names_directory(entry: Option[Listed]) -> bool {
+    return match entry {
+        Some(listed) => listed.is_directory()
+        None => false
+    }
+} names_directory
+
+fn min_u64(a: u64, b: u64) -> u64 {
+    if a < b {
+        return a
+    }
+    return b
+} min_u64

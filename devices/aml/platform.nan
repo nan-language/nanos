@@ -1,0 +1,368 @@
+//! What the namespace describes: its devices with their identifiers and the windows and lines their `_CRS` gives, the PCI interrupt routes `_PRT` gives, and the sleep values `\_Sx_` gives.
+
+/// A window or line a `_CRS` resource template gives.
+pub closed enum Window derives Copy, Eq, Encode {
+    Ports(base: u16, count: u16)
+    Memory(base: u64, size: u64)
+    Line(u32)
+} Window
+
+/// A device of the namespace with a `_HID`: its path, its `_HID`, `_CID`s and `_UID`, the windows of its `_CRS`, and whether evaluating that `_CRS` failed.
+pub closed struct Platform derives Encode {
+    pub path: Path
+    pub hid: text::Fixed[8]
+    pub cids: Array[text::Fixed[8], 4]
+    pub uid: u32
+    pub windows: mem::List[Window]
+    pub failed: bool
+} Platform
+
+/// A route of a `_PRT`: the device holding it, the PCI address and INTx pin it routes, and the link device and index, or the global system interrupt when it names no link.
+pub closed struct Route derives Copy, Eq, Encode {
+    pub device: Path
+    pub address: u32
+    pub pin: u8
+    pub source: Option[Path]
+    pub index: u32
+} Route
+
+/// The values of a sleep state's `\_Sx_` object for the PM1a and PM1b control registers.
+pub closed struct Sleep derives Copy, Eq, Encode {
+    pub a: u8
+    pub b: u8
+} Sleep
+
+/// The present devices of the namespace with a `_HID` given as data.
+pub fn platform(code: Code, alloc: mem::Alloc) -> mem::List[Platform] fails AmlError {
+    let objects = try namespace(code, alloc)
+    let bytes = code.bytes.view()
+    var found = mem::List[Platform].empty(alloc)
+    for object in objects {
+        if object.kind != Kind.Device {
+            continue
+        }
+        let Some(hid_object) = child(objects, path: object.path, name: b"_HID") else {
+            continue
+        }
+        if hid_object.kind != Kind.Name {
+            continue
+        }
+        let named = try evaluate(bytes, objects, object: hid_object, alloc)
+        let hid = try identifier(bytes, value: named.value)
+        match child(objects, path: object.path, name: b"_STA") {
+            Some(status) => {
+                if status.kind == Kind.Name {
+                    let present = try evaluate(bytes, objects, object: status, alloc)
+                    if (try integer(present.value) & 1) == 0 {
+                        continue
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        var cids = Array[text::Fixed[8], 4].filled(text::Fixed[8].empty())
+        match child(objects, path: object.path, name: b"_CID") {
+            Some(cid) => {
+                if cid.kind == Kind.Name {
+                    let evaluated = try evaluate(bytes, objects, object: cid, alloc)
+                    cids = try identifiers(bytes, evaluated)
+                }
+            }
+            None => {
+            }
+        }
+        var uid: u32 = 0
+        match child(objects, path: object.path, name: b"_UID") {
+            Some(unique) => {
+                if unique.kind == Kind.Name {
+                    let numbered = try evaluate(bytes, objects, object: unique, alloc)
+                    uid = unique_number(bytes, value: numbered.value)
+                }
+            }
+            None => {
+            }
+        }
+        var listed = mem::List[Window].empty(alloc)
+        var failed = false
+        match child(objects, path: object.path, name: b"_CRS") {
+            Some(resources) => {
+                match attempt resource_windows(bytes, objects, object: resources, alloc) {
+                    Ok(given) => {
+                        listed = given
+                    }
+                    Err(_) => {
+                        failed = true
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        mut found.push(Platform(path: object.path, hid: hid, cids: cids, uid: uid, windows: take listed, failed: failed))
+    }
+    return found
+} platform
+
+/// The windows the `_CRS` `object` gives.
+fn resource_windows(code: Slice[u8], objects: mem::List[Object], object: Object, alloc: mem::Alloc) -> mem::List[Window] fails AmlError {
+    let evaluated = try evaluate(code, objects, object, alloc)
+    let Value.Buffer(start: start, length: length) = evaluated.value else {
+        fail AmlError.Malformed
+    }
+    return try template_windows(code, from: usize.widen(start), to: usize.widen(start) + usize.widen(length), alloc)
+} resource_windows
+
+/// The routes of every `_PRT` of the namespace.
+pub fn routes(code: Code, alloc: mem::Alloc) -> mem::List[Route] fails AmlError {
+    let objects = try namespace(code, alloc)
+    let bytes = code.bytes.view()
+    var found = mem::List[Route].empty(alloc)
+    for object in objects {
+        if object.path.last() != segment(b"_PRT") or (object.kind != Kind.Name and object.kind != Kind.Method) {
+            continue
+        }
+        let evaluated = try evaluate(bytes, objects, object, alloc)
+        let Value.Package(head: head, count: count) = evaluated.value else {
+            fail AmlError.Malformed
+        }
+        for index in 0..<usize.widen(count) {
+            let Value.Package(head: entry, count: fields) = evaluated.elements[usize.widen(head) + index] else {
+                fail AmlError.Malformed
+            }
+            if fields < 4 {
+                fail AmlError.Malformed
+            }
+            let at = usize.widen(entry)
+            let source = match evaluated.elements[at + 2] {
+                Value.Reference(path) => Some(path)
+                else => None
+            }
+            mut found.push(Route(device: object.path.parent(), address: u32.truncate(try integer(evaluated.elements[at])), pin: u8.truncate(try integer(evaluated.elements[at + 1])), source: source, index: u32.truncate(try integer(evaluated.elements[at + 3]))))
+        }
+    }
+    return found
+} routes
+
+/// The values of the sleep state `state`'s `\_Sx_` object.
+pub fn sleep_state(code: Code, state: u8, alloc: mem::Alloc) -> Sleep fails AmlError {
+    let objects = try namespace(code, alloc)
+    var name = Array[u8, 4].filled(b'_')
+    name[1] = b'S'
+    name[2] = b'0' + state % 10
+    let Some(path) = Path.root().child(segment(name.view())) else {
+        fail AmlError.Missing
+    }
+    let Some(object) = lookup(objects, path, search: false) else {
+        fail AmlError.Missing
+    }
+    let evaluated = try evaluate(code.bytes.view(), objects, object, alloc)
+    let Value.Package(head: head, count: count) = evaluated.value else {
+        fail AmlError.Malformed
+    }
+    if count < 2 {
+        fail AmlError.Malformed
+    }
+    return Sleep(a: u8.truncate(try integer(evaluated.elements[usize.widen(head)])), b: u8.truncate(try integer(evaluated.elements[usize.widen(head) + 1])))
+} sleep_state
+
+/// The object `name` directly below `path`.
+fn child(objects: mem::List[Object], path: Path, name: Slice[u8]) -> Option[Object] {
+    let Some(wanted) = path.child(segment(name)) else {
+        return None
+    }
+    return lookup(objects, path: wanted, search: false)
+} child
+
+/// An identifier: an EISA id integer, rendered as its seven characters, or a string of at most eight.
+fn identifier(code: Slice[u8], value: Value) -> text::Fixed[8] fails AmlError {
+    return match value {
+        Value.Integer(number) => eisa_id(u32.truncate(number))
+        Value.Text(start: start, length: length) => short_text(code, start, length)
+        else => fail AmlError.Malformed
+    }
+} identifier
+
+/// The `_CID`s an evaluation gives: one identifier, or a package of at most four.
+fn identifiers(code: Slice[u8], evaluated: Evaluated) -> Array[text::Fixed[8], 4] fails AmlError {
+    var listed = Array[text::Fixed[8], 4].filled(text::Fixed[8].empty())
+    match evaluated.value {
+        Value.Package(head: head, count: count) => {
+            for index in 0..<usize.widen(count) {
+                if index < 4 {
+                    listed[index] = try identifier(code, value: evaluated.elements[usize.widen(head) + index])
+                }
+            }
+        }
+        else => {
+            listed[0] = try identifier(code, value: evaluated.value)
+        }
+    }
+    return listed
+} identifiers
+
+/// A `_UID` as a number: an integer, or a string's decimal digits; 0 for any other string.
+fn unique_number(code: Slice[u8], value: Value) -> u32 {
+    return match value {
+        Value.Integer(number) => u32.truncate(number)
+        Value.Text(start: start, length: length) => decimal_text(code, start, length)
+        else => 0
+    }
+} unique_number
+
+fn decimal_text(code: Slice[u8], start: u32, length: u32) -> u32 {
+    var number: u32 = 0
+    for index in 0..<usize.widen(length) {
+        let byte = code[usize.widen(start) + index]
+        if byte < b'0' or byte > b'9' or number > 0x0FFF_FFFF {
+            return 0
+        }
+        number = number * 10 + u32.widen(byte - b'0')
+    }
+    return number
+} decimal_text
+
+/// The string of `length` bytes from `start`, cut to eight characters of capitals and digits.
+fn short_text(code: Slice[u8], start: u32, length: u32) -> text::Fixed[8] {
+    var text = text::Fixed[8].empty()
+    for index in 0..<usize.widen(length) {
+        let byte = code[usize.widen(start) + index]
+        if index >= 8 or not ((byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9')) {
+            break
+        }
+        mut text.push(char.checked_from_bits(u32.widen(byte)).value_or('0'))
+    }
+    return text
+} short_text
+
+/// The seven characters of an EISA id: three letters of five bits each, then four hexadecimal digits, from its bytes in the order the integer holds them.
+pub fn eisa_id(number: u32) -> text::Fixed[8]
+    example eisa_id(0x0105_D041).as_str() == "PNP0501"
+    example eisa_id(0x000B_D041).as_str() == "PNP0B00"
+{
+    let b0 = number & 0xFF
+    let b1 = (number >> 8) & 0xFF
+    let b2 = (number >> 16) & 0xFF
+    let b3 = (number >> 24) & 0xFF
+    var text = text::Fixed[8].empty()
+    var letters = Array[u32, 3].filled(0)
+    letters[0] = (b0 >> 2) & 0x1F
+    letters[1] = ((b0 & 0x3) << 3) | (b1 >> 5)
+    letters[2] = b1 & 0x1F
+    for letter in letters {
+        mut text.push(char.checked_from_bits(0x40 + letter).value_or('?'))
+    }
+    var nibbles = Array[u32, 4].filled(0)
+    nibbles[0] = b2 >> 4
+    nibbles[1] = b2 & 0xF
+    nibbles[2] = b3 >> 4
+    nibbles[3] = b3 & 0xF
+    for nibble in nibbles {
+        let shown = match nibble < 10 {
+            true => 0x30 + nibble
+            false => 0x37 + nibble
+        }
+        mut text.push(char.checked_from_bits(shown).value_or('0'))
+    }
+    return text
+} eisa_id
+
+/// The windows and lines of the resource template from `from` to `to`.
+fn template_windows(code: Slice[u8], from: usize, to: usize, alloc: mem::Alloc) -> mem::List[Window] fails AmlError {
+    var found = mem::List[Window].empty(alloc)
+    var pc = from
+    while pc < to {
+        let tag = code[pc]
+        if (tag & 0x80) == 0 {
+            let length = usize.widen(tag & 0x07)
+            if pc + 1 + length > to {
+                fail AmlError.Malformed
+            }
+            if ((tag >> 3) & 0x0F) == 0x0F {
+                return found
+            }
+            small_window(code, kind: (tag >> 3) & 0x0F, body: pc + 1, length, mut found)
+            pc += 1 + length
+            continue
+        }
+        if pc + 3 > to {
+            fail AmlError.Malformed
+        }
+        let length = usize.widen(code.u16_le(pc + 1))
+        if pc + 3 + length > to {
+            fail AmlError.Malformed
+        }
+        try large_window(code, kind: tag & 0x7F, body: pc + 3, length, mut found)
+        pc += 3 + length
+    }
+    return found
+} template_windows
+
+/// Appends what a small descriptor gives: an IRQ's lines, an I/O or fixed I/O window.
+fn small_window(
+    code: Slice[u8],
+    kind: u8,
+    body: usize,
+    length: usize,
+    mut found: mem::List[Window],
+    ) {
+    if kind == 0x04 and length >= 2 {
+        let mask = code.u16_le(body)
+        for line in 0..<16u32 {
+            if ((mask >> line) & 1) != 0 {
+                mut found.push(Window.Line(line))
+            }
+        }
+    } else if kind == 0x08 and length >= 7 {
+        mut found.push(Window.Ports(base: code.u16_le(body + 1), count: u16.widen(code[body + 6])))
+    } else if kind == 0x09 and length >= 3 {
+        mut found.push(Window.Ports(base: code.u16_le(body) & 0x3FF, count: u16.widen(code[body + 2])))
+    }
+} small_window
+
+/// Appends what a large descriptor gives: a 32-bit memory range, an extended interrupt's lines, or an address space's window.
+fn large_window(
+    code: Slice[u8],
+    kind: u8,
+    body: usize,
+    length: usize,
+    mut found: mem::List[Window],
+    ) fails AmlError {
+    if kind == 0x06 and length >= 9 {
+        mut found.push(Window.Memory(base: u64.widen(code.u32_le(body + 1)), size: u64.widen(code.u32_le(body + 5))))
+    } else if kind == 0x05 and length >= 17 {
+        mut found.push(Window.Memory(base: u64.widen(code.u32_le(body + 1)), size: u64.widen(code.u32_le(body + 13))))
+    } else if kind == 0x09 and length >= 2 {
+        let count = usize.widen(code[body + 1])
+        if 2 + 4 * count > length {
+            fail AmlError.Malformed
+        }
+        for index in 0..<count {
+            mut found.push(Window.Line(code.u32_le(body + 2 + 4 * index)))
+        }
+    } else if kind == 0x07 and length >= 23 {
+        space_window(kind: code[body], flags: code[body + 1], base: u64.widen(code.u32_le(body + 7)), size: u64.widen(code.u32_le(body + 19)), mut found)
+    } else if kind == 0x08 and length >= 13 {
+        space_window(kind: code[body], flags: code[body + 1], base: u64.widen(code.u16_le(body + 5)), size: u64.widen(code.u16_le(body + 11)), mut found)
+    } else if kind == 0x0A and length >= 43 {
+        space_window(kind: code[body], flags: code[body + 1], base: code.u64_le(body + 11), size: code.u64_le(body + 35), mut found)
+    }
+} large_window
+
+/// Appends the window an address space descriptor of resource type `kind` and general `flags` gives: memory or I/O ports the device consumes, none for a bus number range or a range it produces for its children.
+fn space_window(
+    kind: u8,
+    flags: u8,
+    base: u64,
+    size: u64,
+    mut found: mem::List[Window],
+    ) {
+    if (flags & 0x01) == 0 {
+        return
+    }
+    if kind == 1 {
+        mut found.push(Window.Ports(base: u16.truncate(base), count: u16.saturate(size)))
+    } else if kind == 0 {
+        mut found.push(Window.Memory(base: base, size: size))
+    }
+} space_window
