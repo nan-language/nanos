@@ -1,6 +1,6 @@
 # 0016. Stack on NaN v0.4.0
 
-Status: accepted
+Status: superseded by 0019
 
 ## Context
 
