@@ -10,14 +10,36 @@ const MSI: u32 = 0x05
 
 const MSIX: u32 = 0x11
 
-/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports, the devices it lists, the firmware tables, the topology's generation and the orders waiting for it to change.
+/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports with the interrupts of their hot-plug slots and the signal those post, the devices it lists, the firmware tables, the topology's generation and where to send it once it changes.
 pkg linear struct Keeper {
     idle: mem::List[hw::PciFunction]
     keepers: mem::List[hw::PciKeeper]
     ports: mem::List[hw::PciPort]
+    slots: mem::List[hw::IrqShared[SlotInterrupt]]
+    signal: mem::Shared[hw::Signal[Unit]]
     found: mem::List[devices::Found]
     tables: mem::List[Table]
+    generation: u64
+    watchers: mem::List[task::Sender[u64]]
 } Keeper
+
+/// What the keeper serves: an order of the device root, or the interrupt of a hot-plug slot.
+pkg enum Input {
+    Order(devices::RootOrder)
+    Slots
+} Input
+
+/// What a hot-plug slot's interrupt fn holds: the keeper's signal.
+pkg struct SlotInterrupt {
+    signal: mem::Shared[hw::Signal[Unit]]
+} SlotInterrupt
+
+/// Posts the keeper's signal for each interrupt of a hot-plug slot.
+interrupt fn SlotInterrupt.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 512 {
+    self.signal.contents().post(irq.irqs_disabled(), value: Unit)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} SlotInterrupt.on_irq
 
 /// A copy of a firmware table.
 pkg struct Table {
@@ -29,23 +51,54 @@ pkg fn Table.of(signature: Array[u8, 4], take bytes: Untrusted[mem::Bytes]) -> T
 
 /// The keeper of `functions` and `ports`, giving each function a keeper and listing it, and of `tables`.
 pkg fn Keeper.of(take functions: mem::List[hw::PciFunction], take ports: mem::List[hw::PciPort], take tables: mem::List[Table], alloc: mem::Alloc) -> Keeper {
-    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, found: mem::List.empty(alloc), tables: take tables)
+    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, slots: mem::List.empty(alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), found: mem::List.empty(alloc), tables: take tables, generation: 0, watchers: mem::List.empty(alloc))
     for function in take functions {
-        var held = function
-        match mut held.keeper() {
-            Some(keeper) => mut kept.keepers.push(take keeper)
-            None => {
-            }
-        }
-        mut kept.found.push(found_of(held, alloc))
-        mut kept.idle.push(take held)
+        mut kept.adopt(take function, alloc)
     }
     return kept
 } Keeper.of
 
+/// Gives `function` a keeper, lists it and holds it.
+fn Keeper.adopt(mut self, take function: hw::PciFunction, alloc: mem::Alloc) {
+    var held = function
+    match mut held.keeper() {
+        Some(keeper) => mut self.keepers.push(take keeper)
+        None => {
+        }
+    }
+    mut self.found.push(found_of(held, alloc))
+    mut self.idle.push(take held)
+} Keeper.adopt
+
+/// The signal the interrupts of the hot-plug slots post.
+pkg fn Keeper.slot_signal(self) -> mem::Shared[hw::Signal[Unit]] {
+    return self.signal.share()
+} Keeper.slot_signal
+
+/// Takes the interrupts of the ports' hot-plug slots, then clears their events so far, so that the next event interrupts.
+fn Keeper.watch_slots(mut self) {
+    for at in 0..<self.ports.len() {
+        let Some(slot) = self.ports[at].slot() else {
+            continue
+        }
+        if not slot.hot_plug {
+            continue
+        }
+        match mut self.ports.at_mut(at).slot_irq(cpu: 0, dev: SlotInterrupt(signal: self.signal.share()), on_irq: SlotInterrupt.on_irq) {
+            Ok(shared) => mut self.slots.push(take shared)
+            Err(_) => {
+            }
+        }
+        discard mut self.ports.at_mut(at).slot_events()
+    }
+} Keeper.watch_slots
+
 /// Releases what the keeper holds.
 pkg fn Keeper.release(take self) {
-    let Keeper(idle: idle, keepers: keepers, ports: ports, found: _, tables: _) = self
+    let Keeper(idle: idle, keepers: keepers, ports: ports, slots: slots, signal: _, found: _, tables: _, generation: _, watchers: _) = self
+    for slot in take slots {
+        discard take slot.uninstall()
+    }
     for function in take idle {
         take function.release()
     }
@@ -57,32 +110,203 @@ pkg fn Keeper.release(take self) {
     }
 } Keeper.release
 
-/// Carries out the device root's orders as they come, recording device events in `rings`, until they end.
-pkg fn Keeper.serve(mut self, take orders: task::Receiver[devices::RootOrder], rings: journal::Rings, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Carries out the device root's orders and takes the hot-plug slots' events as `inputs` bring them, recording device events in `rings`, until they end.
+pkg fn Keeper.serve(mut self, take inputs: task::Receiver[Input], rings: journal::Rings, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    mut self.watch_slots()
+    var receiver = inputs
+    loop {
+        let Some(input) = try await mut receiver.receive() else {
+            return
+        }
+        match input {
+            Input.Slots => {
+                if mut self.slots_changed(alloc) {
+                    try await mut self.changed()
+                }
+            }
+            Input.Order(order) => try await mut self.carry_out(take order, rings, alloc)
+        }
+    }
+} Keeper.serve
+
+/// Carries out `order`.
+fn Keeper.carry_out(mut self, take order: devices::RootOrder, rings: journal::Rings, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    match order {
+        devices::RootOrder.Devices(done: done) => {
+            discard attempt await done.send(self.listed(alloc))
+        }
+        devices::RootOrder.Table(signature: signature, index: index, done: done) => {
+            discard attempt await done.send(self.table(signature, index, alloc))
+        }
+        devices::RootOrder.Declare(path: path, ids: ids, resources: resources, done: done) => {
+            let declared = mut self.declare(path, ids, take resources)
+            discard attempt await done.send(declared)
+        }
+        devices::RootOrder.Claim(path: path, done: done) => {
+            let claimed = mut self.claim(path, alloc)
+            discard attempt await done.send(take claimed)
+        }
+        devices::RootOrder.Cut(path: path, reset: reset, done: done) => {
+            let cut = mut self.cut(path, reset)
+            discard attempt await done.send(cut)
+        }
+        devices::RootOrder.Changes(seen: seen, done: done) => {
+            if self.generation > seen {
+                discard attempt await done.send(self.generation)
+            } else {
+                mut self.watchers.push(take done)
+            }
+        }
+        devices::RootOrder.Emit(event: event) => rings.record_device(event)
+    }
+} Keeper.carry_out
+
+/// Hands each order `orders` brings to the keeper's `inputs`, until either ends.
+pkg fn forward(take orders: task::Receiver[devices::RootOrder], take inputs: task::Sender[Input]) fails task::Cancelled uses wait {
     var receiver = orders
     loop {
         let Some(order) = try await mut receiver.receive() else {
             return
         }
-        match order {
-            devices::RootOrder.Devices(done: done) => {
-                discard attempt await done.send(self.listed(alloc))
+        match attempt await inputs.send(Input.Order(take order)) {
+            Ok(_) => {
             }
-            devices::RootOrder.Table(signature: signature, index: index, done: done) => {
-                discard attempt await done.send(self.table(signature, index, alloc))
-            }
-            devices::RootOrder.Declare(path: path, ids: ids, resources: resources, done: done) => {
-                let declared = mut self.declare(path, ids, take resources)
-                discard attempt await done.send(declared)
-            }
-            devices::RootOrder.Claim(path: path, done: done) => {
-                let claimed = mut self.claim(path, alloc)
-                discard attempt await done.send(take claimed)
-            }
-            devices::RootOrder.Emit(event: event) => rings.record_device(event)
+            Err(task::SendError.Closed) => return
+            Err(task::SendError.Cancelled(cancelled)) => fail cancelled
         }
     }
-} Keeper.serve
+} forward
+
+/// Tells the keeper's `inputs` of each interrupt of a hot-plug slot that `signal` brings, until they end.
+pkg fn relay_slots(signal: mem::Shared[hw::Signal[Unit]], take inputs: task::Sender[Input]) fails task::Cancelled uses wait {
+    loop {
+        try await signal.contents().wait()
+        match attempt await inputs.send(Input.Slots) {
+            Ok(_) => {
+            }
+            Err(task::SendError.Closed) => return
+            Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        }
+    }
+} relay_slots
+
+/// Hands each waiting `Changes` order the topology's next generation.
+fn Keeper.changed(mut self) fails task::Cancelled uses wait {
+    self.generation += 1
+    loop {
+        let Some(done) = mut self.watchers.pop() else {
+            return
+        }
+        discard attempt await done.send(self.generation)
+    }
+} Keeper.changed
+
+/// Takes each hot-plug slot's events: powers off a slot whose attention button is pressed while its card stays, powers on a slot whose card arrives and lists its functions, and drops those of a card that left or lost its link; whether the topology changed.
+fn Keeper.slots_changed(mut self, alloc: mem::Alloc) -> bool {
+    var changed = false
+    for at in 0..<self.ports.len() {
+        let Some(slot) = self.ports[at].slot() else {
+            continue
+        }
+        if not slot.hot_plug {
+            continue
+        }
+        let events = mut self.ports.at_mut(at).slot_events()
+        if events.attention_pressed and not events.presence_changed {
+            mut self.ports.at_mut(at).power(on: false)
+        }
+        if events.presence_changed and events.present {
+            mut self.ports.at_mut(at).power(on: true)
+            let arrived = mut self.ports.at_mut(at).rescan(alloc)
+            for function in take arrived {
+                mut self.adopt(take function, alloc)
+                changed = true
+            }
+        } else if events.presence_changed or (events.link_changed and not events.link_active) {
+            if mut self.drop_below(self.ports[at].buses()) {
+                changed = true
+            }
+        }
+    }
+    return changed
+} Keeper.slots_changed
+
+/// Drops the devices on `buses`, whose card left: their listings, the functions the keeper holds and the keepers of those it reclaims; whether any was listed.
+fn Keeper.drop_below(mut self, buses: hw::PciBuses) -> bool {
+    var dropped = false
+    var at: usize = 0
+    while at < self.found.len() {
+        let gone = match self.found[at].path {
+            devices::BusPath.Pci(address) => address.bus >= buses.secondary and address.bus <= buses.subordinate
+            else => false
+        }
+        if gone {
+            discard mut self.found.remove(at)
+            dropped = true
+        } else {
+            at += 1
+        }
+    }
+    at = 0
+    while at < self.idle.len() {
+        let bus = self.idle[at].address().bus
+        if bus >= buses.secondary and bus <= buses.subordinate {
+            let leaving = mut self.idle.remove(at)
+            take leaving.release()
+        } else {
+            at += 1
+        }
+    }
+    at = 0
+    while at < self.keepers.len() {
+        let bus = self.keepers[at].address().bus
+        if bus >= buses.secondary and bus <= buses.subordinate {
+            match mut self.keepers.at_mut(at).reclaim() {
+                Some(function) => {
+                    take function.release()
+                    let leaving = mut self.keepers.remove(at)
+                    take leaving.release()
+                    continue
+                }
+                None => {
+                }
+            }
+        }
+        at += 1
+    }
+    return dropped
+} Keeper.drop_below
+
+/// Cuts the device at `path` off once its driver has stopped: the keeper holds its function again, reset when `reset` and it has a way to reset, or releases it with its keeper when its card has left; false while a driver holds it, or when its reset failed.
+fn Keeper.cut(mut self, path: devices::BusPath, reset: bool) -> bool {
+    let devices::BusPath.Pci(address) = path else {
+        return true
+    }
+    let Some(function) = mut self.take_function(address) else {
+        return false
+    }
+    if not function.removed() {
+        var held = function
+        var answered = true
+        if reset {
+            answered = match first attempt mut held.reset() {
+                Ok(_) or Err(hw::PciError.Unsupported) => true
+                Err(_) => false
+            }
+        }
+        mut self.idle.push(take held)
+        return answered
+    }
+    take function.release()
+    for at in 0..<self.keepers.len() {
+        if devices::PciAddress.of(self.keepers[at].address()) == address {
+            let leaving = mut self.keepers.remove(at)
+            take leaving.release()
+            return true
+        }
+    }
+    return true
+} Keeper.cut
 
 /// A copy of every device the keeper lists.
 fn Keeper.listed(self, alloc: mem::Alloc) -> mem::List[devices::Found] {

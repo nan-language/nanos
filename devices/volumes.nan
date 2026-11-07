@@ -1,6 +1,6 @@
 //! Volumes and roles: the units of block devices with their partitions, the volume views `devices` creates over them, and the roles their drivers and views hold.
 
-/// The keys of the keyed tasks reading a device's units and creating a view, the record's index added, and of those assigning roles, the role's rank added.
+/// The keys of the keyed tasks reading a device's units, creating a view over it and assigning its role, the device's key added.
 const VOLUMES: u64 = 0x2_0000
 
 const VIEWS: u64 = 0x3_0000
@@ -28,45 +28,50 @@ pub closed struct UnitRecord derives Encode {
     pub partitions: mem::List[Partition]
 } UnitRecord
 
-/// A volume view `devices` created: its moniker, the device, unit and partition it covers, and the role it holds.
+/// A volume view `devices` created: its moniker, the bus path of the device, the unit and partition it covers, and the role it holds.
 pub closed struct ViewRecord derives Encode {
     pub moniker: ident::Moniker
-    pub device: u32
+    pub device: BusPath
     pub unit: u16
     pub partition: u32
     pub role: Option[os::Role]
 } ViewRecord
 
-/// Has a keyed task read the units of the block device at `index` through its driver `moniker`, and their partition tables.
+/// Has a keyed task read the units of the block device at `at` through its driver `moniker`, and their partition tables.
 fn Manager.read_volumes(
     mut self,
-    index: u32,
+    at: usize,
     moniker: ident::Moniker,
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    self.binding += 1
+    self.underway += 1
     let control = env.control
     let alloc = env.alloc
     let driver = ident::Moniker(text: moniker.text)
-    mut cx.spawn(key: VOLUMES + u64.widen(index), run: fn[take driver](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
+    let path = self.records[at].path
+    let key = mut self.key_of(path)
+    mut cx.spawn(key: VOLUMES + key, run: fn[take driver](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
         let units = try await units_of(control, driver, alloc)
-        discard attempt await out.volumes(index, take units)
+        discard attempt await out.volumes(path, take units)
     })
 } Manager.read_volumes
 
-/// Records the units of the block device at `index`.
+/// Records the units of the block device at `path`.
 fn Manager.volumes(
     mut self,
-    take index: u32,
+    take path: BusPath,
     take units: mem::List[UnitRecord],
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    self.binding = self.binding.saturating_sub(1)
-    let at = usize.widen(index)
-    if at < self.records.len() {
-        self.records[at].units = units
+    self.underway = self.underway.saturating_sub(1)
+    match self.index_of(path) {
+        Some(at) => {
+            self.records[at].units = units
+        }
+        None => {
+        }
     }
     mut self.answer_settled(mut env, mut cx)
 } Manager.volumes
@@ -81,19 +86,21 @@ fn Manager.resolve_boot(mut self, mut env: Env, mut cx: sys::Cx[Devices]) -> boo
         return false
     }
     let record = self.records[usize.widen(chosen.device)]
+    let path = record.path
     let Some(driver) = record.driver else {
         return false
     }
     let moniker = view_moniker(driver, unit: chosen.unit, partition: chosen.partition.number)
-    mut self.views.push(ViewRecord(moniker: ident::Moniker(text: moniker.text), device: chosen.device, unit: chosen.unit, partition: chosen.partition.number, role: Some(os::Role.BootVolume)))
-    self.binding += 1
+    mut self.views.push(ViewRecord(moniker: ident::Moniker(text: moniker.text), device: path, unit: chosen.unit, partition: chosen.partition.number, role: Some(os::Role.BootVolume)))
+    self.underway += 1
     let control = env.control
     let alloc = env.alloc
     var spec = os::InstanceSpec.of(principal: ident::Principal(text: text::Fixed[64].of("system")), bundle: env.bundle, component: VIEW_COMPONENT, alloc)
     discard mut spec.wiring.insert(text::String.of("disk", alloc), value: os::Wire.to(ident::Moniker(text: driver.text)))
     let partition = chosen.partition
     let unit = chosen.unit
-    mut cx.spawn(key: VIEWS + u64.widen(chosen.device), run: fn[take moniker, take spec](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
+    let key = mut self.key_of(path)
+    mut cx.spawn(key: VIEWS + key, run: fn[take moniker, take spec](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
         let held = try await start_view(control, moniker, take spec, unit, partition, role: os::Role.BootVolume, alloc)
         discard attempt await out.viewed(moniker: take moniker, held)
     })
@@ -108,7 +115,7 @@ fn Manager.viewed(
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    self.binding = self.binding.saturating_sub(1)
+    self.underway = self.underway.saturating_sub(1)
     for view in mut self.views {
         if view.moniker == moniker and not held {
             view.role = None
@@ -175,10 +182,10 @@ fn names(boot: BootVolume, scheme: Scheme, partition: Partition) -> bool {
     }
 } names
 
-/// Assigns `role` to the driver of the device at `index` when no device holds it yet.
+/// Assigns `role` to the driver of the device at `at` when no device holds it yet.
 fn Manager.hold_role(
     mut self,
-    index: u32,
+    at: usize,
     role: os::Role,
     mut env: Env,
     mut cx: sys::Cx[Devices],
@@ -188,7 +195,6 @@ fn Manager.hold_role(
             return
         }
     }
-    let at = usize.widen(index)
     let named = match self.records[at].driver {
         Some(driver) => Some(ident::Moniker(text: driver.text))
         None => None
@@ -199,7 +205,8 @@ fn Manager.hold_role(
     self.records[at].role = Some(role)
     let control = env.control
     let alloc = env.alloc
-    mut cx.spawn(key: ROLES + u64.widen(index), run: fn[take moniker](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+    let key = mut self.key_of(self.records[at].path)
+    mut cx.spawn(key: ROLES + key, run: fn[take moniker](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
         match attempt await control.assign(role, take moniker, alloc) {
             Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
             else => {

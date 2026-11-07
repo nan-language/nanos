@@ -1,9 +1,22 @@
 //! The `devices` component: the records of the machine's devices, their bindings, and the driver instances it creates for them through its `Control`.
 
-/// The keys of the keyed tasks: discovery, and one per device binding a driver, its record's index added.
+/// The keys of the keyed tasks: discovery, the wait for the topology to change, and per device those binding its driver, retiring it and resetting the device, the device's key added.
 const DISCOVERY: u64 = 1
 
+const WATCHING: u64 = 2
+
 const BINDING: u64 = 0x1_0000
+
+const RETIRING: u64 = 0x5_0000
+
+const RESETTING: u64 = 0x6_0000
+
+/// The reasons `device.cut-off` gives in its argument.
+const CUT_STOPPED: u64 = 1
+
+const CUT_REMOVED: u64 = 2
+
+const CUT_RESET: u64 = 3
 
 /// The keys of the keyed tasks recording events, one per event, the count of events added.
 const EVENTS: u64 = 0x100_0000
@@ -56,13 +69,39 @@ pub closed enum Code derives Copy, Eq, Render, Encode {
     Aml
 } Code
 
+/// A device's power policy: `auto` and `on` keep it on while a driver holds it, `off` keeps it off with no driver.
+pub closed enum PowerPolicy derives Copy, Eq, Render, Encode {
+    Auto
+    On
+    Off
+} PowerPolicy
+
+/// A device's binding: how its driver is chosen, and its power policy.
+pub closed struct Binding derives Copy, Eq, Encode {
+    pub driver: DriverChoice
+    pub power: PowerPolicy
+} Binding
+
+/// Why an operation of `devices` fails, chapter 15's codes.
+pub closed enum DevicesError derives Copy, Eq, Render, Encode {
+    Unknown
+    DriverMismatch
+    NoDriver
+} DevicesError
+
 /// The operations of `devices`, and the messages its keyed tasks post.
 pub protocol Devices {
     /// The number of devices bound to a driver, once every binding under way has bound or failed.
     pub fn settled() -> u32 limits recorded
+    pub fn bind(device: BusPath, driver: text::String) fails DevicesError limits irreversible(emit, actuate, erase, spend)
+    pub fn unbind(device: BusPath) fails DevicesError limits irreversible(emit, actuate, erase, spend)
+    pub fn power(device: BusPath, policy: PowerPolicy) fails DevicesError limits irreversible(emit, actuate, erase, spend)
+    pub fn reset(device: BusPath) fails DevicesError limits irreversible(emit, actuate, erase, spend)
+    fn restarted(path: BusPath, cut: bool, lifecycle: Option[os::Lifecycle]) limits irreversible(emit, actuate, erase, spend)
     fn listed(found: mem::List[Found], failed: mem::List[BusPath]) limits irreversible(emit, actuate, erase, spend)
-    fn bound(index: u32, moniker: ident::Moniker, lifecycle: Option[os::Lifecycle]) limits irreversible(emit, actuate, erase, spend)
-    fn volumes(index: u32, units: mem::List[UnitRecord]) limits irreversible(emit, actuate, erase, spend)
+    fn bound(path: BusPath, moniker: ident::Moniker, lifecycle: Option[os::Lifecycle]) limits irreversible(emit, actuate, erase, spend)
+    fn volumes(path: BusPath, units: mem::List[UnitRecord]) limits irreversible(emit, actuate, erase, spend)
+    fn changed(generation: u64, found: mem::List[Found]) limits irreversible(emit, actuate, erase, spend)
     fn viewed(moniker: ident::Moniker, held: bool) limits irreversible(emit, actuate, erase, spend)
 } Devices
 
@@ -77,11 +116,13 @@ pub closed struct Env {
     pub alloc: mem::Alloc
 } Env
 
-/// The state of `devices`: each device's record, the volume views it created, how many bindings, volume reads and views are under way, whether discovery has listed the devices and `boot-volume` is resolved, the `settled` requests waiting, and the count of events recorded.
+/// The state of `devices`: each device's record, every bus path seen, whose position is its device's key, the bindings set, the volume views it created, how many bindings, volume reads and views are under way, whether discovery has listed the devices and `boot-volume` is resolved, the `settled` requests waiting, and the count of events recorded.
 pub closed struct Manager derives Encode {
     pub records: mem::List[LiveDevice]
+    pub paths: mem::List[BusPath]
+    pub bindings: mem::Map[BusPath, Binding]
     pub views: mem::List[ViewRecord]
-    pub binding: u32
+    pub underway: u32
     pub discovered: bool
     pub boot_resolved: bool
     pub waiting: mem::List[u64]
@@ -92,7 +133,7 @@ impl Manager: sys::Component[Env, Devices]
 
 impl Manager: sys::Resume[Env, Devices]
 
-pub fn Manager.start(mut env: Env) -> Manager = Manager(records: mem::List.empty(env.alloc), views: mem::List.empty(env.alloc), binding: 0, discovered: false, boot_resolved: false, waiting: mem::List.empty(env.alloc), events: 0)
+pub fn Manager.start(mut env: Env) -> Manager = Manager(records: mem::List.empty(env.alloc), paths: mem::List.empty(env.alloc), bindings: mem::Map.empty(env.alloc), views: mem::List.empty(env.alloc), underway: 0, discovered: false, boot_resolved: false, waiting: mem::List.empty(env.alloc), events: 0)
 
 /// Once started, lists the devices the keeper holds, the platform devices of the AML namespace declared first.
 pub fn Manager.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Devices]) {
@@ -108,7 +149,7 @@ pub fn Manager.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx:
 
 /// Answers at once when every binding, volume read and view has settled, else once they have.
 pub fn Manager.settled(mut self, mut env: Env, mut cx: sys::Cx[Devices]) -> u32 {
-    if self.discovered and self.binding == 0 and self.boot_resolved {
+    if self.discovered and self.underway == 0 and self.boot_resolved {
         return self.bound_count()
     }
     let Some(request) = mut cx.postpone() else {
@@ -129,11 +170,51 @@ fn Manager.bound_count(self) -> u32 {
     return count
 } Manager.bound_count
 
-/// Records each device newly found and binds its driver, but for a platform device whose `_CRS` evaluation failed.
+/// Records the devices discovery found and binds their drivers, then waits for the topology to change.
 fn Manager.listed(
     mut self,
     take found: mem::List[Found],
     take failed: mem::List[BusPath],
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    mut self.add(take found, failed, mut env, mut cx)
+    self.discovered = true
+    mut self.watch(seen: 0, mut env, mut cx)
+    mut self.answer_settled(mut env, mut cx)
+} Manager.listed
+
+/// Removes the PCI devices the topology's generation `generation` no longer holds, records the devices it newly holds and binds their drivers, then waits for its next change.
+fn Manager.changed(
+    mut self,
+    take generation: u64,
+    take found: mem::List[Found],
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    var at: usize = 0
+    while at < self.records.len() {
+        let path = self.records[at].path
+        let held = match path {
+            BusPath.Pci(_) => found_in(found, path)
+            else => true
+        }
+        if held {
+            at += 1
+        } else {
+            mut self.remove(at, mut env, mut cx)
+        }
+    }
+    mut self.add(take found, failed: mem::List.empty(env.alloc), mut env, mut cx)
+    mut self.watch(seen: generation, mut env, mut cx)
+    mut self.answer_settled(mut env, mut cx)
+} Manager.changed
+
+/// Records each device of `found` not yet recorded and binds its driver, but for a platform device whose `_CRS` evaluation failed.
+fn Manager.add(
+    mut self,
+    take found: mem::List[Found],
+    failed: mem::List[BusPath],
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
@@ -144,80 +225,347 @@ fn Manager.listed(
         }
         mut self.records.push(LiveDevice(path: path, ids: ids, resources: take resources, dma: Dma.None, entry: None, driver: None, role: None, power: Power.Off, status: Status.Pending, units: mem::List.empty(env.alloc)))
         mut self.emit(env.root, kind: EventKind.Added, path, argument: 0, mut cx)
-        let index = u32.fit(self.records.len() - 1)
+        let at = self.records.len() - 1
         if core {
-            self.records[usize.widen(index)].status = Status.Converged
+            self.records[at].status = Status.Converged
             continue
         }
         if listed_in(failed, path) {
-            self.records[usize.widen(index)].status = Status.Failed(Code.Aml)
+            self.records[at].status = Status.Failed(Code.Aml)
             continue
         }
-        mut self.bind(index, choice: DriverChoice.Automatic, mut env, mut cx)
+        mut self.reconcile(at, mut env, mut cx)
     }
-    self.discovered = true
-    mut self.answer_settled(mut env, mut cx)
-} Manager.listed
+} Manager.add
 
-/// Chooses the driver of the device at `index` and has a keyed task create and start its instance.
-fn Manager.bind(
+/// Has a keyed task wait for the topology to pass the generation `seen` and list the devices it then holds.
+fn Manager.watch(mut self, seen: u64, mut env: Env, mut cx: sys::Cx[Devices]) {
+    let root = env.root
+    let alloc = env.alloc
+    mut cx.spawn(key: WATCHING, run: fn(out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        let generation = match first attempt await root.changes(seen, alloc) {
+            Ok(next) => next
+            Err(RootError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return
+        }
+        let found = match first attempt await root.devices(alloc) {
+            Ok(listed) => listed
+            Err(RootError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return
+        }
+        discard attempt await out.changed(generation, take found)
+    })
+} Manager.watch
+
+/// Deletes the record at `at` of a device that left, and has a keyed task delete its driver and the views over it, then cut it off.
+fn Manager.remove(mut self, at: usize, mut env: Env, mut cx: sys::Cx[Devices]) {
+    let path = self.records[at].path
+    let monikers = mut self.detach(at, alloc: env.alloc)
+    discard mut self.records.remove(at)
+    mut self.emit(env.root, kind: EventKind.Removed, path, argument: 0, mut cx)
+    mut self.emit(env.root, kind: EventKind.CutOff, path, argument: CUT_REMOVED, mut cx)
+    mut self.retire(path, take monikers, reset: false, mut env, mut cx)
+} Manager.remove
+
+/// Takes the driver of the device at `at` and the views over it off its record: their monikers, the driver's last.
+fn Manager.detach(mut self, at: usize, alloc: mem::Alloc) -> mem::List[ident::Moniker] {
+    let path = self.records[at].path
+    var monikers = mem::List[ident::Moniker].empty(alloc)
+    var view: usize = 0
+    while view < self.views.len() {
+        if self.views[view].device == path {
+            let gone = mut self.views.remove(view)
+            mut monikers.push(ident::Moniker(text: gone.moniker.text))
+        } else {
+            view += 1
+        }
+    }
+    match self.records[at].driver {
+        Some(driver) => mut monikers.push(ident::Moniker(text: driver.text))
+        None => {
+        }
+    }
+    self.records[at].driver = None
+    self.records[at].entry = None
+    self.records[at].role = None
+    self.records[at].power = Power.Off
+    mut self.records[at].units.truncate(0)
+    return monikers
+} Manager.detach
+
+/// Has a keyed task delete the instances `monikers`, then cut the device at `path` off, resetting it when `reset`.
+fn Manager.retire(
     mut self,
-    index: u32,
-    choice: DriverChoice,
+    path: BusPath,
+    take monikers: mem::List[ident::Moniker],
+    reset: bool,
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    let at = usize.widen(index)
-    let ids = self.records[at].ids
-    let entries = candidates(env.alloc)
-    let chosen = choose(ids, choice, entries: entries.view())
-    let Choice.Bind(name) = chosen else {
-        self.records[at].status = match chosen {
-            Choice.Mismatch => Status.Failed(Code.DriverMismatch)
-            else => Status.Converged
+    let root = env.root
+    let control = env.control
+    let alloc = env.alloc
+    let key = mut self.key_of(path)
+    mut cx.spawn(key: RETIRING + key, run: fn[take monikers](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        discard try await wind_down(control, root, monikers, path, reset, alloc)
+    })
+} Manager.retire
+
+/// Deletes the instances `monikers`, then cuts the device at `path` off, resetting it when `reset`; whether its reset succeeded.
+fn wind_down(
+    control: os::Control,
+    root: Root,
+    monikers: mem::List[ident::Moniker],
+    path: BusPath,
+    reset: bool,
+    alloc: mem::Alloc,
+    ) -> bool fails task::Cancelled uses wait {
+    for moniker in monikers {
+        match attempt await control.delete(ident::Moniker(text: moniker.text), alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
         }
+    }
+    return match first attempt await root.cut(path, reset, alloc) {
+        Ok(done) => done
+        Err(RootError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => false
+    }
+} wind_down
+
+/// Brings the device at `at` to its binding: the driver the binding chooses, none under `unbound` or the policy `off`, a driver it no longer chooses retired and its device cut off first.
+fn Manager.reconcile(mut self, at: usize, mut env: Env, mut cx: sys::Cx[Devices]) {
+    let path = self.records[at].path
+    let wanted_by = self.binding_of(path)
+    let wanted = match wanted_by.power {
+        PowerPolicy.Off => Choice.Unbound
+        else => choose(self.records[at].ids, choice: wanted_by.driver, entries: candidates(env.alloc).view())
+    }
+    let current = self.records[at].entry
+    let held = self.records[at].driver.is_some()
+    match wanted {
+        Choice.Bind(name) => {
+            if held and current == Some(name) {
+                return
+            }
+            let leaving = mut self.detach(at, alloc: env.alloc)
+            if held {
+                mut self.emit(env.root, kind: EventKind.Unbound, path, argument: 0, mut cx)
+                mut self.emit(env.root, kind: EventKind.CutOff, path, argument: CUT_STOPPED, mut cx)
+            }
+            mut self.attach(at, name, take leaving, mut env, mut cx)
+        }
+        Choice.Unbound or Choice.Mismatch => {
+            self.records[at].status = match wanted {
+                Choice.Mismatch => Status.Failed(Code.DriverMismatch)
+                else => Status.Converged
+            }
+            if not held {
+                return
+            }
+            let leaving = mut self.detach(at, alloc: env.alloc)
+            mut self.emit(env.root, kind: EventKind.Unbound, path, argument: 0, mut cx)
+            mut self.emit(env.root, kind: EventKind.CutOff, path, argument: CUT_STOPPED, mut cx)
+            mut self.retire(path, monikers: take leaving, reset: true, mut env, mut cx)
+        }
+    }
+} Manager.reconcile
+
+/// The binding of the device at `path`: the one set, else the defaults.
+fn Manager.binding_of(self, path: BusPath) -> Binding {
+    return match self.bindings.get(path) {
+        Some(set) => set
+        None => Binding(driver: DriverChoice.Automatic, power: PowerPolicy.Auto)
+    }
+} Manager.binding_of
+
+/// Binds the device at `device` to the `drivers` entry `driver`.
+pub fn Manager.bind(
+    mut self,
+    take device: BusPath,
+    take driver: text::String,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) fails DevicesError {
+    let Some(at) = self.index_of(device) else {
+        fail DevicesError.Unknown
+    }
+    if driver.as_str().byte_len() > 20 {
+        fail DevicesError.DriverMismatch
+    }
+    let choice = DriverChoice.Entry(text::Fixed[20].of(driver.as_str()))
+    if choose(self.records[at].ids, choice, entries: candidates(env.alloc).view()) == Choice.Mismatch {
+        fail DevicesError.DriverMismatch
+    }
+    let set = self.binding_of(device)
+    discard mut self.bindings.insert(device, value: Binding(driver: choice, power: set.power))
+    mut self.reconcile(at, mut env, mut cx)
+} Manager.bind
+
+/// Unbinds the device at `device`: no driver holds it.
+pub fn Manager.unbind(mut self, take device: BusPath, mut env: Env, mut cx: sys::Cx[Devices]) fails DevicesError {
+    let Some(at) = self.index_of(device) else {
+        fail DevicesError.Unknown
+    }
+    let set = self.binding_of(device)
+    discard mut self.bindings.insert(device, value: Binding(driver: DriverChoice.Unbound, power: set.power))
+    mut self.reconcile(at, mut env, mut cx)
+} Manager.unbind
+
+/// Sets the power policy of the device at `device`.
+pub fn Manager.power(
+    mut self,
+    take device: BusPath,
+    take policy: PowerPolicy,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) fails DevicesError {
+    let Some(at) = self.index_of(device) else {
+        fail DevicesError.Unknown
+    }
+    let set = self.binding_of(device)
+    discard mut self.bindings.insert(device, value: Binding(driver: set.driver, power: policy))
+    mut self.reconcile(at, mut env, mut cx)
+} Manager.power
+
+/// Resets the device at `device`: has a keyed task stop its driver, cut it off and reset it, then start the driver again.
+pub fn Manager.reset(mut self, take device: BusPath, mut env: Env, mut cx: sys::Cx[Devices]) fails DevicesError {
+    let Some(at) = self.index_of(device) else {
+        fail DevicesError.Unknown
+    }
+    let Some(driver) = self.records[at].driver else {
+        fail DevicesError.NoDriver
+    }
+    let moniker = ident::Moniker(text: driver.text)
+    self.records[at].status = Status.Pending
+    self.underway += 1
+    mut self.emit(env.root, kind: EventKind.CutOff, path: device, argument: CUT_RESET, mut cx)
+    let root = env.root
+    let control = env.control
+    let alloc = env.alloc
+    let key = mut self.key_of(device)
+    mut cx.spawn(key: RESETTING + key, run: fn[take moniker](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        match attempt await control.stop(ident::Moniker(text: moniker.text), alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+        let cut = match first attempt await root.cut(device, reset: true, alloc) {
+            Ok(done) => done
+            Err(RootError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => false
+        }
+        var lifecycle: Option[os::Lifecycle] = None
+        if cut {
+            lifecycle = match first attempt await control.start(ident::Moniker(text: moniker.text), alloc) {
+                Ok(started) => Some(started)
+                Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+                Err(_) => None
+            }
+        }
+        discard attempt await out.restarted(path: device, cut, lifecycle)
+    })
+} Manager.reset
+
+/// Records how the device at `path` came back from its reset: `converged` once its driver runs again, `failed(device.reset-failed)` when the function did not respond; nothing once it lost its driver meanwhile.
+fn Manager.restarted(
+    mut self,
+    take path: BusPath,
+    take cut: bool,
+    take lifecycle: Option[os::Lifecycle],
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    self.underway = self.underway.saturating_sub(1)
+    let Some(at) = self.index_of(path) else {
+        mut self.answer_settled(mut env, mut cx)
         return
     }
-    let Some(entry) = entry_named(entries.view(), name) else {
+    if self.records[at].driver.is_none() {
+        mut self.answer_settled(mut env, mut cx)
         return
     }
+    self.records[at].status = match lifecycle {
+        Some(os::Lifecycle.Running) => Status.Converged
+        else => match cut {
+            true => Status.Failed(Code.Unhealthy)
+            false => Status.Failed(Code.ResetFailed)
+        }
+    }
+    match self.records[at].status {
+        Status.Failed(_) => mut self.emit(env.root, kind: EventKind.Failed, path, argument: 0, mut cx)
+        else => {
+        }
+    }
+    mut self.answer_settled(mut env, mut cx)
+} Manager.restarted
+
+/// The key of the device at `path`: the position of `path` among the bus paths seen, which it joins when new.
+fn Manager.key_of(mut self, path: BusPath) -> u64 {
+    for at in 0..<self.paths.len() {
+        if self.paths[at] == path {
+            return u64.widen(at)
+        }
+    }
+    mut self.paths.push(path)
+    return u64.widen(self.paths.len() - 1)
+} Manager.key_of
+
+/// Has a keyed task retire the instances `leaving` and cut the device at `at` off when there are any, then create and start its driver of the entry `name`.
+fn Manager.attach(
+    mut self,
+    at: usize,
+    name: text::Fixed[20],
+    take leaving: mem::List[ident::Moniker],
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    let Some(entry) = entry_named(candidates(env.alloc).view(), name) else {
+        return
+    }
+    self.records[at].status = Status.Pending
     let moniker = self.moniker_for(name)
     self.records[at].entry = Some(name)
     self.records[at].driver = Some(ident::Moniker(text: moniker.text))
     self.records[at].dma = Dma.Unconfined
-    self.binding += 1
+    self.underway += 1
     let path = self.records[at].path
     let control = env.control
     let clock = env.clock
     let alloc = env.alloc
     let spec = os::InstanceSpec.of(principal: ident::Principal(text: text::Fixed[64].of("system")), bundle: env.bundle, component: entry.component.as_str(), alloc)
-    mut cx.spawn(key: BINDING + u64.widen(index), run: fn[take moniker, take spec](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+    let key = mut self.key_of(path)
+    let root = env.root
+    mut cx.spawn(key: BINDING + key, run: fn[take moniker, take spec, take leaving](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        if leaving.len() > 0 {
+            discard try await wind_down(control, root, monikers: leaving, path, reset: true, alloc)
+        }
         let lifecycle = try await start_driver(control, clock, moniker, take spec, path, alloc)
-        discard attempt await out.bound(index, take moniker, lifecycle)
+        discard attempt await out.bound(path, take moniker, lifecycle)
     })
-} Manager.bind
+} Manager.attach
 
-/// Records how the driver of the device at `index` started: `converged` once it runs, else `failed`, its device cut off.
+/// Records how the driver of the device at `path` started: `converged` once it runs, else `failed`, its device cut off.
 fn Manager.bound(
     mut self,
-    take index: u32,
+    take path: BusPath,
     take moniker: ident::Moniker,
     take lifecycle: Option[os::Lifecycle],
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    let at = usize.widen(index)
-    if at >= self.records.len() {
+    self.underway = self.underway.saturating_sub(1)
+    let Some(at) = self.index_of(path) else {
+        mut self.answer_settled(mut env, mut cx)
         return
     }
-    self.binding = self.binding.saturating_sub(1)
-    let path = self.records[at].path
     match lifecycle {
         Some(os::Lifecycle.Running) => {
             self.records[at].status = Status.Converged
             self.records[at].power = Power.On
-            mut self.emit(env.root, kind: EventKind.Bound, path, argument: u64.widen(index), mut cx)
-            mut self.serve_class(index, moniker, mut env, mut cx)
+            mut self.emit(env.root, kind: EventKind.Bound, path, argument: entry_index(self.records[at].entry, alloc: env.alloc), mut cx)
+            mut self.serve_class(at, moniker, mut env, mut cx)
         }
         else => {
             let code = match lifecycle {
@@ -234,28 +582,28 @@ fn Manager.bound(
 /// What a bound driver's device protocol brings: a block device's units are read, and a device of a role class holds it when no other does.
 fn Manager.serve_class(
     mut self,
-    index: u32,
+    at: usize,
     moniker: ident::Moniker,
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    let Some(name) = self.records[usize.widen(index)].entry else {
+    let Some(name) = self.records[at].entry else {
         return
     }
     let Some(entry) = entry_named(candidates(env.alloc).view(), name) else {
         return
     }
     match entry.class {
-        Class.Block => mut self.read_volumes(index, moniker, mut env, mut cx)
-        Class.Entropy => mut self.hold_role(index, role: os::Role.Entropy, mut env, mut cx)
-        Class.Rtc => mut self.hold_role(index, role: os::Role.Rtc, mut env, mut cx)
-        Class.Console => mut self.hold_role(index, role: os::Role.Console, mut env, mut cx)
+        Class.Block => mut self.read_volumes(at, moniker, mut env, mut cx)
+        Class.Entropy => mut self.hold_role(at, role: os::Role.Entropy, mut env, mut cx)
+        Class.Rtc => mut self.hold_role(at, role: os::Role.Rtc, mut env, mut cx)
+        Class.Console => mut self.hold_role(at, role: os::Role.Console, mut env, mut cx)
     }
 } Manager.serve_class
 
 /// Answers the waiting `settled` requests once discovery is done, no binding or volume read is under way and `boot-volume` has its view.
 fn Manager.answer_settled(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
-    if not self.discovered or self.binding > 0 {
+    if not self.discovered or self.underway > 0 {
         return
     }
     if mut self.resolve_boot(mut env, mut cx) {
@@ -270,6 +618,29 @@ fn Manager.answer_settled(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
     }
     mut self.waiting.truncate(0)
 } Manager.answer_settled
+
+/// The index in the `drivers` registry of the entry `name`, 0 without one.
+fn entry_index(name: Option[text::Fixed[20]], alloc: mem::Alloc) -> u64 {
+    let Some(wanted) = name else {
+        return 0
+    }
+    let entries = candidates(alloc)
+    for at in 0..<entries.len() {
+        if entries[at].name == wanted {
+            return u64.widen(at)
+        }
+    }
+    return 0
+} entry_index
+
+fn found_in(found: mem::List[Found], path: BusPath) -> bool {
+    for each in found {
+        if each.path == path {
+            return true
+        }
+    }
+    return false
+} found_in
 
 fn listed_in(paths: mem::List[BusPath], path: BusPath) -> bool {
     for each in paths {

@@ -1,6 +1,6 @@
 # 0022. Device root waits recheck
 
-Status: accepted
+Status: superseded by 0023
 
 ## Context
 

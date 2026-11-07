@@ -1,6 +1,6 @@
 # 0021. Kernel core mapping device memory
 
-Status: accepted
+Status: superseded by 0023
 
 ## Context
 
