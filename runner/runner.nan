@@ -127,7 +127,7 @@ fn ask(revocations: task::Sender[Revocation], grant: u64, reason: Reason, alloc:
     return revoked
 } ask
 
-/// Runs the instances `known` describes until `body` returns, then ends them: each has a driver carrying out its lifecycle, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes.
+/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them: each has a driver carrying out its lifecycle, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes.
 pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Reservations and Send, T: Send, E: Send](
     take known: Known,
     components: C,
@@ -143,66 +143,47 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Reservations
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[os::Order].bounded(QUEUED_ORDERS, alloc)
     let task::Channel(sender: revocations, receiver: revoking) = task::Channel[Revocation].bounded(QUEUED_ORDERS, alloc)
     let Known(specs: specs, grants: grants) = known
-    var endpoints = mem::Map[ident::Moniker, Endpoint].empty(alloc)
-    var routes = mem::Map[ident::Moniker, task::Sender[Input]].empty(alloc)
+    var listed = Directory(grants: take grants, endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc))
     var drivers = mem::List[Started].empty(alloc)
-    var revokers = mem::List[task::Sender[Input]].empty(alloc)
-    var slot: u32 = 0
     for entry in take specs {
-        slot += 1
         let mem::KeyValue(key: moniker, value: spec) = entry
-        let Some(protocol) = components.protocol(spec.component.as_str()) else {
+        let Some(started) = mut listed.add(take moniker, take spec, components, slot: u32.fit(drivers.len() + 1), alloc) else {
             continue
         }
-        let gate = os::Gate.of(alloc)
-        let task::Channel(sender: intake, receiver: calls) = task::Channel[os::Call].bounded(QUEUED_CALLS, alloc)
-        let task::Channel(sender: inputs, receiver: taken) = task::Channel[Input].bounded(QUEUED_INPUTS, alloc)
-        discard mut endpoints.insert(ident::Moniker(text: moniker.text), value: Endpoint(intake: take intake, gate: gate.share(), protocol: protocol))
-        discard mut routes.insert(ident::Moniker(text: moniker.text), value: inputs.split())
-        mut revokers.push(inputs.split())
-        let driver = Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, started_ns: 0, queue: mem::List.empty(alloc), domain: None, then: Then.Stop, cause: Cause.Inside, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None)
-        mut drivers.push(Started(driver: take driver, inputs: take inputs, taken: take taken, calls: take calls))
+        mut drivers.push(take started)
     }
-    var listed = Directory(grants: take grants, endpoints: take endpoints)
     let expired = mut listed.expire(reached: latest(config.wall.now(config.clock)), alloc)
     for number in expired {
         journal.record(0, event: Event.Revoked(grant: number, reason: Reason.Expiry))
     }
     let directory = task::Cown.of(take listed, alloc)
     let reached = directory.share()
+    let routes = task::Cown.of(mem::Map[ident::Moniker, task::Sender[Input]].empty(alloc), alloc)
     let shared = Shared[C, R](components: components, reservations: take reservations, config: config, directory: take directory, orders: orders.split(), withheld: withheld)
-    let core = os::MintedControl.of(orders, prefix: None, alloc)
+    let core = os::MintedControl.of(orders, grant: None, prefix: None, alloc)
     defer take core.close()
     var result: Option[T] = None
-    var waiting = Some(Waiting(drivers: take drivers, routes: take routes, ordered: take ordered, revokers: take revokers, revoking: take revoking))
+    var waiting = Some(Waiting(drivers: take drivers, ordered: take ordered, revoking: take revoking))
     defer abandon(take waiting)
     try await task::scope(config.exec, body: fn[mut result, mut waiting](s: task::Scope) fails E uses wait {
-        let Some(Waiting(drivers: started, routes: routing, ordered: orders_in, revokers: revokers_in, revoking: revoking_in)) = mut waiting.extract() else {
+        let Some(Waiting(drivers: started, ordered: orders_in, revoking: revoking_in)) = mut waiting.extract() else {
             return
         }
-        discard s.spawn(fn[take routing, take orders_in]() fails task::Cancelled uses wait limits stack 16_384 {
-            try await route(take orders_in, routes: take routing)
+        let governed = routes.share()
+        discard s.spawn(fn[take started, take orders_in, take governed]() fails task::Cancelled uses wait limits stack 65_536 {
+            try await shared.govern(take started, orders: take orders_in, routes: governed, journal)
         })
         let revoked = reached.share()
-        discard s.spawn(fn[take revoking_in, take revokers_in, take revoked]() fails task::Cancelled uses wait limits stack 16_384 {
-            try await revoke(take revoking_in, drivers: take revokers_in, directory: revoked, journal, alloc)
+        let revoking_routes = routes.share()
+        discard s.spawn(fn[take revoking_in, take revoked, take revoking_routes]() fails task::Cancelled uses wait limits stack 16_384 {
+            try await revoke(take revoking_in, routes: revoking_routes, directory: revoked, journal, alloc)
         })
         let timed = reached.share()
         let expiries = revocations.split()
         discard s.spawn(fn[take timed, take expiries]() fails task::Cancelled uses wait limits stack 16_384 {
             try await expire_deferred(take expiries, directory: timed, config)
         })
-        for each in take started {
-            let Started(driver: driver, inputs: inputs, taken: taken, calls: calls) = each
-            let forwarded = inputs.split()
-            discard s.spawn(fn[take calls, take forwarded]() fails task::Cancelled uses wait limits stack 8_192 {
-                try await forward(take calls, inputs: take forwarded)
-            })
-            discard s.spawn(fn[take driver, take inputs, take taken]() fails task::Cancelled uses wait limits stack 65_536 {
-                try await shared.drive(take driver, inputs: take taken, sender: inputs, journal)
-            })
-        }
-        let control = core.mint(os::ControlRights(read: true, lifecycle: true, reserved: 0))
+        let control = core.mint(os::ControlRights(read: true, lifecycle: true, spawn: true, reserved: 0))
         result = Some(try await body(Core(control: control, directory: reached.share(), revocations: revocations.split(), alloc: alloc)))
         s.cancel()
     })
@@ -224,12 +205,10 @@ linear struct Started {
     calls: task::Receiver[os::Call]
 } Started
 
-/// What the runner's scope takes once: the drivers, the route to each driver's inputs, the orders to route, and the revocations to carry out with the inputs of every driver.
+/// What the runner's scope takes once: the drivers, the orders to carry out, and the revocations.
 linear struct Waiting {
     drivers: mem::List[Started]
-    routes: mem::Map[ident::Moniker, task::Sender[Input]]
     ordered: task::Receiver[os::Order]
-    revokers: mem::List[task::Sender[Input]]
     revoking: task::Receiver[Revocation]
 } Waiting
 
@@ -237,7 +216,7 @@ linear struct Waiting {
 fn abandon(take waiting: Option[Waiting]) {
     match waiting {
         Some(left) => {
-            let Waiting(drivers: drivers, routes: _, ordered: _, revokers: _, revoking: _) = left
+            let Waiting(drivers: drivers, ordered: _, revoking: _) = left
             for each in take drivers {
                 let Started(driver: driver, inputs: _, taken: _, calls: _) = each
                 take driver.abandon()
@@ -248,28 +227,10 @@ fn abandon(take waiting: Option[Waiting]) {
     }
 } abandon
 
-/// Routes each order to the driver of the instance it names, refusing those naming none.
-fn route(take orders: task::Receiver[os::Order], take routes: mem::Map[ident::Moniker, task::Sender[Input]]) fails task::Cancelled uses wait {
-    var receiver = orders
-    loop {
-        let Some(order) = try await mut receiver.receive() else {
-            return
-        }
-        match routes.get(order.moniker) {
-            Some(inputs) => {
-                discard attempt await inputs.send(Input.Order(take order))
-            }
-            None => {
-                discard attempt await order.done.send(Err(os::ControlError.Missing))
-            }
-        }
-    }
-} route
-
-/// Carries out each revocation in turn: its grants leave the live grants, every driver revokes the root entries it holds of them, and each removal is recorded as the core's, before their numbers are answered.
+/// Carries out each revocation in turn: its grants leave the live grants, every driver `routes` reaches revokes the root entries it holds of them, and each removal is recorded as the core's, before their numbers are answered.
 fn revoke[J: Journal](
     take revocations: task::Receiver[Revocation],
-    take drivers: mem::List[task::Sender[Input]],
+    routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]],
     directory: task::Cown[Directory],
     journal: J,
     alloc: mem::Alloc,
@@ -280,6 +241,7 @@ fn revoke[J: Journal](
             return
         }
         let revoked = await when mut directory => mut directory.revoke(grant, alloc)
+        let drivers = await when routes => senders_of(routes, alloc)
         if revoked.len() > 0 and drivers.len() > 0 {
             let task::Channel(sender: closed, receiver: acknowledged) = task::Channel[Unit].bounded(drivers.len(), alloc)
             var asked: usize = 0
@@ -304,6 +266,14 @@ fn revoke[J: Journal](
         discard attempt await done.send(take revoked)
     }
 } revoke
+
+fn senders_of(routes: mem::Map[ident::Moniker, task::Sender[Input]], alloc: mem::Alloc) -> mem::List[task::Sender[Input]] {
+    var senders = mem::List[task::Sender[Input]].empty(alloc)
+    for route in routes {
+        mut senders.push(route.value().split())
+    }
+    return senders
+} senders_of
 
 /// Runs `expire` on an account of core work whose timers never wake an idle machine, so that an expiry passing while it idles revokes at its next wake-up.
 fn expire_deferred(take revocations: task::Sender[Revocation], directory: task::Cown[Directory], config: Config) fails task::Cancelled uses wait {

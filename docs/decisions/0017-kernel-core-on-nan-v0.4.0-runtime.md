@@ -1,6 +1,6 @@
 # 0017. Kernel core on NaN v0.4.0's runtime
 
-Status: accepted
+Status: superseded by 0021
 
 ## Context
 

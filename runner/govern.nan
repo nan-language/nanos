@@ -1,0 +1,268 @@
+//! Governing the instances: launching their drivers, and carrying out the `Control` orders that create instances and assign them roles, routing every other order to the driver of the instance it names.
+
+/// What the governing task takes once: the drivers of the instances the runner starts from, and the orders to carry out.
+linear struct Governed {
+    drivers: mem::List[Started]
+    orders: task::Receiver[os::Order]
+} Governed
+
+/// Launches the drivers `started`, then those of the instances orders create, in a scope of its own, carrying out each order until the orders end. `routes` holds the inputs of every driver of an instance not deleted.
+fn Shared.govern[J: Journal and Send](
+    self,
+    take started: mem::List[Started],
+    take orders: task::Receiver[os::Order],
+    routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]],
+    journal: J,
+    ) fails task::Cancelled uses wait {
+    var given = Some(Governed(drivers: take started, orders: take orders))
+    defer abandon_governed(take given)
+    try await task::scope(self.config.exec, body: fn[mut given](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(Governed(drivers: drivers, orders: incoming)) = mut given.extract() else {
+            return
+        }
+        var pending = drivers
+        defer abandon_started(take pending)
+        var receiver = incoming
+        var slots = u32.fit(pending.len())
+        loop {
+            let Some(Started(driver: driver, inputs: inputs, taken: taken, calls: calls)) = try await self.next_driver(mut pending, orders: mut receiver, routes, slots: mut slots) else {
+                s.cancel()
+                return
+            }
+            let route = inputs.split()
+            let listed = ident::Moniker(text: driver.moniker.text)
+            await when mut routes {
+                discard mut routes.insert(take listed, value: take route)
+            }
+            let forwarded = inputs.split()
+            discard s.spawn(fn[take calls, take forwarded]() fails task::Cancelled uses wait limits stack 8_192 {
+                try await forward(take calls, inputs: take forwarded)
+            })
+            discard s.spawn(fn[take driver, take inputs, take taken]() fails task::Cancelled uses wait limits stack 65_536 {
+                try await self.drive(take driver, inputs: take taken, sender: inputs, journal)
+            })
+        }
+    })
+} Shared.govern
+
+/// The next driver to launch: one of `pending` while it holds any, else that of the next instance an order creates, carrying out the orders before it; `None` once the orders end. Each creation takes the slot after `slots`.
+fn Shared.next_driver(
+    self,
+    mut pending: mem::List[Started],
+    mut orders: task::Receiver[os::Order],
+    routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]],
+    mut slots: u32,
+    ) -> Option[Started] fails task::Cancelled uses wait {
+    if pending.len() > 0 {
+        return Some(mut pending.remove(0))
+    }
+    loop {
+        let Some(order) = try await mut orders.receive() else {
+            return None
+        }
+        let Some(created) = try await self.carry_out(take order, routes, slot: slots + 1) else {
+            continue
+        }
+        slots += 1
+        return Some(take created)
+    }
+} Shared.next_driver
+
+/// Releases the drivers that never ran.
+fn abandon_governed(take given: Option[Governed]) {
+    match given {
+        Some(left) => {
+            let Governed(drivers: drivers, orders: _) = left
+            abandon_started(take drivers)
+        }
+        None => {
+        }
+    }
+} abandon_governed
+
+fn abandon_started(take drivers: mem::List[Started]) {
+    for each in take drivers {
+        let Started(driver: driver, inputs: _, taken: _, calls: _) = each
+        take driver.abandon()
+    }
+} abandon_started
+
+/// What a creation order takes into the directory.
+struct Creation {
+    moniker: ident::Moniker
+    spec: os::InstanceSpec
+    grants: mem::Map[text::String, os::Grant]
+} Creation
+
+/// Carries out an order: a creation gives the new instance's driver, to launch, and a role assignment is answered from the directory; any other order goes to the driver of the instance it names, a deletion leaving `routes`.
+fn Shared.carry_out(
+    self,
+    take order: os::Order,
+    routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]],
+    slot: u32,
+    ) -> Option[Started] fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    let components = self.components
+    let directory = self.directory.share()
+    let os::Order(action: action, moniker: moniker, grant: grant, done: done) = order
+    match action {
+        os::Action.Create(spec: spec, grants: grants) => {
+            var creation = Some(Creation(moniker: take moniker, spec: take spec, grants: take grants))
+            let created = await when mut directory => mut directory.create(mut creation, parent: grant, components, slot, alloc)
+            match created {
+                Ok(started) => {
+                    discard attempt await done.send(Ok(os::Outcome.Done))
+                    return Some(take started)
+                }
+                Err(failure) => {
+                    discard attempt await done.send(Err(take failure))
+                    return None
+                }
+            }
+        }
+        os::Action.Assign(role: role) => {
+            let assigned = await when mut directory => mut directory.assign(role, moniker)
+            if assigned {
+                discard attempt await done.send(Ok(os::Outcome.Done))
+            } else {
+                discard attempt await done.send(Err(os::ControlError.Missing))
+            }
+            return None
+        }
+        else => {
+        }
+    }
+    let deleting = match action {
+        os::Action.Delete => true
+        else => false
+    }
+    let route = await when mut routes => mut route_of(mut routes, moniker, deleting)
+    let Some(inputs) = route else {
+        discard attempt await done.send(Err(os::ControlError.Missing))
+        return None
+    }
+    discard attempt await inputs.send(Input.Order(os::Order(action: take action, moniker: take moniker, grant: grant, done: take done)))
+    return None
+} Shared.carry_out
+
+/// The inputs of the driver of the instance `moniker`, which leaves `routes` when `deleting`.
+fn route_of(mut routes: mem::Map[ident::Moniker, task::Sender[Input]], moniker: ident::Moniker, deleting: bool) -> Option[task::Sender[Input]] {
+    let found = match routes.get(moniker) {
+        Some(inputs) => Some(inputs.split())
+        None => None
+    }
+    if deleting {
+        discard mut routes.remove(moniker)
+    }
+    return found
+} route_of
+
+/// Lists the instance `moniker` under `spec` with an endpoint, giving its driver, `None` when `spec` names no component `components` runs.
+fn Directory.add[C: Components](
+    mut self,
+    take moniker: ident::Moniker,
+    take spec: os::InstanceSpec,
+    components: C,
+    slot: u32,
+    alloc: mem::Alloc,
+    ) -> Option[Started] {
+    let Some(protocol) = components.protocol(spec.component.as_str()) else {
+        return None
+    }
+    let gate = os::Gate.of(alloc)
+    let task::Channel(sender: intake, receiver: calls) = task::Channel[os::Call].bounded(QUEUED_CALLS, alloc)
+    let task::Channel(sender: inputs, receiver: taken) = task::Channel[Input].bounded(QUEUED_INPUTS, alloc)
+    discard mut self.endpoints.insert(ident::Moniker(text: moniker.text), value: Endpoint(intake: take intake, gate: gate.share(), protocol: protocol))
+    let driver = Driver.of(take moniker, slot, take spec, take gate, alloc)
+    return Some(Started(driver: take driver, inputs: take inputs, taken: take taken, calls: take calls))
+} Directory.add
+
+/// Creates the instance `creation` names under its specification with its grants, each held by it, descending from `parent` and filling the Env field it is keyed by under the next free number; failing when an instance has the moniker, the specification names no component `components` runs, a grant is held by another principal, or `parent` is not live.
+fn Directory.create[C: Components](
+    mut self,
+    mut creation: Option[Creation],
+    parent: Option[u64],
+    components: C,
+    slot: u32,
+    alloc: mem::Alloc,
+    ) -> Result[Started, os::ControlError] {
+    let Some(Creation(moniker: moniker, spec: spec, grants: grants)) = mut creation.extract() else {
+        return Err(os::ControlError.Invalid)
+    }
+    if self.endpoints.get(moniker).is_some() {
+        return Err(os::ControlError.Exists)
+    }
+    if components.protocol(spec.component.as_str()).is_none() {
+        return Err(os::ControlError.Invalid)
+    }
+    match parent {
+        Some(number) => {
+            if self.grants.get(number).is_none() {
+                return Err(os::ControlError.Revoked)
+            }
+        }
+        None => {
+        }
+    }
+    let holder = instance_principal(moniker)
+    for entry in grants {
+        if entry.value().holder != holder {
+            return Err(os::ControlError.Invalid)
+        }
+    }
+    var specified = spec
+    var number = self.next_grant()
+    for entry in take grants {
+        let mem::KeyValue(key: field, value: grant) = entry
+        let os::Grant(holder: held_by, object: object, rights: rights, caveats: caveats, parent: _, granted_by: granted_by) = grant
+        discard mut self.grants.insert(number, value: os::Grant(holder: take held_by, object: take object, rights: take rights, caveats: take caveats, parent: parent, granted_by: granted_by))
+        discard mut specified.grants.insert(take field, value: number)
+        number += 1
+    }
+    let Some(started) = mut self.add(take moniker, spec: take specified, components, slot, alloc) else {
+        return Err(os::ControlError.Invalid)
+    }
+    return Ok(take started)
+} Directory.create
+
+/// The number after every live grant's.
+fn Directory.next_grant(self) -> u64 {
+    var next: u64 = 0
+    for entry in self.grants {
+        if entry.key() >= next {
+            next = entry.key() + 1
+        }
+    }
+    return next
+} Directory.next_grant
+
+/// Removes the instance `moniker`: its endpoint, the grants it holds and their descendants, and the roles it holds.
+fn Directory.remove_instance(mut self, moniker: ident::Moniker, alloc: mem::Alloc) {
+    discard mut self.endpoints.remove(moniker)
+    let holder = instance_principal(moniker)
+    var held = mem::Set[u64].empty(alloc)
+    for entry in self.grants {
+        if entry.value().holder == holder {
+            discard mut held.insert(entry.key())
+        }
+    }
+    discard mut self.remove(held, alloc)
+    var roles = mem::List[os::Role].empty(alloc)
+    for entry in self.roles {
+        if entry.value() == moniker {
+            mut roles.push(entry.key())
+        }
+    }
+    for role in roles {
+        discard mut self.roles.remove(role)
+    }
+} Directory.remove_instance
+
+/// Makes the instance `moniker` the holder of `role`, false when it has no specification.
+fn Directory.assign(mut self, role: os::Role, moniker: ident::Moniker) -> bool {
+    if self.endpoints.get(moniker).is_none() {
+        return false
+    }
+    discard mut self.roles.insert(role, value: ident::Moniker(text: moniker.text))
+    return true
+} Directory.assign
