@@ -6,10 +6,11 @@ pub open struct Control {
 
 impl Control: sys::Kind[Orders, ControlRights]
 
-/// What a `Control` capability may do: read lifecycles, and start, stop and restart instances.
+/// What a `Control` capability may do: read lifecycles; start, stop and restart instances; and create and delete instances, mint ports to them and assign them roles.
 pub layout ControlRights: u8 {
     read: bit 0
     lifecycle: bit 1
+    spawn: bit 2
     reserved: rest
 } ControlRights
 
@@ -18,40 +19,59 @@ pub open linear struct MintedControl derives Send {
     minter: sys::Minter[Control, Orders, ControlRights]
 } MintedControl
 
-pub closed enum Action derives Copy, Eq, Render {
+pub closed enum Action {
     Start
     Stop
     Restart
     Read
+    /// Creates the instance from `spec`, with `grants` held by it, each keyed by the Env field it fills and descending from the grant of the `Control` ordering it.
+    Create(spec: InstanceSpec, grants: mem::Map[text::String, Grant])
+    /// Stops the instance and removes its specification, its grants, the ports minted to it and the roles it holds.
+    Delete
+    /// Mints a port to the instance with the credit `credit`, revoked when the instance is deleted.
+    Port(credit: Credit)
+    /// Makes the instance the holder of `role`.
+    Assign(role: Role)
 } Action
 
-/// An order to the runner: what to do with which instance, and where its outcome goes.
+/// An order to the runner: what to do with which instance, the grant of the `Control` ordering it, and where its outcome goes.
 pub closed struct Order {
     pub action: Action
     pub moniker: ident::Moniker
-    pub done: task::Sender[Result[Lifecycle, ControlError]]
+    pub grant: Option[u64]
+    pub done: task::Sender[Result[Outcome, ControlError]]
 } Order
+
+/// What an order gives: the instance's lifecycle, a port, or nothing.
+pub closed enum Outcome {
+    Lifecycle(Lifecycle)
+    Port(PortHandle)
+    Done
+} Outcome
 
 pub closed enum ControlError derives Render {
     Revoked
     Denied
     Missing
+    Exists
+    Invalid
     Cancelled(task::Cancelled) from
 } ControlError
 
-/// Where a minted `Control` sends its orders, and the instances it covers: every one when `None`, else those named the prefix or below it.
+/// Where a minted `Control` sends its orders, the grant it derives from, and the instances it covers: every one when `None`, else those named the prefix or below it.
 struct Orders {
     runner: task::Sender[Order]
+    grant: Option[u64]
     prefix: Option[ident::Moniker]
 } Orders
 
 pub fn ControlRights.of(rights: mem::Set[Right]) -> ControlRights {
-    return ControlRights(read: rights.contains(Right.Read), lifecycle: rights.contains(Right.Lifecycle), reserved: 0)
+    return ControlRights(read: rights.contains(Right.Read), lifecycle: rights.contains(Right.Lifecycle), spawn: rights.contains(Right.Spawn), reserved: 0)
 } ControlRights.of
 
-/// A `Control` root entry sending orders to `runner` over the instances `prefix` covers.
-pub fn MintedControl.of(runner: task::Sender[Order], take prefix: Option[ident::Moniker], alloc: mem::Alloc) -> MintedControl {
-    return MintedControl(minter: sys::Minter[Control, Orders, ControlRights].of(Orders(runner: runner.split(), prefix: take prefix), alloc))
+/// A `Control` root entry of the grant `grant`, none for the core's, sending orders to `runner` over the instances `prefix` covers.
+pub fn MintedControl.of(runner: task::Sender[Order], grant: Option[u64], take prefix: Option[ident::Moniker], alloc: mem::Alloc) -> MintedControl {
+    return MintedControl(minter: sys::Minter[Control, Orders, ControlRights].of(Orders(runner: runner.split(), grant: grant, prefix: take prefix), alloc))
 } MintedControl.of
 
 pub fn MintedControl.mint(self, rights: ControlRights) -> Control {
@@ -66,39 +86,69 @@ pub fn MintedControl.close(take self) {
 
 /// Creates the instance `moniker` from its specification, or clears its `stopped`, and gives its lifecycle once it runs, hibernates or fails.
 pub fn Control.start(self, take moniker: ident::Moniker, alloc: mem::Alloc) -> Lifecycle fails ControlError uses wait {
-    return try await self.order(Action.Start, take moniker, alloc)
+    return try await self.lifecycle_after(Action.Start, take moniker, alloc)
 } Control.start
 
 /// Stops the instance `moniker` and gives its lifecycle once it has stopped.
 pub fn Control.stop(self, take moniker: ident::Moniker, alloc: mem::Alloc) -> Lifecycle fails ControlError uses wait {
-    return try await self.order(Action.Stop, take moniker, alloc)
+    return try await self.lifecycle_after(Action.Stop, take moniker, alloc)
 } Control.stop
 
 /// Restarts the instance `moniker` and gives its lifecycle once it runs again or fails.
 pub fn Control.restart(self, take moniker: ident::Moniker, alloc: mem::Alloc) -> Lifecycle fails ControlError uses wait {
-    return try await self.order(Action.Restart, take moniker, alloc)
+    return try await self.lifecycle_after(Action.Restart, take moniker, alloc)
 } Control.restart
 
 /// The lifecycle of the instance `moniker`.
 pub fn Control.lifecycle(self, take moniker: ident::Moniker, alloc: mem::Alloc) -> Lifecycle fails ControlError uses wait {
-    return try await self.order(Action.Read, take moniker, alloc)
+    return try await self.lifecycle_after(Action.Read, take moniker, alloc)
 } Control.lifecycle
 
-fn Control.order(self, action: Action, take moniker: ident::Moniker, alloc: mem::Alloc) -> Lifecycle fails ControlError uses wait {
-    let reached = sys::reach(self, body: fn(state: Orders, record: ControlRights) -> Option[task::Sender[Order]] {
+/// Creates the instance `moniker` from `spec`, `stopped` until started, with `grants` held by it, each keyed by the Env field it fills; `spec.grants` gains their numbers.
+pub fn Control.create(self, take moniker: ident::Moniker, take spec: InstanceSpec, take grants: mem::Map[text::String, Grant], alloc: mem::Alloc) fails ControlError uses wait {
+    discard try await self.order(Action.Create(spec: take spec, grants: take grants), take moniker, alloc)
+} Control.create
+
+/// Stops and removes the instance `moniker`.
+pub fn Control.delete(self, take moniker: ident::Moniker, alloc: mem::Alloc) fails ControlError uses wait {
+    discard try await self.order(Action.Delete, take moniker, alloc)
+} Control.delete
+
+/// The handle of a port to the instance `moniker` with the credit `credit`, stale once the instance is deleted.
+pub fn Control.port(self, take moniker: ident::Moniker, credit: Credit, alloc: mem::Alloc) -> PortHandle fails ControlError uses wait {
+    let Outcome.Port(handle) = try await self.order(Action.Port(credit: credit), take moniker, alloc) else {
+        fail ControlError.Invalid
+    }
+    return handle
+} Control.port
+
+/// Makes the instance `moniker` the holder of `role`.
+pub fn Control.assign(self, role: Role, take moniker: ident::Moniker, alloc: mem::Alloc) fails ControlError uses wait {
+    discard try await self.order(Action.Assign(role: role), take moniker, alloc)
+} Control.assign
+
+fn Control.lifecycle_after(self, take action: Action, take moniker: ident::Moniker, alloc: mem::Alloc) -> Lifecycle fails ControlError uses wait {
+    let Outcome.Lifecycle(lifecycle) = try await self.order(take action, take moniker, alloc) else {
+        fail ControlError.Invalid
+    }
+    return lifecycle
+} Control.lifecycle_after
+
+fn Control.order(self, take action: Action, take moniker: ident::Moniker, alloc: mem::Alloc) -> Outcome fails ControlError uses wait {
+    let reached = sys::reach(self, body: fn(state: Orders, record: ControlRights) -> Option[Ordering] {
         if not (record.permits(action) and covers(state.prefix, moniker)) {
             return None
         }
-        return Some(state.runner.split())
+        return Some(Ordering(runner: state.runner.split(), grant: state.grant))
     })
     let Some(permitted) = reached else {
         fail ControlError.Revoked
     }
-    let Some(runner) = permitted else {
+    let Some(Ordering(runner: runner, grant: grant)) = permitted else {
         fail ControlError.Denied
     }
-    let task::Channel(sender: done, receiver: outcome) = task::Channel[Result[Lifecycle, ControlError]].bounded(1, alloc)
-    match attempt await runner.send(Order(action: action, moniker: take moniker, done: take done)) {
+    let task::Channel(sender: done, receiver: outcome) = task::Channel[Result[Outcome, ControlError]].bounded(1, alloc)
+    match attempt await runner.send(Order(action: take action, moniker: take moniker, grant: grant, done: take done)) {
         Ok(_) => {
         }
         Err(task::SendError.Closed) => fail ControlError.Revoked
@@ -109,15 +159,22 @@ fn Control.order(self, action: Action, take moniker: ident::Moniker, alloc: mem:
         fail ControlError.Revoked
     }
     return match result {
-        Ok(lifecycle) => lifecycle
+        Ok(given) => given
         Err(failure) => fail failure
     }
 } Control.order
+
+/// What an order through a `Control` needs from its root entry.
+struct Ordering {
+    runner: task::Sender[Order]
+    grant: Option[u64]
+} Ordering
 
 fn ControlRights.permits(self, action: Action) -> bool {
     return match action {
         Action.Read => self.read
         Action.Start or Action.Stop or Action.Restart => self.lifecycle
+        else => self.spawn
     }
 } ControlRights.permits
 

@@ -8,15 +8,21 @@ protocol Counter {
     pub fn add(amount: u32) -> u64 fails Refused limits pure
     pub fn note(amount: u32) limits pure
     pub fn divide(by: u32) limits pure
+    /// The total once a later `settle` answers it, 0 at once while another waits.
+    pub fn later() -> u64 limits recorded
+    /// Answers the `later` waiting with the total, giving how many it answered.
+    pub fn settle() -> u32 limits recorded
 } Counter
 
 struct TallyEnv {
+    alloc: mem::Alloc
 } TallyEnv
 
 impl TallyEnv: nanos::Environment
 
 struct Tally derives Encode {
     total: u64
+    waiting: Option[u64]
 } Tally
 
 impl Tally: sys::Component[TallyEnv, Counter]
@@ -53,9 +59,9 @@ enum Failure derives Render {
     Cancelled(task::Cancelled) from
 } Failure
 
-fn TallyEnv.build(take world: nanos::World) -> TallyEnv = TallyEnv()
+fn TallyEnv.build(take world: nanos::World) -> TallyEnv = TallyEnv(alloc: world.alloc)
 
-fn Tally.start(mut env: TallyEnv) -> Tally = Tally(total: 0)
+fn Tally.start(mut env: TallyEnv) -> Tally = Tally(total: 0, waiting: None)
 
 fn Tally.add(mut self, take amount: u32, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 fails Refused {
     if amount > 1_000 {
@@ -72,6 +78,22 @@ fn Tally.note(mut self, take amount: u32, mut env: TallyEnv, mut cx: sys::Cx[Cou
 fn Tally.divide(mut self, take by: u32, mut env: TallyEnv, mut cx: sys::Cx[Counter]) {
     self.total = self.total / u64.widen(by)
 } Tally.divide
+
+fn Tally.later(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 {
+    self.waiting = mut cx.postpone()
+    return 0
+} Tally.later
+
+fn Tally.settle(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u32 {
+    let Some(request) = mut self.waiting.extract() else {
+        return 0
+    }
+    var reply = sys::Encoded.empty(env.alloc)
+    let total: Result[u64, Never] = Ok(self.total)
+    mem::wire::Codec[Result[u64, Never]].encode(total, out: mut reply.bytes)
+    discard attempt mut cx.reply(request, reply)
+    return 1
+} Tally.settle
 
 fn Tallies.protocol(self, component: Str) -> Option[sys::ProtocolHash] {
     if component == "runner::Tally" {
@@ -504,10 +526,10 @@ test revoked_root_entries_make_their_copies_stale for Minted.revoke {
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[os::Order].bounded(1, alloc)
     let task::Channel(sender: intake, receiver: calls) = task::Channel[os::Call].bounded(1, alloc)
     var minted = Minted.none(alloc)
-    mut minted.controls.push(GrantedControl(grant: 1, control: os::MintedControl.of(orders, prefix: None, alloc)))
-    mut minted.controls.push(GrantedControl(grant: 2, control: os::MintedControl.of(orders, prefix: None, alloc)))
+    mut minted.controls.push(GrantedControl(grant: 1, control: os::MintedControl.of(orders, grant: None, prefix: None, alloc)))
+    mut minted.controls.push(GrantedControl(grant: 2, control: os::MintedControl.of(orders, grant: None, prefix: None, alloc)))
     mut minted.ports.push(WiredPort(field: text::String.of("counter", alloc), grant: 1, port: os::MintedPort.of(intake, gate: os::Gate.of(alloc), hash: sys::Wire[Counter].hash(), operations: None, credit: os::Credit(messages: 1, calls: 1), alloc)))
-    let control = minted.controls[0].control.mint(os::ControlRights(read: true, lifecycle: false, reserved: 0))
+    let control = minted.controls[0].control.mint(os::ControlRights(read: true, lifecycle: false, spawn: false, reserved: 0))
     let port = os::Port[Counter].of(minted.ports[0].port.handle())
     var grants = mem::Set[u64].empty(alloc)
     discard mut grants.insert(1)
@@ -572,3 +594,116 @@ test grants_expire_at_start_and_once_their_expiry_passes for expire {
     expect states[0] == os::Lifecycle.Running and states[1] == os::Lifecycle.Failed
     expect revoked == 3
 } grants_expire_at_start_and_once_their_expiry_passes
+
+/// What a created tally gave: its first total, the total its postponed request was answered with, whether its port was revoked once it was deleted, and whether a start after the deletion found it missing.
+struct Made derives Copy, Eq {
+    initial: u64
+    postponed: u64
+    revoked: bool
+    missing: bool
+} Made
+
+fn wait_later(port: os::Port[Counter], alloc: mem::Alloc) -> u64 fails os::PortError[Never] uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Counter].later(mut call)
+    return try await port.call(take call, reply, alloc)
+} wait_later
+
+fn settle_all(port: os::Port[Counter], alloc: mem::Alloc) -> u32 fails os::PortError[Never] uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Counter].settle(mut call)
+    return try await port.call(take call, reply, alloc)
+} settle_all
+
+/// Creates a tally through the core's `Control`, calls it through a port the order mints, has a later handler answer a postponed request, then deletes it.
+fn made(core: Core, exec: task::Executor, alloc: mem::Alloc) -> Made fails Failure uses wait {
+    var bundle = Array[u8, 33].filled(0)
+    bundle[0] = 0x01
+    let spec = os::InstanceSpec.of(principal: system(), bundle: ident::HashValue(bytes: bundle), component: "runner::Tally", alloc)
+    try await core.control.create(named("made"), take spec, grants: mem::Map.empty(alloc), alloc)
+    discard try await core.control.start(named("made"), alloc)
+    let handle = try await core.control.port(named("made"), credit: os::Credit(messages: 2, calls: 2), alloc)
+    let Some(port) = os::Port[Counter].of(handle) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    let initial = try await add(port, amount: 6, alloc)
+    var postponed: u64 = 0
+    try await task::scope(exec, body: fn[mut postponed](s: task::Scope) fails Failure uses wait {
+        let waited = s.spawn(fn() -> u64 fails os::PortError[Never] uses wait limits stack 16_384 {
+            return try await wait_later(port, alloc)
+        })
+        while try await settle_all(port, alloc) == 0 {
+        }
+        postponed = try await take waited.join()
+    })
+    try await core.control.delete(named("made"), alloc)
+    let after = attempt await add(port, amount: 1, alloc)
+    let again = attempt await core.control.start(named("made"), alloc)
+    let revoked = match after {
+        Err(os::PortError.Revoked) => true
+        else => false
+    }
+    let missing = match again {
+        Err(os::ControlError.Missing) => true
+        else => false
+    }
+    return Made(initial: initial, postponed: postponed, revoked: revoked, missing: missing)
+} made
+
+test created_instances_answer_postponed_requests_until_deleted for Directory.create {
+    let world = testing::world()
+    let alloc = world.alloc
+    let seen = try await run(Known(specs: mem::Map.empty(alloc), grants: mem::Map.empty(alloc)), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), body: fn(core: Core) -> Made fails Failure uses wait {
+        return try await made(core, exec: world.exec, alloc)
+    })
+    expect seen == Some(Made(initial: 6, postponed: 6, revoked: true, missing: true))
+} created_instances_answer_postponed_requests_until_deleted
+
+/// A directory holding the tally's endpoint, the root grant and a `Device` grant held by `inst.driver`, and the spec of `driver`, claiming that device and wired to the holder of the entropy role.
+fn claiming(alloc: mem::Alloc) -> Directory {
+    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc))
+    let task::Channel(sender: intake, receiver: _) = task::Channel[os::Call].bounded(1, alloc)
+    discard mut listed.endpoints.insert(named("tally"), value: Endpoint(intake: take intake, gate: os::Gate.of(alloc), protocol: sys::Wire[Counter].hash()))
+    discard mut listed.grants.insert(0, value: os::Grant(holder: system(), object: os::Object.Machine, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
+    let holder = ident::Principal(text: text::Fixed[64].of("inst.driver"))
+    discard mut listed.grants.insert(5, value: os::Grant(holder: take holder, object: os::Object.Device(path: text::String.of("pci/0000.00.03.0", alloc)), rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    return listed
+} claiming
+
+test worlds_claim_devices_and_wire_roles_once_assigned for Directory.world {
+    let world = testing::world()
+    let alloc = world.alloc
+    var listed = claiming(alloc)
+    var bundle = Array[u8, 33].filled(0)
+    bundle[0] = 0x01
+    var spec = os::InstanceSpec.of(principal: system(), bundle: ident::HashValue(bytes: bundle), component: "runner::Tally", alloc)
+    discard mut spec.grants.insert(text::String.of("device", alloc), value: 5)
+    discard mut spec.wiring.insert(text::String.of("source", alloc), value: os::Wire(target: os::Target.Role(os::Role.Entropy), operations: None, credit: os::Credit(messages: 1, calls: 1)))
+    let task::Channel(sender: orders, receiver: _) = task::Channel[os::Order].bounded(1, alloc)
+    let Ok(withheld) = attempt Withheld.of(world.clock, alloc) else {
+        expect false
+        return
+    }
+    let request = Request(moniker: named("driver"), cell: alloc, exec: world.exec, clock: world.clock, withheld: withheld, orders: take orders, alloc: alloc)
+    var minted = Minted.none(alloc)
+    let unassigned = listed.world(spec, minted: mut minted, request)
+    expect unassigned.is_none()
+    discard mut listed.assign(os::Role.Entropy, moniker: named("tally"))
+    let Some(built) = listed.world(spec, minted: mut minted, request) else {
+        expect false
+        take minted.close()
+        return
+    }
+    let source = attempt nanos::Cap[os::PortHandle].get(built.caps, key: "source")
+    let path = match attempt nanos::Cap[os::Device].get(built.caps, key: "device") {
+        Ok(device) => device.path(alloc)
+        Err(_) => None
+    }
+    take minted.close()
+    expect source.is_ok()
+    let Some(named_path) = path else {
+        expect false
+        return
+    }
+    expect named_path.as_str() == "pci/0000.00.03.0"
+} worlds_claim_devices_and_wire_roles_once_assigned

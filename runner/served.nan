@@ -1,4 +1,4 @@
-//! The task of an instance's domain: it builds the Env, starts the component and serves the calls its driver delivers, one at a time.
+//! The task of an instance's domain: it builds the Env, starts the component and serves the calls its driver delivers, one at a time, and hands its driver the replies the component gives postponed requests.
 
 /// What an instance's driver gives the task of its domain: the calls it delivers, and where the domain reports what it takes and answers and when its handlers run.
 pub open struct Serving {
@@ -19,6 +19,7 @@ enum Delivery {
 enum Report {
     Running
     Taken(id: u64)
+    Postponed(id: u64)
     Answered(id: u64, answer: os::Answer)
     Ending
 } Report
@@ -29,15 +30,20 @@ enum Mark {
     Took(ns: u64)
 } Mark
 
-/// How an instance's domain ended other than by abandonment.
+/// How an instance's domain ended other than by abandonment: stopped, without an Env, or unhealthy at its start.
 pub closed enum Ended derives Copy, Eq {
     Stopped
     EnvIncomplete
+    Unhealthy
 } Ended
 
-/// The instances of a component of state S serving P whose Env is Env.
+/// The instances of a component of state S serving P whose Env is Env, which they build from their world.
 pub open struct Served[S: sys::Component[Env, P] and Encode, Env: nanos::Environment and Send, P: sys::Protocol and Send] {
 } Served
+
+/// The instances of a component of state S serving P whose Env is Env, built before they run.
+pub open struct Driven[S: sys::Component[Env, P] and Encode, Env: Any and Send, P: sys::Protocol and Send] {
+} Driven
 
 /// The end of the delivery loop: the driver asked to stop, or released its deliveries.
 enum Stopping {
@@ -45,31 +51,65 @@ enum Stopping {
     Cancelled(task::Cancelled) from
 } Stopping
 
-/// Runs an instance: builds its Env from `world`, starts the component, then serves what `serving` delivers until it is told to stop, letting the handler running return and handling every message that waits, and ends the component.
+/// Runs an instance whose Env it builds from `world`, as `Driven.run` runs one.
 pub fn Served.run(take world: nanos::World, take serving: Serving) -> Ended fails task::Cancelled uses wait {
     let exec = world.exec
     let alloc = world.alloc
     let Ok(env) = attempt Env.build(take world) else {
         return Ended.EnvIncomplete
     }
+    return try await Driven[S, Env, P].run(take env, exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: Env) {
+    })
+} Served.run
+
+/// Runs an instance on `env`: starts the component, ends it at once when its health is not `Healthy`, then serves what `serving` delivers, P's calls and those of the protocols whose schemas `peers` holds, until it is told to stop, letting the handler running return and handling every message that waits, and ends the component, handing its Env to `release`. The replies its handlers give the requests they postponed go to the driver as they come.
+pub fn Driven.run(
+    take env: Env,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    take serving: Serving,
+    take peers: mem::List[sys::ProtocolSchema],
+    release: fn(take ended: Env),
+    ) -> Ended fails task::Cancelled uses wait {
     let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock) = serving
+    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Replied, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), alloc: alloc)
+    let replies = pending.replies.share()
+    let signal = pending.signal.share()
+    let replier = sys::Minter[Replier, Pending, u8].of(take pending, alloc)
+    defer take replier.close()
     var stepper = try sys::Stepper[S, Env, P].start(take env, exec, alloc)
     defer take stepper.abandon()
+    match attempt sys::Runner.served(replier.mint(0)) {
+        Ok(runner) => mut stepper.attach(runner)
+        Err(_) => {
+        }
+    }
     mut stepper.resumed(sys::ResumeReason.Started)
     discard mut stepper.start_keyed()
+    match mut stepper.health() {
+        sys::HealthReply.Healthy => {
+        }
+        sys::HealthReply.Unhealthy(_) => return Ended.Unhealthy
+    }
     try await tell(reports, incarnation, report: Report.Running)
     let out = stepper.outbox()
     let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0)), alloc)
     let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
-    var given = Some(Given(deliveries: take deliveries, finishes: take finishes))
+    var given = Some(Given(deliveries: take deliveries, finishes: take finishes, peers: take peers))
     let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given](s: task::Scope) fails Stopping uses wait {
-        let Some(Given(deliveries: receiver, finishes: finishing)) = mut given.extract() else {
+        let Some(Given(deliveries: receiver, finishes: finishing, peers: known)) = mut given.extract() else {
             return
         }
         let sending = reports.split()
         let counted = steps.share()
-        discard s.spawn(fn[take receiver, take finishing, take sending, take counted]() fails Stopping uses wait limits stack 16_384 {
-            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, alloc)
+        discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take known]() fails Stopping uses wait limits stack 16_384 {
+            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, peers: known, alloc)
+        })
+        let answering = reports.split()
+        let queued = replies.share()
+        let ringing = signal.share()
+        discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
+            try await hand_replies(queued, signal: ringing, reports: answering, incarnation)
         })
         loop {
             try await stepper.incoming()
@@ -86,9 +126,10 @@ pub fn Served.run(take world: nanos::World, take serving: Serving) -> Ended fail
     try await call_handlers(mut stepper, marks, steps, finished, clock)
     try await tell(reports, incarnation, report: Report.Ending)
     undefer stepper
-    discard try await take stepper.end()
+    let sys::Stopped(state: _, env: ended) = try await take stepper.end()
+    release(take ended)
     return Ended.Stopped
-} Served.run
+} Driven.run
 
 /// The steps of an instance's holder: how many it began and finished, and the count of finished steps the dispatcher waits for, 0 when it waits for none.
 struct Steps {
@@ -97,13 +138,14 @@ struct Steps {
     wanted: core::atomic::AtomicU64
 } Steps
 
-/// What the dispatcher of an instance's domain takes: the calls its driver delivers, and the counts of finished steps the holder signals.
+/// What the dispatcher of an instance's domain takes: the calls its driver delivers, the counts of finished steps the holder signals, and the schemas of the client protocols it serves.
 struct Given {
     deliveries: task::Receiver[Delivery]
     finishes: task::Receiver[u64]
+    peers: mem::List[sys::ProtocolSchema]
 } Given
 
-/// Serves each call delivered through the protocol P on the component behind `out`, one at a time and in order, until told to stop: a request is answered once its handler returns, and a one-way call is reported taken once the handler call that took it has returned.
+/// Serves each call delivered through the protocol P, or one whose schema `peers` holds, on the component behind `out`, one at a time and in order, until told to stop: a request is answered once its handler returns, or reported postponed, and a one-way call is reported taken once the handler call that took it has returned.
 fn dispatch[P: sys::Protocol and Send](
     out: sys::Outbox[P],
     take deliveries: task::Receiver[Delivery],
@@ -111,11 +153,11 @@ fn dispatch[P: sys::Protocol and Send](
     take finishes: task::Receiver[u64],
     reports: task::Sender[Input],
     incarnation: u64,
+    peers: mem::List[sys::ProtocolSchema],
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
     var receiver = deliveries
     var signals = finishes
-    let peers = mem::List[sys::ProtocolSchema].empty(alloc)
     loop {
         let Some(Delivery.Call(id: id, hash: hash, encoded: encoded, request: request)) = try await mut receiver.receive() else {
             fail Stopping.Asked
@@ -130,6 +172,10 @@ fn dispatch[P: sys::Protocol and Send](
         }
         let answer = match outcome {
             Ok(Some(reply)) => os::Answer.Replied(take reply)
+            Ok(None) => {
+                try await tell(reports, incarnation, report: Report.Postponed(id: id))
+                continue
+            }
             Err(sys::CallError.Malformed(_)) => os::Answer.Malformed
             else => os::Answer.ServerStopped
         }
@@ -208,3 +254,130 @@ fn now(clock: sys::Clock) -> u64 {
         Err(_) => 0
     }
 } now
+
+/// The replies an incarnation's queue holds before a task of its domain hands them to the driver.
+const QUEUED_REPLIES: usize = 64
+
+/// The runner capability of an incarnation's component, which takes the replies to the requests it postponed.
+pub open struct Replier {
+} Replier
+
+impl Replier: sys::Kind[Pending, u8]
+
+impl Replier: sys::RunnerService
+
+/// The replies of an incarnation's postponed requests waiting for its driver, the signal its replies post, and where their copies are drawn from.
+struct Pending {
+    replies: mem::Shared[hw::SpinLock[mem::Bounded[Replied, QUEUED_REPLIES]]]
+    signal: mem::Shared[hw::Signal[Unit]]
+    alloc: mem::Alloc
+} Pending
+
+/// The reply to the request an incarnation's driver numbered `request`.
+struct Replied {
+    request: u64
+    reply: sys::Encoded
+} Replied
+
+/// Queues the reply to the request `request` for the driver: its bytes, as replies carry no handles; unknown when it carries some or the queue is full.
+pub fn Replier.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
+    if handles.len() > 0 {
+        fail sys::RunnerError.Unknown
+    }
+    let queued = sys::reach(self, body: fn(state: Pending, record: u8) -> bool {
+        var reply = sys::Encoded.empty(state.alloc)
+        mut reply.bytes.append(bytes)
+        var held = Some(Replied(request: request, reply: take reply))
+        return hw::without_irqs(fn[mut held](t: hw::IrqsDisabled) -> bool limits notrap {
+            let fitted = state.replies.contents().with(t, body: fn[mut held](mut queue: mem::Bounded[Replied, QUEUED_REPLIES]) -> bool limits notrap, terminates, noalloc {
+                let Some(replied) = mut held.extract() else {
+                    return false
+                }
+                if queue.is_full() {
+                    return false
+                }
+                mut queue.push(take replied)
+                return true
+            })
+            if fitted {
+                state.signal.contents().post(t, value: Unit)
+            }
+            return fitted
+        })
+    })
+    if queued != Some(true) {
+        fail sys::RunnerError.Unknown
+    }
+} Replier.reply
+
+pub fn Replier.send_to(
+    self,
+    port: u64,
+    hash: sys::ProtocolHash,
+    bytes: Slice[u8],
+    handles: Slice[sys::Handle],
+    ) fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Replier.send_to
+
+pub fn Replier.call(
+    self,
+    port: u64,
+    hash: sys::ProtocolHash,
+    bytes: Slice[u8],
+    handles: Slice[sys::Handle],
+    alloc: mem::Alloc,
+    ) -> sys::Encoded fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Replier.call
+
+pub fn Replier.publish(self, summary: Slice[u8]) fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Replier.publish
+
+pub fn Replier.sync(self) fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Replier.sync
+
+pub fn Replier.capability(self, id: u64) -> sys::Handle fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Replier.capability
+
+pub fn Replier.drop_capability(self, id: u64) fails sys::RunnerError limits stack 4_096 {
+    fail sys::RunnerError.Unknown
+} Replier.drop_capability
+
+pub fn Replier.resource(self, id: u64) -> sys::Held fails sys::RunnerError limits stack 8_192 {
+    fail sys::RunnerError.Unknown
+} Replier.resource
+
+pub fn Replier.take_resource(self, id: u64) -> sys::Held fails sys::RunnerError limits stack 8_192 {
+    fail sys::RunnerError.Unknown
+} Replier.take_resource
+
+pub fn Replier.put_resource(self, id: u64, take resource: sys::Held) fails sys::RunnerError limits stack 8_192 {
+    fail sys::RunnerError.Unknown
+} Replier.put_resource
+
+/// Hands the driver each reply `replies` queues, as `signal` tells it they come, until cancelled.
+fn hand_replies(
+    replies: mem::Shared[hw::SpinLock[mem::Bounded[Replied, QUEUED_REPLIES]]],
+    signal: mem::Shared[hw::Signal[Unit]],
+    reports: task::Sender[Input],
+    incarnation: u64,
+    ) fails task::Cancelled uses wait {
+    loop {
+        try await signal.contents().wait()
+        loop {
+            let next = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Replied] limits notrap {
+                return replies.contents().with(t, body: fn(mut queue: mem::Bounded[Replied, QUEUED_REPLIES]) -> Option[Replied] limits notrap, terminates, noalloc {
+                    return mut queue.pop()
+                })
+            })
+            let Some(Replied(request: request, reply: reply)) = next else {
+                break
+            }
+            try await tell(reports, incarnation, report: Report.Answered(id: request, answer: os::Answer.Replied(take reply)))
+        }
+    }
+} hand_replies
