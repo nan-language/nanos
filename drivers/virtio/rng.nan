@@ -1,0 +1,195 @@
+//! The `virtio-rng` driver: a virtio entropy device serving `Entropy`, one request at a time on its single queue, completed by MSI-X interrupt.
+
+/// The virtio type of entropy devices.
+const ENTROPY: u16 = 4
+
+/// The key of the keyed task turning interrupts into completions.
+const INTERRUPTS: u64 = 1
+
+/// The most bytes one request fills.
+const MOST_BYTES: u32 = 4_096
+
+contribute devices::drivers virtio_rng = devices::Registration(name: "virtio-rng", matches: devices::matches(devices::DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1044), rest: devices::DeviceMatch.None), class: devices::Class.Entropy, component: "drivers::virtio::Rng", priority: 0)
+
+/// What the driver serves: `Entropy`'s operation, and its device's completions.
+pub protocol RngDevice {
+    pub fn fill(count: u32) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    fn completed() limits irreversible(emit, actuate, erase, spend)
+} RngDevice
+
+/// The buffer the device fills.
+pub layout Pool: bytes 4_096 le {
+    data: Array[u8, 4_096] at 0
+} Pool
+
+/// The driver's Env: its queue's size, its function, the windows over its common and notification structures, its queue and buffer, its interrupt, the signal that interrupt posts, and its cell.
+pub open linear struct RngEnv derives Send {
+    size: u16
+    function: hw::PciFunction
+    common: hw::Mmio[Common]
+    notify: hw::Mmio[Notify]
+    queue: hw::DmaShared[Queue]
+    pool: hw::Dma[Pool]
+    irq: hw::IrqShared[Interrupt]
+    signal: mem::Shared[hw::Signal[Unit]]
+    alloc: mem::Alloc
+} RngEnv
+
+/// A request waiting for its bytes.
+pub closed struct Asked derives Copy, Eq, Encode {
+    pub request: u64
+    pub count: u32
+} Asked
+
+/// The driver's state: the requests waiting, the first of them on the device when `busy`, the available and used indices, the tests of the device's bytes, and whether they failed.
+pub closed struct Rng derives Encode {
+    pub asked: mem::List[Asked]
+    pub busy: bool
+    pub available: u16
+    pub used: u16
+    pub tests: SourceTests
+    pub failed: bool
+} Rng
+
+impl Rng: sys::Component[RngEnv, RngDevice]
+
+impl Rng: sys::Resume[RngEnv, RngDevice]
+
+impl Rng: sys::Health[RngEnv, RngDevice]
+
+/// The Env over `function`: its structures mapped, its features negotiated, its queue and buffer drawn from `alloc`, attached to physical memory, and its queue's interrupt on MSI-X entry 0 of CPU 0; `None` when the device does not allow it, the function then handed back.
+pub fn RngEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[RngEnv] {
+    var held = function
+    let Some(found) = located(held, kind: ENTROPY) else {
+        take held.release()
+        return None
+    }
+    let Ok(common) = attempt hw::Mmio[Common].of_bar(mut held, index: found.common.bar, offset: u64.widen(found.common.offset)) else {
+        take held.release()
+        return None
+    }
+    var regs = common
+    if not negotiate(mut regs, features: 0) or (attempt mut held.attach_physical()).is_err() {
+        release(take held, common: Some(take regs), notify: None, queue: None)
+        return None
+    }
+    let heap = mem::Heap.of(alloc)
+    let queue = hw::DmaShared.of(heap.boxed(empty_queue()), space: hw::IoSpace.physical())
+    let Some(ring) = set_up(mut regs, index: 0, queue, vector: 0, multiplier: found.notify.multiplier) else {
+        release(take held, common: Some(take regs), notify: None, queue: Some(take queue))
+        return None
+    }
+    let Ok(notify) = attempt hw::Mmio[Notify].of_bar(mut held, index: found.notify.bar, offset: u64.widen(found.notify.offset) + ring.notify_offset) else {
+        release(take held, common: Some(take regs), notify: None, queue: Some(take queue))
+        return None
+    }
+    let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
+    let irq = match mut held.msix(entry: 0, cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
+        Ok(shared) => shared
+        Err(_) => {
+            release(take held, common: Some(take regs), notify: Some(take notify), queue: Some(take queue))
+            return None
+        }
+    }
+    ready(mut regs)
+    let pool = hw::Dma.of(heap.boxed(Pool.from_bits(Array[u8, 4_096].filled(0))), space: hw::IoSpace.physical())
+    return Some(RngEnv(size: ring.size, function: take held, common: take regs, notify: take notify, queue: take queue, pool: take pool, irq: take irq, signal: take signal, alloc: alloc))
+} RngEnv.of
+
+/// Resets the device, then releases the interrupt, the windows and the buffers, and hands the function back.
+pub fn RngEnv.abandon(take self) {
+    let RngEnv(size: _, function: function, common: common, notify: notify, queue: queue, pool: pool, irq: irq, signal: _, alloc: _) = self
+    discard take irq.uninstall()
+    discard take pool.into_box()
+    release(take function, common: Some(take common), notify: Some(take notify), queue: Some(take queue))
+} RngEnv.abandon
+
+pub fn Rng.start(mut env: RngEnv) -> Rng = Rng(asked: mem::List.empty(env.alloc), busy: false, available: 0, used: 0, tests: SourceTests.fresh(), failed: false)
+
+/// Once started, turns each interrupt into a completion.
+pub fn Rng.resume(mut self, reason: sys::ResumeReason, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
+    let signal = env.signal.share()
+    mut cx.spawn(key: INTERRUPTS, run: fn[take signal](out: sys::Outbox[RngDevice]) fails task::Cancelled uses wait limits stack 8_192 {
+        loop {
+            try await signal.contents().wait()
+            if (attempt await out.completed()).is_err() {
+                return
+            }
+        }
+    })
+} Rng.resume
+
+pub fn Rng.health(mut self, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) -> sys::HealthReply {
+    if self.failed {
+        return sys::HealthReply.Unhealthy(text::Fixed[256].of("entropy"))
+    }
+    return sys::HealthReply.Healthy
+} Rng.health
+
+/// Queues the request, answered once the device has filled `count` bytes.
+pub fn Rng.fill(mut self, take count: u32, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) -> Untrusted[mem::Bytes] fails devices::DeviceError {
+    if count == 0 {
+        fail devices::DeviceError.OutOfRange
+    }
+    if count > MOST_BYTES {
+        fail devices::DeviceError.TooLarge
+    }
+    if self.failed {
+        fail devices::DeviceError.Io
+    }
+    let Some(request) = mut cx.postpone() else {
+        fail devices::DeviceError.Io
+    }
+    mut self.asked.push(Asked(request: request, count: count))
+    mut self.submit(mut env)
+    return Untrusted.of(mem::Bytes.empty(env.alloc))
+} Rng.fill
+
+/// Answers the request the device completed, then submits the next.
+fn Rng.completed(mut self, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
+    let Some(entry) = next_used(mut env.queue, seen: self.used, size: env.size) else {
+        return
+    }
+    self.used = self.used.wrapping_add(1)
+    self.busy = false
+    if self.asked.len() == 0 {
+        return
+    }
+    let asked = mut self.asked.remove(0)
+    let filled = mut self.taken(env, count: asked.count, written: entry.len)
+    var reply = sys::Encoded.empty(env.alloc)
+    mem::wire::Codec[Result[Untrusted[mem::Bytes], devices::DeviceError]].encode(filled, out: mut reply.bytes)
+    discard attempt mut cx.reply(asked.request, reply)
+    mut self.submit(mut env)
+} Rng.completed
+
+/// The bytes the device wrote for a request of `count`, which the source tests pass, else the failure the request ends with.
+fn Rng.taken(mut self, env: RngEnv, count: u32, written: u32) -> Result[Untrusted[mem::Bytes], devices::DeviceError] {
+    if written < count {
+        return Err(devices::DeviceError.Io)
+    }
+    let pool = env.pool.contents()
+    var bytes = mem::Bytes.empty(env.alloc)
+    for at in 0..<usize.widen(count) {
+        let byte = pool.data[at]
+        if not mut self.tests.sample(byte) {
+            self.failed = true
+        }
+        mut bytes.push(byte)
+    }
+    if self.failed {
+        return Err(devices::DeviceError.Io)
+    }
+    return Ok(Untrusted.of(take bytes))
+} Rng.taken
+
+/// Hands the device the first waiting request when none is on it.
+fn Rng.submit(mut self, mut env: RngEnv) {
+    if self.busy or self.asked.len() == 0 {
+        return
+    }
+    mut env.queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(addr: env.pool.bus_addr().value, len: self.asked[0].count, flags: WRITE, next: 0))
+    self.available = offer(mut env.queue, head: 0, index: self.available, size: env.size)
+    mut env.notify.write(Notify.queue, value: 0)
+    self.busy = true
+} Rng.submit

@@ -1,0 +1,268 @@
+//! Virtio 1.2 PCI devices: their configuration structures, initialisation and split virtqueues.
+
+/// The vendor of virtio PCI functions; modern devices have the device id 0x1040 plus their virtio type.
+const VENDOR: u16 = 0x1AF4
+
+const VENDOR_CAPABILITY: u32 = 0x09
+
+const COMMON_STRUCTURE: u32 = 1
+
+const NOTIFY_STRUCTURE: u32 = 2
+
+const DEVICE_STRUCTURE: u32 = 4
+
+/// The device status bits.
+const ACKNOWLEDGE: u8 = 1
+
+const DRIVER: u8 = 2
+
+const DRIVER_OK: u8 = 4
+
+const FEATURES_OK: u8 = 8
+
+/// The feature bits of the second feature word: the one every modern device offers, and the one by which a device reaches memory through the platform's translation, which a function attached to physical memory accepts.
+const VERSION_1: u32 = 1
+
+const ACCESS_PLATFORM: u32 = 2
+
+/// No MSI-X vector.
+const NO_VECTOR: u16 = 0xFFFF
+
+/// The most entries of each virtqueue the drivers set up.
+pub const QUEUE_SIZE: u16 = 16
+
+/// A descriptor flag: the buffer continues in the descriptor `next` names.
+pub const NEXT: u16 = 1
+
+/// A descriptor flag: the device writes the buffer.
+pub const WRITE: u16 = 2
+
+/// The common configuration structure.
+pub registers Common {
+    device_feature_select: u32 at 0x00 read write
+    device_feature: u32 at 0x04 read
+    driver_feature_select: u32 at 0x08 read write
+    driver_feature: u32 at 0x0C read write
+    msix_config: u16 at 0x10 read write
+    num_queues: u16 at 0x12 read
+    device_status: u8 at 0x14 read write
+    config_generation: u8 at 0x15 read
+    queue_select: u16 at 0x16 read write
+    queue_size: u16 at 0x18 read write
+    queue_msix_vector: u16 at 0x1A read write
+    queue_enable: u16 at 0x1C read write
+    queue_notify_off: u16 at 0x1E read
+    queue_desc: u64 at 0x20 read write
+    queue_driver: u64 at 0x28 read write
+    queue_device: u64 at 0x30 read write
+} Common
+
+/// A queue's notification register.
+pub registers Notify {
+    queue: u16 at 0x0 write
+} Notify
+
+pub layout Descriptor: bytes 16 le {
+    addr: u64 at 0
+    len: u32 at 8
+    flags: u16 at 12
+    next: u16 at 14
+} Descriptor
+
+pub layout UsedEntry: bytes 8 le {
+    id: u32 at 0
+    len: u32 at 4
+} UsedEntry
+
+/// A split virtqueue of `QUEUE_SIZE` entries: its descriptor table, its available ring and, from 512, its used ring.
+pub layout Queue: bytes 1_024 le {
+    descriptors: Array[Descriptor, 16] at 0
+    avail_flags: u16 at 256
+    avail_index: u16 at 258
+    avail_ring: Array[u16, 16] at 260
+    used_event: u16 at 292
+    padding_a: Array[u8, 218] at 294
+    used_flags: u16 at 512
+    used_index: u16 at 514
+    used_ring: Array[UsedEntry, 16] at 516
+    avail_event: u16 at 644
+    padding_b: Array[u8, 378] at 646
+} Queue
+
+const USED_OFFSET: u64 = 512
+
+const AVAIL_OFFSET: u64 = 256
+
+/// Where a configuration structure lies: its BAR, its offset in it, and for the notification structure the multiplier of queue offsets.
+pub closed struct Place derives Copy, Eq {
+    pub bar: u8
+    pub offset: u32
+    pub multiplier: u32
+} Place
+
+/// The configuration structures of a function: its common, notification and device-specific ones.
+pub closed struct Places derives Copy, Eq {
+    pub common: Place
+    pub notify: Place
+    pub device: Option[Place]
+} Places
+
+/// The places of the configuration structures of `function` when it is a modern virtio device of type `kind`, `None` when it is not or lacks the common or the notification structure.
+pub fn located(function: hw::PciFunction, kind: u16) -> Option[Places] {
+    let ids = function.config_read(0)
+    if u16.truncate(ids) != VENDOR or u16.truncate(ids >> 16) != 0x1040 + kind {
+        return None
+    }
+    var common: Option[Place] = None
+    var notify: Option[Place] = None
+    var device: Option[Place] = None
+    if ((function.config_read(0x04) >> 20) & 1) == 0 {
+        return None
+    }
+    var at = function.config_read(0x34) & 0xFC
+    var seen: u32 = 0
+    while at != 0 and seen < 48 {
+        let head = function.config_read(u8.truncate(at))
+        if (head & 0xFF) == VENDOR_CAPABILITY {
+            let structure = (head >> 24) & 0xFF
+            let place = Place(bar: u8.truncate(function.config_read(u8.truncate(at + 4))), offset: function.config_read(u8.truncate(at + 8)), multiplier: 0)
+            if structure == COMMON_STRUCTURE and common.is_none() {
+                common = Some(place)
+            } else if structure == NOTIFY_STRUCTURE and notify.is_none() {
+                notify = Some(Place(bar: place.bar, offset: place.offset, multiplier: function.config_read(u8.truncate(at + 16))))
+            } else if structure == DEVICE_STRUCTURE and device.is_none() {
+                device = Some(place)
+            }
+        }
+        at = (head >> 8) & 0xFC
+        seen += 1
+    }
+    let Some(found_common) = common else {
+        return None
+    }
+    let Some(found_notify) = notify else {
+        return None
+    }
+    return Some(Places(common: found_common, notify: found_notify, device: device))
+} located
+
+/// Resets the device and negotiates `features` of the first word with VERSION_1 and ACCESS_PLATFORM where offered, leaving it at FEATURES_OK; false when the device refuses them.
+pub fn negotiate(mut common: hw::Mmio[Common], features: u32) -> bool {
+    mut common.write(Common.device_status, value: 0)
+    var polls: u32 = 0
+    while mut common.read(Common.device_status) != 0 and polls < 1_000_000 {
+        polls += 1
+    }
+    mut common.write(Common.device_status, value: ACKNOWLEDGE)
+    mut common.write(Common.device_status, value: ACKNOWLEDGE | DRIVER)
+    mut common.write(Common.device_feature_select, value: 0)
+    let offered = mut common.read(Common.device_feature)
+    mut common.write(Common.device_feature_select, value: 1)
+    let modern = mut common.read(Common.device_feature)
+    if (modern & VERSION_1) == 0 {
+        return false
+    }
+    mut common.write(Common.driver_feature_select, value: 0)
+    mut common.write(Common.driver_feature, value: offered & features)
+    mut common.write(Common.driver_feature_select, value: 1)
+    mut common.write(Common.driver_feature, value: modern & (VERSION_1 | ACCESS_PLATFORM))
+    mut common.write(Common.device_status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK)
+    return (mut common.read(Common.device_status) & FEATURES_OK) != 0
+} negotiate
+
+/// A queue set up: the offset of its notification register in the notification structure, and its size.
+pub closed struct Ring derives Copy, Eq {
+    pub notify_offset: u64
+    pub size: u16
+} Ring
+
+/// Sets up queue `index` over `queue` with the device's size or `QUEUE_SIZE` entries, the smaller, its interrupts on MSI-X vector `vector`; `None` when the device has no such queue.
+pub fn set_up(mut common: hw::Mmio[Common], index: u16, queue: hw::DmaShared[Queue], vector: u16, multiplier: u32) -> Option[Ring] {
+    mut common.write(Common.queue_select, value: index)
+    var size = mut common.read(Common.queue_size)
+    if size == 0 {
+        return None
+    }
+    if size > QUEUE_SIZE {
+        size = QUEUE_SIZE
+    }
+    mut common.write(Common.queue_size, value: size)
+    mut common.write(Common.queue_msix_vector, value: vector)
+    let base = queue.bus_addr().value
+    mut common.write(Common.queue_desc, value: base)
+    mut common.write(Common.queue_driver, value: base + AVAIL_OFFSET)
+    mut common.write(Common.queue_device, value: base + USED_OFFSET)
+    mut common.write(Common.queue_enable, value: 1)
+    return Some(Ring(notify_offset: u64.widen(mut common.read(Common.queue_notify_off)) * u64.widen(multiplier), size: size))
+} set_up
+
+/// Ends the device's initialisation: no configuration interrupt, and DRIVER_OK.
+pub fn ready(mut common: hw::Mmio[Common]) {
+    mut common.write(Common.msix_config, value: NO_VECTOR)
+    mut common.write(Common.device_status, value: ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK)
+} ready
+
+/// Resets the device, which stops using its queues.
+pub fn reset(mut common: hw::Mmio[Common]) {
+    mut common.write(Common.device_status, value: 0)
+} reset
+
+/// A queue of descriptors, none of them in use.
+pub fn empty_queue() -> Queue {
+    return Queue.from_bits(Array[u8, 1_024].filled(0))
+} empty_queue
+
+/// Makes the chain starting at descriptor `head` available in a ring of `size` entries and returns the available index after it.
+pub fn offer(mut queue: hw::DmaShared[Queue], head: u16, index: u16, size: u16) -> u16 {
+    mut queue.write_release_at(Queue.avail_ring, index: usize.widen(index % size), value: head)
+    let advanced = index.wrapping_add(1)
+    mut queue.write_release(Queue.avail_index, value: advanced)
+    return advanced
+} offer
+
+/// The next entry the device used after `seen` in a ring of `size` entries, `None` when it used none.
+pub fn next_used(mut queue: hw::DmaShared[Queue], seen: u16, size: u16) -> Option[UsedEntry] {
+    let published = mut queue.read_acquire(Queue.used_index)
+    if published == seen {
+        return None
+    }
+    return Some(mut queue.read_acquire_at(Queue.used_ring, index: usize.widen(seen % size)))
+} next_used
+
+/// What a driver's interrupt fn holds: the signal its keyed task waits on.
+pub closed struct Interrupt {
+    pub signal: mem::Shared[hw::Signal[Unit]]
+} Interrupt
+
+/// Posts the signal for each interrupt of the device.
+pub interrupt fn Interrupt.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 512 {
+    self.signal.contents().post(irq.irqs_disabled(), value: Unit)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Interrupt.on_irq
+
+/// Resets the device when its common structure is mapped, then unmaps the windows, frees the queue and hands the function back, cut off.
+pub fn release(take function: hw::PciFunction, take common: Option[hw::Mmio[Common]], take notify: Option[hw::Mmio[Notify]], take queue: Option[hw::DmaShared[Queue]]) {
+    match common {
+        Some(regs) => {
+            var held = regs
+            reset(mut held)
+            take held.unmap()
+        }
+        None => {
+        }
+    }
+    match notify {
+        Some(window) => take window.unmap()
+        None => {
+        }
+    }
+    match queue {
+        Some(ring) => {
+            discard take ring.into_box()
+        }
+        None => {
+        }
+    }
+    take function.release()
+} release

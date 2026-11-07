@@ -15,6 +15,7 @@ pub protocol Supervisor {
 
 pub closed struct Env {
     pub control: os::Control
+    pub devices: Option[os::Port[devices::Devices]]
     pub exec: task::Executor
     pub alloc: mem::Alloc
 } Env
@@ -30,7 +31,11 @@ impl Supervision: sys::Component[Env, Supervisor]
 impl Supervision: sys::Resume[Env, Supervisor]
 
 pub fn Env.build(take world: nanos::World) -> Env fails nanos::CapError {
-    return Env(control: try nanos::Cap[os::Control].get(world.caps, key: "control"), exec: world.exec, alloc: world.alloc)
+    let devices = match attempt nanos::Cap[os::PortHandle].get(world.caps, key: "devices") {
+        Ok(handle) => os::Port[devices::Devices].of(handle)
+        Err(_) => None
+    }
+    return Env(control: try nanos::Cap[os::Control].get(world.caps, key: "control"), devices: devices, exec: world.exec, alloc: world.alloc)
 } Env.build
 
 pub fn Supervision.start(mut env: Env) -> Supervision = Supervision()
@@ -41,10 +46,11 @@ pub fn Supervision.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut
         return
     }
     let control = env.control
+    let manager = env.devices
     let exec = env.exec
     let alloc = env.alloc
     mut cx.spawn(key: STARTING, run: fn(out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
-        try await start_in_order(control, exec, alloc)
+        try await start_in_order(control, devices: manager, exec, alloc)
     })
 } Supervision.resume
 
@@ -81,8 +87,8 @@ fn carry_out(
     })
 } carry_out
 
-/// Starts the base instances in their order, each step once every instance of the step before runs, hibernates or has failed.
-fn start_in_order(control: os::Control, exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Starts the base instances in their order, each step once every instance of the step before runs, hibernates or has failed, and the step after `devices` once `devices` has settled the drivers it binds.
+fn start_in_order(control: os::Control, devices: Option[os::Port[devices::Devices]], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var step = mem::List[ident::Moniker].empty(alloc)
     var name = text::Fixed[59].empty()
     for byte in START_ORDER.as_bytes() {
@@ -90,14 +96,32 @@ fn start_in_order(control: os::Control, exec: task::Executor, alloc: mem::Alloc)
             mut name.push(char.checked_from_bits(u32.widen(byte)).value_or(' '))
             continue
         }
+        let manager = name.as_str() == "devices"
         mut step.push(ident::Moniker(text: name))
         name = text::Fixed[59].empty()
         if byte == b'\n' {
             try await start_all(control, monikers: take step, exec, alloc)
             step = mem::List.empty(alloc)
         }
+        if manager {
+            try await settle(devices, alloc)
+        }
     }
 } start_in_order
+
+/// Waits until `devices` has settled the drivers it binds, at once without a port to it.
+fn settle(devices: Option[os::Port[devices::Devices]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(port) = devices else {
+        return
+    }
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Devices].settled(mut call)
+    match attempt await port.call(take call, reply, alloc) {
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} settle
 
 /// Starts the instances `monikers` names in parallel and returns once each runs, hibernates or has failed, passing over those without a specification.
 fn start_all(control: os::Control, take monikers: mem::List[ident::Moniker], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
@@ -148,7 +172,7 @@ test base_instances_start_step_by_step for start_in_order {
     var given = Some(take ordered)
     try await task::scope(world.exec, body: fn[mut names, mut given](s: task::Scope) fails task::Cancelled uses wait {
         discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
-            try await start_in_order(control, exec: world.exec, alloc)
+            try await start_in_order(control, devices: None, exec: world.exec, alloc)
         })
         let Some(receiver) = mut given.extract() else {
             return
