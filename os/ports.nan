@@ -53,11 +53,17 @@ pub closed enum PortError[E: Send] derives Render {
     Cancelled(task::Cancelled) from
 } PortError
 
-/// Where a minted port's calls go: the target's intake, gate and protocol hash, the operations it may call, every one when `None`, and its credit.
+/// The protocols an instance serves: its own, and the client protocol whose calls its own schema serves, if any.
+pub closed struct Protocols derives Copy, Eq {
+    pub own: sys::ProtocolHash
+    pub serves: Option[sys::ProtocolHash]
+} Protocols
+
+/// Where a minted port's calls go: the target's intake, gate and protocols, the operations it may call, every one when `None`, and its credit.
 struct Route {
     intake: task::Sender[Call]
     gate: Gate
-    hash: sys::ProtocolHash
+    protocols: Protocols
     operations: Option[mem::Set[text::String]]
     credits: task::Cown[Credits]
     alloc: mem::Alloc
@@ -74,7 +80,6 @@ struct Credits {
 /// What a call through a port needs from its minted port.
 struct Reached {
     intake: task::Sender[Call]
-    hash: sys::ProtocolHash
     credits: task::Cown[Credits]
     alloc: mem::Alloc
 } Reached
@@ -105,17 +110,17 @@ pub fn Gate.is_open(self) -> bool {
     return self.open.contents().load() == 1
 } Gate.is_open
 
-/// A port minted for one sender: its calls of the operations `operations` names, all when `None`, go to `intake` while `gate` is open, under `credit`, to an instance serving the protocol `hash`.
+/// A port minted for one sender: its calls of the operations `operations` names, all when `None`, go to `intake` while `gate` is open, under `credit`, to an instance serving `protocols`.
 pub fn MintedPort.of(
     intake: task::Sender[Call],
     gate: Gate,
-    hash: sys::ProtocolHash,
+    protocols: Protocols,
     take operations: Option[mem::Set[text::String]],
     credit: Credit,
     alloc: mem::Alloc,
     ) -> MintedPort {
     let credits = task::Cown.of(Credits(messages: credit.messages, calls: credit.calls, waiting_messages: mem::List.empty(alloc), waiting_calls: mem::List.empty(alloc)), alloc)
-    let route = Route(intake: intake.split(), gate: gate.share(), hash: hash, operations: take operations, credits: take credits, alloc: alloc)
+    let route = Route(intake: intake.split(), gate: gate.share(), protocols: protocols, operations: take operations, credits: take credits, alloc: alloc)
     let minter = sys::Minter[PortHandle, Route, u8].of(take route, alloc)
     let root = minter.mint(0)
     return MintedPort(minter: take minter, root: root)
@@ -129,10 +134,10 @@ pub fn MintedPort.close(take self) {
     take minter.close()
 } MintedPort.close
 
-/// The port of protocol P a handle gives, `None` when it is stale or its instance serves another protocol.
+/// The port of protocol P a handle gives, `None` when it is stale or its instance serves neither P nor P's calls.
 pub fn Port.of(handle: PortHandle) -> Option[Port[P]] {
     let wanted = sys::Wire[P].hash()
-    let serves = sys::reach(handle, body: fn(state: Route, record: u8) => state.hash == wanted)
+    let serves = sys::reach(handle, body: fn(state: Route, record: u8) => state.protocols.own == wanted or state.protocols.serves == Some(wanted))
     if serves != Some(true) {
         return None
     }
@@ -147,7 +152,7 @@ pub fn Port.post(self, take call: sys::Encoded) fails PortError[Never] uses wait
         Err(Refusal.Stopped) => fail PortError.Stopped
     }
     let lease = try await Lease.acquire(reached.credits, request: false, alloc: reached.alloc)
-    let sent = attempt await reached.intake.send(Call(hash: reached.hash, encoded: take call, reply: None, lease: take lease))
+    let sent = attempt await reached.intake.send(Call(hash: sys::Wire[P].hash(), encoded: take call, reply: None, lease: take lease))
     match sent {
         Ok(_) => {
         }
@@ -165,7 +170,7 @@ pub fn Port.call[R: Send, E: Send](self, take call: sys::Encoded, reply: sys::Re
     }
     let lease = try await Lease.acquire(reached.credits, request: true, alloc)
     let task::Channel(sender: answer, receiver: answers) = task::Channel[Answer].bounded(1, alloc)
-    let sent = attempt await reached.intake.send(Call(hash: reached.hash, encoded: take call, reply: Some(take answer), lease: take lease))
+    let sent = attempt await reached.intake.send(Call(hash: sys::Wire[P].hash(), encoded: take call, reply: Some(take answer), lease: take lease))
     match sent {
         Ok(_) => {
         }
@@ -198,7 +203,7 @@ fn Port.reach(self, encoded: Slice[u8]) -> Result[Reached, Refusal] {
         if not state.gate.is_open() {
             return Err(Refusal.Stopped)
         }
-        return Ok(Reached(intake: state.intake.split(), hash: state.hash, credits: state.credits.share(), alloc: state.alloc))
+        return Ok(Reached(intake: state.intake.split(), credits: state.credits.share(), alloc: state.alloc))
     })
     let Some(outcome) = reached else {
         return Err(Refusal.Revoked)

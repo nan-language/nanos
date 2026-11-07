@@ -5,43 +5,64 @@ const SUPERVISOR: Str = "supervisor::Supervision"
 
 const DEVICES: Str = "devices::Manager"
 
+const VIEW: Str = "devices::View"
+
 const VIRTIO_RNG: Str = "drivers::virtio::Rng"
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, and the bundle the image's instances run.
+const VIRTIO_BLK: Str = "drivers::virtio::Blk"
+
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, and the boot volume the handoff record names.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
     bundle: ident::HashValue
+    boot: devices::BootVolume
 } Base
 
 impl Base: runner::Components
 
-fn Base.protocol(self, component: Str) -> Option[sys::ProtocolHash] {
+fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == SUPERVISOR {
-        return Some(sys::Wire[supervisor::Supervisor].hash())
+        return Some(os::Protocols(own: sys::Wire[supervisor::Supervisor].hash(), serves: None))
     }
     if component == DEVICES {
-        return Some(sys::Wire[devices::Devices].hash())
+        return Some(os::Protocols(own: sys::Wire[devices::Devices].hash(), serves: None))
     }
-    for entry in devices::drivers {
-        if entry.component == component {
-            return Some(entry.class.protocol())
-        }
+    if component == VIEW {
+        return Some(os::Protocols(own: sys::Wire[devices::VolumeView].hash(), serves: Some(sys::Wire[devices::Block].hash())))
+    }
+    if component == VIRTIO_RNG {
+        return Some(os::Protocols(own: sys::Wire[drivers::virtio::RngDevice].hash(), serves: Some(sys::Wire[devices::Entropy].hash())))
+    }
+    if component == VIRTIO_BLK {
+        return Some(os::Protocols(own: sys::Wire[drivers::virtio::BlkDevice].hash(), serves: Some(sys::Wire[devices::Block].hash())))
     }
     return None
-} Base.protocol
+} Base.protocols
 
 fn Base.serve(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     if component == DEVICES {
         let Ok(control) = attempt nanos::Cap[os::Control].get(world.caps, key: "control") else {
             return runner::Ended.EnvIncomplete
         }
-        let env = devices::Env(root: self.root, control: control, bundle: self.bundle, clock: world.clock, exec: world.exec, alloc: world.alloc)
+        let env = devices::Env(root: self.root, control: control, bundle: self.bundle, boot: self.boot, clock: world.clock, exec: world.exec, alloc: world.alloc)
         return try await runner::Driven[devices::Manager, devices::Env, devices::Devices].run(take env, exec: world.exec, alloc: world.alloc, take serving, peers: mem::List.empty(world.alloc), release: fn(take ended: devices::Env) limits stack 512 {
+        })
+    }
+    if component == VIEW {
+        let exec = world.exec
+        let alloc = world.alloc
+        let Ok(env) = attempt devices::ViewEnv.build(take world) else {
+            return runner::Ended.EnvIncomplete
+        }
+        return try await runner::Driven[devices::View, devices::ViewEnv, devices::VolumeView].run(take env, exec, alloc, take serving, peers: schema_of_block(alloc), release: fn(take ended: devices::ViewEnv) limits stack 512 {
         })
     }
     if component == VIRTIO_RNG {
         return try await self.serve_rng(take world, take serving)
+    }
+    if component == VIRTIO_BLK {
+        return try await self.serve_blk(take world, take serving)
     }
     return try await runner::Served[supervisor::Supervision, supervisor::Env, supervisor::Supervisor].run(take world, take serving)
 } Base.serve
@@ -61,6 +82,27 @@ fn Base.serve_rng(self, take world: nanos::World, take serving: runner::Serving)
         Some(devices::Claimed.Platform(_)) or None => return runner::Ended.EnvIncomplete
     }
 } Base.serve_rng
+
+/// Serves `virtio-blk` on the function its claim names.
+fn Base.serve_blk(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    match try await self.claimed(world) {
+        Some(devices::Claimed.Pci(function)) => {
+            let Some(env) = drivers::virtio::BlkEnv.of(take function, alloc) else {
+                return runner::Ended.EnvIncomplete
+            }
+            return try await runner::Driven[drivers::virtio::Blk, drivers::virtio::BlkEnv, drivers::virtio::BlkDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::virtio::BlkEnv.abandon)
+        }
+        Some(devices::Claimed.Platform(_)) or None => return runner::Ended.EnvIncomplete
+    }
+} Base.serve_blk
+
+/// The schemas a block driver or view serves the calls of: `Block`'s.
+fn schema_of_block(alloc: mem::Alloc) -> mem::List[sys::ProtocolSchema] {
+    var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+    mut peers.push(sys::Wire[devices::Block].schema(alloc))
+    return peers
+} schema_of_block
 
 /// The hardware of the device a driver's world claims, `None` when it holds no live claim or a driver holds the device.
 fn Base.claimed(self, world: nanos::World) -> Option[devices::Claimed] fails task::Cancelled uses wait {
@@ -124,12 +166,12 @@ fn image_genesis(bundle: ident::HashValue, alloc: mem::Alloc) -> runner::Known {
 } image_genesis
 
 /// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames` and prints each event `rings` record; it never ends unless cancelled.
-fn run_base(take known: runner::Known, take keeper: keeper::Keeper, bundle: ident::HashValue, config: runner::Config, rings: journal::Rings, mut frames: frames::Frames) fails task::Cancelled uses wait {
+fn run_base(take known: runner::Known, take keeper: keeper::Keeper, bundle: ident::HashValue, boot: devices::BootVolume, config: runner::Config, rings: journal::Rings, mut frames: frames::Frames) fails task::Cancelled uses wait {
     let task::Channel(sender: requests, receiver: incoming) = task::Channel[Reservation].bounded(1, alloc: config.alloc)
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
     let minted = devices::MintedRoot.of(orders, alloc: config.alloc)
     defer take minted.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle)
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot)
     var requested = incoming
     var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered))
     defer abandon_given(take given)
@@ -260,7 +302,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unserved
     let minted = devices::MintedRoot.of(orders, alloc)
     defer take minted.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle))
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)))
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)
