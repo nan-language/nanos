@@ -1,0 +1,282 @@
+//! Partition tables: a unit's GPT, checked by its CRC32s, else its MBR's four primary entries, else a FAT boot sector at block 0 covering the unit.
+
+/// The block size the tables are read in, and the GPT header's signature.
+const GPT_SIGNATURE: Array[u8, 8] = signature_bytes()
+
+/// The MBR partition types of FAT volumes, of an EFI system partition and of a GPT's protective entry.
+const ESP_TYPE: u8 = 0xEF
+
+const PROTECTIVE_TYPE: u8 = 0xEE
+
+/// The most GPT entries read, and the size of the entries read.
+const MOST_GPT_ENTRIES: u32 = 128
+
+const GPT_ENTRY_BYTES: u32 = 128
+
+/// The GPT type GUID of an EFI system partition, in the byte order the disk holds it.
+const ESP_GUID: Array[u8, 16] = esp_guid_bytes()
+
+/// What a partition's type is: a GPT type GUID or an MBR type byte, as the disk holds them.
+pub closed enum PartitionType derives Copy, Eq, Encode {
+    Gpt(Array[u8, 16])
+    Mbr(u8)
+    Whole
+} PartitionType
+
+/// A partition of a unit at `/live/devices/<bus path>/u<n>/p<m>`, m counting from 1 in table order: its type, its GPT unique GUID, and where it lies in blocks, `start` being chapter 15's `first`, a NaN keyword.
+pub closed struct Partition derives Copy, Eq, Encode {
+    pub number: u32
+    pub kind: PartitionType
+    pub unique: Option[Array[u8, 16]]
+    pub start: u64
+    pub blocks: u64
+} Partition
+
+/// How a unit is partitioned: by a GPT, by an MBR with its disk signature, as one FAT volume, or not at all.
+pub closed enum Scheme derives Copy, Eq, Encode {
+    Gpt
+    Mbr(signature: u32)
+    Fat
+    None
+} Scheme
+
+/// A unit's table: its scheme and its partitions.
+pub closed struct Table derives Encode {
+    pub scheme: Scheme
+    pub partitions: mem::List[Partition]
+} Table
+
+/// Where a GPT's entries lie, which `Table.read` asks for once it has read the header at block 1.
+pub closed struct GptEntries derives Copy, Eq {
+    pub from_block: u64
+    pub count: u32
+    pub entry_bytes: u32
+    pub crc: u32
+} GptEntries
+
+/// Whether `partition` is an EFI system partition.
+pub fn Partition.is_esp(self) -> bool {
+    return match self.kind {
+        PartitionType.Gpt(guid) => guid == ESP_GUID
+        PartitionType.Mbr(kind) => kind == ESP_TYPE
+        PartitionType.Whole => false
+    }
+} Partition.is_esp
+
+/// Whether `partition` holds a FAT volume by its MBR type, or covers a FAT unit.
+pub fn Partition.is_fat(self) -> bool {
+    return match self.kind {
+        PartitionType.Mbr(kind) => kind == 0x01 or kind == 0x04 or kind == 0x06 or kind == 0x0B or kind == 0x0C or kind == 0x0E or kind == ESP_TYPE
+        PartitionType.Gpt(_) => self.is_esp()
+        PartitionType.Whole => true
+    }
+} Partition.is_fat
+
+/// Where the GPT's entries lie when block 1 of `head`, the unit's first two blocks of `block_bytes` each, holds a GPT header whose CRC32 holds, `None` otherwise.
+pub validator fn gpt_entries(head: Untrusted[Slice[u8]], block_bytes: u32) -> Option[GptEntries] {
+    let bytes = head.inspect()
+    let start = usize.widen(block_bytes)
+    let Some(parts) = bytes.split_at(start) else {
+        return None
+    }
+    let header = parts.tail
+    if header.len() < 92 or header.prefix(8) != Some(GPT_SIGNATURE.view()) {
+        return None
+    }
+    let size = header.u32_le(12)
+    if size < 92 or usize.widen(size) > header.len() {
+        return None
+    }
+    var copy = mem::Bounded[u8, 512].empty()
+    for at in 0..<usize.widen(size) {
+        if at >= 16 and at < 20 {
+            mut copy.push(0)
+        } else {
+            mut copy.push(header[at])
+        }
+    }
+    if crc32(copy.view()) != header.u32_le(16) {
+        return None
+    }
+    let count = header.u32_le(80)
+    let entry_bytes = header.u32_le(84)
+    if count == 0 or count > MOST_GPT_ENTRIES or entry_bytes < 128 or entry_bytes > GPT_ENTRY_BYTES * 4 {
+        return None
+    }
+    return Some(GptEntries(from_block: header.u64_le(72), count: count, entry_bytes: entry_bytes, crc: header.u32_le(88)))
+} gpt_entries
+
+/// The partitions a GPT's entries `raw` list, whose CRC32 `entries.crc` holds; `None` when it does not.
+pub validator fn gpt_partitions(raw: Untrusted[Slice[u8]], entries: GptEntries, alloc: mem::Alloc) -> Option[Table] {
+    let bytes = raw.inspect()
+    let length = usize.widen(entries.count) * usize.widen(entries.entry_bytes)
+    let Some(listed) = bytes.prefix(length) else {
+        return None
+    }
+    if crc32(listed) != entries.crc {
+        return None
+    }
+    var partitions = mem::List[Partition].empty(alloc)
+    for index in 0..<usize.widen(entries.count) {
+        let at = index * usize.widen(entries.entry_bytes)
+        let Some(entry) = listed.split_at(at) else {
+            break
+        }
+        let fields = entry.tail
+        var kind = Array[u8, 16].filled(0)
+        var unique = Array[u8, 16].filled(0)
+        var used = false
+        for byte in 0..<16usize {
+            kind[byte] = fields[byte]
+            unique[byte] = fields[16 + byte]
+            used = used or fields[byte] != 0
+        }
+        if not used {
+            continue
+        }
+        let low = fields.u64_le(32)
+        let last = fields.u64_le(40)
+        if last < low {
+            continue
+        }
+        mut partitions.push(Partition(number: u32.fit(partitions.len() + 1), kind: PartitionType.Gpt(kind), unique: Some(unique), start: low, blocks: last - low + 1))
+    }
+    return Some(Table(scheme: Scheme.Gpt, partitions: take partitions))
+} gpt_partitions
+
+/// The partition table block 0 of a unit of `blocks` blocks gives when no GPT holds: its MBR's primary entries, else one partition covering a FAT unit, else none. A protective MBR alone gives none.
+pub validator fn mbr_table(raw: Untrusted[Slice[u8]], blocks: u64, alloc: mem::Alloc) -> Table {
+    let bytes = raw.inspect()
+    var partitions = mem::List[Partition].empty(alloc)
+    if bytes.len() < 512 or bytes[510] != 0x55 or bytes[511] != 0xAA {
+        return Table(scheme: Scheme.None, partitions: take partitions)
+    }
+    if is_fat_boot_sector(bytes) {
+        mut partitions.push(Partition(number: 1, kind: PartitionType.Whole, unique: None, start: 0, blocks: blocks))
+        return Table(scheme: Scheme.Fat, partitions: take partitions)
+    }
+    var protective = false
+    for index in 0..<4usize {
+        let at = 446 + 16 * index
+        let kind = bytes[at + 4]
+        let low = u64.widen(bytes.u32_le(at + 8))
+        let count = u64.widen(bytes.u32_le(at + 12))
+        if kind == PROTECTIVE_TYPE {
+            protective = true
+        }
+        if kind == 0 or kind == PROTECTIVE_TYPE or count == 0 or low >= blocks {
+            continue
+        }
+        mut partitions.push(Partition(number: u32.fit(partitions.len() + 1), kind: PartitionType.Mbr(kind), unique: None, start: low, blocks: count))
+    }
+    if protective and partitions.len() == 0 {
+        return Table(scheme: Scheme.None, partitions: take partitions)
+    }
+    return Table(scheme: Scheme.Mbr(signature: bytes.u32_le(440)), partitions: take partitions)
+} mbr_table
+
+/// Whether `sector` begins a FAT volume: a jump, a power-of-two sector size of 512 to 4,096 bytes and a power-of-two cluster size.
+fn is_fat_boot_sector(sector: Slice[u8]) -> bool {
+    let jump = sector[0] == 0xEB or sector[0] == 0xE9
+    let bytes_per_sector = sector.u16_le(11)
+    let per_cluster = sector[13]
+    let sized = bytes_per_sector == 512 or bytes_per_sector == 1_024 or bytes_per_sector == 2_048 or bytes_per_sector == 4_096
+    return jump and sized and per_cluster != 0 and (per_cluster & (per_cluster - 1)) == 0
+} is_fat_boot_sector
+
+/// The CRC32 (IEEE 802.3, reflected) of `bytes`.
+pub fn crc32(bytes: Slice[u8]) -> u32
+    example crc32(b"123456789") == 0xCBF4_3926
+{
+    var crc: u32 = 0xFFFF_FFFF
+    for byte in bytes {
+        crc = crc ^ u32.widen(byte)
+        for _ in 0..<8u32 {
+            let mask = 0u32.wrapping_sub(crc & 1)
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask)
+        }
+    }
+    return ~crc
+} crc32
+
+fn signature_bytes() -> Array[u8, 8] limits pure {
+    var signature = Array[u8, 8].filled(0)
+    mut signature.view_mut().copy_from(b"EFI PART")
+    return signature
+} signature_bytes
+
+/// C12A7328-F81F-11D2-BA4B-00A0C93EC93B, its first three fields little-endian.
+fn esp_guid_bytes() -> Array[u8, 16] limits pure {
+    var guid = Array[u8, 16].filled(0)
+    mut guid.view_mut().copy_from(b"\x28\x73\x2A\xC1\x1F\xF8\xD2\x11\xBA\x4B\x00\xA0\xC9\x3E\xC9\x3B")
+    return guid
+} esp_guid_bytes
+
+/// A unit of `blocks` 512-byte blocks whose MBR lists a FAT32 partition from block 2,048.
+fn sample_mbr(alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.zeroed(512, alloc)
+    mut bytes.view_mut().write_u32_le(440, value: 0x1234_5678)
+    bytes[446 + 4] = 0x0C
+    mut bytes.view_mut().write_u32_le(446 + 8, value: 2_048)
+    mut bytes.view_mut().write_u32_le(446 + 12, value: 1_000)
+    bytes[510] = 0x55
+    bytes[511] = 0xAA
+    return bytes
+} sample_mbr
+
+test mbrs_list_their_primary_entries for mbr_table {
+    let alloc = testing::world().alloc
+    let mbr = sample_mbr(alloc)
+    let table = mbr_table(Untrusted.of(mbr.view()), blocks: 8_192, alloc)
+    expect table.scheme == Scheme.Mbr(signature: 0x1234_5678)
+    expect table.partitions.len() == 1 and table.partitions[0].start == 2_048 and table.partitions[0].blocks == 1_000 and table.partitions[0].is_fat()
+    var blank = mem::Bytes.zeroed(512, alloc)
+    let none = mbr_table(Untrusted.of(blank.view()), blocks: 8_192, alloc)
+    expect none.scheme == Scheme.None and none.partitions.len() == 0
+    blank[0] = 0xEB
+    mut blank.view_mut().write_u16_le(11, value: 512)
+    blank[13] = 8
+    blank[510] = 0x55
+    blank[511] = 0xAA
+    let whole = mbr_table(Untrusted.of(blank.view()), blocks: 8_192, alloc)
+    expect whole.scheme == Scheme.Fat and whole.partitions[0].blocks == 8_192
+} mbrs_list_their_primary_entries
+
+test gpts_need_their_crcs for gpt_entries {
+    let alloc = testing::world().alloc
+    var head = mem::Bytes.zeroed(1_024, alloc)
+    var entries = mem::Bytes.zeroed(128, alloc)
+    for at in 0..<16usize {
+        entries[at] = ESP_GUID[at]
+        entries[16 + at] = u8.truncate(at + 1)
+    }
+    mut entries.view_mut().write_u64_le(32, value: 34)
+    mut entries.view_mut().write_u64_le(40, value: 1_057)
+    let header = 512usize
+    for at in 0..<8usize {
+        head[header + at] = GPT_SIGNATURE[at]
+    }
+    mut head.view_mut().write_u32_le(header + 12, value: 92)
+    mut head.view_mut().write_u64_le(header + 72, value: 2)
+    mut head.view_mut().write_u32_le(header + 80, value: 1)
+    mut head.view_mut().write_u32_le(header + 84, value: 128)
+    mut head.view_mut().write_u32_le(header + 88, value: crc32(entries.view()))
+    var summed = mem::Bytes.empty(alloc)
+    for at in header..<(header + 92) {
+        mut summed.push(head[at])
+    }
+    mut head.view_mut().write_u32_le(header + 16, value: crc32(summed.view()))
+    let Some(found) = gpt_entries(Untrusted.of(head.view()), block_bytes: 512) else {
+        expect false
+        return
+    }
+    expect found.from_block == 2 and found.count == 1
+    let Some(table) = gpt_partitions(Untrusted.of(entries.view()), entries: found, alloc) else {
+        expect false
+        return
+    }
+    expect table.partitions.len() == 1 and table.partitions[0].is_esp() and table.partitions[0].start == 34 and table.partitions[0].blocks == 1_024
+    entries[40] = 0xFF
+    let damaged = gpt_partitions(Untrusted.of(entries.view()), entries: found, alloc)
+    expect damaged.is_none()
+} gpts_need_their_crcs

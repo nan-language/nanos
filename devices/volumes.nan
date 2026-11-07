@@ -1,0 +1,315 @@
+//! Volumes and roles: the units of block devices with their partitions, the volume views `devices` creates over them, and the roles their drivers and views hold.
+
+/// The keys of the keyed tasks reading a device's units and creating a view, the record's index added, and of those assigning roles, the role's rank added.
+const VOLUMES: u64 = 0x2_0000
+
+const VIEWS: u64 = 0x3_0000
+
+const ROLES: u64 = 0x4_0000
+
+/// The component of volume views.
+const VIEW_COMPONENT: Str = "devices::View"
+
+/// The credit of the ports `devices` holds to its drivers and views.
+const CREDIT: os::Credit = os::Credit(messages: 4, calls: 4)
+
+/// The boot volume the handoff record names: its partitioning, its partition number, and its GPT unique GUID, or its MBR disk signature in the first four bytes.
+pub closed struct BootVolume derives Copy, Eq, Encode {
+    pub scheme: u8
+    pub partition: u32
+    pub signature: Array[u8, 16]
+} BootVolume
+
+/// A unit of a block device at `/live/devices/<bus path>/u<n>`: its number, its geometry, and its partitions.
+pub closed struct UnitRecord derives Encode {
+    pub number: u16
+    pub info: BlockInfo
+    pub scheme: Scheme
+    pub partitions: mem::List[Partition]
+} UnitRecord
+
+/// A volume view `devices` created: its moniker, the device, unit and partition it covers, and the role it holds.
+pub closed struct ViewRecord derives Encode {
+    pub moniker: ident::Moniker
+    pub device: u32
+    pub unit: u16
+    pub partition: u32
+    pub role: Option[os::Role]
+} ViewRecord
+
+/// Has a keyed task read the units of the block device at `index` through its driver `moniker`, and their partition tables.
+fn Manager.read_volumes(mut self, index: u32, moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Devices]) {
+    self.binding += 1
+    let control = env.control
+    let alloc = env.alloc
+    let driver = ident::Moniker(text: moniker.text)
+    mut cx.spawn(key: VOLUMES + u64.widen(index), run: fn[take driver](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
+        let units = try await units_of(control, driver, alloc)
+        discard attempt await out.volumes(index, units: take units)
+    })
+} Manager.read_volumes
+
+/// Records the units of the block device at `index`.
+fn Manager.volumes(mut self, take index: u32, take units: mem::List[UnitRecord], mut env: Env, mut cx: sys::Cx[Devices]) {
+    self.binding = self.binding.saturating_sub(1)
+    let at = usize.widen(index)
+    if at < self.records.len() {
+        self.records[at].units = units
+    }
+    mut self.answer_settled(mut env, mut cx)
+} Manager.volumes
+
+/// Resolves `boot-volume` once every device's units are read: the partition the handoff record names, else the first ESP, else the first FAT partition, in bus path order; has a keyed task create its view. False when nothing is left to do.
+fn Manager.resolve_boot(mut self, mut env: Env, mut cx: sys::Cx[Devices]) -> bool {
+    if self.boot_resolved {
+        return false
+    }
+    self.boot_resolved = true
+    let Some(chosen) = self.boot_partition(env.boot) else {
+        return false
+    }
+    let record = self.records[usize.widen(chosen.device)]
+    let Some(driver) = record.driver else {
+        return false
+    }
+    let moniker = view_moniker(driver, unit: chosen.unit, partition: chosen.partition.number)
+    mut self.views.push(ViewRecord(moniker: ident::Moniker(text: moniker.text), device: chosen.device, unit: chosen.unit, partition: chosen.partition.number, role: Some(os::Role.BootVolume)))
+    self.binding += 1
+    let control = env.control
+    let alloc = env.alloc
+    var spec = os::InstanceSpec.of(principal: ident::Principal(text: text::Fixed[64].of("system")), bundle: env.bundle, component: VIEW_COMPONENT, alloc)
+    discard mut spec.wiring.insert(text::String.of("disk", alloc), value: os::Wire.to(ident::Moniker(text: driver.text)))
+    let partition = chosen.partition
+    let unit = chosen.unit
+    mut cx.spawn(key: VIEWS + u64.widen(chosen.device), run: fn[take moniker, take spec](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
+        let held = try await start_view(control, moniker, take spec, unit, partition, role: os::Role.BootVolume, alloc)
+        discard attempt await out.viewed(moniker: take moniker, held: held)
+    })
+    return true
+} Manager.resolve_boot
+
+/// Records whether the view `moniker` holds its role.
+fn Manager.viewed(mut self, take moniker: ident::Moniker, take held: bool, mut env: Env, mut cx: sys::Cx[Devices]) {
+    self.binding = self.binding.saturating_sub(1)
+    for view in mut self.views {
+        if view.moniker == moniker and not held {
+            view.role = None
+        }
+    }
+    mut self.answer_settled(mut env, mut cx)
+} Manager.viewed
+
+/// Where a chosen partition lies: the device's record, its unit and the partition.
+struct Chosen derives Copy {
+    device: u32
+    unit: u16
+    partition: Partition
+} Chosen
+
+/// The partition `boot-volume` resolves to among the bound devices' units, in bus path order.
+fn Manager.boot_partition(self, boot: BootVolume) -> Option[Chosen] {
+    var named: Option[Chosen] = None
+    var esp: Option[Chosen] = None
+    var fat: Option[Chosen] = None
+    for at in 0..<self.records.len() {
+        let record = self.records[at]
+        if record.driver.is_none() or record.status != Status.Converged {
+            continue
+        }
+        for unit in record.units {
+            for partition in unit.partitions {
+                let chosen = Chosen(device: u32.fit(at), unit: unit.number, partition: partition)
+                if named.is_none() and names(boot, scheme: unit.scheme, partition) {
+                    named = Some(chosen)
+                }
+                if partition.is_esp() and earlier(self.records, chosen, than: esp) {
+                    esp = Some(chosen)
+                }
+                if partition.is_fat() and earlier(self.records, chosen, than: fat) {
+                    fat = Some(chosen)
+                }
+            }
+        }
+    }
+    return match named {
+        Some(chosen) => Some(chosen)
+        None => match esp {
+            Some(chosen) => Some(chosen)
+            None => fat
+        }
+    }
+} Manager.boot_partition
+
+/// Whether `chosen` lies at an earlier bus path than `than`, or `than` is none.
+fn earlier(records: mem::List[LiveDevice], chosen: Chosen, than: Option[Chosen]) -> bool {
+    let Some(other) = than else {
+        return true
+    }
+    return records[usize.widen(chosen.device)].path < records[usize.widen(other.device)].path
+} earlier
+
+/// Whether the handoff record's boot volume is `partition` of a unit partitioned by `scheme`: by its GPT unique GUID, or by its MBR disk signature and number.
+fn names(boot: BootVolume, scheme: Scheme, partition: Partition) -> bool {
+    return match scheme {
+        Scheme.Gpt => boot.scheme == 2 and partition.unique == Some(boot.signature)
+        Scheme.Mbr(signature: signature) => boot.scheme == 1 and boot.signature.view().u32_le(0) == signature and boot.partition == partition.number
+        else => false
+    }
+} names
+
+/// Assigns `role` to the driver of the device at `index` when no device holds it yet.
+fn Manager.hold_role(mut self, index: u32, role: os::Role, mut env: Env, mut cx: sys::Cx[Devices]) {
+    for record in self.records {
+        if record.role == Some(role) {
+            return
+        }
+    }
+    let at = usize.widen(index)
+    let named = match self.records[at].driver {
+        Some(driver) => Some(ident::Moniker(text: driver.text))
+        None => None
+    }
+    let Some(moniker) = named else {
+        return
+    }
+    self.records[at].role = Some(role)
+    let control = env.control
+    let alloc = env.alloc
+    mut cx.spawn(key: ROLES + u64.widen(index), run: fn[take moniker](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        match attempt await control.assign(role, take moniker, alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    })
+} Manager.hold_role
+
+/// `<driver>-u<n>p<m>`, the view over partition m of the driver's unit n.
+fn view_moniker(driver: ident::Moniker, unit: u16, partition: u32) -> ident::Moniker {
+    var text = text::Fixed[59].of(driver.text.as_str())
+    mut text.append("-u")
+    decimal(mut text, value: u64.widen(unit))
+    mut text.append("p")
+    decimal(mut text, value: u64.widen(partition))
+    return ident::Moniker(text: text)
+} view_moniker
+
+/// The units of the driver `driver` with their partition tables, none when it does not answer.
+fn units_of(control: os::Control, driver: ident::Moniker, alloc: mem::Alloc) -> mem::List[UnitRecord] fails task::Cancelled uses wait {
+    var units = mem::List[UnitRecord].empty(alloc)
+    let handle = match first attempt await control.port(ident::Moniker(text: driver.text), credit: CREDIT, alloc) {
+        Ok(found) => found
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return units
+    }
+    let Some(disk) = os::Port[Block].of(handle) else {
+        return units
+    }
+    let Some(first_info) = try await info_of(disk, unit: 0, alloc) else {
+        return units
+    }
+    for number in 0..<first_info.units {
+        let Some(info) = try await info_of(disk, unit: number, alloc) else {
+            continue
+        }
+        let table = try await table_of(disk, unit: number, info, alloc)
+        let Table(scheme: scheme, partitions: partitions) = table
+        mut units.push(UnitRecord(number: number, info: info, scheme: scheme, partitions: take partitions))
+    }
+    return units
+} units_of
+
+fn info_of(disk: os::Port[Block], unit: u16, alloc: mem::Alloc) -> Option[BlockInfo] fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Block].info(mut call, unit)
+    return match first attempt await disk.call(take call, reply, alloc) {
+        Ok(info) => Some(info)
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} info_of
+
+fn blocks_of(disk: os::Port[Block], unit: u16, block: u64, count: u32, alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]] fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Block].read(mut call, unit, block, count)
+    return match first attempt await disk.call(take call, reply, alloc) {
+        Ok(bytes) => Some(take bytes)
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} blocks_of
+
+/// The unit's partition table: its GPT when its header and entries hold, else what block 0 gives.
+fn table_of(disk: os::Port[Block], unit: u16, info: BlockInfo, alloc: mem::Alloc) -> Table fails task::Cancelled uses wait {
+    let none = Table(scheme: Scheme.None, partitions: mem::List.empty(alloc))
+    if info.blocks < 2 {
+        return none
+    }
+    let Some(head) = try await blocks_of(disk, unit, block: 0, count: 2, alloc) else {
+        return none
+    }
+    match gpt_entries(head.view(), block_bytes: info.block_bytes) {
+        Some(entries) => {
+            let bytes = u64.widen(entries.count) * u64.widen(entries.entry_bytes)
+            let count = u32.fit((bytes + u64.widen(info.block_bytes) - 1) / u64.widen(info.block_bytes))
+            if entries.from_block + u64.widen(count) <= info.blocks {
+                let Some(listed) = try await blocks_of(disk, unit, block: entries.from_block, count, alloc) else {
+                    return none
+                }
+                match gpt_partitions(listed.view(), entries, alloc) {
+                    Some(table) => return table
+                    None => {
+                    }
+                }
+            }
+        }
+        None => {
+        }
+    }
+    return mbr_table(head.view(), blocks: info.blocks, alloc)
+} table_of
+
+/// Creates the view `moniker` under `spec` and starts it, then sets the range of `partition` of its driver's unit `unit` and makes it the holder of `role`: whether it holds it.
+fn start_view(
+    control: os::Control,
+    moniker: ident::Moniker,
+    take spec: os::InstanceSpec,
+    unit: u16,
+    partition: Partition,
+    role: os::Role,
+    alloc: mem::Alloc,
+    ) -> bool fails task::Cancelled uses wait {
+    match first attempt await control.create(ident::Moniker(text: moniker.text), take spec, grants: mem::Map.empty(alloc), alloc) {
+        Ok(_) => {
+        }
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return false
+    }
+    match first attempt await control.start(ident::Moniker(text: moniker.text), alloc) {
+        Ok(os::Lifecycle.Running) => {
+        }
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        else => return false
+    }
+    let handle = match first attempt await control.port(ident::Moniker(text: moniker.text), credit: CREDIT, alloc) {
+        Ok(found) => found
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return false
+    }
+    let Some(view) = os::Port[VolumeView].of(handle) else {
+        return false
+    }
+    var call = sys::Encoded.empty(alloc)
+    sys::Wire[VolumeView].cover(mut call, unit, start: partition.start, blocks: partition.blocks)
+    match first attempt await view.post(take call) {
+        Ok(_) => {
+        }
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return false
+    }
+    return match first attempt await control.assign(role, moniker: ident::Moniker(text: moniker.text), alloc) {
+        Ok(_) => true
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => false
+    }
+} start_view

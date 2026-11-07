@@ -22,6 +22,7 @@ pub closed struct LiveDevice derives Encode {
     pub role: Option[os::Role]
     pub power: Power
     pub status: Status
+    pub units: mem::List[UnitRecord]
 } LiveDevice
 
 /// The DMA confinement of a device's driver.
@@ -61,23 +62,28 @@ pub protocol Devices {
     pub fn settled() -> u32 limits recorded
     fn listed(found: mem::List[Found]) limits irreversible(emit, actuate, erase, spend)
     fn bound(index: u32, moniker: ident::Moniker, lifecycle: Option[os::Lifecycle]) limits irreversible(emit, actuate, erase, spend)
+    fn volumes(index: u32, units: mem::List[UnitRecord]) limits irreversible(emit, actuate, erase, spend)
+    fn viewed(moniker: ident::Moniker, held: bool) limits irreversible(emit, actuate, erase, spend)
 } Devices
 
-/// The Env of `devices`: the device root, a `Control` over the instances under `devices`, the bundle its drivers run, and its clock, executor and cell.
+/// The Env of `devices`: the device root, a `Control` over the instances under `devices`, the bundle its drivers run, the boot volume the handoff record names, and its clock, executor and cell.
 pub closed struct Env {
     pub root: Root
     pub control: os::Control
     pub bundle: ident::HashValue
+    pub boot: BootVolume
     pub clock: sys::Clock
     pub exec: task::Executor
     pub alloc: mem::Alloc
 } Env
 
-/// The state of `devices`: each device's record, how many bindings are under way, whether discovery has listed the devices, the `settled` requests waiting, and the count of events recorded.
+/// The state of `devices`: each device's record, the volume views it created, how many bindings, volume reads and views are under way, whether discovery has listed the devices and `boot-volume` is resolved, the `settled` requests waiting, and the count of events recorded.
 pub closed struct Manager derives Encode {
     pub records: mem::List[LiveDevice]
+    pub views: mem::List[ViewRecord]
     pub binding: u32
     pub discovered: bool
+    pub boot_resolved: bool
     pub waiting: mem::List[u64]
     pub events: u64
 } Manager
@@ -86,7 +92,7 @@ impl Manager: sys::Component[Env, Devices]
 
 impl Manager: sys::Resume[Env, Devices]
 
-pub fn Manager.start(mut env: Env) -> Manager = Manager(records: mem::List.empty(env.alloc), binding: 0, discovered: false, waiting: mem::List.empty(env.alloc), events: 0)
+pub fn Manager.start(mut env: Env) -> Manager = Manager(records: mem::List.empty(env.alloc), views: mem::List.empty(env.alloc), binding: 0, discovered: false, boot_resolved: false, waiting: mem::List.empty(env.alloc), events: 0)
 
 /// Once started, lists the devices the keeper holds.
 pub fn Manager.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Devices]) {
@@ -102,9 +108,9 @@ pub fn Manager.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx:
     })
 } Manager.resume
 
-/// Answers at once when every binding has settled, else once they have.
+/// Answers at once when every binding, volume read and view has settled, else once they have.
 pub fn Manager.settled(mut self, mut env: Env, mut cx: sys::Cx[Devices]) -> u32 {
-    if self.discovered and self.binding == 0 {
+    if self.discovered and self.binding == 0 and self.boot_resolved {
         return self.bound_count()
     }
     let Some(request) = mut cx.postpone() else {
@@ -132,7 +138,7 @@ fn Manager.listed(mut self, take found: mem::List[Found], mut env: Env, mut cx: 
         if self.index_of(path).is_some() {
             continue
         }
-        mut self.records.push(LiveDevice(path: path, ids: ids, resources: take resources, dma: Dma.None, entry: None, driver: None, role: None, power: Power.Off, status: Status.Pending))
+        mut self.records.push(LiveDevice(path: path, ids: ids, resources: take resources, dma: Dma.None, entry: None, driver: None, role: None, power: Power.Off, status: Status.Pending, units: mem::List.empty(env.alloc)))
         mut self.emit(env.root, kind: EventKind.Added, path, argument: 0, mut cx)
         let index = u32.fit(self.records.len() - 1)
         if core {
@@ -142,7 +148,7 @@ fn Manager.listed(mut self, take found: mem::List[Found], mut env: Env, mut cx: 
         mut self.bind(index, choice: DriverChoice.Automatic, mut env, mut cx)
     }
     self.discovered = true
-    mut self.answer_settled(env.alloc, mut cx)
+    mut self.answer_settled(mut env, mut cx)
 } Manager.listed
 
 /// Chooses the driver of the device at `index` and has a keyed task create and start its instance.
@@ -190,6 +196,7 @@ fn Manager.bound(mut self, take index: u32, take moniker: ident::Moniker, take l
             self.records[at].status = Status.Converged
             self.records[at].power = Power.On
             mut self.emit(env.root, kind: EventKind.Bound, path, argument: u64.widen(index), mut cx)
+            mut self.serve_class(index, moniker, mut env, mut cx)
         }
         else => {
             let code = match lifecycle {
@@ -200,14 +207,34 @@ fn Manager.bound(mut self, take index: u32, take moniker: ident::Moniker, take l
             mut self.emit(env.root, kind: EventKind.Failed, path, argument: 0, mut cx)
         }
     }
-    mut self.answer_settled(env.alloc, mut cx)
+    mut self.answer_settled(mut env, mut cx)
 } Manager.bound
 
-/// Answers the waiting `settled` requests once discovery is done and no binding is under way.
-fn Manager.answer_settled(mut self, alloc: mem::Alloc, mut cx: sys::Cx[Devices]) {
+/// What a bound driver's device protocol brings: a block device's units are read, and a device of a role class holds it when no other does.
+fn Manager.serve_class(mut self, index: u32, moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Devices]) {
+    let Some(name) = self.records[usize.widen(index)].entry else {
+        return
+    }
+    let Some(entry) = entry_named(candidates(env.alloc).view(), name) else {
+        return
+    }
+    match entry.class {
+        Class.Block => mut self.read_volumes(index, moniker, mut env, mut cx)
+        Class.Entropy => mut self.hold_role(index, role: os::Role.Entropy, mut env, mut cx)
+        Class.Rtc => mut self.hold_role(index, role: os::Role.Rtc, mut env, mut cx)
+        Class.Console => mut self.hold_role(index, role: os::Role.Console, mut env, mut cx)
+    }
+} Manager.serve_class
+
+/// Answers the waiting `settled` requests once discovery is done, no binding or volume read is under way and `boot-volume` has its view.
+fn Manager.answer_settled(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
     if not self.discovered or self.binding > 0 {
         return
     }
+    if mut self.resolve_boot(mut env, mut cx) {
+        return
+    }
+    let alloc = env.alloc
     let count: Result[u32, Never] = Ok(self.bound_count())
     for request in self.waiting {
         var reply = sys::Encoded.empty(alloc)
