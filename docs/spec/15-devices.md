@@ -80,7 +80,7 @@ Loading or unloading a bundle that contributes `drivers` entries reruns these st
 
 ### Driver instances
 
-A **driver** is an [instance](06-execution.md#instances) of the component its entry names, which `devices` starts for one device. Its moniker is `devices.<name><n>`, with n the lowest index no other instance of that entry uses (`devices.ahci0`). Its [spec](06-execution.md#instance-specifications) is `volatile`, `permanent` and of class `normal`, and its `grants` name a `Device` grant on its bus path ([objects and rights](09-authority.md#objects-and-rights)), from which its Env receives the **device capability** of its device, an OS [capability kind](09-authority.md#capability-kinds) (requires [N27](22-nan.md#n27)), of one of two kinds.
+A **driver** is an [instance](06-execution.md#instances) of the component its entry names, which `devices` starts for one device. Its moniker is `devices.<name><n>`, with n the lowest index no other instance of that entry uses (`devices.ahci0`). Its [spec](06-execution.md#instance-specifications) is `volatile`, `permanent` and of class `normal`, and its `grants` name a `Clock` grant, for the times its protocol's driver rules measure, and a `Device` grant on its bus path ([objects and rights](09-authority.md#objects-and-rights)), from which its Env receives the **device capability** of its device, an OS [capability kind](09-authority.md#capability-kinds) (requires [N27](22-nan.md#n27)), of one of two kinds.
 
 | `PciFunction` part | Rule |
 | --- | --- |

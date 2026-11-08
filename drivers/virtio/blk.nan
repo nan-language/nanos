@@ -1,14 +1,16 @@
-//! The `virtio-blk` driver: a virtio block device serving `Block` on its one unit, one request at a time on its first queue, completed by MSI-X interrupt.
+//! The `virtio-blk` driver: a virtio block device serving `Block` on its one unit through a queue per CPU, or the queues the device offers, CPU c using queue c mod their count, each holding one request at a time that an MSI-X interrupt on the queue's CPU completes. The device has no abort: a request not completed in 30 s fails with `device.timeout` and the device is reset, its other requests failing with `device.reset`.
 
 /// The virtio type of block devices.
 const BLOCK_TYPE: u16 = 2
 
-/// The feature bits the driver accepts: a read-only device, a block size, and a cache flushes empty.
+/// The feature bits the driver accepts: a read-only device, a block size, a cache flushes empty, and several queues.
 const READ_ONLY: u32 = 1 << 5
 
 const BLOCK_SIZE: u32 = 1 << 6
 
 const FLUSH: u32 = 1 << 9
+
+const MULTIQUEUE: u32 = 1 << 12
 
 /// The request types.
 const READ_REQUEST: u32 = 0
@@ -31,22 +33,30 @@ const SEGMENT_COUNT: u32 = 8
 
 const SECTOR_BYTES: u64 = 512
 
+/// The keys of the keyed tasks timing each queue's request, the queue's number added; those turning its interrupts into completions add it to `INTERRUPTS`.
+const TIMING: u64 = 0x100
+
+/// How long the device has to complete a request.
+const REQUEST_MS: u64 = 30_000
+
 contribute devices::drivers virtio_blk = devices::Registration(name: text::Fixed[20].of("virtio-blk"), matches: devices::matches(devices::DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1042), rest: devices::DeviceMatch.None), class: devices::Class.Block, component: text::Fixed[48].of("drivers::virtio::Blk"), priority: 0)
 
-/// What the driver serves: `Block`'s operations, and its device's completions.
+/// What the driver serves: `Block`'s operations, the completions of its queues, and the ends of their requests' time.
 pub protocol BlkDevice {
     pub fn info(unit: u16) -> devices::BlockInfo fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn read(unit: u16, block: u64, count: u32) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn write(unit: u16, block: u64, data: mem::Bytes, fua: bool) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn flush(unit: u16) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn discard_blocks(unit: u16, block: u64, count: u32) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
-    fn completed() limits irreversible(emit, actuate, erase, spend)
+    fn completed(queue: u16) limits irreversible(emit, actuate, erase, spend)
+    fn expired(queue: u16, handed: u64) limits irreversible(emit, actuate, erase, spend)
 } BlkDevice
 
-/// The device-specific configuration: the capacity in sectors, and the block size when offered.
+/// The device-specific configuration: the capacity in sectors, the block size when offered, and the count of queues when several are offered.
 pub registers Geometry {
     capacity: u64 at 0x00 read
     block_size: u32 at 0x14 read
+    queues: u16 at 0x22 read
 } Geometry
 
 /// A request's header and the status the device writes after it.
@@ -63,18 +73,26 @@ pub layout Segment: bytes 8_192 le {
     data: Array[u8, 8_192] at 0
 } Segment
 
-/// The driver's Env: the unit's geometry and features, its queue's size, its function, its windows, its queue, a request's header and the segments of its buffer, its interrupt, the signal that interrupt posts, and its cell.
-pub open linear struct BlkEnv derives Send {
-    info: devices::BlockInfo
-    size: u16
-    function: hw::PciFunction
-    common: hw::Mmio[Common]
+/// A queue of the device: its ring and doorbell, the header and buffer of the request on it, its interrupt, and the signal that interrupt posts.
+pub open linear struct Lane derives Send {
+    ring: Ring
     notify: hw::Mmio[Notify]
     queue: hw::DmaShared[Queue]
     header: hw::DmaShared[Header]
     segments: mem::List[hw::DmaShared[Segment]]
     irq: hw::IrqShared[Interrupt]
     signal: mem::Shared[hw::Signal[Unit]]
+} Lane
+
+/// The driver's Env: the unit's geometry, the features it accepted, its function, its common configuration, its queues, the CPU each handler runs on, its clock and its cell.
+pub open linear struct BlkEnv derives Send {
+    info: devices::BlockInfo
+    features: u32
+    function: hw::PciFunction
+    common: hw::Mmio[Common]
+    lanes: mem::List[Lane]
+    here: hw::PerCpu[u32]
+    clock: sys::Clock
     alloc: mem::Alloc
 } BlkEnv
 
@@ -92,20 +110,27 @@ pub closed struct Waiting derives Encode {
     pub data: Option[mem::Bytes]
 } Waiting
 
-/// The driver's state: the requests waiting, the first of them on the device when `busy`, and the available and used indices.
-pub closed struct Blk derives Encode {
+/// A queue's requests: those waiting, the first of them on the device when `busy`, its available and used indices, and how many requests it has handed the device, the last being the one its timer runs for.
+pub closed struct Track derives Encode {
     pub waiting: mem::List[Waiting]
     pub busy: bool
     pub available: u16
     pub used: u16
+    pub handed: u64
+} Track
+
+/// The driver's state: the requests of each queue, and whether the device failed to come back from a reset.
+pub closed struct Blk derives Encode {
+    pub tracks: mem::List[Track]
+    pub lost: bool
 } Blk
 
 impl Blk: sys::Component[BlkEnv, BlkDevice]
 
 impl Blk: sys::Resume[BlkEnv, BlkDevice]
 
-/// The Env over `function`, set up as `RngEnv.of` sets up an entropy device; `None` when the device does not allow it, the function then handed back.
-pub fn BlkEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[BlkEnv] {
+/// The Env over `function`, set up as `RngEnv.of` sets up an entropy device with a queue for each CPU up to those the device offers; `None` when the device does not allow it, the function then handed back.
+pub fn BlkEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem::Alloc) -> Option[BlkEnv] {
     var held = function
     let Some(found) = located(held, kind: BLOCK_TYPE) else {
         take held.release()
@@ -125,69 +150,149 @@ pub fn BlkEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[Bl
         return None
     }
     var shape = geometry
-    let accepted = offered(mut regs) & (READ_ONLY | BLOCK_SIZE | FLUSH)
+    let accepted = offered(mut regs) & (READ_ONLY | BLOCK_SIZE | FLUSH | MULTIQUEUE)
     let block_bytes = match (accepted & BLOCK_SIZE) != 0 {
         true => mut shape.read(Geometry.block_size)
         false => 512
     }
     let sectors = mut shape.read(Geometry.capacity)
+    var wanted: u32 = 1
+    if (accepted & MULTIQUEUE) != 0 {
+        wanted = u32.widen(mut shape.read(Geometry.queues))
+    }
     take shape.unmap()
+    if wanted > hw::cpu_count() {
+        wanted = hw::cpu_count()
+    }
     if not negotiate(mut regs, features: accepted) or (attempt mut held.attach_physical()).is_err() or (block_bytes != 512 and block_bytes != 4_096) {
         release(take held, common: Some(take regs), notify: None, queue: None)
         return None
     }
     let heap = mem::Heap.of(alloc)
-    let queue = hw::DmaShared.of(heap.boxed(empty_queue()), space: hw::IoSpace.physical())
-    let Some(ring) = set_up(mut regs, index: 0, queue, vector: 0, multiplier: found.notify.multiplier) else {
-        release(take held, common: Some(take regs), notify: None, queue: Some(take queue))
+    var lanes = mem::List[Lane].empty(alloc)
+    for index in 0..<wanted {
+        let Some(lane) = lane_of(mut held, common: mut regs, found, index: u16.fit(index), heap, alloc) else {
+            break
+        }
+        mut lanes.push(take lane)
+    }
+    if lanes.len() == 0 {
+        for lane in take lanes {
+            take lane.release()
+        }
+        release(take held, common: Some(take regs), notify: None, queue: None)
         return None
     }
-    let Ok(notify) = attempt hw::Mmio[Notify].of_bar(mut held, index: found.notify.bar, offset: u64.widen(found.notify.offset) + ring.notify_offset) else {
-        release(take held, common: Some(take regs), notify: None, queue: Some(take queue))
+    ready(mut regs)
+    let info = devices::BlockInfo(units: 1, block_bytes: block_bytes, blocks: sectors * SECTOR_BYTES / u64.widen(block_bytes), max_transfer_bytes: TRANSFER_BYTES, zone_blocks: 0, cache: (accepted & FLUSH) != 0, fua: false, discards: false, read_only: (accepted & READ_ONLY) != 0)
+    return Some(BlkEnv(info: info, features: accepted, function: take held, common: take regs, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alloc: alloc))
+} BlkEnv.of
+
+/// Queue `index` enabled with its buffers and an interrupt on CPU `index`; `None`, nothing enabled, when the device has no such queue or no MSI-X entry or doorbell for it.
+fn lane_of(
+    mut function: hw::PciFunction,
+    mut common: hw::Mmio[Common],
+    found: Places,
+    index: u16,
+    heap: mem::Heap,
+    alloc: mem::Alloc,
+    ) -> Option[Lane] {
+    let Some(ring) = probe(mut common, index, multiplier: found.notify.multiplier) else {
         return None
     }
     let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
-    let irq = match mut held.msix(entry: 0, cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
+    let irq = match mut function.msix(entry: index, cpu: u32.widen(index), dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
         Ok(shared) => shared
-        Err(_) => {
-            release(take held, common: Some(take regs), notify: Some(take notify), queue: Some(take queue))
-            return None
-        }
+        Err(_) => return None
     }
-    ready(mut regs)
+    let Ok(notify) = attempt hw::Mmio[Notify].of_bar(mut function, index: found.notify.bar, offset: u64.widen(found.notify.offset) + ring.notify_offset) else {
+        discard take irq.uninstall()
+        return None
+    }
+    let queue = hw::DmaShared.of(heap.boxed(empty_queue()), space: hw::IoSpace.physical())
+    enable(mut common, index, ring, queue, vector: index)
     let header = hw::DmaShared.of(heap.boxed(Header.from_bits(Array[u8, 32].filled(0))), space: hw::IoSpace.physical())
     var segments = mem::List[hw::DmaShared[Segment]].empty(alloc)
     for _ in 0..<SEGMENT_COUNT {
         mut segments.push(hw::DmaShared.of(heap.boxed(Segment.from_bits(Array[u8, 8_192].filled(0))), space: hw::IoSpace.physical()))
     }
-    let info = devices::BlockInfo(units: 1, block_bytes: block_bytes, blocks: sectors * SECTOR_BYTES / u64.widen(block_bytes), max_transfer_bytes: TRANSFER_BYTES, zone_blocks: 0, cache: (accepted & FLUSH) != 0, fua: false, discards: false, read_only: (accepted & READ_ONLY) != 0)
-    return Some(BlkEnv(info: info, size: ring.size, function: take held, common: take regs, notify: take notify, queue: take queue, header: take header, segments: take segments, irq: take irq, signal: take signal, alloc: alloc))
-} BlkEnv.of
+    return Some(Lane(ring: ring, notify: take notify, queue: take queue, header: take header, segments: take segments, irq: take irq, signal: take signal))
+} lane_of
 
-/// Resets the device, then releases the interrupt, the windows and the buffers, and hands the function back.
+/// Resets the device, then releases the interrupts, the windows and the buffers, and hands the function back.
 pub fn BlkEnv.abandon(take self) {
-    let BlkEnv(info: _, size: _, function: function, common: common, notify: notify, queue: queue, header: header, segments: segments, irq: irq, signal: _, alloc: _) = self
+    let BlkEnv(info: _, features: _, function: function, common: common, lanes: lanes, here: _, clock: _, alloc: _) = self
+    var regs = common
+    reset(mut regs)
+    for lane in take lanes {
+        take lane.release()
+    }
+    release(take function, common: Some(take regs), notify: None, queue: None)
+} BlkEnv.abandon
+
+/// Releases the queue's interrupt, doorbell and buffers, once the device no longer uses them.
+fn Lane.release(take self) {
+    let Lane(ring: _, notify: notify, queue: queue, header: header, segments: segments, irq: irq, signal: _) = self
     discard take irq.uninstall()
+    take notify.unmap()
+    discard take queue.into_box()
     discard take header.into_box()
     for segment in take segments {
         discard take segment.into_box()
     }
-    release(take function, common: Some(take common), notify: Some(take notify), queue: Some(take queue))
-} BlkEnv.abandon
+} Lane.release
 
-pub fn Blk.start(mut env: BlkEnv) -> Blk = Blk(waiting: mem::List.empty(env.alloc), busy: false, available: 0, used: 0)
+/// Resets the device and enables its queues again over their emptied rings; false when it refuses its features.
+fn BlkEnv.restart(mut self) -> bool {
+    if not negotiate(mut self.common, features: self.features) {
+        return false
+    }
+    for index in 0..<self.lanes.len() {
+        mut self.lanes.at_mut(index).rearm(mut self.common, index: u16.fit(index))
+    }
+    ready(mut self.common)
+    return true
+} BlkEnv.restart
 
-/// Once started, turns each interrupt into a completion.
-pub fn Blk.resume(mut self, reason: sys::ResumeReason, mut env: BlkEnv, mut cx: sys::Cx[BlkDevice]) {
-    let signal = env.signal.share()
-    mut cx.spawn(key: INTERRUPTS, run: fn[take signal](out: sys::Outbox[BlkDevice]) fails task::Cancelled uses wait limits stack 8_192 {
-        loop {
-            try await signal.contents().wait()
-            if (attempt await out.completed()).is_err() {
-                return
-            }
-        }
+/// Empties the queue's ring and enables it as queue `index` again.
+fn Lane.rearm(mut self, mut common: hw::Mmio[Common], index: u16) {
+    mut self.queue.write_release(Queue.avail_index, value: 0)
+    mut self.queue.write_release(Queue.used_index, value: 0)
+    enable(mut common, index, ring: self.ring, queue: self.queue, vector: index)
+} Lane.rearm
+
+/// The queue of the CPU running the handler.
+fn BlkEnv.lane_here(self) -> usize {
+    let cpu = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u32 limits notrap, terminates {
+        return self.here.with(t, body: fn(mut cpu: u32) -> u32 limits notrap, terminates, noalloc {
+            return cpu
+        })
     })
+    return usize.widen(cpu) % self.lanes.len()
+} BlkEnv.lane_here
+
+pub fn Blk.start(mut env: BlkEnv) -> Blk {
+    var tracks = mem::List[Track].empty(env.alloc)
+    for _ in 0..<env.lanes.len() {
+        mut tracks.push(Track(waiting: mem::List.empty(env.alloc), busy: false, available: 0, used: 0, handed: 0))
+    }
+    return Blk(tracks: take tracks, lost: false)
+} Blk.start
+
+/// Once started, turns each queue's interrupts into its completions.
+pub fn Blk.resume(mut self, reason: sys::ResumeReason, mut env: BlkEnv, mut cx: sys::Cx[BlkDevice]) {
+    for index in 0..<env.lanes.len() {
+        let signal = env.lanes[index].signal.share()
+        let queue = u16.fit(index)
+        mut cx.spawn(key: INTERRUPTS + u64.widen(index), run: fn[take signal](out: sys::Outbox[BlkDevice]) fails task::Cancelled uses wait limits stack 8_192 {
+            loop {
+                try await signal.contents().wait()
+                if (attempt await out.completed(queue)).is_err() {
+                    return
+                }
+            }
+        })
+    }
 } Blk.resume
 
 pub fn Blk.info(mut self, take unit: u16, mut env: BlkEnv, mut cx: sys::Cx[BlkDevice]) -> devices::BlockInfo fails devices::DeviceError {
@@ -254,7 +359,7 @@ pub fn Blk.discard_blocks(
     fail devices::DeviceError.Unsupported
 } Blk.discard_blocks
 
-/// Postpones the request and hands it to the device once it is first.
+/// Postpones the request and queues it on the handler's CPU's queue, failing it at once with `device.reset` once the device is lost.
 fn Blk.queue_request(
     mut self,
     operation: Operation,
@@ -265,30 +370,87 @@ fn Blk.queue_request(
     let Some(request) = mut cx.postpone() else {
         return
     }
-    mut self.waiting.push(Waiting(request: request, operation: operation, data: take data))
-    mut self.submit(mut env)
+    let waiting = Waiting(request: request, operation: operation, data: take data)
+    if self.lost {
+        refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
+        return
+    }
+    let lane = env.lane_here()
+    mut self.tracks[lane].waiting.push(take waiting)
+    mut self.submit(lane, mut env, mut cx)
 } Blk.queue_request
 
-/// Answers the request the device completed, then submits the next.
-fn Blk.completed(mut self, mut env: BlkEnv, mut cx: sys::Cx[BlkDevice]) {
-    let Some(_) = next_used(mut env.queue, seen: self.used, size: env.size) else {
+/// Answers the request queue `queue` completed, then hands it its next.
+fn Blk.completed(mut self, take queue: u16, mut env: BlkEnv, mut cx: sys::Cx[BlkDevice]) {
+    let lane = usize.widen(queue)
+    if lane >= self.tracks.len() or not self.tracks[lane].busy {
         return
     }
-    self.used = self.used.wrapping_add(1)
-    self.busy = false
-    if self.waiting.len() == 0 {
+    let Some(_) = next_used(mut env.lanes.at_mut(lane).queue, seen: self.tracks[lane].used, size: env.lanes[lane].ring.size) else {
         return
     }
-    let Waiting(request: request, operation: operation, data: _) = mut self.waiting.remove(0)
-    let status = mut env.header.read_acquire(Header.status)
-    var reply = sys::Encoded.empty(env.alloc)
+    self.tracks[lane].used = self.tracks[lane].used.wrapping_add(1)
+    self.tracks[lane].busy = false
+    let Waiting(request: request, operation: operation, data: _) = mut self.tracks[lane].waiting.remove(0)
+    let status = mut env.lanes.at_mut(lane).header.read_acquire(Header.status)
     match operation {
-        Operation.Read(block: _, count: count) => mem::wire::Codec[Result[Untrusted[mem::Bytes], devices::DeviceError]].encode(read_outcome(status, mut env, count), out: mut reply.bytes)
-        else => mem::wire::Codec[Result[Unit, devices::DeviceError]].encode(outcome(status), out: mut reply.bytes)
+        Operation.Read(block: _, count: count) => answer(request, result: read_outcome(status, mut env, lane, count), alloc: env.alloc, mut cx)
+        else => answer(request, result: outcome(status), alloc: env.alloc, mut cx)
     }
-    discard attempt mut cx.reply(request, reply)
-    mut self.submit(mut env)
+    if self.tracks[lane].waiting.len() == 0 {
+        mut cx.cancel(key: TIMING + u64.widen(lane))
+    }
+    mut self.submit(lane, mut env, mut cx)
 } Blk.completed
+
+/// Fails the request on queue `queue` with `device.timeout` once the time of the `handed`th it took has run out with the request still on it, then resets the device, failing every other request with `device.reset`.
+fn Blk.expired(
+    mut self,
+    take queue: u16,
+    take handed: u64,
+    mut env: BlkEnv,
+    mut cx: sys::Cx[BlkDevice],
+    ) {
+    let lane = usize.widen(queue)
+    if lane >= self.tracks.len() or not self.tracks[lane].busy or self.tracks[lane].handed != handed {
+        return
+    }
+    let late = mut self.tracks[lane].waiting.remove(0)
+    refuse(take late, error: devices::DeviceError.Timeout, alloc: env.alloc, mut cx)
+    self.lost = not mut env.restart()
+    for index in 0..<self.tracks.len() {
+        mut cx.cancel(key: TIMING + u64.widen(index))
+        self.tracks[index].busy = false
+        self.tracks[index].available = 0
+        self.tracks[index].used = 0
+        while self.tracks[index].waiting.len() > 0 {
+            let waiting = mut self.tracks[index].waiting.remove(0)
+            refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
+        }
+    }
+} Blk.expired
+
+/// Answers the request `request` with `result`.
+fn answer[R: Encode](request: u64, take result: Result[R, devices::DeviceError], alloc: mem::Alloc, mut cx: sys::Cx[BlkDevice]) {
+    var reply = sys::Encoded.empty(alloc)
+    mem::wire::Codec[Result[R, devices::DeviceError]].encode(result, out: mut reply.bytes)
+    discard attempt mut cx.reply(request, reply)
+} answer
+
+/// Fails the request `waiting` holds with `error`.
+fn refuse(take waiting: Waiting, error: devices::DeviceError, alloc: mem::Alloc, mut cx: sys::Cx[BlkDevice]) {
+    let Waiting(request: request, operation: operation, data: _) = waiting
+    match operation {
+        Operation.Read(block: _, count: _) => {
+            let failed: Result[Untrusted[mem::Bytes], devices::DeviceError] = Err(error)
+            answer(request, result: take failed, alloc, mut cx)
+        }
+        else => {
+            let failed: Result[Unit, devices::DeviceError] = Err(error)
+            answer(request, result: failed, alloc, mut cx)
+        }
+    }
+} refuse
 
 /// What a request's header and descriptors hold: its type, its first sector and the bytes it moves.
 struct Shape derives Copy {
@@ -307,28 +469,43 @@ fn Operation.shape(self, block_bytes: u32) -> Shape {
     }
 } Operation.shape
 
-/// Hands the device the first waiting request when none is on it: its header, the data it moves, then its status byte.
-fn Blk.submit(mut self, mut env: BlkEnv) {
-    if self.busy or self.waiting.len() == 0 {
+/// Hands queue `lane` its first waiting request when none is on it, its time then starting.
+fn Blk.submit(mut self, lane: usize, mut env: BlkEnv, mut cx: sys::Cx[BlkDevice]) {
+    if self.tracks[lane].busy or self.tracks[lane].waiting.len() == 0 {
         return
     }
-    let shape = self.waiting[0].operation.shape(env.info.block_bytes)
-    match self.waiting[0].data {
+    let shape = self.tracks[lane].waiting[0].operation.shape(env.info.block_bytes)
+    let data = mut self.tracks[lane].waiting[0].data.extract()
+    self.tracks[lane].available = mut env.lanes.at_mut(lane).hand(shape, take data, index: self.tracks[lane].available)
+    self.tracks[lane].busy = true
+    self.tracks[lane].handed += 1
+    let clock = env.clock
+    let queue = u16.fit(lane)
+    let handed = self.tracks[lane].handed
+    mut cx.spawn(key: TIMING + u64.widen(lane), run: fn(out: sys::Outbox[BlkDevice]) fails task::Cancelled uses wait limits stack 8_192 {
+        try await clock.sleep(REQUEST_MS)
+        discard attempt await out.expired(queue, handed)
+    })
+} Blk.submit
+
+/// Hands the device a request of `shape` on this queue: its header, the data it moves, then its status byte; the available index after it.
+fn Lane.hand(mut self, shape: Shape, take data: Option[mem::Bytes], index: u16) -> u16 {
+    match data {
         Some(bytes) => {
             var at: usize = 0
             for byte in bytes.view() {
                 let segment = at / usize.widen(SEGMENT_BYTES)
-                mut env.segments.at_mut(segment).write_release_at(Segment.data, index: at % usize.widen(SEGMENT_BYTES), value: byte)
+                mut self.segments.at_mut(segment).write_release_at(Segment.data, index: at % usize.widen(SEGMENT_BYTES), value: byte)
                 at += 1
             }
         }
         None => {
         }
     }
-    let header = env.header.bus_addr().value
-    mut env.header.write_release(Header.kind, value: shape.kind)
-    mut env.header.write_release(Header.sector, value: shape.sector)
-    mut env.header.write_release(Header.status, value: 0xFF)
+    let header = self.header.bus_addr().value
+    mut self.header.write_release(Header.kind, value: shape.kind)
+    mut self.header.write_release(Header.sector, value: shape.sector)
+    mut self.header.write_release(Header.status, value: 0xFF)
     var flags = NEXT
     if shape.kind == READ_REQUEST {
         flags = NEXT | WRITE
@@ -341,16 +518,16 @@ fn Blk.submit(mut self, mut env: BlkEnv) {
             true => SEGMENT_BYTES
             false => left
         }
-        mut env.queue.write_release_at(Queue.descriptors, index: usize.widen(status_at), value: Descriptor(addr: env.segments[segment].bus_addr().value, len: length, flags: flags, next: status_at + 1))
+        mut self.queue.write_release_at(Queue.descriptors, index: usize.widen(status_at), value: Descriptor(addr: self.segments[segment].bus_addr().value, len: length, flags: flags, next: status_at + 1))
         left -= length
         status_at += 1
     }
-    mut env.queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(addr: header, len: 16, flags: NEXT, next: 1))
-    mut env.queue.write_release_at(Queue.descriptors, index: usize.widen(status_at), value: Descriptor(addr: header + 16, len: 1, flags: WRITE, next: 0))
-    self.available = offer(mut env.queue, head: 0, index: self.available, size: env.size)
-    mut env.notify.write(Notify.queue, value: 0)
-    self.busy = true
-} Blk.submit
+    mut self.queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(addr: header, len: 16, flags: NEXT, next: 1))
+    mut self.queue.write_release_at(Queue.descriptors, index: usize.widen(status_at), value: Descriptor(addr: header + 16, len: 1, flags: WRITE, next: 0))
+    let available = offer(mut self.queue, head: 0, index, size: self.ring.size)
+    mut self.notify.write(Notify.queue, value: 0)
+    return available
+} Lane.hand
 
 /// What a request whose device wrote `status` ends with.
 fn outcome(status: u8) -> Result[Unit, devices::DeviceError] {
@@ -361,15 +538,15 @@ fn outcome(status: u8) -> Result[Unit, devices::DeviceError] {
     }
 } outcome
 
-/// What a read of `count` blocks whose device wrote `status` ends with: the blocks it moved.
-fn read_outcome(status: u8, mut env: BlkEnv, count: u32) -> Result[Untrusted[mem::Bytes], devices::DeviceError] {
+/// What a read of `count` blocks on queue `lane` whose device wrote `status` ends with: the blocks it moved.
+fn read_outcome(status: u8, mut env: BlkEnv, lane: usize, count: u32) -> Result[Untrusted[mem::Bytes], devices::DeviceError] {
     let Ok(_) = outcome(status) else {
         return Err(devices::DeviceError.Io)
     }
     var bytes = mem::Bytes.empty(env.alloc)
     for at in 0..<usize.widen(count * env.info.block_bytes) {
         let segment = at / usize.widen(SEGMENT_BYTES)
-        mut bytes.push(mut env.segments.at_mut(segment).read_acquire_at(Segment.data, index: at % usize.widen(SEGMENT_BYTES)))
+        mut bytes.push(mut env.lanes.at_mut(lane).segments.at_mut(segment).read_acquire_at(Segment.data, index: at % usize.widen(SEGMENT_BYTES)))
     }
     return Ok(Untrusted.of(take bytes))
 } read_outcome
