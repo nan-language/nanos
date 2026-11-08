@@ -369,3 +369,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** each BAR of a function as a memory BAR it implements, with the address it holds or none.
 - **Chapters:** [15](15-devices.md).
 - **Issue:** [nan-language/nan#120](https://github.com/nan-language/nan/issues/120).
+
+## N33
+
+**Interrupt storms.**
+
+- **Language 1:** the runtime dispatches each interrupt to the interrupt fn installed on its vector, and `hw::IrqShared` can uninstall a binding but not mask it (NaN 24 §Locks).
+- **NaN OS requires:** a kernel learns when a vector raises more interrupts than a rate it sets, the vector then masked with its binding kept.
+- **Chapters:** [15](15-devices.md).
+- **Issue:** [nan-language/nan#122](https://github.com/nan-language/nan/issues/122).

@@ -222,7 +222,7 @@ On a machine without `iommu`, bus addresses are physical, every driver's record 
 - `devices` requests a device's vectors from the core ([vectors](04-kernel.md#vectors)): with MSI-X, one per queue, at most one per CPU plus one; else one MSI vector; else its INTx line as `_PRT` or the device tree routes it, level-triggered and possibly shared. A platform device gets its firmware-described lines. Each MSI-X vector targets one CPU (requires [N21](22-nan.md#n21)).
 - A driver in the shared space installs an interrupt fn on each vector with `hw::IrqShared.install` ([NaN 24 §Locks](https://github.com/nan-language/nan/blob/main/docs/spec/24-kernel.md#locks)). The interrupt fn quiets the device and posts an `hw::Signal` ([NaN 24 §Signals](https://github.com/nan-language/nan/blob/main/docs/spec/24-kernel.md#signals)); a keyed task of the driver waits on the signal and sends the driver a message. A driver in an isolated space receives its interrupts as doorbells ([interrupts and vectors](04-kernel.md#vectors)), so it binds only to a device with MSI or MSI-X.
 - A shared INTx line stays masked until the interrupt fn of every driver sharing it has run (requires [N21](22-nan.md#n21)).
-- A vector raising more than 100,000 interrupts in 1 s is masked, `device.interrupt-storm` is emitted, and the driver is cut off and restarted.
+- A vector raising more than 100,000 interrupts in 1 s is masked, `device.interrupt-storm` is emitted, and the driver is cut off and restarted (requires [N33](22-nan.md#n33)).
 - A device with no request pending raises no interrupt except to deliver input: `Console` bytes, `Nic` frames and link changes.
 
 ## Device power
