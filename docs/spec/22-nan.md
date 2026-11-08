@@ -387,3 +387,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a kernel overwrites what a module holds.
 - **Chapters:** [03](03-boot.md).
 - **Issue:** [nan-language/nan#125](https://github.com/nan-language/nan/issues/125).
+
+## N35
+
+**Link power management.**
+
+- **Language 1:** `hw::PciFunction` reads configuration space alone, and its power and reset operations give a function's link control back as it was (NaN 24 §PCI functions).
+- **NaN OS requires:** a kernel enables and disables ASPM on a function's link, at the function and its upstream port, as both support.
+- **Chapters:** [15](15-devices.md).
+- **Issue:** [nan-language/nan#126](https://github.com/nan-language/nan/issues/126).

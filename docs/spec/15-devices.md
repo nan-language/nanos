@@ -143,7 +143,7 @@ A **device protocol** is a [protocol](07-communication.md#protocols) that driver
 - A transfer above `max_transfer_bytes` fails with `device.too-large`, and `data` of partial blocks with `device.unaligned`.
 - Requests complete in any order. A `write` is durable when it completes with `fua`, or once a `flush` sent after its completion completes; without a volatile cache, every write is durable at completion.
 - On a zoned unit a write starts at its zone's write pointer (`device.unaligned`), and a `discard` of exactly one zone resets it.
-- Driver rules: one queue pair per CPU when the device offers that many, else shared round-robin; one MSI-X vector per queue, bound to its CPU; completions by interrupt with device coalescing of at most 100 µs, never polled. A request not completed in 30 s is aborted and fails with `device.timeout`; a failed abort resets the controller, failing its other requests with `device.reset`. No runtime suspend; under `PowerPolicy.Auto` the driver enables the device's link power management.
+- Driver rules: one queue pair per CPU when the device offers that many, else shared round-robin; one MSI-X vector per queue, bound to its CPU; completions by interrupt with device coalescing of at most 100 µs, never polled. A request not completed in 30 s is aborted and fails with `device.timeout`; a failed abort resets the controller, failing its other requests with `device.reset`. No runtime suspend; under `PowerPolicy.Auto` the driver enables the device's link power management (requires [N35](22-nan.md#n35)).
 
 ### Console
 
