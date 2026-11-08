@@ -1,6 +1,6 @@
 //! The `devices` component: the records of the machine's devices, their bindings, and the driver instances it creates for them through its `Control`.
 
-/// The keys of the keyed tasks: discovery, the wait for the topology to change, and per device those binding its driver, retiring it, resetting the device and following its driver's lifecycle, the device's key added.
+/// The keys of the keyed tasks: discovery, the wait for the topology to change, and per device those binding its driver, retiring it, resetting the device, following its driver's lifecycle, setting its driver's suspension and reseeding from it, and following its suspension, the device's key added.
 const DISCOVERY: u64 = 1
 
 const WATCHING: u64 = 2
@@ -12,6 +12,15 @@ const RETIRING: u64 = 0x5_0000
 const RESETTING: u64 = 0x6_0000
 
 const FOLLOWING: u64 = 0x7_0000
+
+const POWERING: u64 = 0x9_0000
+
+const SUSPENDING: u64 = 0xA_0000
+
+/// How long an entropy driver goes without a message before `Auto` suspends it, and the bytes a reseed draws from it.
+const ENTROPY_IDLE_MS: u32 = 10_000
+
+const RESEED_BYTES: u32 = 64
 
 /// The reasons `device.cut-off` gives in its argument.
 const CUT_ABANDONED: u64 = 0
@@ -118,6 +127,7 @@ pub protocol Devices {
     pub fn reset(device: BusPath) fails DevicesError limits irreversible(emit, actuate, erase, spend)
     fn restarted(path: BusPath, cut: bool, lifecycle: Option[os::Lifecycle]) limits irreversible(emit, actuate, erase, spend)
     fn driver_changed(path: BusPath, moniker: ident::Moniker, from: Option[os::Lifecycle], to: os::Lifecycle) limits irreversible(emit, actuate, erase, spend)
+    fn driver_suspended(path: BusPath, moniker: ident::Moniker, suspended: bool) limits irreversible(emit, actuate, erase, spend)
     fn listed(found: mem::List[Found], failed: mem::List[BusPath], console: Option[u16]) limits irreversible(emit, actuate, erase, spend)
     fn bound(path: BusPath, moniker: ident::Moniker, lifecycle: Option[os::Lifecycle]) limits irreversible(emit, actuate, erase, spend)
     fn volumes(path: BusPath, units: mem::List[UnitRecord]) limits irreversible(emit, actuate, erase, spend)
@@ -315,6 +325,8 @@ fn Manager.detach(mut self, at: usize, mut env: Env, mut cx: sys::Cx[Devices]) -
     let path = self.records[at].path
     let key = mut self.key_of(path)
     mut cx.cancel(key: FOLLOWING + key)
+    mut cx.cancel(key: POWERING + key)
+    mut cx.cancel(key: SUSPENDING + key)
     var monikers = mem::List[ident::Moniker].empty(alloc)
     var view: usize = 0
     while view < self.views.len() {
@@ -481,6 +493,12 @@ pub fn Manager.power(
     let set = self.binding_of(device)
     discard mut self.bindings.insert(device, value: Binding(driver: set.driver, power: policy))
     mut self.reconcile(at, mut env, mut cx)
+    let Some(driver) = self.records[at].driver else {
+        return
+    }
+    if self.records[at].status == Status.Converged and self.class_of(at) == Some(Class.Entropy) {
+        mut self.power_entropy(at, moniker: ident::Moniker(text: driver.text), mut env, mut cx)
+    }
 } Manager.power
 
 /// Resets the device at `device`: has a keyed task stop its driver, cut it off and reset it, then start the driver again.
@@ -698,7 +716,7 @@ fn Manager.bound(
     mut self.answer_settled(mut env, mut cx)
 } Manager.bound
 
-/// What a bound driver's device protocol brings: a block device's units are read, and a device of a role class holds it when no other does.
+/// What a bound driver's device protocol brings: a block device's units are read, a device of a role class holds it when no other does, and the core's random source is reseeded from each entropy device once its driver is suspended as its policy sets.
 fn Manager.serve_class(
     mut self,
     at: usize,
@@ -706,17 +724,151 @@ fn Manager.serve_class(
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    let Some(name) = self.records[at].entry else {
+    let Some(class) = self.class_of(at) else {
         return
     }
-    let Some(entry) = entry_named(name) else {
-        return
-    }
-    match entry.class {
+    match class {
         Class.Block => mut self.read_volumes(at, moniker, mut env, mut cx)
-        Class.Entropy or Class.Rtc or Class.Console => mut self.resolve_roles(mut env, mut cx)
+        Class.Entropy => {
+            mut self.resolve_roles(mut env, mut cx)
+            mut self.follow_suspension(at, moniker: ident::Moniker(text: moniker.text), mut env, mut cx)
+            for each in 0..<self.records.len() {
+                let Some(driver) = self.records[each].driver else {
+                    continue
+                }
+                if self.runs_class(each, class: Class.Entropy) {
+                    mut self.power_entropy(each, moniker: ident::Moniker(text: driver.text), mut env, mut cx)
+                }
+            }
+        }
+        Class.Rtc or Class.Console => mut self.resolve_roles(mut env, mut cx)
     }
 } Manager.serve_class
+
+/// The class of the entry bound to the device at `at`.
+fn Manager.class_of(self, at: usize) -> Option[Class] {
+    let Some(name) = self.records[at].entry else {
+        return None
+    }
+    let Some(entry) = entry_named(name) else {
+        return None
+    }
+    return Some(entry.class)
+} Manager.class_of
+
+/// Has a keyed task give the entropy driver `moniker` of the device at `at` the suspension its policy sets, `Auto` suspending a device with power management after 10 s without a message, then reseed the core's random source from it, a request that wakes it when suspended and from which the setting holds.
+fn Manager.power_entropy(
+    mut self,
+    at: usize,
+    take moniker: ident::Moniker,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    let path = self.records[at].path
+    let suspends = self.binding_of(path).power == PowerPolicy.Auto and power_managed(self.records[at].resources)
+    let ms: Option[u32] = match suspends {
+        true => Some(ENTROPY_IDLE_MS)
+        false => None
+    }
+    let control = env.control
+    let root = env.root
+    let alloc = env.alloc
+    let key = mut self.key_of(path)
+    mut cx.spawn(key: POWERING + key, run: fn[take moniker](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        match attempt await control.suspend_after(ident::Moniker(text: moniker.text), ms, alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+        try await reseed(control, root, take moniker, alloc)
+    })
+} Manager.power_entropy
+
+/// Whether `resources` hold a power management capability.
+fn power_managed(resources: mem::List[Resource]) -> bool {
+    for resource in resources {
+        if resource == Resource.Power {
+            return true
+        }
+    }
+    return false
+} power_managed
+
+/// Draws bytes from the entropy driver `moniker` and mixes them into the core's random source, unless the driver does not answer.
+fn reseed(control: os::Control, root: Root, take moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let handle = match first attempt await control.port(take moniker, credit: os::Credit(messages: 1, calls: 1), alloc) {
+        Ok(found) => found
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return
+    }
+    let Some(device) = os::Port[Entropy].of(handle) else {
+        return
+    }
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Entropy].fill(mut call, count: RESEED_BYTES)
+    let drawn = match first attempt await device.call(take call, reply, alloc) {
+        Ok(bytes) => bytes
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return
+    }
+    match attempt await root.mix(take drawn) {
+        Err(RootError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} reseed
+
+/// Has a keyed task follow whether the driver `moniker` of the device at `at` is suspended, posting each change.
+fn Manager.follow_suspension(
+    mut self,
+    at: usize,
+    take moniker: ident::Moniker,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    let path = self.records[at].path
+    let control = env.control
+    let alloc = env.alloc
+    let key = mut self.key_of(path)
+    mut cx.spawn(key: SUSPENDING + key, run: fn[take moniker](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        var seen = false
+        loop {
+            let now = match first attempt await control.suspended(ident::Moniker(text: moniker.text), seen, alloc) {
+                Ok(suspended) => suspended
+                Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+                Err(_) => return
+            }
+            if (attempt await out.driver_suspended(path, moniker: ident::Moniker(text: moniker.text), suspended: now)).is_err() {
+                return
+            }
+            seen = now
+        }
+    })
+} Manager.follow_suspension
+
+/// Records the device at `path` suspended or on, as its driver `moniker` now is, with `device.suspended` or `device.resumed`.
+fn Manager.driver_suspended(
+    mut self,
+    take path: BusPath,
+    take moniker: ident::Moniker,
+    take suspended: bool,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    let Some(at) = self.index_of(path) else {
+        return
+    }
+    if self.records[at].driver != Some(ident::Moniker(text: moniker.text)) {
+        return
+    }
+    if suspended {
+        self.records[at].power = Power.Suspended
+        mut self.emit(env.root, kind: EventKind.Suspended, path, argument: 0, mut cx)
+    } else {
+        self.records[at].power = Power.On
+        mut self.emit(env.root, kind: EventKind.Resumed, path, argument: 0, mut cx)
+    }
+} Manager.driver_suspended
 
 /// Answers the waiting `settled` requests once discovery is done, no binding, volume read or view is under way, `boot-volume` has its view, and a try at placing `store-volume` has ended.
 fn Manager.answer_settled(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {

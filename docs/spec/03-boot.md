@@ -149,7 +149,7 @@ On a machine with `tpm`, the loader extends PCRs with `EFI_TCG2_PROTOCOL.HashLog
 ## Entropy
 
 - The loader draws 64 bytes for the handoff record from `EFI_RNG_PROTOCOL`, with its default algorithm, when the firmware provides it; otherwise the field is zero and its flag clear.
-- The kernel's random source is seeded once it has mixed at least 256 bits from the handoff record, RDSEED on a CPU that has it (requires [N11](22-nan.md#n11)), and the entropy devices ([15-devices](15-devices.md#device-classes)). The link opens no transport and `keys` generates no key before that. The kernel overwrites the handoff entropy once mixed.
+- The kernel's random source is seeded once it has mixed at least 256 bits from the handoff record, RDSEED on a CPU that has it (requires [N11](22-nan.md#n11)), and the entropy devices ([15-devices](15-devices.md#device-classes)). The link opens no transport and `keys` generates no key before that. The kernel overwrites the handoff entropy once mixed (requires [N34](22-nan.md#n34)).
 
 ## Handoff record
 

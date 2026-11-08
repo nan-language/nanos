@@ -5,12 +5,14 @@ const LOG_UART: u16 = 0x3F8
 
 const LOG_UART_PORTS: u16 = 8
 
-/// The capability ids of MSI and MSI-X.
+/// The capability ids of power management, MSI and MSI-X.
+const POWER: u32 = 0x01
+
 const MSI: u32 = 0x05
 
 const MSIX: u32 = 0x11
 
-/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports with the interrupts of their hot-plug slots and the signal those post, the devices it lists, the firmware tables, the topology's generation and where to send it once it changes.
+/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports with the interrupts of their hot-plug slots and the signal those post, the devices it lists, the firmware tables, the topology's generation and where to send it once it changes, and the random source entropy devices reseed.
 pkg linear struct Keeper {
     idle: mem::List[hw::PciFunction]
     keepers: mem::List[hw::PciKeeper]
@@ -21,6 +23,7 @@ pkg linear struct Keeper {
     tables: mem::List[Table]
     generation: u64
     watchers: mem::List[task::Sender[u64]]
+    source: random::Source
 } Keeper
 
 /// What the keeper serves: an order of the device root, or the interrupt of a hot-plug slot.
@@ -49,9 +52,15 @@ pkg struct Table {
 
 pkg fn Table.of(signature: Array[u8, 4], take bytes: Untrusted[mem::Bytes]) -> Table = Table(signature: signature, bytes: take bytes)
 
-/// The keeper of `functions` and `ports`, giving each function a keeper and listing it, and of `tables`.
-pkg fn Keeper.of(take functions: mem::List[hw::PciFunction], take ports: mem::List[hw::PciPort], take tables: mem::List[Table], alloc: mem::Alloc) -> Keeper {
-    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, slots: mem::List.empty(alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), found: mem::List.empty(alloc), tables: take tables, generation: 0, watchers: mem::List.empty(alloc))
+/// The keeper of `functions` and `ports`, giving each function a keeper and listing it, of `tables`, and of the random source `source`.
+pkg fn Keeper.of(
+    take functions: mem::List[hw::PciFunction],
+    take ports: mem::List[hw::PciPort],
+    take tables: mem::List[Table],
+    take source: random::Source,
+    alloc: mem::Alloc,
+    ) -> Keeper {
+    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, slots: mem::List.empty(alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), found: mem::List.empty(alloc), tables: take tables, generation: 0, watchers: mem::List.empty(alloc), source: take source)
     for function in take functions {
         mut kept.adopt(take function, alloc)
     }
@@ -95,7 +104,7 @@ fn Keeper.watch_slots(mut self) {
 
 /// Releases what the keeper holds.
 pkg fn Keeper.release(take self) {
-    let Keeper(idle: idle, keepers: keepers, ports: ports, slots: slots, signal: _, found: _, tables: _, generation: _, watchers: _) = self
+    let Keeper(idle: idle, keepers: keepers, ports: ports, slots: slots, signal: _, found: _, tables: _, generation: _, watchers: _, source: _) = self
     for slot in take slots {
         discard take slot.uninstall()
     }
@@ -158,8 +167,14 @@ fn Keeper.carry_out(mut self, take order: devices::RootOrder, rings: journal::Ri
             }
         }
         devices::RootOrder.Emit(event: event) => rings.record_device(event)
+        devices::RootOrder.Mix(drawn: drawn) => mix(self.source, take drawn)
     }
 } Keeper.carry_out
+
+/// Mixes the bytes an entropy device drew into `source`.
+validator fn mix(source: random::Source, take drawn: Untrusted[mem::Bytes]) {
+    source.mix(drawn.inspect().view())
+} mix
 
 /// Hands each order `orders` brings to the keeper's `inputs`, until either ends.
 pkg fn forward(take orders: task::Receiver[devices::RootOrder], take inputs: task::Sender[Input]) fails task::Cancelled uses wait {
@@ -456,6 +471,7 @@ fn capabilities(function: hw::PciFunction, mut resources: mem::List[devices::Res
     while at != 0 and seen < 48 {
         let head = function.config_read(u8.truncate(at))
         match head & 0xFF {
+            POWER => mut resources.push(devices::Resource.Power)
             MSI => mut resources.push(devices::Resource.Msi)
             MSIX => mut resources.push(devices::Resource.Msix(vectors: u16.truncate((head >> 16) & 0x7FF) + 1))
             else => {

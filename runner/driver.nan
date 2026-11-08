@@ -21,7 +21,7 @@ enum Input {
     Revoke(grants: mem::Set[u64], done: task::Sender[Unit])
 } Input
 
-/// An instance as its driver holds it.
+/// An instance as its driver holds it, `suspended` while its component is, `suspend_ms` the time without a message after which it is.
 linear struct Driver {
     moniker: ident::Moniker
     slot: u32
@@ -41,6 +41,8 @@ linear struct Driver {
     postponed: mem::List[Outstanding]
     deleting: Option[task::Sender[Result[os::Outcome, os::ControlError]]]
     unplugged: bool
+    suspend_ms: Option[u32]
+    suspended: bool
 } Driver
 
 /// The running incarnation's domain: where its calls go, what abandons it, and the call delivered to it whose handler call has not ended.
@@ -70,7 +72,7 @@ enum Cause derives Copy, Eq {
     Lingered
 } Cause
 
-/// An order waiting for its instance's lifecycle: to run, hibernate or fail, to stop, or to differ from the one an order saw.
+/// An order waiting for its instance's lifecycle to run, hibernate or fail, to stop, or to differ from the one an order saw, or for its suspension to differ from the one an order saw.
 struct Waiter {
     done: task::Sender[Result[os::Outcome, os::ControlError]]
     awaits: Awaited
@@ -80,6 +82,7 @@ enum Awaited derives Copy, Eq {
     Running
     Stopped
     Change(seen: Option[os::Lifecycle])
+    Suspension(seen: bool)
 } Awaited
 
 /// What the tasks a driver spawns need from the runner.
@@ -100,7 +103,7 @@ fn Driver.of(
     take gate: os::Gate,
     alloc: mem::Alloc,
     ) -> Driver {
-    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, started_ns: 0, queue: mem::List.empty(alloc), domain: None, then: Then.Stop, cause: Cause.Inside, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false)
+    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, started_ns: 0, queue: mem::List.empty(alloc), domain: None, then: Then.Stop, cause: Cause.Inside, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false)
 } Driver.of
 
 /// Carries out the lifecycle of the instance `driver` holds, as its inputs come, until they end or the instance, deleted, has stopped, left the directory and had its capabilities revoked; the tasks of its incarnations run in the driver's own scope.
@@ -257,6 +260,18 @@ fn Shared.order[J: Journal](
             try await self.stop(mut driver, then: Then.Stop, journal)
         }
         os::Action.Changed(seen: seen) => mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Change(seen: seen)))
+        os::Action.SuspendAfter(ms: ms) => {
+            driver.suspend_ms = ms
+            match driver.domain {
+                Some(domain) => {
+                    discard attempt await domain.deliveries.send(Delivery.SuspendAfter(ms: ms.value_or(0)))
+                }
+                None => {
+                }
+            }
+            discard attempt await done.send(Ok(os::Outcome.Done))
+        }
+        os::Action.Suspended(seen: seen) => mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Suspension(seen: seen)))
         os::Action.Start => {
             mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
             try await self.create_or_start(mut driver, sender, journal, s)
@@ -315,13 +330,14 @@ fn Shared.start[J: Journal](
     driver.incarnation += 1
     driver.lifecycle = Some(os::Lifecycle.Starting)
     driver.cause = Cause.Inside
+    driver.suspended = false
     driver.started_ns = now(self.config.clock)
     let Some(budget) = try await self.cell(mut driver) else {
         try await self.give_up(mut driver, journal)
         return
     }
     let account = self.config.exec.split(self.config.share(driver.spec.share))
-    let request = Request(moniker: ident::Moniker(text: driver.moniker.text), cell: budget.alloc(), exec: account.executor(), clock: self.config.clock, withheld: self.withheld, orders: self.orders.split(), alloc: self.config.alloc)
+    let request = Request(moniker: ident::Moniker(text: driver.moniker.text), cell: budget.alloc(), exec: account.executor(), clock: self.config.clock, random: self.config.random, withheld: self.withheld, orders: self.orders.split(), alloc: self.config.alloc)
     let directory = self.directory.share()
     let built = await when directory => directory.world(driver.spec, minted: mut driver.minted, request)
     let Some(world) = built else {
@@ -333,7 +349,7 @@ fn Shared.start[J: Journal](
     let task::Channel(sender: deliveries, receiver: delivered) = task::Channel[Delivery].bounded(2, alloc: self.config.alloc)
     let task::Channel(sender: marks, receiver: marked) = task::Channel[Mark].bounded(2, alloc: self.config.alloc)
     let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: self.config.alloc)
-    let serving = Serving(deliveries: take delivered, reports: sender.split(), marks: take marks, incarnation: driver.incarnation, clock: self.config.clock, abandoner: abandoner.share())
+    let serving = Serving(deliveries: take delivered, reports: sender.split(), marks: take marks, incarnation: driver.incarnation, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: driver.suspend_ms.value_or(0))
     self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, take budget, take account, abandoner: abandoner.share(), ended: sender.split(), incarnation: driver.incarnation)
     self.watch(s, marks: take marked, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers)
     driver.domain = Some(Domain(deliveries: take deliveries, abandoner: take abandoner, outstanding: None, next_id: 0))
@@ -553,7 +569,7 @@ fn Driver.stopped[J: Journal](mut self, journal: J, abandoned: bool) {
     journal.record(self.slot, event: Event.Stopped(abandoned: abandoned))
 } Driver.stopped
 
-/// Handles what the domain reports: that it runs, that it took a call, or a request's answer.
+/// Handles what the domain reports: that it runs, that it took a call, a request's answer, or that its component was suspended or woken.
 fn Driver.report[J: Journal](mut self, take report: Report, journal: J) fails task::Cancelled uses wait {
     match report {
         Report.Running => {
@@ -571,6 +587,12 @@ fn Driver.report[J: Journal](mut self, take report: Report, journal: J) fails ta
             }
         }
         Report.Ending => {
+        }
+        Report.Suspended => {
+            self.suspended = true
+        }
+        Report.Woken => {
+            self.suspended = false
         }
         Report.Postponed(id: id) => {
             let postponed = mut self.take_outstanding(id, request: true)
@@ -745,10 +767,15 @@ fn Driver.settle(mut self) fails task::Cancelled uses wait {
             Awaited.Change(seen: seen) => seen != Some(lifecycle)
             Awaited.Stopped => lifecycle == os::Lifecycle.Stopped or lifecycle == os::Lifecycle.Failed
             Awaited.Running => lifecycle == os::Lifecycle.Running or lifecycle == os::Lifecycle.Hibernated or lifecycle == os::Lifecycle.Failed
+            Awaited.Suspension(seen: seen) => seen != self.suspended
         }
         if settled {
-            let Waiter(done: done, awaits: _) = mut self.waiters.remove(at)
-            discard attempt await done.send(Ok(os::Outcome.Lifecycle(lifecycle)))
+            let Waiter(done: done, awaits: awaits) = mut self.waiters.remove(at)
+            let outcome = match awaits {
+                Awaited.Suspension(seen: _) => os::Outcome.Suspended(self.suspended)
+                else => os::Outcome.Lifecycle(lifecycle)
+            }
+            discard attempt await done.send(Ok(take outcome))
         } else {
             at += 1
         }
@@ -765,7 +792,7 @@ fn Driver.trigger(self) {
 
 /// Releases what the driver holds once its inputs have ended.
 fn Driver.abandon(take self) {
-    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, started_ns: _, queue: _, domain: _, then: _, cause: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _) = self
+    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, started_ns: _, queue: _, domain: _, then: _, cause: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _) = self
     gate.set(open: false)
     take minted.close()
 } Driver.abandon

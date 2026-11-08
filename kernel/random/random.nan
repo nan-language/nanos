@@ -1,0 +1,139 @@
+//! The kernel's random source: a key that each input is hashed into and that each draw is hashed from, the draw then replacing it by a hash of itself, so that no later key gives an earlier draw.
+
+/// The tags under which the key derives: a key that has mixed an input, a block of a draw, and the key replacing the one a draw used.
+const MIX: u8 = 0
+
+const DRAW: u8 = 1
+
+const REKEY: u8 = 2
+
+/// The source's key, and how many numbers its draws have taken: one for each 32-byte block and one for the key replacing theirs.
+struct Pool derives Copy {
+    key: Array[u8, 32]
+    taken: u64
+} Pool
+
+/// The kernel's random source, shared by every CPU.
+pkg struct Source {
+    pool: mem::Shared[hw::SpinLock[Pool]]
+} Source
+
+/// The capability kind through which instances draw from the source.
+pkg struct Draws {
+} Draws
+
+impl Draws: sys::Kind[Source, u8]
+
+impl Draws: sys::RandomService
+
+/// The root entry of the capabilities through which instances draw from the source, kept as long as the kernel runs.
+pkg linear struct Drawing {
+    minter: sys::Minter[Draws, Source, u8]
+} Drawing
+
+/// The source before it has mixed anything.
+pkg fn Source.empty(alloc: mem::Alloc) -> Source {
+    return Source(pool: mem::Shared.of(hw::SpinLock.of(Pool(key: Array[u8, 32].filled(0), taken: 0)), alloc))
+} Source.empty
+
+pkg fn Source.share(self) -> Source {
+    return Source(pool: self.pool.share())
+} Source.share
+
+/// Hashes `input` into the key, `ident::DERIVED_BYTES` at a time.
+pkg fn Source.mix(self, take input: Slice[u8]) {
+    var rest = input
+    while rest.len() > ident::DERIVED_BYTES {
+        let Some(core::Parts(head: head, tail: tail)) = rest.split_at(ident::DERIVED_BYTES) else {
+            return
+        }
+        self.mix_piece(head)
+        rest = tail
+    }
+    self.mix_piece(rest)
+} Source.mix
+
+fn Source.mix_piece(self, piece: Slice[u8])
+    requires piece.len() <= ident::DERIVED_BYTES
+{
+    loop {
+        let seen = self.reserve(count: 0).key
+        if self.replace(seen, by: ident::derive(seen, tag: MIX, data: piece)) {
+            return
+        }
+    }
+} Source.mix_piece
+
+/// Fills `out` with blocks the key derives under numbers no other draw takes, then replaces that key unless a draw or a mix already has.
+pkg fn Source.fill(self, mut out: SliceMut[u8]) {
+    let blocks = u64.widen(out.len() / 32 + 1)
+    let taken = self.reserve(count: blocks + 1)
+    var block = Array[u8, 32].filled(0)
+    for at in 0..<out.len() {
+        if at % 32 == 0 {
+            block = ident::derive(taken.key, tag: DRAW, data: number(taken.taken + u64.widen(at / 32)).view())
+        }
+        out[at] = block[at % 32]
+    }
+    discard self.replace(taken.key, by: ident::derive(taken.key, tag: REKEY, data: number(taken.taken + blocks).view()))
+} Source.fill
+
+/// The pool as it stands, `count` more numbers then taken.
+fn Source.reserve(self, count: u64) -> Pool {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Pool limits notrap, terminates {
+        return self.pool.contents().with(t, body: fn(mut pool: Pool) -> Pool limits notrap, terminates, noalloc {
+            let seen = pool
+            pool.taken = pool.taken.wrapping_add(count)
+            return seen
+        })
+    })
+} Source.reserve
+
+/// Replaces the key by `by` when it is still `seen`: whether it was.
+fn Source.replace(self, seen: Array[u8, 32], by: Array[u8, 32]) -> bool {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> bool limits notrap, terminates {
+        return self.pool.contents().with(t, body: fn(mut pool: Pool) -> bool limits notrap, terminates, noalloc {
+            if pool.key != seen {
+                return false
+            }
+            pool.key = by
+            return true
+        })
+    })
+} Source.replace
+
+/// `value` in 8 little-endian bytes.
+fn number(value: u64) -> Array[u8, 8] {
+    var bytes = Array[u8, 8].filled(0)
+    mut bytes.view_mut().write_u64_le(0, value)
+    return bytes
+} number
+
+pkg fn Drawing.of(take source: Source, alloc: mem::Alloc) -> Drawing {
+    return Drawing(minter: sys::Minter[Draws, Source, u8].of(take source, alloc))
+} Drawing.of
+
+/// A capability drawing from the source.
+pkg fn Drawing.random(self) -> sys::Random fails sys::Revoked {
+    return try sys::Random.served(self.minter.mint(0))
+} Drawing.random
+
+pkg fn Draws.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    discard sys::reach(self, body: fn[mut buf](state: Source, record: u8) {
+        state.fill(mut buf)
+    })
+} Draws.fill
+
+test draws_differ_and_follow_what_was_mixed for Source.fill {
+    let world = testing::world()
+    let source = Source.empty(world.alloc)
+    var earlier = Array[u8, 40].filled(0)
+    var later = Array[u8, 40].filled(0)
+    source.fill(mut earlier.view_mut())
+    source.fill(mut later.view_mut())
+    let seeded = Source.empty(world.alloc)
+    seeded.mix(b"seed")
+    var mixed = Array[u8, 40].filled(0)
+    seeded.fill(mut mixed.view_mut())
+    expect earlier != later and earlier != mixed and later != mixed
+} draws_differ_and_follow_what_was_mixed

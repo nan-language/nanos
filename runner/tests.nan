@@ -12,6 +12,8 @@ protocol Counter {
     pub fn later() -> u64 limits recorded
     /// Answers the `later` waiting with the total, giving how many it answered.
     pub fn settle() -> u32 limits recorded
+    /// Whether the tally is suspended.
+    pub fn asleep() -> bool limits pure
 } Counter
 
 struct TallyEnv {
@@ -23,9 +25,12 @@ impl TallyEnv: nanos::Environment
 struct Tally derives Encode {
     total: u64
     waiting: Option[u64]
+    suspended: bool
 } Tally
 
 impl Tally: sys::Component[TallyEnv, Counter]
+
+impl Tally: sys::Suspend[TallyEnv, Counter]
 
 /// A component of the runner's tests, which runs only `runner::Tally`.
 struct Tallies derives Copy {
@@ -61,7 +66,7 @@ enum Failure derives Render {
 
 fn TallyEnv.build(take world: nanos::World) -> TallyEnv = TallyEnv(alloc: world.alloc)
 
-fn Tally.start(mut env: TallyEnv) -> Tally = Tally(total: 0, waiting: None)
+fn Tally.start(mut env: TallyEnv) -> Tally = Tally(total: 0, waiting: None, suspended: false)
 
 fn Tally.add(mut self, take amount: u32, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 fails Refused {
     if amount > 1_000 {
@@ -94,6 +99,18 @@ fn Tally.settle(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u32 {
     discard attempt mut cx.reply(request, reply)
     return 1
 } Tally.settle
+
+fn Tally.asleep(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> bool {
+    return self.suspended
+} Tally.asleep
+
+fn Tally.suspend(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) {
+    self.suspended = true
+} Tally.suspend
+
+fn Tally.wake(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) {
+    self.suspended = false
+} Tally.wake
 
 fn Tallies.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == "runner::Tally" {
@@ -151,7 +168,7 @@ fn configured(world: host::World) -> Config {
     classes[1] = 2
     classes[2] = 3
     classes[3] = 4
-    return Config(exec: world.exec, pool: world.alloc, alloc: world.alloc, clock: world.clock, wall: Wall(at: ident::WallTime(utc_ns: NOON_NS, uncertainty_ns: 1_000_000_000), since_ns: 0), classes: classes)
+    return Config(exec: world.exec, pool: world.alloc, alloc: world.alloc, clock: world.clock, wall: Wall(at: ident::WallTime(utc_ns: NOON_NS, uncertainty_ns: 1_000_000_000), since_ns: 0), random: world.random, classes: classes)
 } configured
 
 /// One tally named `tally`, whose specification `adjust` changes, and no grant.
@@ -392,6 +409,44 @@ test lazy_instances_start_at_their_first_call for run {
     expect seen[0] == os::Lifecycle.Hibernated and seen[1] == os::Lifecycle.Running
     expect started == 1
 } lazy_instances_start_at_their_first_call
+
+fn asleep(port: os::Port[Counter], alloc: mem::Alloc) -> bool fails os::PortError[Never] uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Counter].asleep(mut call)
+    return try await port.call(take call, reply, alloc)
+} asleep
+
+/// Has the tally suspended after 20 ms without a message, calls it, waits until it is suspended, then calls it again: whether it was suspended, whether it was still asleep at that call, and whether it was suspended after it.
+fn slept(core: Core, alloc: mem::Alloc) -> Array[bool, 3] fails Failure uses wait {
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    try await core.control.suspend_after(named("tally"), ms: Some(20), alloc)
+    discard try await add(port, amount: 1, alloc)
+    var seen = Array[bool, 3].filled(false)
+    seen[0] = try await core.control.suspended(named("tally"), seen: false, alloc)
+    seen[1] = try await asleep(port, alloc)
+    seen[2] = try await core.control.suspended(named("tally"), seen: true, alloc)
+    return seen
+} slept
+
+test idle_instances_suspend_until_their_next_message for idle {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), body: fn(core: Core) -> Array[bool, 3] fails Failure uses wait {
+        return try await slept(core, alloc: world.alloc)
+    })
+    let Some(states) = seen else {
+        expect false
+        return
+    }
+    expect states[0] and not states[1] and not states[2]
+} idle_instances_suspend_until_their_next_message
 
 protocol Probed {
     pub fn ping() limits recorded
@@ -707,6 +762,40 @@ fn claiming(alloc: mem::Alloc) -> Directory {
     return listed
 } claiming
 
+test worlds_draw_randomness_only_under_a_random_grant for Directory.world {
+    let world = testing::world()
+    let alloc = world.alloc
+    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc))
+    discard mut listed.grants.insert(0, value: os::Grant(holder: ident::Principal(text: text::Fixed[64].of("inst.drawer")), object: os::Object.Random, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
+    var bundle = Array[u8, 33].filled(0)
+    bundle[0] = 0x01
+    let bare = os::InstanceSpec.of(principal: system(), bundle: ident::HashValue(bytes: bundle), component: "runner::Tally", alloc)
+    var granted = os::InstanceSpec.of(principal: system(), bundle: ident::HashValue(bytes: bundle), component: "runner::Tally", alloc)
+    discard mut granted.grants.insert(text::String.of("random", alloc), value: 0)
+    let task::Channel(sender: orders, receiver: _) = task::Channel[os::Order].bounded(1, alloc)
+    let Ok(withheld) = attempt Withheld.of(world.clock, alloc) else {
+        expect false
+        return
+    }
+    let request = Request(moniker: named("drawer"), cell: alloc, exec: world.exec, clock: world.clock, random: world.random, withheld: withheld, orders: take orders, alloc: alloc)
+    var minted = Minted.none(alloc)
+    let without = listed.world(bare, mut minted, request)
+    let with = listed.world(granted, mut minted, request)
+    take minted.close()
+    let Some(denied) = without else {
+        expect false
+        return
+    }
+    let Some(served) = with else {
+        expect false
+        return
+    }
+    var drawn = Array[u8, 8].filled(0)
+    let refused = attempt denied.random.fill(mut drawn.view_mut())
+    let filled = attempt served.random.fill(mut drawn.view_mut())
+    expect refused.is_err() and filled.is_ok()
+} worlds_draw_randomness_only_under_a_random_grant
+
 test worlds_claim_devices_and_wire_roles_once_assigned for Directory.world {
     let world = testing::world()
     let alloc = world.alloc
@@ -721,7 +810,7 @@ test worlds_claim_devices_and_wire_roles_once_assigned for Directory.world {
         expect false
         return
     }
-    let request = Request(moniker: named("driver"), cell: alloc, exec: world.exec, clock: world.clock, withheld: withheld, orders: take orders, alloc: alloc)
+    let request = Request(moniker: named("driver"), cell: alloc, exec: world.exec, clock: world.clock, random: world.random, withheld: withheld, orders: take orders, alloc: alloc)
     var minted = Minted.none(alloc)
     let unassigned = listed.world(spec, mut minted, request)
     expect unassigned.is_none()

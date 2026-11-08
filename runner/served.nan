@@ -1,6 +1,6 @@
 //! The task of an instance's domain: it builds the Env, starts the component and serves the calls its driver delivers, one at a time, and hands its driver the replies the component gives postponed requests.
 
-/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, and the abandoner of the domain.
+/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, and the time without a message after which the component is suspended, never when 0.
 pub open struct Serving {
     deliveries: task::Receiver[Delivery]
     reports: task::Sender[Input]
@@ -8,11 +8,13 @@ pub open struct Serving {
     incarnation: u64
     clock: sys::Clock
     pub abandoner: mem::Shared[sys::Abandoner]
+    suspend_ms: u32
 } Serving
 
-/// What a driver delivers to its instance's domain: a call, or the order to stop once the handler running returns.
+/// What a driver delivers to its instance's domain: a call, the time without a message after which its component is suspended, never when 0, or the order to stop once the handler running returns.
 enum Delivery {
     Call(id: u64, hash: sys::ProtocolHash, encoded: sys::Encoded, request: bool)
+    SuspendAfter(ms: u32)
     Stop
 } Delivery
 
@@ -22,6 +24,8 @@ enum Report {
     Taken(id: u64)
     Postponed(id: u64)
     Answered(id: u64, answer: os::Answer)
+    Suspended
+    Woken
     Ending
 } Report
 
@@ -63,7 +67,7 @@ pub fn Served.run(take world: nanos::World, take serving: Serving) -> Ended fail
     })
 } Served.run
 
-/// Runs an instance on `env`: starts the component, ends it at once when its health is not `Healthy`, then serves what `serving` delivers, P's calls and those of the protocols whose schemas `peers` holds, until it is told to stop, letting the handler running return and handling every message that waits, and ends the component, handing its Env to `release`. The replies its handlers give the requests they postponed go to the driver as they come.
+/// Runs an instance on `env`: starts the component, ends it at once when its health is not `Healthy`, then serves what `serving` delivers, P's calls and those of the protocols whose schemas `peers` holds, until it is told to stop, letting the handler running return and handling every message that waits, and ends the component, handing its Env to `release`. The replies its handlers give the requests they postponed go to the driver as they come. A component that has had no message for the time `serving` sets is suspended until its next message.
 pub fn Driven.run(
     take env: Env,
     exec: task::Executor,
@@ -72,7 +76,7 @@ pub fn Driven.run(
     take peers: mem::List[sys::ProtocolSchema],
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _) = serving
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms) = serving
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Replied, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), alloc: alloc)
     let replies = pending.replies.share()
     let signal = pending.signal.share()
@@ -95,6 +99,7 @@ pub fn Driven.run(
     try await tell(reports, incarnation, report: Report.Running)
     let out = stepper.outbox()
     let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0)), alloc)
+    let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
     let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
     var given = Some(Given(deliveries: take deliveries, finishes: take finishes, peers: take peers))
     let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given](s: task::Scope) fails Stopping uses wait {
@@ -103,8 +108,9 @@ pub fn Driven.run(
         }
         let sending = reports.split()
         let counted = steps.share()
-        discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take known]() fails Stopping uses wait limits stack 16_384 {
-            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, peers: known, alloc)
+        let setting = quiet.share()
+        discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take known, take setting]() fails Stopping uses wait limits stack 16_384 {
+            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, peers: known, quiet: setting, alloc)
         })
         let answering = reports.split()
         let queued = replies.share()
@@ -113,7 +119,7 @@ pub fn Driven.run(
             try await hand_replies(queued, signal: ringing, reports: answering, incarnation)
         })
         loop {
-            try await stepper.incoming()
+            try await idle(mut stepper, quiet: quiet.contents(), clock, reports, incarnation)
             try await call_handlers(mut stepper, marks, steps, finished, clock)
         }
     })
@@ -146,7 +152,7 @@ struct Given {
     peers: mem::List[sys::ProtocolSchema]
 } Given
 
-/// Serves each call delivered through the protocol P, or one whose schema `peers` holds, on the component behind `out`, one at a time and in order, until told to stop: a request is answered once its handler returns, or reported postponed, and a one-way call is reported taken once the handler call that took it has returned.
+/// Serves each call delivered through the protocol P, or one whose schema `peers` holds, on the component behind `out`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which the component is suspended.
 fn dispatch[P: sys::Protocol and Send](
     out: sys::Outbox[P],
     take deliveries: task::Receiver[Delivery],
@@ -155,34 +161,56 @@ fn dispatch[P: sys::Protocol and Send](
     reports: task::Sender[Input],
     incarnation: u64,
     peers: mem::List[sys::ProtocolSchema],
+    quiet: mem::Shared[core::atomic::AtomicU64],
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
     var receiver = deliveries
     var signals = finishes
     loop {
-        let Some(Delivery.Call(id: id, hash: hash, encoded: encoded, request: request)) = try await mut receiver.receive() else {
+        let Some(delivery) = try await mut receiver.receive() else {
             fail Stopping.Asked
         }
-        let outcome = attempt await sys::Wire[P].serve(out, request: id, hash, peers: peers.view(), raw: Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc)
-        if not request {
-            if outcome.is_ok() {
-                try await finish_step(steps.contents(), mut signals)
-            }
-            try await tell(reports, incarnation, report: Report.Taken(id: id))
-            continue
+        match delivery {
+            Delivery.Call(id: id, hash: hash, encoded: encoded, request: request) => try await serve_call(out, id, hash, take encoded, request, steps, mut signals, reports, incarnation, peers, alloc)
+            Delivery.SuspendAfter(ms: ms) => quiet.contents().store(u64.widen(ms))
+            Delivery.Stop => fail Stopping.Asked
         }
-        let answer = match outcome {
-            Ok(Some(reply)) => os::Answer.Replied(take reply)
-            Ok(None) => {
-                try await tell(reports, incarnation, report: Report.Postponed(id: id))
-                continue
-            }
-            Err(sys::CallError.Malformed(_)) => os::Answer.Malformed
-            else => os::Answer.ServerStopped
-        }
-        try await tell(reports, incarnation, report: Report.Answered(id: id, answer: take answer))
     }
 } dispatch
+
+/// Serves the call `id` on the component behind `out`: a request is answered once its handler returns, or reported postponed, and a one-way call is reported taken once the handler call that took it has returned.
+fn serve_call[P: sys::Protocol and Send](
+    out: sys::Outbox[P],
+    id: u64,
+    hash: sys::ProtocolHash,
+    take encoded: sys::Encoded,
+    request: bool,
+    steps: mem::Shared[Steps],
+    mut signals: task::Receiver[u64],
+    reports: task::Sender[Input],
+    incarnation: u64,
+    peers: mem::List[sys::ProtocolSchema],
+    alloc: mem::Alloc,
+    ) fails Stopping uses wait {
+    let outcome = attempt await sys::Wire[P].serve(out, request: id, hash, peers: peers.view(), raw: Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc)
+    if not request {
+        if outcome.is_ok() {
+            try await finish_step(steps.contents(), mut signals)
+        }
+        try await tell(reports, incarnation, report: Report.Taken(id: id))
+        return
+    }
+    let answer = match outcome {
+        Ok(Some(reply)) => os::Answer.Replied(take reply)
+        Ok(None) => {
+            try await tell(reports, incarnation, report: Report.Postponed(id: id))
+            return
+        }
+        Err(sys::CallError.Malformed(_)) => os::Answer.Malformed
+        else => os::Answer.ServerStopped
+    }
+    try await tell(reports, incarnation, report: Report.Answered(id: id, answer: take answer))
+} serve_call
 
 /// Waits until the step that took the call just posted has finished: every step begun by now. The holder signals the count it waits for when it reaches it, unless the count is already reached and the dispatcher withdraws its wait first.
 fn finish_step(steps: Steps, mut signals: task::Receiver[u64]) fails Stopping uses wait {
@@ -200,6 +228,37 @@ fn finish_step(steps: Steps, mut signals: task::Receiver[u64]) fails Stopping us
         }
     }
 } finish_step
+
+/// Waits until a message waits in the component's intake; once the component has had none for the time `quiet` holds, never when 0, suspends it until its next message and then wakes it, telling the driver of both.
+fn idle[S, Env: Any, P: Any](
+    mut stepper: sys::Stepper[S, Env, P],
+    quiet: core::atomic::AtomicU64,
+    clock: sys::Clock,
+    reports: task::Sender[Input],
+    incarnation: u64,
+    ) fails task::Cancelled uses wait {
+    loop {
+        let ms = quiet.load()
+        if ms == 0 {
+            try await stepper.incoming()
+            return
+        }
+        let arrived = try await task::within(clock, ms, body: fn() fails task::Cancelled uses wait {
+            try await stepper.incoming()
+        })
+        if arrived.is_some() {
+            return
+        }
+        if quiet.load() != 0 {
+            break
+        }
+    }
+    mut stepper.suspend()
+    try await tell(reports, incarnation, report: Report.Suspended)
+    try await stepper.incoming()
+    mut stepper.wake()
+    try await tell(reports, incarnation, report: Report.Woken)
+} idle
 
 /// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took.
 fn call_handlers[S, Env: Any, P: Any](

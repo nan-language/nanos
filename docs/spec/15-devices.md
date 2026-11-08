@@ -232,8 +232,8 @@ A device is `on` (PCI D0), `suspended` (D3hot through its power management capab
 | State | Event | Next | Effect |
 | --- | --- | --- | --- |
 | `off` | a driver binds to it under `Auto` or `On` ([driver instances](#driver-instances)) | `on` | — |
-| `on` | under `Auto`, the protocol allows runtime suspend and the driver has had no request for the protocol's idle time | `suspended` | the runner calls the driver's `suspend()` ([system interfaces](06-execution.md#system-interfaces)), which quiets the device, then `devices` puts the device in its low-power state; `device.suspended` |
-| `suspended` | a request to the driver, or the policy becomes `On` | `on` | `devices` powers the device on, then the runner calls `wake()` and delivers the waiting request, if any; `device.resumed` |
+| `on` | under `Auto`, the protocol allows runtime suspend, the device has a low-power state, and the driver has had no request for the protocol's idle time | `suspended` | the runner calls the driver's `suspend()` ([system interfaces](06-execution.md#system-interfaces)), which quiets the device and puts it in its low-power state; `device.suspended` |
+| `suspended` | a request to the driver, or the policy becomes `On` | `on` | the runner calls `wake()`, which powers the device on, then delivers the waiting request, if any; `device.resumed` |
 | `on`, `suspended` | the policy becomes `Off`, or the device is unbound | `off` | the driver stops and the device is cut off ([reset](#reset)) |
 
 Power off and reboot use `\_S5`, which `devices.aml` evaluates, and the FADT reset register ([power off and reboot](08-scheduling.md#power-off-and-reboot)).

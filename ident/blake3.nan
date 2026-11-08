@@ -16,17 +16,22 @@ const CHUNK_BLOCKS: u32 = 16
 
 /// A digest of the bytes given to [Blake3.update], kept with the last block and the last chunk pending so that [Blake3.finish] can mark them.
 pkg struct Blake3 {
-    cv: Array[u32, 8]
+    chunk: Chunk
     chunks: u64
-    block: Array[u8, 64]
-    block_len: usize
-    blocks: u32
     stack: Array[Array[u32, 8], 54]
     depth: usize
 } Blake3
 
+/// The chunk being hashed: its chaining value, its pending block and that block's length, and how many blocks it has compressed.
+pkg struct Chunk derives Copy {
+    cv: Array[u32, 8]
+    block: Array[u8, 64]
+    block_len: usize
+    blocks: u32
+} Chunk
+
 /// The inputs of one compression, which yields a chaining value or, flagged `ROOT`, the digest.
-struct Output derives Copy {
+pkg struct Output derives Copy {
     cv: Array[u32, 8]
     words: Array[u32, 16]
     counter: u64
@@ -35,58 +40,73 @@ struct Output derives Copy {
 } Output
 
 pkg fn Blake3.empty() -> Blake3 {
-    return Blake3(
-        cv: IV,
-        chunks: 0,
-        block: Array[u8, 64].filled(0),
-        block_len: 0,
-        blocks: 0,
-        stack: Array[Array[u32, 8], 54].filled(IV),
-        depth: 0,
-    )
+    return Blake3(chunk: Chunk.empty(), chunks: 0, stack: Array[Array[u32, 8], 54].filled(IV), depth: 0)
 } Blake3.empty
 
 pkg fn Blake3.update(mut self, data: Slice[u8]) {
     for byte in data {
-        if self.block_len == BLOCK_BYTES {
-            mut self.compress_block()
+        if self.chunk.block_len == BLOCK_BYTES and self.chunk.blocks + 1 == CHUNK_BLOCKS {
+            let cv = self.chunk.output(counter: self.chunks).chaining_value()
+            self.chunks += 1
+            mut self.add_chunk(cv)
+            self.chunk = Chunk.empty()
         }
-        self.block[self.block_len] = byte
-        self.block_len += 1
+        mut self.chunk.add(byte, counter: self.chunks)
     }
 } Blake3.update
 
 pkg fn Blake3.finish(self) -> Array[u8, 32] {
-    var output = self.chunk_output()
+    var output = self.chunk.output(counter: self.chunks)
     var depth = self.depth
     while depth > 0 {
         depth -= 1
         output = parent_node(self.stack[depth], right: output.chaining_value())
     }
-    let words = compress(output.cv, words: output.words, counter: 0, block_len: output.block_len, flags: output.flags | ROOT)
+    return output.root()
+} Blake3.finish
+
+pkg fn Chunk.empty() -> Chunk = Chunk(cv: IV, block: Array[u8, 64].filled(0), block_len: 0, blocks: 0)
+
+/// Adds `byte` to the chunk of number `counter`, compressing its full pending block first, which more input follows.
+pkg fn Chunk.add(mut self, byte: u8, counter: u64) {
+    if self.block_len == BLOCK_BYTES {
+        let words = compress(self.cv, words: block_words(self.block), counter, block_len: 64, flags: self.start_flag())
+        self.cv = chaining(words)
+        self.blocks += 1
+        self.block = Array[u8, 64].filled(0)
+        self.block_len = 0
+    }
+    self.block[self.block_len] = byte
+    self.block_len += 1
+} Chunk.add
+
+/// The compression ending the chunk of number `counter`.
+pkg fn Chunk.output(self, counter: u64) -> Output {
+    return Output(
+        cv: self.cv,
+        words: block_words(self.block),
+        counter: counter,
+        block_len: u32.fit(self.block_len),
+        flags: self.start_flag() | CHUNK_END,
+    )
+} Chunk.output
+
+fn Chunk.start_flag(self) -> u32 {
+    if self.blocks == 0 {
+        return CHUNK_START
+    }
+    return 0
+} Chunk.start_flag
+
+/// The digest of the tree this compression is the root of.
+pkg fn Output.root(self) -> Array[u8, 32] {
+    let words = compress(self.cv, words: self.words, counter: 0, block_len: self.block_len, flags: self.flags | ROOT)
     var digest = Array[u8, 32].filled(0)
     for i in 0..<8usize {
         mut digest.view_mut().write_u32_le(4 * i, value: words[i])
     }
     return digest
-} Blake3.finish
-
-/// Compresses the full block buffer, which more input follows, ending the chunk when it is the chunk's last block.
-fn Blake3.compress_block(mut self) {
-    if self.blocks + 1 == CHUNK_BLOCKS {
-        let cv = self.chunk_output().chaining_value()
-        self.chunks += 1
-        mut self.add_chunk(cv)
-        self.cv = IV
-        self.blocks = 0
-    } else {
-        let words = compress(self.cv, words: block_words(self.block), counter: self.chunks, block_len: 64, flags: self.start_flag())
-        self.cv = chaining(words)
-        self.blocks += 1
-    }
-    self.block = Array[u8, 64].filled(0)
-    self.block_len = 0
-} Blake3.compress_block
+} Output.root
 
 /// Merges the chaining value of a finished chunk into the stack of subtrees, the number of finished chunks deciding how many merge.
 fn Blake3.add_chunk(mut self, cv: Array[u32, 8]) {
@@ -100,23 +120,6 @@ fn Blake3.add_chunk(mut self, cv: Array[u32, 8]) {
     self.stack[self.depth] = merged
     self.depth += 1
 } Blake3.add_chunk
-
-fn Blake3.chunk_output(self) -> Output {
-    return Output(
-        cv: self.cv,
-        words: block_words(self.block),
-        counter: self.chunks,
-        block_len: u32.fit(self.block_len),
-        flags: self.start_flag() | CHUNK_END,
-    )
-} Blake3.chunk_output
-
-fn Blake3.start_flag(self) -> u32 {
-    if self.blocks == 0 {
-        return CHUNK_START
-    }
-    return 0
-} Blake3.start_flag
 
 fn Output.chaining_value(self) -> Array[u32, 8] {
     return chaining(compress(self.cv, words: self.words, counter: self.counter, block_len: self.block_len, flags: self.flags))

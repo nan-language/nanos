@@ -19,9 +19,9 @@ pub layout Pool: bytes 4_096 le {
     data: Array[u8, 4_096] at 0
 } Pool
 
-/// The driver's Env: its queue's size, its function, the windows over its common and notification structures, its queue and buffer, its interrupt, the signal that interrupt posts, its clock, its alarm and its cell.
+/// The driver's Env: its queue's ring, its function, the windows over its common and notification structures, its queue and buffer, its interrupt, the signal that interrupt posts, its clock, its alarm and its cell.
 pub open linear struct RngEnv derives Send {
-    size: u16
+    ring: Ring
     function: hw::PciFunction
     common: hw::Mmio[Common]
     notify: hw::Mmio[Notify]
@@ -40,7 +40,7 @@ pub closed struct Asked derives Copy, Eq, Encode {
     pub count: u32
 } Asked
 
-/// The driver's state: the requests waiting, the first of them on the device when `busy`, the available and used indices, the tests of the device's bytes, and whether they failed.
+/// The driver's state: the requests waiting, the first of them on the device when `busy`, the available and used indices, the tests of the device's bytes, whether they failed, and whether the device failed to come back from its suspension.
 pub closed struct Rng derives Encode {
     pub asked: mem::List[Asked]
     pub busy: bool
@@ -48,6 +48,7 @@ pub closed struct Rng derives Encode {
     pub used: u16
     pub tests: SourceTests
     pub failed: bool
+    pub lost: bool
 } Rng
 
 impl Rng: sys::Component[RngEnv, RngDevice]
@@ -55,6 +56,8 @@ impl Rng: sys::Component[RngEnv, RngDevice]
 impl Rng: sys::Resume[RngEnv, RngDevice]
 
 impl Rng: sys::Health[RngEnv, RngDevice]
+
+impl Rng: sys::Suspend[RngEnv, RngDevice]
 
 /// The Env over `function`: its structures mapped, its features negotiated, its queue and buffer drawn from `alloc`, attached to physical memory, and its queue's interrupt on MSI-X entry 0 of CPU 0 under the storm limit; `None` when the device does not allow it, the function then handed back.
 pub fn RngEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[RngEnv] {
@@ -93,18 +96,18 @@ pub fn RngEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: 
     mut irq.limit(per_second: devices::STORM_LIMIT)
     ready(mut regs)
     let pool = hw::DmaShared.of(heap.boxed(Pool.from_bits(Array[u8, 4_096].filled(0))), space: hw::IoSpace.physical())
-    return Some(RngEnv(size: ring.size, function: take held, common: take regs, notify: take notify, queue: take queue, pool: take pool, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, alloc: alloc))
+    return Some(RngEnv(ring: ring, function: take held, common: take regs, notify: take notify, queue: take queue, pool: take pool, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, alloc: alloc))
 } RngEnv.of
 
 /// Resets the device, then releases the interrupt, the windows and the buffers, and hands the function back.
 pub fn RngEnv.abandon(take self) {
-    let RngEnv(size: _, function: function, common: common, notify: notify, queue: queue, pool: pool, irq: irq, signal: _, clock: _, alarm: _, alloc: _) = self
+    let RngEnv(ring: _, function: function, common: common, notify: notify, queue: queue, pool: pool, irq: irq, signal: _, clock: _, alarm: _, alloc: _) = self
     discard take irq.uninstall()
     discard take pool.into_box()
     release(take function, common: Some(take common), notify: Some(take notify), queue: Some(take queue))
 } RngEnv.abandon
 
-pub fn Rng.start(mut env: RngEnv) -> Rng = Rng(asked: mem::List.empty(env.alloc), busy: false, available: 0, used: 0, tests: SourceTests.fresh(), failed: false)
+pub fn Rng.start(mut env: RngEnv) -> Rng = Rng(asked: mem::List.empty(env.alloc), busy: false, available: 0, used: 0, tests: SourceTests.fresh(), failed: false, lost: false)
 
 /// Once started, turns each interrupt into a completion.
 pub fn Rng.resume(mut self, reason: sys::ResumeReason, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
@@ -132,7 +135,7 @@ pub fn Rng.fill(mut self, take count: u32, mut env: RngEnv, mut cx: sys::Cx[RngD
     if count > MOST_BYTES {
         fail devices::DeviceError.TooLarge
     }
-    if self.failed {
+    if self.failed or self.lost {
         fail devices::DeviceError.Io
     }
     let Some(request) = mut cx.postpone() else {
@@ -143,13 +146,49 @@ pub fn Rng.fill(mut self, take count: u32, mut env: RngEnv, mut cx: sys::Cx[RngD
     return Untrusted.of(mem::Bytes.empty(env.alloc))
 } Rng.fill
 
+/// Resets the device, failing the requests waiting with `device.reset`, then puts its function in D3hot.
+pub fn Rng.suspend(mut self, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
+    reset(mut env.common)
+    while self.asked.len() > 0 {
+        let asked = mut self.asked.remove(0)
+        var reply = sys::Encoded.empty(env.alloc)
+        let reset_failure: Result[Untrusted[mem::Bytes], devices::DeviceError] = Err(devices::DeviceError.Reset)
+        mem::wire::Codec[Result[Untrusted[mem::Bytes], devices::DeviceError]].encode(reset_failure, out: mut reply.bytes)
+        discard attempt mut cx.reply(asked.request, reply)
+    }
+    self.busy = false
+    discard attempt mut env.function.set_power(hw::PowerState.Suspended)
+} Rng.suspend
+
+/// Turns the function on and sets the device up again over its emptied queue; a device that does not come back fails every later request with `device.io`.
+pub fn Rng.wake(mut self, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
+    let powered = attempt mut env.function.set_power(hw::PowerState.On)
+    if powered.is_err() or not mut env.restart() {
+        self.lost = true
+    }
+    self.available = 0
+    self.used = 0
+} Rng.wake
+
+/// Resets the device and enables its queue again over its emptied ring; false when it refuses its features.
+fn RngEnv.restart(mut self) -> bool {
+    if not negotiate(mut self.common, features: 0) {
+        return false
+    }
+    mut self.queue.write_release(Queue.avail_index, value: 0)
+    mut self.queue.write_release(Queue.used_index, value: 0)
+    enable(mut self.common, index: 0, ring: self.ring, queue: self.queue, vector: 0)
+    ready(mut self.common)
+    return true
+} RngEnv.restart
+
 /// Answers the request the device completed, then submits the next; raises the alarm instead when the interrupt storms.
 fn Rng.completed(mut self, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
     if env.irq.storming() {
         env.alarm.raise(mut cx, key: INTERRUPTS, vector: 0)
         return
     }
-    let Some(entry) = next_used(mut env.queue, seen: self.used, size: env.size) else {
+    let Some(entry) = next_used(mut env.queue, seen: self.used, size: env.ring.size) else {
         return
     }
     self.used = self.used.wrapping_add(1)
@@ -190,7 +229,7 @@ fn Rng.submit(mut self, mut env: RngEnv) {
         return
     }
     mut env.queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(addr: env.pool.bus_addr().value, len: self.asked[0].count, flags: WRITE, next: 0))
-    self.available = offer(mut env.queue, head: 0, index: self.available, size: env.size)
+    self.available = offer(mut env.queue, head: 0, index: self.available, size: env.ring.size)
     mut env.notify.write(Notify.queue, value: 0)
     self.busy = true
 } Rng.submit

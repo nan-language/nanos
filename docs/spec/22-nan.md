@@ -378,3 +378,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a kernel learns when a vector raises more interrupts than a rate it sets, the vector then masked with its binding kept.
 - **Chapters:** [15](15-devices.md).
 - **Issue:** [nan-language/nan#122](https://github.com/nan-language/nan/issues/122).
+
+## N34
+
+**Writable modules.**
+
+- **Language 1:** `boot::Module.contents` views a module's bytes read-only, and `into_region` gives a region of exactly those bytes, which holds no whole frame for a module smaller than a page (NaN 24 §Start information).
+- **NaN OS requires:** a kernel overwrites what a module holds.
+- **Chapters:** [03](03-boot.md).
+- **Issue:** [nan-language/nan#125](https://github.com/nan-language/nan/issues/125).
