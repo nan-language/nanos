@@ -1,11 +1,11 @@
 //! The NaN OS kernel: the core's entry and start sequence.
 
-/// Copies of the firmware tables the start reads and of those holding the AML namespace, taken before the shared space replaces the entry root that maps them.
+/// Copies of the firmware tables the start reads and of those `devices` reads, taken before the shared space replaces the entry root that maps them.
 struct Tables {
     madt: Option[Untrusted[mem::Bytes]]
     fadt: Option[Untrusted[mem::Bytes]]
     srat: Option[Untrusted[mem::Bytes]]
-    aml: mem::List[keeper::Table]
+    copies: mem::List[keeper::Table]
 } Tables
 
 /// The start sequence: each step that fails halts the kernel with its code. The first task starts every other CPU, prints the start line, then runs the base instances of the image's genesis record.
@@ -21,7 +21,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
         halt(code: "fault.handoff-invalid", subject: "handoff")
     }
     let features = cpu::Features.read(cpu)
-    let tables = Tables(madt: k.acpi_table(acpi::Signature.Madt.bytes(), alloc), fadt: k.acpi_table(acpi::Signature.Fadt.bytes(), alloc), srat: k.acpi_table(acpi::Signature.Srat.bytes(), alloc), aml: aml_tables(k, alloc))
+    let tables = Tables(madt: k.acpi_table(acpi::Signature.Madt.bytes(), alloc), fadt: k.acpi_table(acpi::Signature.Fadt.bytes(), alloc), srat: k.acpi_table(acpi::Signature.Srat.bytes(), alloc), copies: device_tables(k, alloc))
     var regions = mut k.regions()
     for module in take modules {
         insert_region(mut regions, region: take module.into_region())
@@ -42,9 +42,13 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     var roots = take shared.into_roots()
     cpu::enable(cpu, features)
     spaces::install(cpu, root: mut roots.remove(0))
-    if not valid(tables.madt, check: acpi::check_madt) {
+    let Some(madt) = tables.madt else {
         halt(code: "fault.firmware-tables-invalid", subject: "MADT")
     }
+    if not (attempt acpi::check_madt(madt.view())).is_ok() {
+        halt(code: "fault.firmware-tables-invalid", subject: "MADT")
+    }
+    let isa = acpi::isa_routes(madt.view())
     if not valid(tables.fadt, check: acpi::check_fadt) {
         halt(code: "fault.firmware-tables-invalid", subject: "FADT")
     }
@@ -57,8 +61,8 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     let known = image_genesis(bundle, alloc: core)
     let functions = mut k.pci_functions()
     let ports = mut k.pci_ports()
-    let Tables(madt: _, fadt: _, srat: _, aml: aml) = tables
-    let keeper = keeper::Keeper.of(take functions, take ports, tables: take aml, alloc: core)
+    let Tables(madt: _, fadt: _, srat: _, copies: copies) = tables
+    let keeper = keeper::Keeper.of(take functions, take ports, tables: take copies, alloc: core)
     let rings = journal::Rings.of(cpus, clock, alloc: core)
     take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state, take known, take keeper, take rings](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         discard attempt await start_cpus(cpu, take roots, features, state, frames: mut memory.frames, exec)
@@ -69,7 +73,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
             halt(code: "fault.memory-insufficient", subject: "pools")
         }
         let config = runner::Config(exec: exec, pool: pool.alloc(), alloc: core, clock: clock, wall: wall, classes: sched::classes())
-        discard attempt await run_base(take known, take keeper, bundle, boot: devices::BootVolume(scheme: handoff.volume_scheme, partition: handoff.volume_partition, signature: handoff.volume_signature), config, rings, frames: mut memory.frames)
+        discard attempt await run_base(take known, take keeper, bundle, boot: devices::BootVolume(scheme: handoff.volume_scheme, partition: handoff.volume_partition, signature: handoff.volume_signature), isa, config, rings, frames: mut memory.frames)
         let parked = hw::Signal[Unit].empty()
         loop {
             discard attempt await parked.wait()
@@ -77,21 +81,23 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     })
 } main
 
-/// Copies of the DSDT and the SSDT, which hold the AML namespace.
-fn aml_tables(k: boot::Kernel, alloc: mem::Alloc) -> mem::List[keeper::Table] {
+/// Copies of the tables `devices` reads: the DSDT and the SSDT, which hold the AML namespace, and the SPCR, which names the console UART.
+fn device_tables(k: boot::Kernel, alloc: mem::Alloc) -> mem::List[keeper::Table] {
     var tables = mem::List[keeper::Table].empty(alloc)
-    match k.acpi_table(acpi::Signature.Dsdt.bytes(), alloc) {
-        Some(bytes) => mut tables.push(keeper::Table.of(acpi::Signature.Dsdt.bytes(), take bytes))
-        None => {
-        }
-    }
-    match k.acpi_table(acpi::Signature.Ssdt.bytes(), alloc) {
-        Some(bytes) => mut tables.push(keeper::Table.of(acpi::Signature.Ssdt.bytes(), take bytes))
-        None => {
-        }
-    }
+    copy_table(k, signature: acpi::Signature.Dsdt, mut tables, alloc)
+    copy_table(k, signature: acpi::Signature.Ssdt, mut tables, alloc)
+    copy_table(k, signature: acpi::Signature.Spcr, mut tables, alloc)
     return tables
-} aml_tables
+} device_tables
+
+/// Appends a copy of the table of `signature` to `tables` when the firmware has one.
+fn copy_table(k: boot::Kernel, signature: acpi::Signature, mut tables: mem::List[keeper::Table], alloc: mem::Alloc) {
+    match k.acpi_table(signature.bytes(), alloc) {
+        Some(bytes) => mut tables.push(keeper::Table.of(signature.bytes(), take bytes))
+        None => {
+        }
+    }
+} copy_table
 
 /// The handoff record, module 0 of the start information, decoded through its validator.
 fn read_handoff(modules: mem::List[boot::Module]) -> Option[bootfmt::Handoff] {

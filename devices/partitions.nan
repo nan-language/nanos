@@ -13,8 +13,13 @@ const MOST_GPT_ENTRIES: u32 = 128
 
 const GPT_ENTRY_BYTES: u32 = 128
 
-/// The GPT type GUID of an EFI system partition, in the byte order the disk holds it.
-const ESP_GUID: Array[u8, 16] = esp_guid_bytes()
+/// The GPT type GUIDs of an EFI system partition and of a store partition, in the byte order the disk holds them.
+const ESP_GUID: Array[u8, 16] = guid_bytes(b"\x28\x73\x2A\xC1\x1F\xF8\xD2\x11\xBA\x4B\x00\xA0\xC9\x3E\xC9\x3B")
+
+const STORE_GUID: Array[u8, 16] = guid_bytes(b"\x3C\xD2\xCA\xE4\xC4\xFE\xF8\x40\x8D\x0C\x11\x61\xD0\x78\x42\xD6")
+
+/// The name of a store partition.
+const STORE_NAME: Str = "nanos store"
 
 /// What a partition's type is: a GPT type GUID or an MBR type byte, as the disk holds them.
 pub closed enum PartitionType derives Copy, Eq, Encode {
@@ -23,13 +28,14 @@ pub closed enum PartitionType derives Copy, Eq, Encode {
     Whole
 } PartitionType
 
-/// A partition of a unit at `/live/devices/<bus path>/u<n>/p<m>`, m counting from 1 in table order: its type, its GPT unique GUID, and where it lies in blocks, `start` being chapter 15's `first`, a NaN keyword.
+/// A partition of a unit at `/live/devices/<bus path>/u<n>/p<m>`, m counting from 1 in table order: its type, its GPT unique GUID, where it lies in blocks, `start` being chapter 15's `first`, a NaN keyword, and its GPT name, each character outside ASCII as `?`.
 pub closed struct Partition derives Copy, Eq, Encode {
     pub number: u32
     pub kind: PartitionType
     pub unique: Option[Array[u8, 16]]
     pub start: u64
     pub blocks: u64
+    pub name: text::Fixed[36]
 } Partition
 
 /// How a unit is partitioned: by a GPT, by an MBR with its disk signature, as one FAT volume, or not at all.
@@ -62,6 +68,11 @@ pub fn Partition.is_esp(self) -> bool {
         PartitionType.Whole => false
     }
 } Partition.is_esp
+
+/// Whether `partition` is a GPT partition of the store's type and name.
+pub fn Partition.is_store(self) -> bool {
+    return self.kind == PartitionType.Gpt(STORE_GUID) and self.name.as_str() == STORE_NAME
+} Partition.is_store
 
 /// Whether `partition` holds a FAT volume by its MBR type, or covers a FAT unit.
 pub fn Partition.is_fat(self) -> bool {
@@ -139,7 +150,18 @@ pub validator fn gpt_partitions(raw: Untrusted[Slice[u8]], entries: GptEntries, 
         if last < low {
             continue
         }
-        mut partitions.push(Partition(number: u32.fit(partitions.len() + 1), kind: PartitionType.Gpt(kind), unique: Some(unique), start: low, blocks: last - low + 1))
+        var name = text::Fixed[36].empty()
+        for unit in 0..<36usize {
+            let code = fields.u16_le(56 + 2 * unit)
+            if code == 0 {
+                break
+            }
+            mut name.push(match code < 0x80 {
+                true => char.checked_from_bits(u32.widen(code)).value_or('?')
+                false => '?'
+            })
+        }
+        mut partitions.push(Partition(number: u32.fit(partitions.len() + 1), kind: PartitionType.Gpt(kind), unique: Some(unique), start: low, blocks: last - low + 1, name: name))
     }
     return Some(Table(scheme: Scheme.Gpt, partitions: take partitions))
 } gpt_partitions
@@ -152,7 +174,7 @@ pub validator fn mbr_table(raw: Untrusted[Slice[u8]], blocks: u64, alloc: mem::A
         return Table(scheme: Scheme.None, partitions: take partitions)
     }
     if is_fat_boot_sector(bytes) {
-        mut partitions.push(Partition(number: 1, kind: PartitionType.Whole, unique: None, start: 0, blocks: blocks))
+        mut partitions.push(Partition(number: 1, kind: PartitionType.Whole, unique: None, start: 0, blocks: blocks, name: text::Fixed[36].empty()))
         return Table(scheme: Scheme.Fat, partitions: take partitions)
     }
     var protective = false
@@ -167,7 +189,7 @@ pub validator fn mbr_table(raw: Untrusted[Slice[u8]], blocks: u64, alloc: mem::A
         if kind == 0 or kind == PROTECTIVE_TYPE or count == 0 or low >= blocks {
             continue
         }
-        mut partitions.push(Partition(number: u32.fit(partitions.len() + 1), kind: PartitionType.Mbr(kind), unique: None, start: low, blocks: count))
+        mut partitions.push(Partition(number: u32.fit(partitions.len() + 1), kind: PartitionType.Mbr(kind), unique: None, start: low, blocks: count, name: text::Fixed[36].empty()))
     }
     if protective and partitions.len() == 0 {
         return Table(scheme: Scheme.None, partitions: take partitions)
@@ -205,12 +227,12 @@ fn signature_bytes() -> Array[u8, 8] limits pure {
     return signature
 } signature_bytes
 
-/// C12A7328-F81F-11D2-BA4B-00A0C93EC93B, its first three fields little-endian.
-fn esp_guid_bytes() -> Array[u8, 16] limits pure {
+/// The GUID of the 16 bytes `bytes`, its first three fields little-endian as the disk holds them.
+fn guid_bytes(bytes: Slice[u8]) -> Array[u8, 16] limits pure {
     var guid = Array[u8, 16].filled(0)
-    mut guid.view_mut().copy_from(b"\x28\x73\x2A\xC1\x1F\xF8\xD2\x11\xBA\x4B\x00\xA0\xC9\x3E\xC9\x3B")
+    mut guid.view_mut().copy_from(bytes)
     return guid
-} esp_guid_bytes
+} guid_bytes
 
 /// A unit of `blocks` 512-byte blocks whose MBR lists a FAT32 partition from block 2,048.
 fn sample_mbr(alloc: mem::Alloc) -> mem::Bytes {
@@ -252,6 +274,8 @@ test gpts_need_their_crcs for gpt_entries {
     }
     mut entries.view_mut().write_u64_le(32, value: 34)
     mut entries.view_mut().write_u64_le(40, value: 1_057)
+    mut entries.view_mut().write_u16_le(56, value: 0x45)
+    mut entries.view_mut().write_u16_le(58, value: 0x2014)
     let header = 512usize
     for at in 0..<8usize {
         head[header + at] = GPT_SIGNATURE[at]
@@ -275,7 +299,9 @@ test gpts_need_their_crcs for gpt_entries {
         expect false
         return
     }
-    expect table.partitions.len() == 1 and table.partitions[0].is_esp() and table.partitions[0].start == 34 and table.partitions[0].blocks == 1_024
+    expect table.partitions.len() == 1 and table.partitions[0].is_esp() and table.partitions[0].start == 34 and table.partitions[0].blocks == 1_024 and table.partitions[0].name.as_str() == "E?"
+    let store = Partition(number: 2, kind: PartitionType.Gpt(STORE_GUID), unique: None, start: 2_048, blocks: 131_072, name: text::Fixed[36].of(STORE_NAME))
+    expect store.is_store() and not table.partitions[0].is_store()
     entries[40] = 0xFF
     let damaged = gpt_partitions(Untrusted.of(entries.view()), entries: found, alloc)
     expect damaged.is_none()

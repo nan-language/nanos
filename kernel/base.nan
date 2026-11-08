@@ -23,12 +23,13 @@ const CMOS_DRIVER: Str = "drivers::cmos::Cmos"
 
 const AHCI: Str = "drivers::ahci::Ahci"
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, and the boot volume the handoff record names.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, and where the MADT routes each ISA interrupt.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
     bundle: ident::HashValue
     boot: devices::BootVolume
+    isa: Array[acpi::IsaRoute, 16]
 } Base
 
 impl Base: runner::Components
@@ -44,7 +45,7 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
         return Some(os::Protocols(own: sys::Wire[devices::VolumeView].hash(), serves: Some(sys::Wire[devices::Block].hash())))
     }
     if component == FAT {
-        return Some(os::Protocols(own: sys::Wire[fat::Fat].hash(), serves: None))
+        return Some(os::Protocols(own: sys::Wire[fat::FatFiles].hash(), serves: Some(sys::Wire[devices::Fat].hash())))
     }
     if component == VIRTIO_RNG {
         return Some(os::Protocols(own: sys::Wire[drivers::virtio::RngDevice].hash(), serves: Some(sys::Wire[devices::Entropy].hash())))
@@ -75,7 +76,13 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
         let Ok(control) = attempt nanos::Cap[os::Control].get(world.caps, key: "control") else {
             return runner::Ended.EnvIncomplete
         }
-        let env = devices::Env(root: self.root, control: control, bundle: self.bundle, boot: self.boot, clock: world.clock, exec: world.exec, alloc: world.alloc)
+        let Ok(handle) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "fat") else {
+            return runner::Ended.EnvIncomplete
+        }
+        let Some(files) = os::Port[devices::Fat].of(handle) else {
+            return runner::Ended.EnvIncomplete
+        }
+        let env = devices::Env(root: self.root, control: control, bundle: self.bundle, boot: self.boot, clock: world.clock, files: files, exec: world.exec, alloc: world.alloc)
         return try await runner::Driven[devices::Manager, devices::Env, devices::Devices].run(take env, exec: world.exec, alloc: world.alloc, take serving, peers: mem::List.empty(world.alloc), release: fn(take ended: devices::Env) limits stack 512 {
         })
     }
@@ -89,7 +96,14 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
         })
     }
     if component == FAT {
-        return try await runner::Served[fat::Files, fat::Env, fat::Fat].run(take world, take serving)
+        let exec = world.exec
+        let alloc = world.alloc
+        let Ok(env) = attempt fat::Env.build(take world) else {
+            return runner::Ended.EnvIncomplete
+        }
+        var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+        mut peers.push(sys::Wire[devices::Fat].schema(alloc))
+        return try await runner::Driven[fat::Files, fat::Env, fat::FatFiles].run(take env, exec, alloc, take serving, take peers, release: fat::Env.abandon)
     }
     if component == VIRTIO_RNG {
         return try await self.serve_rng(take world, take serving)
@@ -160,28 +174,59 @@ fn Base.serve_nvme(self, take world: nanos::World, take serving: runner::Serving
 fn Base.serve_platform(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
-    var base: Option[u16] = None
+    var resources = mem::List[devices::Resource].empty(alloc)
     match try await self.claimed(world) {
-        Some(devices::Claimed.Platform(resources)) => {
-            base = first_ports(resources)
+        Some(devices::Claimed.Platform(claimed)) => {
+            resources = claimed
         }
         Some(devices::Claimed.Pci(function)) => take function.release()
         None => {
         }
     }
-    let Some(port) = base else {
+    let Some(port) = first_ports(resources) else {
         return runner::Ended.EnvIncomplete
     }
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
     if component == UART_DRIVER {
+        let Some(line) = routed_line(resources, isa: self.isa) else {
+            return runner::Ended.EnvIncomplete
+        }
         let regs = trusted "devices declared the UART_DRIVER's I/O window as the firmware's _CRS gives it, the keeper refuses a window overlapping another device's, and devices binds one driver per device" { hw::Ports[drivers::uart::Regs].map(port: port) }
+        let Some(env) = drivers::uart::UartEnv.of(take regs, line: line.line, edge: line.edge, active_low: line.active_low, alloc) else {
+            return runner::Ended.EnvIncomplete
+        }
         mut peers.push(sys::Wire[devices::Console].schema(alloc))
-        return try await runner::Driven[drivers::uart::Uart, drivers::uart::UartEnv, drivers::uart::UartDevice].run(drivers::uart::UartEnv.of(take regs, alloc), exec, alloc, take serving, take peers, release: drivers::uart::UartEnv.abandon)
+        return try await runner::Driven[drivers::uart::Uart, drivers::uart::UartEnv, drivers::uart::UartDevice].run(take env, exec, alloc, take serving, take peers, release: drivers::uart::UartEnv.abandon)
     }
     let regs = trusted "devices declared the RTC's I/O window as the firmware's _CRS gives it, the keeper refuses a window overlapping another device's, devices binds one driver per device, and the core reads the RTC only before any instance runs" { hw::Ports[drivers::cmos::Regs].map(port: port) }
     mut peers.push(sys::Wire[devices::Rtc].schema(alloc))
     return try await runner::Driven[drivers::cmos::Cmos, drivers::cmos::CmosEnv, drivers::cmos::CmosDevice].run(drivers::cmos::CmosEnv.of(take regs), exec, alloc, take serving, take peers, release: drivers::cmos::CmosEnv.abandon)
 } Base.serve_platform
+
+/// A platform line as `install_platform` takes it: its global system interrupt, its trigger and its polarity.
+struct Routed derives Copy {
+    line: u32
+    edge: bool
+    active_low: bool
+} Routed
+
+/// The first interrupt line of `resources`, an ISA interrupt as `isa` routes it.
+fn routed_line(resources: mem::List[devices::Resource], isa: Array[acpi::IsaRoute, 16]) -> Option[Routed] {
+    for resource in resources {
+        let devices::Resource.Line(number: number, isa: from_isa, edge: edge, active_low: active_low) = resource else {
+            continue
+        }
+        if not from_isa {
+            return Some(Routed(line: number, edge: edge, active_low: active_low))
+        }
+        if number >= 16 {
+            continue
+        }
+        let route = isa[usize.widen(number)]
+        return Some(Routed(line: route.line, edge: route.edge.value_or(edge), active_low: route.active_low.value_or(active_low)))
+    }
+    return None
+} routed_line
 
 /// The first I/O port window of `resources`.
 fn first_ports(resources: mem::List[devices::Resource]) -> Option[u16] {
@@ -266,6 +311,7 @@ fn image_genesis(bundle: ident::HashValue, alloc: mem::Alloc) -> runner::Known {
     var managing = os::InstanceSpec.of(principal: principal("system"), bundle, component: DEVICES, alloc)
     discard mut managing.grants.insert(text::String.of("control", alloc), value: 2)
     discard mut managing.grants.insert(text::String.of("clock", alloc), value: 3)
+    discard mut managing.wiring.insert(text::String.of("fat", alloc), value: os::Wire.to(moniker("fat")))
     var filing = os::InstanceSpec.of(principal: principal("system"), bundle, component: FAT, alloc)
     discard mut filing.wiring.insert(text::String.of("volume", alloc), value: os::Wire(target: os::Target.Role(os::Role.BootVolume), operations: None, credit: os::Credit(messages: 64, calls: 64)))
     var specs = mem::Map[ident::Moniker, os::InstanceSpec].empty(alloc)
@@ -286,6 +332,7 @@ fn run_base(
     take keeper: keeper::Keeper,
     bundle: ident::HashValue,
     boot: devices::BootVolume,
+    isa: Array[acpi::IsaRoute, 16],
     config: runner::Config,
     rings: journal::Rings,
     mut frames: frames::Frames,
@@ -294,7 +341,7 @@ fn run_base(
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
     let minted = devices::MintedRoot.of(orders, alloc: config.alloc)
     defer take minted.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot)
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa)
     var requested = incoming
     var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered))
     defer abandon_given(take given)
@@ -434,7 +481,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unserved
     let minted = devices::MintedRoot.of(orders, alloc)
     defer take minted.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)))
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)))
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)

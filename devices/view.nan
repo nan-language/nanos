@@ -1,6 +1,6 @@
 //! Volume views: instances serving `Block` with one unit, 0, over a range of a unit of their driver, which they check every request against before forwarding it.
 
-/// The keys of the keyed tasks forwarding postponed requests, the request's number added.
+/// The keys of the keyed tasks forwarding postponed requests, the number of the slot each runs in added: a slot serves again once its task has posted its reply.
 const FORWARDING: u64 = 0x1_0000
 
 /// What a view serves: `Block`'s operations, the range `devices` sets, and the replies of its driver.
@@ -12,7 +12,7 @@ pub protocol VolumeView {
     pub fn discard_blocks(unit: u16, block: u64, count: u32) fails DeviceError limits irreversible(emit, actuate, erase, spend)
     /// Covers `blocks` blocks of the driver's unit `unit` from `start`.
     pub fn cover(unit: u16, start: u64, blocks: u64) limits recorded
-    fn forwarded(request: u64, reply: mem::Bytes) limits recorded
+    fn forwarded(slot: u64, request: u64, reply: mem::Bytes) limits recorded
 } VolumeView
 
 /// The Env of a view: the port of its driver, and its cell.
@@ -30,9 +30,11 @@ pub closed struct Range derives Copy, Eq, Encode {
     pub blocks: u64
 } Range
 
-/// A view's state: its range once `devices` sets it.
+/// A view's state: its range once `devices` sets it, the slots of forwarding tasks free to serve again, and how many slots there are.
 pub closed struct View derives Encode {
     pub range: Option[Range]
+    pub free: mem::List[u64]
+    pub slots: u64
 } View
 
 impl View: sys::Component[ViewEnv, VolumeView]
@@ -45,7 +47,7 @@ pub fn ViewEnv.build(take world: nanos::World) -> ViewEnv fails nanos::CapError 
     return ViewEnv(disk: disk, alloc: world.alloc)
 } ViewEnv.build
 
-pub fn View.start(mut env: ViewEnv) -> View = View(range: None)
+pub fn View.start(mut env: ViewEnv) -> View = View(range: None, free: mem::List.empty(env.alloc), slots: 0)
 
 pub fn View.cover(
     mut self,
@@ -64,7 +66,8 @@ pub fn View.info(mut self, take unit: u16, mut env: ViewEnv, mut cx: sys::Cx[Vol
     let disk = env.disk
     let alloc = env.alloc
     let request = try postponed(mut cx)
-    mut cx.spawn(key: FORWARDING + request, run: fn(out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
+    let slot = mut self.slot()
+    mut cx.spawn(key: FORWARDING + slot, run: fn(out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
         var call = sys::Encoded.empty(alloc)
         let reply = sys::Wire[Block].info(mut call, unit: range.unit)
         let answer: Result[BlockInfo, DeviceError] = match attempt await disk.call(take call, reply, alloc) {
@@ -73,7 +76,7 @@ pub fn View.info(mut self, take unit: u16, mut env: ViewEnv, mut cx: sys::Cx[Vol
         }
         var bytes = mem::Bytes.empty(alloc)
         mem::wire::Codec[Result[BlockInfo, DeviceError]].encode(answer, out: mut bytes)
-        discard attempt await out.forwarded(request, reply: take bytes)
+        discard attempt await out.forwarded(slot, request, reply: take bytes)
     })
     return BlockInfo(units: 1, block_bytes: 0, blocks: 0, max_transfer_bytes: 0, zone_blocks: 0, cache: false, fua: false, discards: false, read_only: false)
 } View.info
@@ -90,7 +93,8 @@ pub fn View.read(
     let disk = env.disk
     let alloc = env.alloc
     let request = try postponed(mut cx)
-    mut cx.spawn(key: FORWARDING + request, run: fn(out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
+    let slot = mut self.slot()
+    mut cx.spawn(key: FORWARDING + slot, run: fn(out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
         var call = sys::Encoded.empty(alloc)
         let reply = sys::Wire[Block].read(mut call, unit: range.unit, block: range.start + block, count)
         let answer: Result[Untrusted[mem::Bytes], DeviceError] = match attempt await disk.call(take call, reply, alloc) {
@@ -99,7 +103,7 @@ pub fn View.read(
         }
         var bytes = mem::Bytes.empty(alloc)
         mem::wire::Codec[Result[Untrusted[mem::Bytes], DeviceError]].encode(answer, out: mut bytes)
-        discard attempt await out.forwarded(request, reply: take bytes)
+        discard attempt await out.forwarded(slot, request, reply: take bytes)
     })
     return Untrusted.of(mem::Bytes.empty(env.alloc))
 } View.read
@@ -118,14 +122,15 @@ pub fn View.write(
     let alloc = env.alloc
     var held = Some(take data)
     let request = try postponed(mut cx)
-    mut cx.spawn(key: FORWARDING + request, run: fn[take held](out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
+    let slot = mut self.slot()
+    mut cx.spawn(key: FORWARDING + slot, run: fn[take held](out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
         var written = held
         let Some(blocks) = mut written.extract() else {
             return
         }
         var call = sys::Encoded.empty(alloc)
         let reply = sys::Wire[Block].write(mut call, unit: range.unit, block: range.start + block, data: take blocks, fua)
-        try await forward_unit(disk, take call, reply, request, out, alloc)
+        try await forward_unit(disk, take call, reply, slot, request, out, alloc)
     })
 } View.write
 
@@ -134,10 +139,11 @@ pub fn View.flush(mut self, take unit: u16, mut env: ViewEnv, mut cx: sys::Cx[Vo
     let disk = env.disk
     let alloc = env.alloc
     let request = try postponed(mut cx)
-    mut cx.spawn(key: FORWARDING + request, run: fn(out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
+    let slot = mut self.slot()
+    mut cx.spawn(key: FORWARDING + slot, run: fn(out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
         var call = sys::Encoded.empty(alloc)
         let reply = sys::Wire[Block].flush(mut call, unit: range.unit)
-        try await forward_unit(disk, take call, reply, request, out, alloc)
+        try await forward_unit(disk, take call, reply, slot, request, out, alloc)
     })
 } View.flush
 
@@ -153,20 +159,23 @@ pub fn View.discard_blocks(
     let disk = env.disk
     let alloc = env.alloc
     let request = try postponed(mut cx)
-    mut cx.spawn(key: FORWARDING + request, run: fn(out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
+    let slot = mut self.slot()
+    mut cx.spawn(key: FORWARDING + slot, run: fn(out: sys::Outbox[VolumeView]) fails task::Cancelled uses wait limits stack 16_384 {
         var call = sys::Encoded.empty(alloc)
         let reply = sys::Wire[Block].discard_blocks(mut call, unit: range.unit, block: range.start + block, count)
-        try await forward_unit(disk, take call, reply, request, out, alloc)
+        try await forward_unit(disk, take call, reply, slot, request, out, alloc)
     })
 } View.discard_blocks
 
 fn View.forwarded(
     mut self,
+    take slot: u64,
     take request: u64,
     take reply: mem::Bytes,
     mut env: ViewEnv,
     mut cx: sys::Cx[VolumeView],
     ) {
+    mut self.free.push(slot)
     let encoded = sys::Encoded(bytes: take reply, handles: mem::List.empty(env.alloc))
     discard attempt mut cx.reply(request, reply: encoded)
 } View.forwarded
@@ -182,7 +191,18 @@ fn View.range_for(self, unit: u16, block: u64, count: u64) -> Range fails Device
     return range
 } View.range_for
 
-/// The number of the request the handler postpones, which a keyed task of its own forwards.
+/// The slot a new forwarding task runs in: a free one, else a new one.
+fn View.slot(mut self) -> u64 {
+    match mut self.free.pop() {
+        Some(slot) => return slot
+        None => {
+            self.slots += 1
+            return self.slots - 1
+        }
+    }
+} View.slot
+
+/// The number of the request the handler postpones, which a keyed task forwards.
 fn postponed(mut cx: sys::Cx[VolumeView]) -> u64 fails DeviceError {
     let Some(request) = mut cx.postpone() else {
         fail DeviceError.Io
@@ -190,11 +210,12 @@ fn postponed(mut cx: sys::Cx[VolumeView]) -> u64 fails DeviceError {
     return request
 } postponed
 
-/// Forwards a call whose reply is `Unit`, posting its encoding for the request `request`.
+/// Forwards a call whose reply is `Unit`, posting its encoding for the request `request` from the slot `slot`.
 fn forward_unit(
     disk: os::Port[Block],
     take call: sys::Encoded,
     reply: sys::Reply[Unit, DeviceError],
+    slot: u64,
     request: u64,
     out: sys::Outbox[VolumeView],
     alloc: mem::Alloc,
@@ -205,7 +226,7 @@ fn forward_unit(
     }
     var bytes = mem::Bytes.empty(alloc)
     mem::wire::Codec[Result[Unit, DeviceError]].encode(answer, out: mut bytes)
-    discard attempt await out.forwarded(request, reply: take bytes)
+    discard attempt await out.forwarded(slot, request, reply: take bytes)
 } forward_unit
 
 /// The device failure a port failure gives: the driver's own, else `device.reset` once the driver no longer serves.

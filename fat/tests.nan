@@ -1,16 +1,20 @@
-//! Tests of the file system on an in-memory FAT16 volume.
+//! Tests of the file system on in-memory FAT16 and FAT12 volumes.
 
-/// A volume in memory: 8,192 blocks of 512 bytes.
+/// A volume in memory: its blocks of 512 bytes.
 struct MemoryDisk {
     bytes: task::Cown[mem::Bytes]
+    blocks: u64
 } MemoryDisk
 
 impl MemoryDisk: Storage
 
+/// The blocks of the FAT16 and of the FAT12 test volume.
 const TEST_BLOCKS: u64 = 8_192
 
+const FAT12_BLOCKS: u64 = 2_048
+
 fn MemoryDisk.geometry(self, alloc: mem::Alloc) -> devices::BlockInfo {
-    return devices::BlockInfo(units: 1, block_bytes: 512, blocks: TEST_BLOCKS, max_transfer_bytes: 65_536, zone_blocks: 0, cache: false, fua: false, discards: false, read_only: false)
+    return devices::BlockInfo(units: 1, block_bytes: 512, blocks: self.blocks, max_transfer_bytes: 65_536, zone_blocks: 0, cache: false, fua: false, discards: false, read_only: false)
 } MemoryDisk.geometry
 
 fn MemoryDisk.read(self, block: u64, count: u32, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails Failure uses wait {
@@ -44,9 +48,17 @@ fn slice_of(bytes: mem::Bytes, start: usize, length: usize, alloc: mem::Alloc) -
     return copied
 } slice_of
 
-/// A blank FAT16 volume: 1 reserved block, two FATs of 32 blocks, 512 root entries and a block per cluster.
-fn formatted(alloc: mem::Alloc) -> MemoryDisk {
-    var bytes = mem::Bytes.zeroed(usize.widen(TEST_BLOCKS) * 512, alloc)
+/// A blank volume of 1 reserved block, two FATs, 512 root entries and a block per cluster: FAT16 over `TEST_BLOCKS` blocks with FATs of 32, or FAT12 over `FAT12_BLOCKS` with FATs of 6.
+fn formatted(kind: Variant, alloc: mem::Alloc) -> MemoryDisk {
+    let blocks = match kind {
+        Variant.Fat12 => FAT12_BLOCKS
+        else => TEST_BLOCKS
+    }
+    let fat_blocks: usize = match kind {
+        Variant.Fat12 => 6
+        else => 32
+    }
+    var bytes = mem::Bytes.zeroed(usize.widen(blocks) * 512, alloc)
     bytes[0] = 0xEB
     bytes[1] = 0x3C
     bytes[2] = 0x90
@@ -55,17 +67,21 @@ fn formatted(alloc: mem::Alloc) -> MemoryDisk {
     mut bytes.view_mut().write_u16_le(14, value: 1)
     bytes[16] = 2
     mut bytes.view_mut().write_u16_le(17, value: 512)
-    mut bytes.view_mut().write_u16_le(19, value: u16.fit(TEST_BLOCKS))
+    mut bytes.view_mut().write_u16_le(19, value: u16.fit(blocks))
     bytes[21] = 0xF8
-    mut bytes.view_mut().write_u16_le(22, value: 32)
+    mut bytes.view_mut().write_u16_le(22, value: u16.fit(fat_blocks))
     bytes[510] = 0x55
     bytes[511] = 0xAA
     for fat in 0..<2usize {
-        let at = 512 + fat * 32 * 512
-        mut bytes.view_mut().write_u16_le(at, value: 0xFFF8)
-        mut bytes.view_mut().write_u16_le(at + 2, value: 0xFFFF)
+        let at = 512 + fat * fat_blocks * 512
+        bytes[at] = 0xF8
+        bytes[at + 1] = 0xFF
+        bytes[at + 2] = 0xFF
+        if kind == Variant.Fat16 {
+            bytes[at + 3] = 0xFF
+        }
     }
-    return MemoryDisk(bytes: task::Cown.of(take bytes, alloc))
+    return MemoryDisk(bytes: task::Cown.of(take bytes, alloc), blocks: blocks)
 } formatted
 
 fn pattern(length: usize, seed: u8, alloc: mem::Alloc) -> mem::Bytes {
@@ -125,13 +141,13 @@ fn written(disk: MemoryDisk, alloc: mem::Alloc) -> Written fails Failure uses wa
 test files_are_written_whole_and_read_back_by_any_case for Volume.write_file {
     let world = testing::world()
     let alloc = world.alloc
-    let seen = try await written(formatted(alloc), alloc)
+    let seen = try await written(formatted(kind: Variant.Fat16, alloc), alloc)
     expect seen == Written(read_back: true, across_case: true, long_listed: true, replaced: true, overwritten: true)
 } files_are_written_whole_and_read_back_by_any_case
 
 /// What the allocation test saw: the allocated file's extent, whether a second allocation found it, whether removing it freed the path, and whether a missing file was not found.
 struct Allocated derives Copy, Eq {
-    extent: Extent
+    extent: devices::Extent
     exists: bool
     removed: bool
     missing: bool
@@ -146,10 +162,10 @@ fn allocated(disk: MemoryDisk, alloc: mem::Alloc) -> Allocated fails Failure use
     try await mut volume.remove_file(disk, path: "/nanos/store.img", alloc)
     let gone = attempt await mut volume.read_file(disk, path: "/nanos/store.img", offset: 0, count: 1, alloc)
     let missing = attempt await mut volume.read_file(disk, path: "/nothing", offset: 0, count: 1, alloc)
-    return Allocated(extent: extent, exists: is_failure(again, wanted: FatError.Exists), removed: is_failure(gone, wanted: FatError.NotFound), missing: is_failure(missing, wanted: FatError.NotFound))
+    return Allocated(extent: extent, exists: is_failure(again, wanted: devices::FatError.Exists), removed: is_failure(gone, wanted: devices::FatError.NotFound), missing: is_failure(missing, wanted: devices::FatError.NotFound))
 } allocated
 
-fn is_failure[T](outcome: Result[T, Failure], wanted: FatError) -> bool {
+fn is_failure[T](outcome: Result[T, Failure], wanted: devices::FatError) -> bool {
     return match outcome {
         Err(Failure.Fat(error)) => error == wanted
         else => false
@@ -159,7 +175,7 @@ fn is_failure[T](outcome: Result[T, Failure], wanted: FatError) -> bool {
 test allocated_files_are_contiguous for Volume.allocate_file {
     let world = testing::world()
     let alloc = world.alloc
-    let seen = try await allocated(formatted(alloc), alloc)
+    let seen = try await allocated(formatted(kind: Variant.Fat16, alloc), alloc)
     expect seen.extent.blocks == 40 and seen.exists and seen.removed and seen.missing
 } allocated_files_are_contiguous
 
@@ -177,6 +193,49 @@ fn lost(disk: MemoryDisk, alloc: mem::Alloc) -> Array[u32, 2] fails Failure uses
 test mounting_frees_clusters_no_entry_reaches for Volume.free_lost {
     let world = testing::world()
     let alloc = world.alloc
-    let seen = try await lost(formatted(alloc), alloc)
+    let seen = try await lost(formatted(kind: Variant.Fat16, alloc), alloc)
     expect seen[0] == END and seen[1] == 0
 } mounting_frees_clusters_no_entry_reaches
+
+/// The free bytes of a blank volume, then once a file of three clusters is written.
+fn free_after_write(disk: MemoryDisk, alloc: mem::Alloc) -> Array[u64, 2] fails Failure uses wait {
+    var volume = try await mount(disk, alloc)
+    var seen = Array[u64, 2].filled(0)
+    seen[0] = try await volume.free_bytes(disk, alloc)
+    try await mut volume.write_file(disk, path: "/three.bin", data: pattern(1_500, seed: 5, alloc).view(), alloc)
+    seen[1] = try await volume.free_bytes(disk, alloc)
+    return seen
+} free_after_write
+
+test free_bytes_count_free_clusters for Volume.free_bytes {
+    let world = testing::world()
+    let alloc = world.alloc
+    let seen = try await free_after_write(formatted(kind: Variant.Fat16, alloc), alloc)
+    expect seen[0] == (TEST_BLOCKS - 97) * 512 and seen[1] == seen[0] - 3 * 512
+} free_bytes_count_free_clusters
+
+/// What the FAT12 test saw: the extent of a file whose chain crosses the first FAT block, whether both FATs then held the same bytes, and whether removing the file freed every cluster it took.
+struct Straddled derives Copy, Eq {
+    extent: devices::Extent
+    mirrored: bool
+    freed: bool
+} Straddled
+
+fn straddled(disk: MemoryDisk, alloc: mem::Alloc) -> Straddled fails Failure uses wait {
+    var volume = try await mount(disk, alloc)
+    let before = try await volume.free_bytes(disk, alloc)
+    try await mut volume.allocate_file(disk, path: "/run.bin", bytes: 400 * 512, alloc)
+    let extent = try await mut volume.extent_of(disk, path: "/run.bin", alloc)
+    let primary = try await disk.read(1, count: 6, alloc)
+    let mirror = try await disk.read(7, count: 6, alloc)
+    try await mut volume.remove_file(disk, path: "/run.bin", alloc)
+    let after = try await volume.free_bytes(disk, alloc)
+    return Straddled(extent: extent, mirrored: plain(primary.view(), alloc) == plain(mirror.view(), alloc), freed: after == before)
+} straddled
+
+test fat12_chains_cross_fat_blocks for Volume.set_links {
+    let world = testing::world()
+    let alloc = world.alloc
+    let seen = try await straddled(formatted(kind: Variant.Fat12, alloc), alloc)
+    expect seen.extent.blocks == 400 and seen.mirrored and seen.freed
+} fat12_chains_cross_fat_blocks

@@ -1,7 +1,7 @@
-//! The `uart` driver: a 16550 serving `Console`, polling its FIFOs every 10 ms while output is queued or a read waits, its line settings as the firmware left them.
+//! The `uart` driver: a 16550 serving `Console`, receiving and transmitting by interrupt on its platform line, its line settings as the firmware left them.
 
-/// How often the driver polls while it has work.
-const POLL_MS: u64 = 10
+/// The keys of the keyed tasks: the one turning interrupts into messages.
+const INTERRUPTS: u64 = 1
 
 /// The most bytes one write carries, the most queued, and the most a reserved write goes behind on the line it interrupts.
 const MOST_WRITE: usize = 4_096
@@ -10,18 +10,31 @@ const MOST_QUEUED: usize = 65_536
 
 const LINE_LIMIT: u32 = 256
 
-/// The most received bytes the driver holds before it drops more.
+/// The most received bytes the driver holds before it drops more, and the most one interrupt drains.
 const MOST_INPUT: usize = 65_536
 
+const MOST_DRAINED: usize = 256
+
 /// The bytes a transmit FIFO takes once empty.
-const FIFO_BYTES: u32 = 16
+const FIFO_BYTES: usize = 16
 
 /// The line status bits: a byte received, and the transmit FIFO empty.
 const DATA_READY: u8 = 0x01
 
 const TRANSMIT_EMPTY: u8 = 0x20
 
-contribute devices::drivers uart = devices::Registration(name: "uart", matches: devices::matches(devices::DeviceMatch.AcpiId(devices::acpi_id("PNP0501")), rest: devices::DeviceMatch.None), class: devices::Class.Console, component: "drivers::uart::Uart", priority: 0)
+/// The interrupts the driver enables: bytes received or the receive FIFO timed out, and the transmit FIFO empty.
+const RECEIVED: u8 = 0x01
+
+const EMPTIED: u8 = 0x02
+
+/// The FIFOs on and cleared, the receive FIFO interrupting at 8 bytes.
+const FIFO_CONTROL: u8 = 0x87
+
+/// DTR and RTS raised, and OUT2, which connects the UART's interrupt to its line.
+const MODEM_CONTROL: u8 = 0x0B
+
+contribute devices::drivers uart = devices::Registration(name: text::Fixed[20].of("uart"), matches: devices::matches(devices::DeviceMatch.AcpiId(text::Fixed[8].of("PNP0501")), rest: devices::DeviceMatch.None), class: devices::Class.Console, component: text::Fixed[48].of("drivers::uart::Uart"), priority: 0)
 
 /// The registers of a 16550, from its first port.
 pub registers Regs {
@@ -32,18 +45,33 @@ pub registers Regs {
     line_status: u8 at 5 read
 } Regs
 
-/// What the driver serves: `Console`'s operations, and its polls.
+/// What the driver serves: `Console`'s operations, and the interrupts its keyed task reports.
 pub protocol UartDevice {
     pub fn write(data: mem::Bytes) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn read(max: u32) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn write_reserved(data: mem::Bytes) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn read_reserved(max: u32) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
-    fn poll() limits irreversible(emit, actuate, erase, spend)
+    fn interrupted() limits irreversible(emit, actuate, erase, spend)
 } UartDevice
 
-/// The driver's Env: the UART's ports, and its cell.
-pub open linear struct UartEnv derives Send {
+/// What the UART's interrupt fn holds: its ports, and the signal the driver's keyed task waits on.
+linear struct Chip {
     regs: hw::Ports[Regs]
+    signal: mem::Shared[hw::Signal[Unit]]
+} Chip
+
+/// Quiets the UART, its interrupts off until the driver has served them, and posts the signal.
+interrupt fn Chip.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limits stack 512 {
+    mut self.regs.write(Regs.interrupts, value: 0)
+    self.signal.contents().post(irq.irqs_disabled(), value: Unit)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} Chip.on_irq
+
+/// The driver's Env: the UART behind its interrupt, the signal that interrupt posts, and its cell.
+pub open linear struct UartEnv derives Send {
+    irq: hw::IrqShared[Chip]
+    signal: mem::Shared[hw::Signal[Unit]]
     alloc: mem::Alloc
 } UartEnv
 
@@ -59,7 +87,7 @@ pub closed struct Writer derives Encode {
     pub data: mem::Bytes
 } Writer
 
-/// The driver's state: the output queued and the reserved output, the bytes of queued output sent since its last line feed, the bytes received, the reads and writes waiting, and whether a poll is due.
+/// The driver's state: the output queued and the reserved output, the bytes of queued output sent since its last line feed, the bytes received, and the reads and writes waiting.
 pub closed struct Uart derives Encode {
     pub queued: mem::Bytes
     pub reserved: mem::Bytes
@@ -68,26 +96,69 @@ pub closed struct Uart derives Encode {
     pub reader: Option[Reader]
     pub reserved_reader: Option[Reader]
     pub writers: mem::List[Writer]
-    pub polling: bool
 } Uart
 
 impl Uart: sys::Component[UartEnv, UartDevice]
 
-/// The Env over the UART at `regs`: its interrupts off, its FIFOs on and cleared, DTR and RTS raised.
-pub fn UartEnv.of(take regs: hw::Ports[Regs], alloc: mem::Alloc) -> UartEnv {
+impl Uart: sys::Resume[UartEnv, UartDevice]
+
+/// The Env over the UART at `regs` on the platform `line`: its FIFOs on and cleared, DTR, RTS and OUT2 raised, and its receive interrupt enabled once the line is installed; `None` when the line is refused.
+pub fn UartEnv.of(
+    take regs: hw::Ports[Regs],
+    line: u32,
+    edge: bool,
+    active_low: bool,
+    alloc: mem::Alloc,
+    ) -> Option[UartEnv] {
     var ports = regs
     mut ports.write(Regs.interrupts, value: 0)
-    mut ports.write(Regs.fifo, value: 0x87)
-    mut ports.write(Regs.modem, value: 0x03)
-    return UartEnv(regs: take ports, alloc: alloc)
+    mut ports.write(Regs.fifo, value: FIFO_CONTROL)
+    mut ports.write(Regs.modem, value: MODEM_CONTROL)
+    let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
+    let irq = match hw::IrqShared.install_platform(Chip(regs: take ports, signal: signal.share()), line, edge, active_low, on_irq: Chip.on_irq) {
+        Ok(shared) => shared
+        Err(refused) => {
+            let hw::MsiRefusal(dev: Chip(regs: left, signal: _), error: _) = refused
+            take left.unmap()
+            return None
+        }
+    }
+    enable(irq, enabled: RECEIVED)
+    return Some(UartEnv(irq: take irq, signal: take signal, alloc: alloc))
 } UartEnv.of
 
+/// Turns the UART's interrupts off, releases its line and its ports.
 pub fn UartEnv.abandon(take self) {
-    let UartEnv(regs: regs, alloc: _) = self
-    take regs.unmap()
+    let UartEnv(irq: irq, signal: _, alloc: _) = self
+    let Chip(regs: regs, signal: _) = take irq.uninstall()
+    var ports = regs
+    mut ports.write(Regs.interrupts, value: 0)
+    take ports.unmap()
 } UartEnv.abandon
 
-pub fn Uart.start(mut env: UartEnv) -> Uart = Uart(queued: mem::Bytes.empty(env.alloc), reserved: mem::Bytes.empty(env.alloc), line: 0, input: mem::Bytes.empty(env.alloc), reader: None, reserved_reader: None, writers: mem::List.empty(env.alloc), polling: false)
+/// Enables the UART's interrupts `enabled`.
+fn enable(irq: hw::IrqShared[Chip], enabled: u8) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        irq.with(t, body: fn(mut chip: Chip) limits notrap, terminates, noalloc {
+            mut chip.regs.write(Regs.interrupts, value: enabled)
+        })
+    })
+} enable
+
+/// Has a keyed task send `interrupted` for each interrupt of the UART.
+pub fn Uart.resume(mut self, reason: sys::ResumeReason, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) {
+    let signal = env.signal.share()
+    mut cx.spawn(key: INTERRUPTS, run: fn[take signal](out: sys::Outbox[UartDevice]) fails task::Cancelled uses wait limits stack 8_192 {
+        loop {
+            try await signal.contents().wait()
+            if (attempt await out.interrupted()).is_err() {
+                return
+            }
+        }
+    })
+} Uart.resume
+
+pub fn Uart.start(mut env: UartEnv) -> Uart = Uart(queued: mem::Bytes.empty(env.alloc), reserved: mem::Bytes.empty(env.alloc), line: 0, input: mem::Bytes.empty(env.alloc), reader: None, reserved_reader: None, writers: mem::List.empty(env.alloc))
 
 /// Queues `data`, waiting while the queue holds 64 KiB.
 pub fn Uart.write(mut self, take data: mem::Bytes, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) fails devices::DeviceError {
@@ -102,7 +173,7 @@ pub fn Uart.write(mut self, take data: mem::Bytes, mut env: UartEnv, mut cx: sys
         }
         mut self.writers.push(Writer(request: request, data: take data))
     }
-    mut self.wake(mut cx)
+    mut self.serve(mut env, mut cx)
 } Uart.write
 
 /// Queues `data` on the reserved lane, ahead of queued output.
@@ -111,12 +182,11 @@ pub fn Uart.write_reserved(mut self, take data: mem::Bytes, mut env: UartEnv, mu
         fail devices::DeviceError.TooLarge
     }
     mut self.reserved.append(data.view())
-    mut self.wake(mut cx)
+    mut self.serve(mut env, mut cx)
 } Uart.write_reserved
 
 /// From 1 to `max` received bytes, once any arrive and no reserved read waits.
 pub fn Uart.read(mut self, take max: u32, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) -> Untrusted[mem::Bytes] fails devices::DeviceError {
-    mut self.receive(mut env)
     if self.reader.is_none() and self.reserved_reader.is_none() and self.input.len() > 0 and max > 0 {
         return Untrusted.of(mut self.take_input(max, alloc: env.alloc))
     }
@@ -124,13 +194,11 @@ pub fn Uart.read(mut self, take max: u32, mut env: UartEnv, mut cx: sys::Cx[Uart
         fail devices::DeviceError.Reset
     }
     self.reader = Some(Reader(request: request, max: max))
-    mut self.wake(mut cx)
     return Untrusted.of(mem::Bytes.empty(env.alloc))
 } Uart.read
 
 /// From 1 to `max` received bytes on the reserved lane, which takes every byte while it waits.
 pub fn Uart.read_reserved(mut self, take max: u32, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) -> Untrusted[mem::Bytes] fails devices::DeviceError {
-    mut self.receive(mut env)
     if self.reserved_reader.is_none() and self.input.len() > 0 and max > 0 {
         return Untrusted.of(mut self.take_input(max, alloc: env.alloc))
     }
@@ -138,68 +206,109 @@ pub fn Uart.read_reserved(mut self, take max: u32, mut env: UartEnv, mut cx: sys
         fail devices::DeviceError.Reset
     }
     self.reserved_reader = Some(Reader(request: request, max: max))
-    mut self.wake(mut cx)
     return Untrusted.of(mem::Bytes.empty(env.alloc))
 } Uart.read_reserved
 
-/// Receives and transmits what the FIFOs allow, answers the reads and writes it can, and polls again while work is left.
-fn Uart.poll(mut self, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) {
-    self.polling = false
-    mut self.receive(mut env)
-    mut self.transmit(mut env)
+/// Serves the UART after its interrupt.
+fn Uart.interrupted(mut self, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) {
+    mut self.serve(mut env, mut cx)
+} Uart.interrupted
+
+/// Takes the bytes received, fills the transmit FIFO once it is empty, enables the interrupts the work left needs, then answers the reads and writes it can.
+fn Uart.serve(mut self, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) {
+    let next = self.next_output()
+    let pending = self.queued.len() + self.reserved.len()
+    let done = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Exchanged limits notrap, terminates {
+        return env.irq.with(t, body: fn(mut chip: Chip) -> Exchanged limits notrap, terminates, noalloc {
+            return mut chip.exchange(next, pending)
+        })
+    })
+    for at in 0..<done.received {
+        if self.input.len() < MOST_INPUT {
+            mut self.input.push(done.bytes[at])
+        }
+    }
+    if done.sent {
+        mut self.consume(next, alloc: env.alloc)
+    }
     mut self.answer_reads(env.alloc, mut cx)
     mut self.admit_writers(env.alloc, mut cx)
-    mut self.wake(mut cx)
-} Uart.poll
+} Uart.serve
 
-/// Schedules a poll when output is queued or a read waits and none is due.
-fn Uart.wake(mut self, mut cx: sys::Cx[UartDevice]) {
-    let busy = self.queued.len() > 0 or self.reserved.len() > 0 or self.reader.is_some() or self.reserved_reader.is_some() or self.writers.len() > 0
-    if busy and not self.polling {
-        self.polling = true
-        mut cx.after(ms: POLL_MS, send: UartDevice.poll())
-    }
-} Uart.wake
+/// The bytes the transmit FIFO takes next: reserved output once the current line ends or has run 256 bytes, else queued output, how many of each, and the length of the line after them.
+struct Output derives Copy {
+    bytes: Array[u8, FIFO_BYTES]
+    count: usize
+    reserved: usize
+    queued: usize
+    line: u32
+} Output
 
-/// Moves the bytes the receive FIFO holds to the input, dropping those past its limit.
-fn Uart.receive(mut self, mut env: UartEnv) {
-    var drained: u32 = 0
-    while drained < MOST_INPUT_POLL and (mut env.regs.read(Regs.line_status) & DATA_READY) != 0 {
-        let byte = mut env.regs.read(Regs.data)
-        if self.input.len() < MOST_INPUT {
-            mut self.input.push(byte)
-        }
-        drained += 1
-    }
-} Uart.receive
+/// What one exchange with the UART did: the bytes it received and how many, and whether it sent the output it was given.
+struct Exchanged derives Copy {
+    bytes: Array[u8, MOST_DRAINED]
+    received: usize
+    sent: bool
+} Exchanged
 
-/// The most bytes one poll drains from the receive FIFO.
-const MOST_INPUT_POLL: u32 = 256
-
-/// Fills the transmit FIFO once it is empty: reserved output once the current line ends or has run 256 bytes, else queued output.
-fn Uart.transmit(mut self, mut env: UartEnv) {
-    if (mut env.regs.read(Regs.line_status) & TRANSMIT_EMPTY) == 0 {
-        return
-    }
-    var sent: u32 = 0
-    while sent < FIFO_BYTES {
-        if self.reserved.len() > 0 and (self.line == 0 or self.line >= LINE_LIMIT) {
-            mut env.regs.write(Regs.data, value: self.reserved[0])
-            self.reserved = drop_first(self.reserved, alloc: env.alloc)
-        } else if self.queued.len() > 0 {
-            let byte = self.queued[0]
-            mut env.regs.write(Regs.data, value: byte)
-            self.queued = drop_first(self.queued, alloc: env.alloc)
-            self.line = match byte == b'\n' {
+fn Uart.next_output(self) -> Output {
+    var next = Output(bytes: Array[u8, FIFO_BYTES].filled(0), count: 0, reserved: 0, queued: 0, line: self.line)
+    while next.count < FIFO_BYTES {
+        if next.reserved < self.reserved.len() and (next.line == 0 or next.line >= LINE_LIMIT) {
+            next.bytes[next.count] = self.reserved[next.reserved]
+            next.reserved += 1
+        } else if next.queued < self.queued.len() {
+            let byte = self.queued[next.queued]
+            next.bytes[next.count] = byte
+            next.queued += 1
+            next.line = match byte == b'\n' {
                 true => 0
-                false => self.line.saturating_add(1)
+                false => next.line.saturating_add(1)
             }
         } else {
-            return
+            return next
         }
-        sent += 1
+        next.count += 1
     }
-} Uart.transmit
+    return next
+} Uart.next_output
+
+/// Drains the receive FIFO, sends `next` when the transmit FIFO is empty, then enables the receive interrupt, and the transmit one while output of the `pending` bytes is left.
+fn Chip.exchange(mut self, next: Output, pending: usize) -> Exchanged limits notrap, terminates, noalloc {
+    var done = Exchanged(bytes: Array[u8, MOST_DRAINED].filled(0), received: 0, sent: false)
+    for at in 0..<MOST_DRAINED {
+        if (mut self.regs.read(Regs.line_status) & DATA_READY) == 0 {
+            break
+        }
+        done.bytes[at] = mut self.regs.read(Regs.data)
+        done.received = at + 1
+    }
+    if next.count > 0 and (mut self.regs.read(Regs.line_status) & TRANSMIT_EMPTY) != 0 {
+        for at in 0..<FIFO_BYTES {
+            if at < next.count {
+                mut self.regs.write(Regs.data, value: next.bytes[at])
+            }
+        }
+        done.sent = true
+    }
+    var left = pending
+    if done.sent {
+        left = pending.saturating_sub(next.count)
+    }
+    var enabled = RECEIVED
+    if left > 0 or (next.count > 0 and not done.sent) {
+        enabled = enabled | EMPTIED
+    }
+    mut self.regs.write(Regs.interrupts, value: enabled)
+    return done
+} Chip.exchange
+
+/// Takes the output `sent` off the queues.
+fn Uart.consume(mut self, sent: Output, alloc: mem::Alloc) {
+    self.reserved = without_front(self.reserved, count: sent.reserved, alloc)
+    self.queued = without_front(self.queued, count: sent.queued, alloc)
+    self.line = sent.line
+} Uart.consume
 
 /// Answers the read waiting, the reserved one first, with the input received.
 fn Uart.answer_reads(mut self, alloc: mem::Alloc, mut cx: sys::Cx[UartDevice]) {
@@ -254,15 +363,13 @@ fn Uart.take_input(mut self, max: u32, alloc: mem::Alloc) -> mem::Bytes {
     return taken
 } Uart.take_input
 
-/// `bytes` without its first byte.
-fn drop_first(bytes: mem::Bytes, alloc: mem::Alloc) -> mem::Bytes {
+/// `bytes` without its first `count` bytes.
+fn without_front(bytes: mem::Bytes, count: usize, alloc: mem::Alloc) -> mem::Bytes {
     var rest = mem::Bytes.empty(alloc)
-    var at: usize = 0
-    for byte in bytes.view() {
-        if at > 0 {
-            mut rest.push(byte)
+    match bytes.view().split_at(count) {
+        Some(parts) => mut rest.append(parts.tail)
+        None => {
         }
-        at += 1
     }
     return rest
-} drop_first
+} without_front

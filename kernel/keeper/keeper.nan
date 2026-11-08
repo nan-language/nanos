@@ -143,7 +143,7 @@ fn Keeper.carry_out(mut self, take order: devices::RootOrder, rings: journal::Ri
             discard attempt await done.send(declared)
         }
         devices::RootOrder.Claim(path: path, done: done) => {
-            let claimed = mut self.claim(path, alloc)
+            let claimed = mut self.claim(path, rings, alloc)
             discard attempt await done.send(take claimed)
         }
         devices::RootOrder.Cut(path: path, reset: reset, done: done) => {
@@ -289,10 +289,7 @@ fn Keeper.cut(mut self, path: devices::BusPath, reset: bool) -> bool {
         var held = function
         var answered = true
         if reset {
-            answered = match first attempt mut held.reset() {
-                Ok(_) or Err(hw::PciError.Unsupported) => true
-                Err(_) => false
-            }
+            answered = is_reset(attempt mut held.reset())
         }
         mut self.idle.push(take held)
         return answered
@@ -353,10 +350,14 @@ fn Keeper.declare(mut self, path: devices::BusPath, ids: devices::DeviceIds, tak
 } Keeper.declare
 
 /// The hardware of the device at `path`: a PCI function the keeper holds, or one its keeper reclaims; a platform device's windows unless the core keeps it.
-fn Keeper.claim(mut self, path: devices::BusPath, alloc: mem::Alloc) -> Option[devices::Claimed] {
+fn Keeper.claim(mut self, path: devices::BusPath, rings: journal::Rings, alloc: mem::Alloc) -> Option[devices::Claimed] {
     match path {
         devices::BusPath.Pci(address) => {
-            let Some(function) = mut self.take_function(address) else {
+            let Some(function) = mut self.take_idle(address) else {
+                return mut self.claim_reclaimed(path, address, rings)
+            }
+            if function.removed() {
+                mut self.idle.push(take function)
                 return None
             }
             return Some(devices::Claimed.Pci(take function))
@@ -372,19 +373,54 @@ fn Keeper.claim(mut self, path: devices::BusPath, alloc: mem::Alloc) -> Option[d
     }
 } Keeper.claim
 
-/// The function at `address`, held by the keeper or reclaimed from the driver that released it.
-fn Keeper.take_function(mut self, address: devices::PciAddress) -> Option[hw::PciFunction] {
+/// The function at `address` that its last holder handed back, reset for its next driver: `None` while a driver holds it, or once it does not answer its reset, recorded as `device.failed` with `device.reset-failed`.
+fn Keeper.claim_reclaimed(mut self, path: devices::BusPath, address: devices::PciAddress, rings: journal::Rings) -> Option[devices::Claimed] {
+    let Some(function) = mut self.reclaim(address) else {
+        return None
+    }
+    var held = function
+    if is_reset(attempt mut held.reset()) {
+        return Some(devices::Claimed.Pci(take held))
+    }
+    mut self.idle.push(take held)
+    rings.record_device(devices::Event(kind: devices::EventKind.Failed, path: path, argument: devices::Code.ResetFailed.number()))
+    return None
+} Keeper.claim_reclaimed
+
+/// Whether a function's reset leaves it answering: reset, or without a way to reset.
+fn is_reset(outcome: Result[Unit, hw::PciError]) -> bool {
+    return match first outcome {
+        Ok(_) or Err(hw::PciError.Unsupported) => true
+        Err(_) => false
+    }
+} is_reset
+
+/// The function at `address` the keeper holds.
+fn Keeper.take_idle(mut self, address: devices::PciAddress) -> Option[hw::PciFunction] {
     for at in 0..<self.idle.len() {
         if devices::PciAddress.of(self.idle[at].address()) == address {
             return Some(mut self.idle.remove(at))
         }
     }
+    return None
+} Keeper.take_idle
+
+/// The function at `address` from its keeper, once the holder it went to has handed it back.
+fn Keeper.reclaim(mut self, address: devices::PciAddress) -> Option[hw::PciFunction] {
     for at in 0..<self.keepers.len() {
         if devices::PciAddress.of(self.keepers[at].address()) == address {
             return mut self.keepers.at_mut(at).reclaim()
         }
     }
     return None
+} Keeper.reclaim
+
+/// The function at `address`, held by the keeper or reclaimed from the holder that handed it back.
+fn Keeper.take_function(mut self, address: devices::PciAddress) -> Option[hw::PciFunction] {
+    let Some(function) = mut self.take_idle(address) else {
+        return mut self.reclaim(address)
+    }
+    return Some(take function)
 } Keeper.take_function
 
 /// The listing of a PCI function: its identifiers from its configuration space, its memory BARs, its MSI and MSI-X capabilities and its INTx pin.

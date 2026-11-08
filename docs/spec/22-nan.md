@@ -360,3 +360,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a loader can place a bare kernel in usable memory, whether by relocatable images or by a placement clear of firmware memory.
 - **Chapters:** [03](03-boot.md).
 - **Issue:** [nan-language/nan#2](https://github.com/nan-language/nan/issues/2).
+
+## N32
+
+**PCI BAR states.**
+
+- **Language 1:** `boot::Kernel.pci_functions` and `PciPort.rescan` give a memory BAR without an address one from its bus's window, else leave it no memory BAR, and `PciFunction` reads configuration space alone (NaN 24 §PCI functions).
+- **NaN OS requires:** each BAR of a function as a memory BAR it implements, with the address it holds or none.
+- **Chapters:** [15](15-devices.md).
+- **Issue:** [nan-language/nan#120](https://github.com/nan-language/nan/issues/120).

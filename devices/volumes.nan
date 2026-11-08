@@ -1,11 +1,40 @@
-//! Volumes and roles: the units of block devices with their partitions, the volume views `devices` creates over them, and the roles their drivers and views hold.
+//! Volumes and roles: the units of block devices with their partitions, the volume views `devices` creates over them, the store volume it places, and the roles their drivers and views hold.
 
-/// The keys of the keyed tasks reading a device's units, creating a view over it and assigning its role, the device's key added.
+/// The keys of the keyed tasks reading a device's units, creating a view over it and assigning a role to its driver, the device's key added, and of the one placing the store volume.
 const VOLUMES: u64 = 0x2_0000
 
 const VIEWS: u64 = 0x3_0000
 
 const ROLES: u64 = 0x4_0000
+
+const STORING: u64 = 0x8_0000
+
+/// The store image on the boot volume, and the view over it.
+const STORE_IMAGE: Str = "/nanos/store.img"
+
+const STORE_VIEW: Str = "devices.store-img"
+
+/// The fewest bytes of a store volume, the multiple a store image's size is, and the most bytes a store image takes.
+const LEAST_STORE_BYTES: u64 = 67_108_864
+
+const IMAGE_ALIGNMENT: u64 = 8_388_608
+
+const MOST_IMAGE_BYTES: u64 = 4_286_578_688
+
+/// How far `store-volume` is placed: open to a try, tried for the `settled` requests waiting while `fat` did not run, under way, or done, placed or found impossible.
+pub closed enum Placement derives Copy, Eq, Encode {
+    Open
+    Tried
+    Placing
+    Done
+} Placement
+
+/// How a try at placing `store-volume` ended.
+pub closed enum Stored derives Copy, Eq, Encode {
+    Placed
+    Later
+    Impossible
+} Stored
 
 /// The component of volume views.
 const VIEW_COMPONENT: Str = "devices::View"
@@ -101,7 +130,7 @@ fn Manager.resolve_boot(mut self, mut env: Env, mut cx: sys::Cx[Devices]) -> boo
     let unit = chosen.unit
     let key = mut self.key_of(path)
     mut cx.spawn(key: VIEWS + key, run: fn[take moniker, take spec](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
-        let held = try await start_view(control, moniker, take spec, unit, partition, role: os::Role.BootVolume, alloc)
+        let held = try await start_view(control, moniker, take spec, unit, start: partition.start, blocks: partition.blocks, role: os::Role.BootVolume, alloc)
         discard attempt await out.viewed(moniker: take moniker, held)
     })
     return true
@@ -123,6 +152,214 @@ fn Manager.viewed(
     }
     mut self.answer_settled(mut env, mut cx)
 } Manager.viewed
+
+/// Places `store-volume` once nothing else is under way: on the store partition of the boot volume's device, else on the lowest one in bus path order, else on the view `devices.store-img` over the boot volume's file `/nanos/store.img`, which `fat` allocates when it is absent; has a keyed task create the view.
+fn Manager.place_store(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
+    let boot = self.boot_place()
+    let preferred = match boot {
+        Some(chosen) => Some(self.records[usize.widen(chosen.device)].path)
+        None => None
+    }
+    let partition = self.store_partition(preferred)
+    let image = partition.is_none()
+    let Some(chosen) = match partition {
+        Some(found) => Some(found)
+        None => boot
+    } else {
+        self.store = Placement.Done
+        return
+    }
+    let record = self.records[usize.widen(chosen.device)]
+    let path = record.path
+    let Some(driver) = record.driver else {
+        self.store = Placement.Done
+        return
+    }
+    let block_bytes = block_bytes_of(record, unit: chosen.unit)
+    let moniker = match image {
+        true => ident::Moniker(text: text::Fixed[59].of(STORE_VIEW))
+        false => view_moniker(driver, unit: chosen.unit, partition: chosen.partition.number)
+    }
+    mut self.views.push(ViewRecord(moniker: ident::Moniker(text: moniker.text), device: path, unit: chosen.unit, partition: chosen.partition.number, role: Some(os::Role.StoreVolume)))
+    self.store = Placement.Placing
+    self.underway += 1
+    let control = env.control
+    let files = env.files
+    let alloc = env.alloc
+    var spec = os::InstanceSpec.of(principal: ident::Principal(text: text::Fixed[64].of("system")), bundle: env.bundle, component: VIEW_COMPONENT, alloc)
+    discard mut spec.wiring.insert(text::String.of("disk", alloc), value: os::Wire.to(ident::Moniker(text: driver.text)))
+    let unit = chosen.unit
+    let range = chosen.partition
+    mut cx.spawn(key: STORING, run: fn[take moniker, take spec](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 32_768 {
+        let outcome = match image {
+            true => try await placed_image(control, files, moniker, take spec, unit, base: range.start, block_bytes, alloc)
+            false => match try await start_view(control, moniker, take spec, unit, start: range.start, blocks: range.blocks, role: os::Role.StoreVolume, alloc) {
+                true => Stored.Placed
+                false => Stored.Impossible
+            }
+        }
+        discard attempt await out.stored(take moniker, outcome)
+    })
+} Manager.place_store
+
+/// Records how a try at placing `store-volume` on the view `moniker` ended: tried again for later `settled` requests while `fat` does not run.
+fn Manager.stored(
+    mut self,
+    take moniker: ident::Moniker,
+    take outcome: Stored,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    self.underway = self.underway.saturating_sub(1)
+    self.store = match outcome {
+        Stored.Later => Placement.Tried
+        else => Placement.Done
+    }
+    if outcome != Stored.Placed {
+        var at: usize = 0
+        while at < self.views.len() {
+            if self.views[at].moniker == moniker {
+                discard mut self.views.remove(at)
+            } else {
+                at += 1
+            }
+        }
+    }
+    mut self.answer_settled(mut env, mut cx)
+} Manager.stored
+
+/// Where `boot-volume`'s view lies.
+fn Manager.boot_place(self) -> Option[Chosen] {
+    for view in self.views {
+        if view.role != Some(os::Role.BootVolume) {
+            continue
+        }
+        let Some(at) = self.index_of(view.device) else {
+            return None
+        }
+        for unit in self.records[at].units {
+            if unit.number != view.unit {
+                continue
+            }
+            for partition in unit.partitions {
+                if partition.number == view.partition {
+                    return Some(Chosen(device: u32.fit(at), unit: unit.number, partition: partition))
+                }
+            }
+        }
+    }
+    return None
+} Manager.boot_place
+
+/// The store partition of at least 64 MiB on a device whose driver runs: the first on the device at `preferred`, else the first on the lowest device in bus path order.
+fn Manager.store_partition(self, preferred: Option[BusPath]) -> Option[Chosen] {
+    var found: Option[Chosen] = None
+    for at in 0..<self.records.len() {
+        let record = self.records[at]
+        if record.driver.is_none() or record.status != Status.Converged {
+            continue
+        }
+        for unit in record.units {
+            for partition in unit.partitions {
+                if not partition.is_store() or partition.blocks.saturating_mul(u64.widen(unit.info.block_bytes)) < LEAST_STORE_BYTES {
+                    continue
+                }
+                let better = match found {
+                    None => true
+                    Some(held) => preferred_path(record.path, than: self.records[usize.widen(held.device)].path, preferred)
+                }
+                if better {
+                    found = Some(Chosen(device: u32.fit(at), unit: unit.number, partition: partition))
+                }
+            }
+        }
+    }
+    return found
+} Manager.store_partition
+
+/// Whether the device at `path` comes before the one at `than`: the one at `preferred` first, then by bus path.
+fn preferred_path(path: BusPath, than: BusPath, preferred: Option[BusPath]) -> bool {
+    if path == than {
+        return false
+    }
+    let Some(wanted) = preferred else {
+        return path < than
+    }
+    if path == wanted or than == wanted {
+        return path == wanted
+    }
+    return path < than
+} preferred_path
+
+/// The block size of unit `unit` of `record`, 512 when it is not read.
+fn block_bytes_of(record: LiveDevice, unit: u16) -> u32 {
+    for each in record.units {
+        if each.number == unit {
+            return each.info.block_bytes
+        }
+    }
+    return 512
+} block_bytes_of
+
+/// Places the store image: the extent of `/nanos/store.img`, which `fat` allocates when it is absent with half the volume's free space, a multiple of 8 MiB of at most 4 GiB − 8 MiB, then the view `moniker` over it, `base` being the boot volume's first block and `block_bytes` its block size; `Later` while `fat` does not run.
+fn placed_image(
+    control: os::Control,
+    files: os::Port[Fat],
+    moniker: ident::Moniker,
+    take spec: os::InstanceSpec,
+    unit: u16,
+    base: u64,
+    block_bytes: u32,
+    alloc: mem::Alloc,
+    ) -> Stored fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let asked = sys::Wire[Fat].extent(mut call, path: text::String.of(STORE_IMAGE, alloc))
+    var extent = match first attempt await files.call(take call, reply: asked, alloc) {
+        Ok(found) => found
+        Err(os::PortError.Failed(FatError.NotFound)) => Extent(start: 0, blocks: 0)
+        Err(os::PortError.Stopped) or Err(os::PortError.ServerStopped) => return Stored.Later
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return Stored.Impossible
+    }
+    if extent.blocks == 0 {
+        call = sys::Encoded.empty(alloc)
+        let freed = sys::Wire[Fat].free(mut call)
+        let free = match first attempt await files.call(take call, reply: freed, alloc) {
+            Ok(bytes) => bytes
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return Stored.Impossible
+        }
+        var size = free / 2 / IMAGE_ALIGNMENT * IMAGE_ALIGNMENT
+        if size > MOST_IMAGE_BYTES {
+            size = MOST_IMAGE_BYTES
+        }
+        if size < LEAST_STORE_BYTES {
+            return Stored.Impossible
+        }
+        call = sys::Encoded.empty(alloc)
+        let allocated = sys::Wire[Fat].allocate(mut call, path: text::String.of(STORE_IMAGE, alloc), bytes: size)
+        match first attempt await files.call(take call, reply: allocated, alloc) {
+            Ok(_) => {
+            }
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return Stored.Impossible
+        }
+        call = sys::Encoded.empty(alloc)
+        let again = sys::Wire[Fat].extent(mut call, path: text::String.of(STORE_IMAGE, alloc))
+        extent = match first attempt await files.call(take call, reply: again, alloc) {
+            Ok(found) => found
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return Stored.Impossible
+        }
+    }
+    if extent.blocks.saturating_mul(u64.widen(block_bytes)) < LEAST_STORE_BYTES {
+        return Stored.Impossible
+    }
+    return match try await start_view(control, moniker, take spec, unit, start: base + extent.start, blocks: extent.blocks, role: os::Role.StoreVolume, alloc) {
+        true => Stored.Placed
+        false => Stored.Impossible
+    }
+} placed_image
 
 /// Where a chosen partition lies: the device's record, its unit and the partition.
 struct Chosen derives Copy {
@@ -182,30 +419,55 @@ fn names(boot: BootVolume, scheme: Scheme, partition: Partition) -> bool {
     }
 } names
 
-/// Assigns `role` to the driver of the device at `at` when no device holds it yet.
-fn Manager.hold_role(
+/// Gives the class roles their holders among the devices whose drivers run, in bus path order: `console` the UART whose ports the SPCR names, else the first UART; `rtc` the first RTC; and `entropy` every entropy device, the first holding it for wirings. Has a keyed task assign each role whose holder changed.
+fn Manager.resolve_roles(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
+    mut self.hold(role: os::Role.Console, class: Class.Console, every: false, mut env, mut cx)
+    mut self.hold(role: os::Role.Rtc, class: Class.Rtc, every: false, mut env, mut cx)
+    mut self.hold(role: os::Role.Entropy, class: Class.Entropy, every: true, mut env, mut cx)
+} Manager.resolve_roles
+
+/// Gives `role` to the first device of `class` whose driver runs, or to each of them when `every`, and assigns it to the first one's driver when that changed.
+fn Manager.hold(
     mut self,
-    at: usize,
     role: os::Role,
+    class: Class,
+    every: bool,
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    for record in self.records {
-        if record.role == Some(role) {
-            return
+    var leader: Option[usize] = None
+    for at in 0..<self.records.len() {
+        if self.runs_class(at, class) and before(self.records, at, than: leader, console: self.console) {
+            leader = Some(at)
         }
     }
-    let named = match self.records[at].driver {
-        Some(driver) => Some(ident::Moniker(text: driver.text))
+    for at in 0..<self.records.len() {
+        if self.runs_class(at, class) {
+            self.records[at].role = match every or leader == Some(at) {
+                true => Some(role)
+                false => None
+            }
+        }
+    }
+    let holder = match leader {
+        Some(at) => match self.records[at].driver {
+            Some(driver) => Some(ident::Moniker(text: driver.text))
+            None => None
+        }
         None => None
     }
-    let Some(moniker) = named else {
+    if holder == self.holders.get(role) {
         return
     }
-    self.records[at].role = Some(role)
+    let Some(moniker) = holder else {
+        discard mut self.holders.remove(role)
+        return
+    }
+    discard mut self.holders.insert(role, value: ident::Moniker(text: moniker.text))
     let control = env.control
     let alloc = env.alloc
-    let key = mut self.key_of(self.records[at].path)
+    let path = self.records[leader.value_or(0)].path
+    let key = mut self.key_of(path)
     mut cx.spawn(key: ROLES + key, run: fn[take moniker](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
         match attempt await control.assign(role, take moniker, alloc) {
             Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
@@ -213,7 +475,53 @@ fn Manager.hold_role(
             }
         }
     })
-} Manager.hold_role
+} Manager.hold
+
+/// Whether the device at `at` has a driver of `class` that runs.
+fn Manager.runs_class(self, at: usize, class: Class) -> bool {
+    let record = self.records[at]
+    if record.driver.is_none() or record.status != Status.Converged {
+        return false
+    }
+    let Some(name) = record.entry else {
+        return false
+    }
+    return match entry_named(name) {
+        Some(entry) => entry.class == class
+        None => false
+    }
+} Manager.runs_class
+
+/// Whether the device at `at` comes before the one at `than`: a UART on the `console` port first, then by bus path; any device comes before none.
+fn before(records: mem::List[LiveDevice], at: usize, than: Option[usize], console: Option[u16]) -> bool {
+    let Some(other) = than else {
+        return true
+    }
+    let named = on_port(records[at].resources, port: console)
+    if named != on_port(records[other].resources, port: console) {
+        return named
+    }
+    return records[at].path < records[other].path
+} before
+
+/// Whether `resources` hold a port window from `port`.
+fn on_port(resources: mem::List[Resource], port: Option[u16]) -> bool {
+    let Some(wanted) = port else {
+        return false
+    }
+    for resource in resources {
+        match resource {
+            Resource.Ports(base: base, count: _) => {
+                if base == wanted {
+                    return true
+                }
+            }
+            else => {
+            }
+        }
+    }
+    return false
+} on_port
 
 /// `<driver>-u<n>p<m>`, the view over partition m of the driver's unit n.
 fn view_moniker(driver: ident::Moniker, unit: u16, partition: u32) -> ident::Moniker {
@@ -312,7 +620,8 @@ fn start_view(
     moniker: ident::Moniker,
     take spec: os::InstanceSpec,
     unit: u16,
-    partition: Partition,
+    start: u64,
+    blocks: u64,
     role: os::Role,
     alloc: mem::Alloc,
     ) -> bool fails task::Cancelled uses wait {
@@ -337,7 +646,7 @@ fn start_view(
         return false
     }
     var call = sys::Encoded.empty(alloc)
-    sys::Wire[VolumeView].cover(mut call, unit, start: partition.start, blocks: partition.blocks)
+    sys::Wire[VolumeView].cover(mut call, unit, start, blocks)
     match first attempt await view.post(take call) {
         Ok(_) => {
         }

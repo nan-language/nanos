@@ -1,6 +1,6 @@
 # 0023. Kernel core without preemption
 
-Status: accepted
+Status: superseded by 0025
 
 ## Context
 

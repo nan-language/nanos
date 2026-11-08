@@ -12,7 +12,7 @@ pub closed enum DeviceMatch derives Copy, Eq {
     PciSubsystem(vendor: u16, device: u16, subsystem_vendor: u16, subsystem: u16)
     PciDevice(vendor: u16, device: u16)
     PciClass(class: u32, mask: u32)
-    AcpiId(u64)
+    AcpiId(text::Fixed[8])
 } DeviceMatch
 
 /// The matches of an entry: at most four.
@@ -24,31 +24,13 @@ pub fn matches(head: DeviceMatch, rest: DeviceMatch) -> Array[DeviceMatch, 4] li
 } matches
 
 /// An entry of the `drivers` registry: its name, the devices it drives, the device protocol its instances serve, the canonical path of their component, and its tie-break among equally specific matches, higher first.
-pub closed view struct Registration {
-    pub name: Str
-    pub matches: Array[DeviceMatch, 4]
-    pub class: Class
-    pub component: Str
-    pub priority: u8
-} Registration
-
-/// A `drivers` entry as matching compares it.
-pub closed struct Candidate derives Copy, Eq {
+pub closed struct Registration derives Copy, Eq {
     pub name: text::Fixed[20]
     pub matches: Array[DeviceMatch, 4]
     pub class: Class
     pub component: text::Fixed[48]
     pub priority: u8
-} Candidate
-
-/// The entries of the `drivers` registry.
-pub fn candidates(alloc: mem::Alloc) -> mem::List[Candidate] {
-    var listed = mem::List[Candidate].empty(alloc)
-    for entry in drivers {
-        mut listed.push(Candidate(name: text::Fixed[20].of(entry.name), matches: entry.matches, class: entry.class, component: text::Fixed[48].of(entry.component), priority: entry.priority))
-    }
-    return listed
-} candidates
+} Registration
 
 pub registry drivers: Registration keyed by name
 
@@ -83,37 +65,20 @@ fn ranked(holds: bool, rank: u8) -> u8 {
 } ranked
 
 /// An `_HID` match above a `_CID` match.
-fn acpi_rank(id: u64, hid: text::Fixed[8], cids: Array[text::Fixed[8], 4]) -> u8 {
-    if packed(hid.as_bytes()) == id {
+fn acpi_rank(id: text::Fixed[8], hid: text::Fixed[8], cids: Array[text::Fixed[8], 4]) -> u8 {
+    if hid == id {
         return 2
     }
     for cid in cids {
-        if cid.byte_len() > 0 and packed(cid.as_bytes()) == id {
+        if cid.byte_len() > 0 and cid == id {
             return 1
         }
     }
     return 0
 } acpi_rank
 
-/// An ACPI identifier of at most eight characters as a match holds it: its bytes, little-endian.
-pub fn acpi_id(name: Str) -> u64 limits pure {
-    return packed(name.as_bytes())
-} acpi_id
-
-fn packed(bytes: Slice[u8]) -> u64 limits pure {
-    var id: u64 = 0
-    var at: usize = 0
-    for byte in bytes {
-        if at < 8 {
-            id = id | (u64.widen(byte) << u32.fit(8 * at))
-        }
-        at += 1
-    }
-    return id
-} packed
-
 /// How specifically an entry matches `ids`: its best match, 0 when none matches.
-pub fn Candidate.rank(self, ids: DeviceIds) -> u8 {
+pub fn Registration.rank(self, ids: DeviceIds) -> u8 {
     var best: u8 = 0
     for wanted in self.matches {
         let rank = wanted.rank(ids)
@@ -122,7 +87,7 @@ pub fn Candidate.rank(self, ids: DeviceIds) -> u8 {
         }
     }
     return best
-} Candidate.rank
+} Registration.rank
 
 /// The outcome of choosing a device's driver.
 pub closed enum Choice derives Copy, Eq {
@@ -132,7 +97,7 @@ pub closed enum Choice derives Copy, Eq {
 } Choice
 
 /// The driver `choice` gives a device identified by `ids` among `entries`: the entry a binding names when it matches, else the most specific match, ties going to the higher priority, then to the lower name.
-pub fn choose(ids: DeviceIds, choice: DriverChoice, entries: Slice[Candidate]) -> Choice {
+pub fn choose(ids: DeviceIds, choice: DriverChoice, entries: Slice[Registration]) -> Choice {
     match choice {
         DriverChoice.Unbound => return Choice.Unbound
         DriverChoice.Entry(name) => {
@@ -146,7 +111,7 @@ pub fn choose(ids: DeviceIds, choice: DriverChoice, entries: Slice[Candidate]) -
         DriverChoice.Automatic => {
         }
     }
-    var best: Option[Candidate] = None
+    var best: Option[Registration] = None
     for entry in entries {
         let rank = entry.rank(ids)
         if rank == 0 {
@@ -165,3 +130,39 @@ pub fn choose(ids: DeviceIds, choice: DriverChoice, entries: Slice[Candidate]) -
         None => Choice.Unbound
     }
 } choose
+
+fn registration(name: Str, head: DeviceMatch, priority: u8) -> Registration {
+    return Registration(name: text::Fixed[20].of(name), matches: matches(head, rest: DeviceMatch.None), class: Class.Block, component: text::Fixed[48].of("drivers::probe::Probe"), priority: priority)
+} registration
+
+fn bound(choice: Choice) -> text::Fixed[20] {
+    return match choice {
+        Choice.Bind(name) => name
+        Choice.Unbound => text::Fixed[20].of("unbound")
+        Choice.Mismatch => text::Fixed[20].of("mismatch")
+    }
+} bound
+
+/// A virtio disk among entries matching its class, its identifiers at two priorities and under two names, and a 16550 by `_HID` or `_CID`.
+test the_most_specific_entry_drives_a_device for choose {
+    let world = testing::world()
+    var entries = mem::List[Registration].empty(world.alloc)
+    mut entries.push(registration("class", head: DeviceMatch.PciClass(class: 0x01_0000, mask: 0xFF_0000), priority: 9))
+    mut entries.push(registration("plain", head: DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1042), priority: 0))
+    mut entries.push(registration("raised", head: DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1042), priority: 1))
+    mut entries.push(registration("also-raised", head: DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1042), priority: 1))
+    mut entries.push(registration("by-cid", head: DeviceMatch.AcpiId(text::Fixed[8].of("PNP0500")), priority: 9))
+    mut entries.push(registration("by-hid", head: DeviceMatch.AcpiId(text::Fixed[8].of("PNP0501")), priority: 0))
+    let disk = DeviceIds.Pci(vendor: 0x1AF4, device: 0x1042, subsystem_vendor: 0x1AF4, subsystem: 2, class: 0x01_0000, revision: 1)
+    var cids = Array[text::Fixed[8], 4].filled(text::Fixed[8].empty())
+    cids[0] = text::Fixed[8].of("PNP0500")
+    let uart = DeviceIds.Acpi(hid: text::Fixed[8].of("PNP0501"), cids: cids, uid: 1)
+    let other = DeviceIds.Pci(vendor: 0x8086, device: 0x1234, subsystem_vendor: 0, subsystem: 0, class: 0x02_0000, revision: 0)
+    let named = text::Fixed[20].of("class")
+    expect bound(choose(disk, choice: DriverChoice.Automatic, entries: entries.view())).as_str() == "also-raised"
+    expect bound(choose(disk, choice: DriverChoice.Entry(named), entries: entries.view())).as_str() == "class"
+    expect bound(choose(disk, choice: DriverChoice.Entry(text::Fixed[20].of("by-hid")), entries: entries.view())).as_str() == "mismatch"
+    expect bound(choose(disk, choice: DriverChoice.Unbound, entries: entries.view())).as_str() == "unbound"
+    expect bound(choose(uart, choice: DriverChoice.Automatic, entries: entries.view())).as_str() == "by-hid"
+    expect bound(choose(other, choice: DriverChoice.Automatic, entries: entries.view())).as_str() == "unbound"
+} the_most_specific_entry_drives_a_device

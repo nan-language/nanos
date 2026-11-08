@@ -1,6 +1,6 @@
 # 0020. Devices on a core keeper and driver instances
 
-Status: accepted
+Status: superseded by 0026
 
 ## Context
 

@@ -23,21 +23,9 @@ pub interface Storage {
     fn flush(self, alloc: mem::Alloc) fails Failure uses wait
 } Storage
 
-/// Why an operation of `fat` fails, chapter 15's codes.
-pub closed enum FatError derives Copy, Eq, Render, Encode {
-    NotFound
-    OutOfRange
-    NoSpace
-    InUse
-    Exists
-    NotContiguous
-    BadVolume
-    Io
-} FatError
-
 /// Why a step of an operation fails: as the operation does, or cancelled.
 pub closed enum Failure derives Render {
-    Fat(FatError) from
+    Fat(devices::FatError) from
     Cancelled(task::Cancelled) from
 } Failure
 
@@ -153,7 +141,7 @@ pub fn Geometry.holds(self, cluster: u32) -> bool = cluster >= 2 and u64.widen(c
 pub fn Volume.mount[D: Storage](disk: D, block_bytes: u32, blocks: u64, alloc: mem::Alloc) -> Volume fails Failure uses wait {
     let sector = try await disk.read(0, count: 1, alloc)
     let Some(geometry) = Geometry.read(sector.view(), block_bytes, blocks) else {
-        fail FatError.BadVolume
+        fail devices::FatError.BadVolume
     }
     return Volume(geometry: geometry, cached: mem::List.empty(alloc))
 } Volume.mount
@@ -262,9 +250,15 @@ pub fn Volume.next[D: Storage](mut self, disk: D, cluster: u32, alloc: mem::Allo
     return raw
 } Volume.next
 
-/// The used clusters `reached` does not mark, read from the first FAT in runs of at most `SCAN_BYTES`; clusters marked bad stay used.
-pub fn Volume.unreached[D: Storage](self, disk: D, reached: mem::Bytes, alloc: mem::Alloc) -> mem::List[u32] fails Failure uses wait {
-    var unused = mem::List[u32].empty(alloc)
+/// What the first FAT holds: how many clusters are free, and the used ones a bitmap of reached clusters does not mark.
+pub closed struct Census {
+    pub free: u64
+    pub unreached: mem::List[u32]
+} Census
+
+/// The census of the first FAT, read in runs of at most `SCAN_BYTES`: its free clusters, and, when `reached` marks clusters, the used ones it does not mark, clusters marked bad staying used.
+pub fn Volume.census[D: Storage](self, disk: D, reached: Slice[u8], alloc: mem::Alloc) -> Census fails Failure uses wait {
+    var found = Census(free: 0, unreached: mem::List.empty(alloc))
     let geometry = self.geometry
     let block_bytes = u64.widen(geometry.block_bytes)
     let bits = geometry.entry_bits()
@@ -289,18 +283,20 @@ pub fn Volume.unreached[D: Storage](self, disk: D, reached: mem::Bytes, alloc: m
             let index = u32.truncate(cluster)
             let offset = usize.widen(cluster * bits / 8 - start)
             let value = geometry.raw_entry(bytes.view(), offset, cluster: index)
-            if value != 0 and value != geometry.bad() and not is_reached(reached, cluster: index) {
-                mut unused.push(index)
+            if value == 0 {
+                found.free += 1
+            } else if reached.len() > 0 and value != geometry.bad() and not is_reached(reached, cluster: index) {
+                mut found.unreached.push(index)
             }
             cluster += 1
         }
         block += count
     }
-    return unused
-} Volume.unreached
+    return found
+} Volume.census
 
 /// Whether `reached` marks `cluster`.
-pub fn is_reached(reached: mem::Bytes, cluster: u32) -> bool {
+pub fn is_reached(reached: Slice[u8], cluster: u32) -> bool {
     let index = usize.widen(cluster)
     return (reached[index / 8] & (1u8 << u32.truncate(index % 8))) != 0
 } is_reached
@@ -346,59 +342,102 @@ pub fn Volume.set_next[D: Storage](
     value: u32,
     alloc: mem::Alloc,
     ) fails Failure uses wait {
-    let stored: u32 = match value == END {
-        true => match self.geometry.kind {
-            Variant.Fat12 => 0xFFF
-            Variant.Fat16 => 0xFFFF
-            Variant.Fat32 => 0x0FFF_FFFF
-        }
-        false => value
-    }
-    for fat_index in 0..<self.geometry.fats {
-        let place = self.entry_place(cluster, fat_index)
-        var block = try await mut self.block(disk, block: place.block, alloc)
-        match self.geometry.kind {
-            Variant.Fat12 => {
-                if place.offset + 1 >= block.len() {
-                    var next = try await mut self.block(disk, block: place.block + 1, alloc)
-                    set_fat12(cluster, stored, low: mut block, high_block: mut next, place)
-                    try await mut self.put_block(disk, block: place.block + 1, bytes: take next, alloc)
-                } else {
-                    let pair = u32.widen(block[place.offset]) | (u32.widen(block[place.offset + 1]) << 8)
-                    let merged = match cluster % 2 {
-                        0 => (pair & 0xF000) | stored
-                        else => (pair & 0x000F) | (stored << 4)
-                    }
-                    block[place.offset] = u8.truncate(merged)
-                    block[place.offset + 1] = u8.truncate(merged >> 8)
-                }
-            }
-            Variant.Fat16 => mut block.view_mut().write_u16_le(place.offset, value: u16.truncate(stored))
-            Variant.Fat32 => {
-                let kept = block.view().u32_le(place.offset) & 0xF000_0000
-                mut block.view_mut().write_u32_le(place.offset, value: kept | stored)
-            }
-        }
-        try await mut self.put_block(disk, block: place.block, bytes: take block, alloc)
-    }
+    var links = mem::List[Link].empty(alloc)
+    mut links.push(Link(cluster: cluster, next: value))
+    try await mut self.set_links(disk, links: links.view(), alloc)
 } Volume.set_next
 
-/// Sets a FAT12 entry whose two bytes straddle a block boundary.
-fn set_fat12(
-    cluster: u32,
-    stored: u32,
-    mut low: mem::Bytes,
-    mut high_block: mem::Bytes,
-    place: FatPlace,
-    ) {
-    let pair = u32.widen(low[place.offset]) | (u32.widen(high_block[0]) << 8)
-    let merged = match cluster % 2 {
-        0 => (pair & 0xF000) | stored
-        else => (pair & 0x000F) | (stored << 4)
+/// A FAT entry to set: its cluster, and the next cluster of its chain, 0 freeing it or `END` ending the chain.
+pub closed struct Link derives Copy {
+    pub cluster: u32
+    pub next: u32
+} Link
+
+/// The FAT block entries are set in, `None` before the first.
+struct Held {
+    block: Option[u64]
+    bytes: mem::Bytes
+} Held
+
+/// Sets the FAT entry of every link in every FAT, writing each block once per run of links within it.
+pub fn Volume.set_links[D: Storage](mut self, disk: D, links: Slice[Link], alloc: mem::Alloc) fails Failure uses wait {
+    for fat_index in 0..<self.geometry.fats {
+        var held = Held(block: None, bytes: mem::Bytes.empty(alloc))
+        for link in links {
+            let stored = self.geometry.stored(link.next)
+            let place = self.entry_place(link.cluster, fat_index)
+            held = try await mut self.hold(disk, take held, block: Some(place.block), alloc)
+            match self.geometry.kind {
+                Variant.Fat12 => {
+                    held.bytes[place.offset] = fat12_low(old: held.bytes[place.offset], cluster: link.cluster, stored)
+                    var high = place.offset + 1
+                    if high >= held.bytes.len() {
+                        held = try await mut self.hold(disk, take held, block: Some(place.block + 1), alloc)
+                        high = 0
+                    }
+                    held.bytes[high] = fat12_high(old: held.bytes[high], cluster: link.cluster, stored)
+                }
+                Variant.Fat16 => mut held.bytes.view_mut().write_u16_le(place.offset, value: u16.truncate(stored))
+                Variant.Fat32 => {
+                    let kept = held.bytes.view().u32_le(place.offset) & 0xF000_0000
+                    mut held.bytes.view_mut().write_u32_le(place.offset, value: kept | stored)
+                }
+            }
+        }
+        discard try await mut self.hold(disk, take held, block: None, alloc)
     }
-    low[place.offset] = u8.truncate(merged)
-    high_block[0] = u8.truncate(merged >> 8)
-} set_fat12
+} Volume.set_links
+
+/// The FAT entry's bits that store `next`.
+fn Geometry.stored(self, next: u32) -> u32 {
+    if next != END {
+        return next
+    }
+    return match self.kind {
+        Variant.Fat12 => 0xFFF
+        Variant.Fat16 => 0xFFFF
+        Variant.Fat32 => 0x0FFF_FFFF
+    }
+} Geometry.stored
+
+/// Holds block `block`: the block held when it is that one, else the block read once the one held is written; `None` only writes it.
+fn Volume.hold[D: Storage](
+    mut self,
+    disk: D,
+    take held: Held,
+    block: Option[u64],
+    alloc: mem::Alloc,
+    ) -> Held fails Failure uses wait {
+    if held.block == block {
+        return held
+    }
+    let Held(block: holding, bytes: contents) = held
+    match holding {
+        Some(at) => try await mut self.put_block(disk, block: at, bytes: take contents, alloc)
+        None => {
+        }
+    }
+    return match block {
+        Some(at) => Held(block: block, bytes: try await mut self.block(disk, block: at, alloc))
+        None => Held(block: None, bytes: mem::Bytes.empty(alloc))
+    }
+} Volume.hold
+
+/// The first byte of a FAT12 entry pair once `cluster`'s entry stores `stored`, `old` before: the entry's low byte for an even cluster, else its low nibble over the previous entry's.
+fn fat12_low(old: u8, cluster: u32, stored: u32) -> u8 {
+    return match cluster % 2 {
+        0 => u8.truncate(stored)
+        else => (old & 0x0F) | u8.truncate(stored << 4)
+    }
+} fat12_low
+
+/// The second byte of a FAT12 entry pair once `cluster`'s entry stores `stored`, `old` before: the entry's high nibble under the next entry's for an even cluster, else its high byte.
+fn fat12_high(old: u8, cluster: u32, stored: u32) -> u8 {
+    return match cluster % 2 {
+        0 => (old & 0xF0) | u8.truncate(stored >> 8)
+        else => u8.truncate(stored >> 4)
+    }
+} fat12_high
 
 /// The clusters of the chain from `start`, in order, at most the volume's count.
 pub fn Volume.chain[D: Storage](mut self, disk: D, start: u32, alloc: mem::Alloc) -> mem::List[u32] fails Failure uses wait {
@@ -413,10 +452,11 @@ pub fn Volume.chain[D: Storage](mut self, disk: D, start: u32, alloc: mem::Alloc
 
 /// Frees every cluster of the chain from `start`.
 pub fn Volume.free_chain[D: Storage](mut self, disk: D, start: u32, alloc: mem::Alloc) fails Failure uses wait {
-    let clusters = try await mut self.chain(disk, start, alloc)
-    for cluster in clusters {
-        try await mut self.set_next(disk, cluster, value: 0, alloc)
+    var links = mem::List[Link].empty(alloc)
+    for cluster in try await mut self.chain(disk, start, alloc) {
+        mut links.push(Link(cluster: cluster, next: 0))
     }
+    try await mut self.set_links(disk, links: links.view(), alloc)
 } Volume.free_chain
 
 /// Takes `count` free clusters, contiguous when `contiguous`, chains them and gives them in order; fails with `no-space` when the volume has not that many.
@@ -442,15 +482,17 @@ pub fn Volume.take_clusters[D: Storage](
         cluster += 1
     }
     if taken.len() < usize.widen(count) {
-        fail FatError.NoSpace
+        fail devices::FatError.NoSpace
     }
+    var links = mem::List[Link].empty(alloc)
     for at in 0..<taken.len() {
         let next = match at + 1 < taken.len() {
             true => taken[at + 1]
             false => END
         }
-        try await mut self.set_next(disk, cluster: taken[at], value: next, alloc)
+        mut links.push(Link(cluster: taken[at], next: next))
     }
+    try await mut self.set_links(disk, links: links.view(), alloc)
     return taken
 } Volume.take_clusters
 

@@ -8,7 +8,7 @@ The **device manager** is the [base instance](20-base.md#base-instances) `device
 
 1. ACPI: SPCR (console UART), TPM2 (TPM interface), and the DSDT and SSDTs (the AML namespace).
 2. The device tree, on AArch64 machines booted without ACPI: nodes with `compatible`, `reg`, `interrupts` and `iommus`, and `/chosen` with `stdout-path`.
-3. PCIe, through the ECAM windows of MCFG or of `pci-host-ecam-generic` nodes. `devices` scans every bus below each host bridge, depth first, reading each function's identifiers, BARs and capabilities, and keeps the bus numbers and BAR addresses the firmware assigned; a function with an unassigned memory BAR gets status `failed(device.bar-unassigned)`. A machine without ECAM has no PCI devices.
+3. PCIe, through the ECAM windows of MCFG or of `pci-host-ecam-generic` nodes. `devices` scans every bus below each host bridge, depth first, reading each function's identifiers, BARs and capabilities, and keeps the bus numbers and BAR addresses the firmware assigned; a function with an unassigned memory BAR gets status `failed(device.bar-unassigned)` (requires [N32](22-nan.md#n32)). A machine without ECAM has no PCI devices.
 
 The AML evaluator is the instance `devices.aml`, which holds the AML table bytes and no device capability. It evaluates only `\_S5`, `_PRT` and `_CRS`, and reads `_HID`, `_CID`, `_UID` and `_ADR` when they are data objects. An evaluation that reaches an operation region, runs more than 100,000 AML opcodes or allocates more than 1 MiB fails, and the device it describes gets status `failed(device.aml)`.
 
@@ -122,7 +122,7 @@ A **role** names a device a base instance needs. A [wiring](09-authority.md#env-
 
 A device whose driver's bundle has provenance `agent` ([provenance](09-authority.md#provenance)) holds no role, and neither do its units and partitions; each holder the table names is chosen among the other devices, units and partitions.
 
-For `devices.store-img`, once `fat` runs ([start order](20-base.md#start-order)), `devices` has `fat` create the file as [placement](12-store-format.md#placement) sizes it when it is absent (`allocate`), then takes its block range (`extent`); a file whose clusters are not contiguous leaves `store-volume` unresolved (`device.not-contiguous`).
+For `devices.store-img`, once `fat` runs ([start order](20-base.md#start-order)), `devices` has `fat` create the file as [placement](12-store-format.md#placement) sizes it from the free space when it is absent (`free`, then `allocate`), then takes its block range (`extent`); a file whose clusters are not contiguous leaves `store-volume` unresolved (`device.not-contiguous`).
 
 ## Device protocols
 
@@ -277,10 +277,11 @@ Unbinding and the policy `Off` stop the driver at quiescence ([lifecycle](06-exe
 | `remove` | `path: text` | — | `device.not-found`, `device.in-use`, `device.bad-volume`, `device.io` | `irreversible{erase}` |
 | `allocate` | `path: text`, `bytes: u64` | — | `device.exists`, `device.no-space`, `device.bad-volume`, `device.io` | `irreversible{actuate}` |
 | `extent` | `path: text` | `first: u64`, `blocks: u64` (volume blocks) | `device.not-found`, `device.not-contiguous`, `device.bad-volume` | `none` |
+| `free` | — | `bytes: u64` | `device.bad-volume`, `device.io` | `none` |
 
 - `write` creates or replaces a whole file, creating missing directories: it writes the data to free clusters, flushes, rewrites the file's directory entry in one block write, flushes, then frees the old clusters in both FATs. A crash leaves the old file or the new one, and clusters no entry reaches, which `fat` frees when it mounts the volume.
 - `overwrite` replaces bytes inside the file's size in place, one aligned block being one device write; the [boot record](03-boot.md#boot-record) copies use it. `remove` deletes a file or an empty directory.
-- `allocate` creates a file of `bytes` bytes on one run of free clusters, its contents unspecified; without such a run it fails with `device.no-space`. `extent` gives the block range of a file whose clusters are contiguous. While `devices.store-img` exists, `write`, `overwrite` and `remove` of `/nanos/store.img` fail with `device.in-use`.
+- `allocate` creates a file of `bytes` bytes on one run of free clusters, its contents unspecified; without such a run it fails with `device.no-space`. `extent` gives the block range of a file whose clusters are contiguous, and `free` the bytes of the volume's free clusters. While `devices.store-img` exists, `write`, `overwrite` and `remove` of `/nanos/store.img` fail with `device.in-use`.
 - `fat` validates the boot sector and FAT geometry when it mounts the volume; after a failed validation every operation fails with `device.bad-volume`. It caches up to 256 KiB of FAT and directory blocks, dropped under memory [pressure](05-memory.md#pressure).
 
 ## Events

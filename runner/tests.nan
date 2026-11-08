@@ -319,6 +319,43 @@ test intensity_sends_instances_to_failed for run {
     expect failed == 1
 } intensity_sends_instances_to_failed
 
+/// Starts the tally, waits for its lifecycle to differ from `starting`, then from `running` while a task stops it.
+fn followed(core: Core, exec: task::Executor, alloc: mem::Alloc) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+    var states = Array[os::Lifecycle, 2].filled(os::Lifecycle.Starting)
+    discard try await core.control.start(named("tally"), alloc)
+    states[0] = try await core.control.changed(named("tally"), seen: Some(os::Lifecycle.Starting), alloc)
+    let control = core.control
+    var changed: Result[os::Lifecycle, os::ControlError] = Err(os::ControlError.Missing)
+    try await task::scope(exec, body: fn[mut changed](s: task::Scope) fails task::Cancelled uses wait {
+        discard s.spawn(fn() fails task::Cancelled uses wait limits stack 8_192 {
+            discard attempt await control.stop(named("tally"), alloc)
+        })
+        changed = match first attempt await control.changed(named("tally"), seen: Some(os::Lifecycle.Running), alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            other => other
+        }
+    })
+    states[1] = match changed {
+        Ok(lifecycle) => lifecycle
+        Err(failure) => fail Failure.Control(take failure)
+    }
+    return states
+} followed
+
+test changes_are_answered_once_the_lifecycle_differs for run {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let states = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+        return try await followed(core, exec: world.exec, alloc: world.alloc)
+    })
+    let Some(seen) = states else {
+        expect false
+        return
+    }
+    expect seen[0] == os::Lifecycle.Running
+    expect seen[1] == os::Lifecycle.Stopping or seen[1] == os::Lifecycle.Stopped
+} changes_are_answered_once_the_lifecycle_differs
+
 fn lazy(mut spec: os::InstanceSpec) {
     spec.lazy = true
 } lazy
@@ -686,10 +723,10 @@ test worlds_claim_devices_and_wire_roles_once_assigned for Directory.world {
     }
     let request = Request(moniker: named("driver"), cell: alloc, exec: world.exec, clock: world.clock, withheld: withheld, orders: take orders, alloc: alloc)
     var minted = Minted.none(alloc)
-    let unassigned = listed.world(spec, minted: mut minted, request)
+    let unassigned = listed.world(spec, mut minted, request)
     expect unassigned.is_none()
     discard mut listed.assign(os::Role.Entropy, moniker: named("tally"))
-    let Some(built) = listed.world(spec, minted: mut minted, request) else {
+    let Some(built) = listed.world(spec, mut minted, request) else {
         expect false
         take minted.close()
         return
