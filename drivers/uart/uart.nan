@@ -68,10 +68,12 @@ interrupt fn Chip.on_irq(mut self, take irq: hw::IrqContext) -> hw::IrqExit limi
     return hw::IrqExit.Resume
 } Chip.on_irq
 
-/// The driver's Env: the UART behind its interrupt, the signal that interrupt posts, and its cell.
+/// The driver's Env: the UART behind its interrupt, the signal that interrupt posts, its clock, its alarm and its cell.
 pub open linear struct UartEnv derives Send {
     irq: hw::IrqShared[Chip]
     signal: mem::Shared[hw::Signal[Unit]]
+    clock: sys::Clock
+    alarm: devices::Alarm
     alloc: mem::Alloc
 } UartEnv
 
@@ -102,12 +104,14 @@ impl Uart: sys::Component[UartEnv, UartDevice]
 
 impl Uart: sys::Resume[UartEnv, UartDevice]
 
-/// The Env over the UART at `regs` on the platform `line`: its FIFOs on and cleared, DTR, RTS and OUT2 raised, and its receive interrupt enabled once the line is installed; `None` when the line is refused.
+/// The Env over the UART at `regs` on the platform `line`: its FIFOs on and cleared, DTR, RTS and OUT2 raised, and its receive interrupt enabled once the line is installed under the storm limit; `None` when the line is refused.
 pub fn UartEnv.of(
     take regs: hw::Ports[Regs],
     line: u32,
     edge: bool,
     active_low: bool,
+    clock: sys::Clock,
+    take alarm: devices::Alarm,
     alloc: mem::Alloc,
     ) -> Option[UartEnv] {
     var ports = regs
@@ -115,7 +119,7 @@ pub fn UartEnv.of(
     mut ports.write(Regs.fifo, value: FIFO_CONTROL)
     mut ports.write(Regs.modem, value: MODEM_CONTROL)
     let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
-    let irq = match hw::IrqShared.install_platform(Chip(regs: take ports, signal: signal.share()), line, edge, active_low, on_irq: Chip.on_irq) {
+    var irq = match hw::IrqShared.install_platform(Chip(regs: take ports, signal: signal.share()), line, edge, active_low, on_irq: Chip.on_irq) {
         Ok(shared) => shared
         Err(refused) => {
             let hw::MsiRefusal(dev: Chip(regs: left, signal: _), error: _) = refused
@@ -123,13 +127,14 @@ pub fn UartEnv.of(
             return None
         }
     }
+    mut irq.limit(per_second: devices::STORM_LIMIT)
     enable(irq, enabled: RECEIVED)
-    return Some(UartEnv(irq: take irq, signal: take signal, alloc: alloc))
+    return Some(UartEnv(irq: take irq, signal: take signal, clock: clock, alarm: take alarm, alloc: alloc))
 } UartEnv.of
 
 /// Turns the UART's interrupts off, releases its line and its ports.
 pub fn UartEnv.abandon(take self) {
-    let UartEnv(irq: irq, signal: _, alloc: _) = self
+    let UartEnv(irq: irq, signal: _, clock: _, alarm: _, alloc: _) = self
     let Chip(regs: regs, signal: _) = take irq.uninstall()
     var ports = regs
     mut ports.write(Regs.interrupts, value: 0)
@@ -148,13 +153,11 @@ fn enable(irq: hw::IrqShared[Chip], enabled: u8) {
 /// Has a keyed task send `interrupted` for each interrupt of the UART.
 pub fn Uart.resume(mut self, reason: sys::ResumeReason, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) {
     let signal = env.signal.share()
+    let clock = env.clock
     mut cx.spawn(key: INTERRUPTS, run: fn[take signal](out: sys::Outbox[UartDevice]) fails task::Cancelled uses wait limits stack 8_192 {
-        loop {
-            try await signal.contents().wait()
-            if (attempt await out.interrupted()).is_err() {
-                return
-            }
-        }
+        try await devices::relay(signal, clock, post: fn() -> bool fails task::Cancelled uses wait {
+            return (attempt await out.interrupted()).is_ok()
+        })
     })
 } Uart.resume
 
@@ -209,8 +212,12 @@ pub fn Uart.read_reserved(mut self, take max: u32, mut env: UartEnv, mut cx: sys
     return Untrusted.of(mem::Bytes.empty(env.alloc))
 } Uart.read_reserved
 
-/// Serves the UART after its interrupt.
+/// Serves the UART after its interrupt; raises the alarm instead when the interrupt storms.
 fn Uart.interrupted(mut self, mut env: UartEnv, mut cx: sys::Cx[UartDevice]) {
+    if env.irq.storming() {
+        env.alarm.raise(mut cx, key: INTERRUPTS, vector: 0)
+        return
+    }
     mut self.serve(mut env, mut cx)
 } Uart.interrupted
 

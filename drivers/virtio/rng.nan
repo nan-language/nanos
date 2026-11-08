@@ -19,7 +19,7 @@ pub layout Pool: bytes 4_096 le {
     data: Array[u8, 4_096] at 0
 } Pool
 
-/// The driver's Env: its queue's size, its function, the windows over its common and notification structures, its queue and buffer, its interrupt, the signal that interrupt posts, and its cell.
+/// The driver's Env: its queue's size, its function, the windows over its common and notification structures, its queue and buffer, its interrupt, the signal that interrupt posts, its clock, its alarm and its cell.
 pub open linear struct RngEnv derives Send {
     size: u16
     function: hw::PciFunction
@@ -29,6 +29,8 @@ pub open linear struct RngEnv derives Send {
     pool: hw::DmaShared[Pool]
     irq: hw::IrqShared[Interrupt]
     signal: mem::Shared[hw::Signal[Unit]]
+    clock: sys::Clock
+    alarm: devices::Alarm
     alloc: mem::Alloc
 } RngEnv
 
@@ -54,8 +56,8 @@ impl Rng: sys::Resume[RngEnv, RngDevice]
 
 impl Rng: sys::Health[RngEnv, RngDevice]
 
-/// The Env over `function`: its structures mapped, its features negotiated, its queue and buffer drawn from `alloc`, attached to physical memory, and its queue's interrupt on MSI-X entry 0 of CPU 0; `None` when the device does not allow it, the function then handed back.
-pub fn RngEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[RngEnv] {
+/// The Env over `function`: its structures mapped, its features negotiated, its queue and buffer drawn from `alloc`, attached to physical memory, and its queue's interrupt on MSI-X entry 0 of CPU 0 under the storm limit; `None` when the device does not allow it, the function then handed back.
+pub fn RngEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[RngEnv] {
     var held = function
     let Some(found) = located(held, kind: ENTROPY) else {
         take held.release()
@@ -81,21 +83,22 @@ pub fn RngEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[Rn
         return None
     }
     let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
-    let irq = match mut held.msix(entry: 0, cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
+    var irq = match mut held.msix(entry: 0, cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
         Ok(shared) => shared
         Err(_) => {
             release(take held, common: Some(take regs), notify: Some(take notify), queue: Some(take queue))
             return None
         }
     }
+    mut irq.limit(per_second: devices::STORM_LIMIT)
     ready(mut regs)
     let pool = hw::DmaShared.of(heap.boxed(Pool.from_bits(Array[u8, 4_096].filled(0))), space: hw::IoSpace.physical())
-    return Some(RngEnv(size: ring.size, function: take held, common: take regs, notify: take notify, queue: take queue, pool: take pool, irq: take irq, signal: take signal, alloc: alloc))
+    return Some(RngEnv(size: ring.size, function: take held, common: take regs, notify: take notify, queue: take queue, pool: take pool, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, alloc: alloc))
 } RngEnv.of
 
 /// Resets the device, then releases the interrupt, the windows and the buffers, and hands the function back.
 pub fn RngEnv.abandon(take self) {
-    let RngEnv(size: _, function: function, common: common, notify: notify, queue: queue, pool: pool, irq: irq, signal: _, alloc: _) = self
+    let RngEnv(size: _, function: function, common: common, notify: notify, queue: queue, pool: pool, irq: irq, signal: _, clock: _, alarm: _, alloc: _) = self
     discard take irq.uninstall()
     discard take pool.into_box()
     release(take function, common: Some(take common), notify: Some(take notify), queue: Some(take queue))
@@ -106,13 +109,11 @@ pub fn Rng.start(mut env: RngEnv) -> Rng = Rng(asked: mem::List.empty(env.alloc)
 /// Once started, turns each interrupt into a completion.
 pub fn Rng.resume(mut self, reason: sys::ResumeReason, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
     let signal = env.signal.share()
+    let clock = env.clock
     mut cx.spawn(key: INTERRUPTS, run: fn[take signal](out: sys::Outbox[RngDevice]) fails task::Cancelled uses wait limits stack 8_192 {
-        loop {
-            try await signal.contents().wait()
-            if (attempt await out.completed()).is_err() {
-                return
-            }
-        }
+        try await devices::relay(signal, clock, post: fn() -> bool fails task::Cancelled uses wait {
+            return (attempt await out.completed()).is_ok()
+        })
     })
 } Rng.resume
 
@@ -142,8 +143,12 @@ pub fn Rng.fill(mut self, take count: u32, mut env: RngEnv, mut cx: sys::Cx[RngD
     return Untrusted.of(mem::Bytes.empty(env.alloc))
 } Rng.fill
 
-/// Answers the request the device completed, then submits the next.
+/// Answers the request the device completed, then submits the next; raises the alarm instead when the interrupt storms.
 fn Rng.completed(mut self, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
+    if env.irq.storming() {
+        env.alarm.raise(mut cx, key: INTERRUPTS, vector: 0)
+        return
+    }
     let Some(entry) = next_used(mut env.queue, seen: self.used, size: env.size) else {
         return
     }

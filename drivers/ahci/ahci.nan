@@ -147,7 +147,7 @@ pub open linear struct Disk derives Send {
     segments: mem::List[hw::DmaShared[Segment]]
 } Disk
 
-/// The driver's Env: its function, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, its clock and its cell.
+/// The driver's Env: its function, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, its clock, its alarm and its cell.
 pub open linear struct AhciEnv derives Send {
     function: hw::PciFunction
     abar: hw::Mmio[Hba]
@@ -155,6 +155,7 @@ pub open linear struct AhciEnv derives Send {
     irq: hw::IrqShared[Interrupt]
     signal: mem::Shared[hw::Signal[Unit]]
     clock: sys::Clock
+    alarm: devices::Alarm
     alloc: mem::Alloc
 } AhciEnv
 
@@ -197,8 +198,8 @@ pub interrupt fn Interrupt.on_irq(mut self, take irq: hw::IrqContext) -> hw::Irq
     return hw::IrqExit.Resume
 } Interrupt.on_irq
 
-/// The Env over `function`: its ABAR mapped, AHCI mode on, attached to physical memory, each port holding an ATA disk set up and identified, and the controller's interrupt on its MSI vector of CPU 0; `None` when the controller does not allow it or holds no disk, the function then handed back.
-pub fn AhciEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem::Alloc) -> Option[AhciEnv] {
+/// The Env over `function`: its ABAR mapped, AHCI mode on, attached to physical memory, each port holding an ATA disk set up and identified, and the controller's interrupt on its MSI vector of CPU 0 under the storm limit; `None` when the controller does not allow it or holds no disk, the function then handed back.
+pub fn AhciEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[AhciEnv] {
     var held = function
     let Ok(window) = attempt hw::Mmio[Hba].of_bar(mut held, index: 5, offset: 0) else {
         take held.release()
@@ -229,21 +230,22 @@ pub fn AhciEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem:
         return None
     }
     let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
-    let irq = match mut held.msi(cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
+    var irq = match mut held.msi(cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
         Ok(shared) => shared
         Err(_) => {
             release(take held, take abar, take disks, clock)
             return None
         }
     }
+    mut irq.limit(per_second: devices::STORM_LIMIT)
     mut abar.write(Hba.is, value: 0xFFFF_FFFF)
     mut abar.write(Hba.ghc, value: mut abar.read(Hba.ghc) | INTERRUPT_ENABLE)
-    return Some(AhciEnv(function: take held, abar: take abar, disks: take disks, irq: take irq, signal: take signal, clock: clock, alloc: alloc))
+    return Some(AhciEnv(function: take held, abar: take abar, disks: take disks, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, alloc: alloc))
 } AhciEnv.of
 
 /// Stops the ports, then releases the interrupt, the window and the buffers, and hands the function back.
 pub fn AhciEnv.abandon(take self) {
-    let AhciEnv(function: function, abar: abar, disks: disks, irq: irq, signal: _, clock: clock, alloc: _) = self
+    let AhciEnv(function: function, abar: abar, disks: disks, irq: irq, signal: _, clock: clock, alarm: _, alloc: _) = self
     discard take irq.uninstall()
     release(take function, take abar, take disks, clock)
 } AhciEnv.abandon
@@ -509,13 +511,11 @@ pub fn Ahci.start(mut env: AhciEnv) -> Ahci {
 /// Once started, turns each interrupt into a completion.
 pub fn Ahci.resume(mut self, reason: sys::ResumeReason, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
     let signal = env.signal.share()
+    let clock = env.clock
     mut cx.spawn(key: INTERRUPTS, run: fn[take signal](out: sys::Outbox[AhciDevice]) fails task::Cancelled uses wait limits stack 8_192 {
-        loop {
-            try await signal.contents().wait()
-            if (attempt await out.completed()).is_err() {
-                return
-            }
-        }
+        try await devices::relay(signal, clock, post: fn() -> bool fails task::Cancelled uses wait {
+            return (attempt await out.completed()).is_ok()
+        })
     })
 } Ahci.resume
 
@@ -606,8 +606,12 @@ fn Ahci.queue_request(
     mut self.submit(mut env, mut cx)
 } Ahci.queue_request
 
-/// Clears the controller's and its ports' interrupt status, answers each issued command its disk has completed, then issues the next ones.
+/// Clears the controller's and its ports' interrupt status, answers each issued command its disk has completed, then issues the next ones; raises the alarm instead when the interrupt storms.
 fn Ahci.completed(mut self, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
+    if env.irq.storming() {
+        env.alarm.raise(mut cx, key: INTERRUPTS, vector: 0)
+        return
+    }
     let pending = mut env.abar.read(Hba.is)
     var errors: u32 = 0
     for unit in 0..<env.disks.len() {

@@ -84,7 +84,7 @@ pub open linear struct Lane derives Send {
     signal: mem::Shared[hw::Signal[Unit]]
 } Lane
 
-/// The driver's Env: the unit's geometry, the features it accepted, its function, its common configuration, its queues, the CPU each handler runs on, its clock and its cell.
+/// The driver's Env: the unit's geometry, the features it accepted, its function, its common configuration, its queues, the CPU each handler runs on, its clock, its alarm and its cell.
 pub open linear struct BlkEnv derives Send {
     info: devices::BlockInfo
     features: u32
@@ -93,6 +93,7 @@ pub open linear struct BlkEnv derives Send {
     lanes: mem::List[Lane]
     here: hw::PerCpu[u32]
     clock: sys::Clock
+    alarm: devices::Alarm
     alloc: mem::Alloc
 } BlkEnv
 
@@ -130,7 +131,7 @@ impl Blk: sys::Component[BlkEnv, BlkDevice]
 impl Blk: sys::Resume[BlkEnv, BlkDevice]
 
 /// The Env over `function`, set up as `RngEnv.of` sets up an entropy device with a queue for each CPU up to those the device offers; `None` when the device does not allow it, the function then handed back.
-pub fn BlkEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem::Alloc) -> Option[BlkEnv] {
+pub fn BlkEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[BlkEnv] {
     var held = function
     let Some(found) = located(held, kind: BLOCK_TYPE) else {
         take held.release()
@@ -185,10 +186,10 @@ pub fn BlkEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem::
     }
     ready(mut regs)
     let info = devices::BlockInfo(units: 1, block_bytes: block_bytes, blocks: sectors * SECTOR_BYTES / u64.widen(block_bytes), max_transfer_bytes: TRANSFER_BYTES, zone_blocks: 0, cache: (accepted & FLUSH) != 0, fua: false, discards: false, read_only: (accepted & READ_ONLY) != 0)
-    return Some(BlkEnv(info: info, features: accepted, function: take held, common: take regs, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alloc: alloc))
+    return Some(BlkEnv(info: info, features: accepted, function: take held, common: take regs, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alarm: take alarm, alloc: alloc))
 } BlkEnv.of
 
-/// Queue `index` enabled with its buffers and an interrupt on CPU `index`; `None`, nothing enabled, when the device has no such queue or no MSI-X entry or doorbell for it.
+/// Queue `index` enabled with its buffers and an interrupt on CPU `index` under the storm limit; `None`, nothing enabled, when the device has no such queue or no MSI-X entry or doorbell for it.
 fn lane_of(
     mut function: hw::PciFunction,
     mut common: hw::Mmio[Common],
@@ -201,10 +202,11 @@ fn lane_of(
         return None
     }
     let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
-    let irq = match mut function.msix(entry: index, cpu: u32.widen(index), dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
+    var irq = match mut function.msix(entry: index, cpu: u32.widen(index), dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
         Ok(shared) => shared
         Err(_) => return None
     }
+    mut irq.limit(per_second: devices::STORM_LIMIT)
     let Ok(notify) = attempt hw::Mmio[Notify].of_bar(mut function, index: found.notify.bar, offset: u64.widen(found.notify.offset) + ring.notify_offset) else {
         discard take irq.uninstall()
         return None
@@ -221,7 +223,7 @@ fn lane_of(
 
 /// Resets the device, then releases the interrupts, the windows and the buffers, and hands the function back.
 pub fn BlkEnv.abandon(take self) {
-    let BlkEnv(info: _, features: _, function: function, common: common, lanes: lanes, here: _, clock: _, alloc: _) = self
+    let BlkEnv(info: _, features: _, function: function, common: common, lanes: lanes, here: _, clock: _, alarm: _, alloc: _) = self
     var regs = common
     reset(mut regs)
     for lane in take lanes {
@@ -281,16 +283,14 @@ pub fn Blk.start(mut env: BlkEnv) -> Blk {
 
 /// Once started, turns each queue's interrupts into its completions.
 pub fn Blk.resume(mut self, reason: sys::ResumeReason, mut env: BlkEnv, mut cx: sys::Cx[BlkDevice]) {
+    let clock = env.clock
     for index in 0..<env.lanes.len() {
         let signal = env.lanes[index].signal.share()
         let queue = u16.fit(index)
         mut cx.spawn(key: INTERRUPTS + u64.widen(index), run: fn[take signal](out: sys::Outbox[BlkDevice]) fails task::Cancelled uses wait limits stack 8_192 {
-            loop {
-                try await signal.contents().wait()
-                if (attempt await out.completed(queue)).is_err() {
-                    return
-                }
-            }
+            try await devices::relay(signal, clock, post: fn() -> bool fails task::Cancelled uses wait {
+                return (attempt await out.completed(queue)).is_ok()
+            })
         })
     }
 } Blk.resume
@@ -380,10 +380,17 @@ fn Blk.queue_request(
     mut self.submit(lane, mut env, mut cx)
 } Blk.queue_request
 
-/// Answers the request queue `queue` completed, then hands it its next.
+/// Answers the request queue `queue` completed, then hands it its next; raises the alarm instead when the queue's interrupt storms.
 fn Blk.completed(mut self, take queue: u16, mut env: BlkEnv, mut cx: sys::Cx[BlkDevice]) {
     let lane = usize.widen(queue)
-    if lane >= self.tracks.len() or not self.tracks[lane].busy {
+    if lane >= self.tracks.len() {
+        return
+    }
+    if env.lanes[lane].irq.storming() {
+        env.alarm.raise(mut cx, key: INTERRUPTS + u64.widen(lane), vector: queue)
+        return
+    }
+    if not self.tracks[lane].busy {
         return
     }
     let Some(_) = next_used(mut env.lanes.at_mut(lane).queue, seen: self.tracks[lane].used, size: env.lanes[lane].ring.size) else {

@@ -1,6 +1,6 @@
 # 0026. Devices with platform interrupts, roles and the store volume
 
-Status: accepted
+Status: superseded by 0028
 
 ## Context
 

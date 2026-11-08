@@ -49,7 +49,7 @@ pub open linear struct Lane derives Send {
     signal: mem::Shared[hw::Signal[Unit]]
 } Lane
 
-/// The driver's Env: what the controller reported, its function, its registers, its admin pair, its I/O pairs, the CPU each handler runs on, its clock and its cell.
+/// The driver's Env: what the controller reported, its function, its registers, its admin pair, its I/O pairs, the CPU each handler runs on, its clock, its alarm and its cell.
 pub open linear struct NvmeEnv derives Send {
     identified: Identified
     function: hw::PciFunction
@@ -58,6 +58,7 @@ pub open linear struct NvmeEnv derives Send {
     lanes: mem::List[Lane]
     here: hw::PerCpu[u32]
     clock: sys::Clock
+    alarm: devices::Alarm
     alloc: mem::Alloc
 } NvmeEnv
 
@@ -95,8 +96,8 @@ impl Nvme: sys::Component[NvmeEnv, NvmeDevice]
 
 impl Nvme: sys::Resume[NvmeEnv, NvmeDevice]
 
-/// The Env over `function`: its registers mapped, attached to physical memory, the controller enabled over its admin pair, its namespaces identified, then an I/O pair per CPU up to those it grants, each created once the interrupt of its MSI-X entry is installed; `None` when the controller does not allow it, the function then handed back.
-pub fn NvmeEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem::Alloc) -> Option[NvmeEnv] {
+/// The Env over `function`: its registers mapped, attached to physical memory, the controller enabled over its admin pair, its namespaces identified, then an I/O pair per CPU up to those it grants, each created once the interrupt of its MSI-X entry is installed under the storm limit; `None` when the controller does not allow it, the function then handed back.
+pub fn NvmeEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[NvmeEnv] {
     var held = function
     let Ok(mapped) = attempt hw::Mmio[Controller].of_bar(mut held, index: 0, offset: 0) else {
         take held.release()
@@ -132,7 +133,7 @@ pub fn NvmeEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem:
         take held.release()
         return None
     }
-    return Some(NvmeEnv(identified: identified, function: take held, regs: take regs, admin: take control, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alloc: alloc))
+    return Some(NvmeEnv(identified: identified, function: take held, regs: take regs, admin: take control, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alarm: take alarm, alloc: alloc))
 } NvmeEnv.of
 
 /// I/O pair `index` created with its pages and an interrupt on CPU `index`; `None`, nothing created, when there is no MSI-X entry for it or the controller refuses it.
@@ -145,10 +146,11 @@ fn lane_of(
     alloc: mem::Alloc,
     ) -> Option[Lane] {
     let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
-    let irq = match mut function.msix(entry: index, cpu: u32.widen(index), dev: virtio::Interrupt(signal: signal.share()), on_irq: virtio::Interrupt.on_irq) {
+    var irq = match mut function.msix(entry: index, cpu: u32.widen(index), dev: virtio::Interrupt(signal: signal.share()), on_irq: virtio::Interrupt.on_irq) {
         Ok(shared) => shared
         Err(_) => return None
     }
+    mut irq.limit(per_second: devices::STORM_LIMIT)
     var pages = mem::List[Page].empty(alloc)
     for _ in 0..<DATA_PAGES {
         mut pages.push(Page.of(heap))
@@ -169,7 +171,7 @@ fn lane_of(
 
 /// Disables the controller, then releases the interrupts, the registers and the pages, and hands the function back.
 pub fn NvmeEnv.abandon(take self) {
-    let NvmeEnv(identified: _, function: function, regs: regs, admin: control, lanes: lanes, here: _, clock: _, alloc: _) = self
+    let NvmeEnv(identified: _, function: function, regs: regs, admin: control, lanes: lanes, here: _, clock: _, alarm: _, alloc: _) = self
     release_queues(take regs, take control, take lanes)
     take function.release()
 } NvmeEnv.abandon
@@ -251,16 +253,14 @@ pub fn Nvme.start(mut env: NvmeEnv) -> Nvme {
 
 /// Once started, turns each pair's interrupts into its completions.
 pub fn Nvme.resume(mut self, reason: sys::ResumeReason, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevice]) {
+    let clock = env.clock
     for index in 0..<env.lanes.len() {
         let signal = env.lanes[index].signal.share()
         let pair = u16.fit(index)
         mut cx.spawn(key: INTERRUPTS + u64.widen(index), run: fn[take signal](out: sys::Outbox[NvmeDevice]) fails task::Cancelled uses wait limits stack 8_192 {
-            loop {
-                try await signal.contents().wait()
-                if (attempt await out.completed(pair)).is_err() {
-                    return
-                }
-            }
+            try await devices::relay(signal, clock, post: fn() -> bool fails task::Cancelled uses wait {
+                return (attempt await out.completed(pair)).is_ok()
+            })
         })
     }
 } Nvme.resume
@@ -345,10 +345,14 @@ fn Nvme.queue_request(
     mut self.submit(lane, mut env, mut cx)
 } Nvme.queue_request
 
-/// Answers the request pair `pair` completed, unless it was aborted, then hands the pair its next.
+/// Answers the request pair `pair` completed, unless it was aborted, then hands the pair its next; raises the alarm instead when the pair's interrupt storms.
 fn Nvme.completed(mut self, take pair: u16, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevice]) {
     let lane = usize.widen(pair)
     if lane >= self.tracks.len() {
+        return
+    }
+    if env.lanes[lane].irq.storming() {
+        env.alarm.raise(mut cx, key: INTERRUPTS + u64.widen(lane), vector: pair)
         return
     }
     let Some(done) = mut self.tracks[lane].pair.completion(completions: mut env.lanes.at_mut(lane).completions) else {
