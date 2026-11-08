@@ -1,15 +1,34 @@
-//! The `ahci` driver: an AHCI controller serving `Block`, a unit per port holding an ATA disk, in port order, one command in flight per port, completed by MSI interrupt.
+//! The `ahci` driver: an AHCI controller serving `Block`, a unit per port holding an ATA disk, in port order, one command in flight per port, completed by MSI interrupt. A command not completed in 30 s is aborted by a reset of its port and fails with `device.timeout`; when the port does not come back, the controller is reset, its other requests failing with `device.reset`.
 
-/// The key of the keyed task turning interrupts into completions.
+/// The keys of the keyed tasks: the one turning interrupts into completions, and those timing each unit's command, the unit's number added.
 const INTERRUPTS: u64 = 1
+
+const TIMING: u64 = 0x100
+
+/// How long a disk has to complete a command.
+const REQUEST_MS: u64 = 30_000
+
+/// How long the hardware has to stop a port's command list or FIS receive, and to report its device present and not busy, end a reset of the HBA or answer an IDENTIFY; how long a COMRESET is held.
+const STOP_MS: u64 = 500
+
+const ANSWER_MS: u64 = 1_000
+
+const HOLD_MS: u64 = 1
 
 /// The ports an HBA has at most.
 const PORTS: u32 = 32
 
-/// The global host control bits: AHCI enable, interrupt enable.
+/// The global host control bits: AHCI enable, interrupt enable, HBA reset.
 const AHCI_ENABLE: u32 = 1 << 31
 
 const INTERRUPT_ENABLE: u32 = 1 << 1
+
+const HBA_RESET: u32 = 1
+
+/// The device detection field of a port's SATA control, and its value holding a COMRESET.
+const DETECTION: u32 = 0xF
+
+const COMRESET: u32 = 1
 
 /// The port command bits: start, FIS receive enable, FIS receive running, command list running.
 const RUN: u32 = 1
@@ -67,12 +86,9 @@ const FIS_BYTES: u64 = 256
 
 const TABLE_ALIGN: u64 = 128
 
-/// How many times setting up a port polls the hardware before giving up.
-const MOST_POLLS: u32 = 1_000_000
-
 contribute devices::drivers ahci = devices::Registration(name: text::Fixed[20].of("ahci"), matches: devices::matches(devices::DeviceMatch.PciClass(class: 0x01_0601, mask: 0xFF_FFFF), rest: devices::DeviceMatch.None), class: devices::Class.Block, component: text::Fixed[48].of("drivers::ahci::Ahci"), priority: 0)
 
-/// What the driver serves: `Block`'s operations, and its controller's completions.
+/// What the driver serves: `Block`'s operations, its controller's completions, and the ends of its commands' time.
 pub protocol AhciDevice {
     pub fn info(unit: u16) -> devices::BlockInfo fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn read(unit: u16, block: u64, count: u32) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
@@ -80,6 +96,7 @@ pub protocol AhciDevice {
     pub fn flush(unit: u16) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn discard_blocks(unit: u16, block: u64, count: u32) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     fn completed() limits irreversible(emit, actuate, erase, spend)
+    fn expired(unit: u16, handed: u64) limits irreversible(emit, actuate, erase, spend)
 } AhciDevice
 
 /// The HBA's generic host control.
@@ -101,6 +118,7 @@ pub registers Port {
     tfd: u32 at 0x20 read
     sig: u32 at 0x24 read
     ssts: u32 at 0x28 read
+    sctl: u32 at 0x2C read write
     serr: u32 at 0x30 write_one_clear
     ci: u32 at 0x38 read write
 } Port
@@ -129,13 +147,14 @@ pub open linear struct Disk derives Send {
     segments: mem::List[hw::DmaShared[Segment]]
 } Disk
 
-/// The driver's Env: its function, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, and its cell.
+/// The driver's Env: its function, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, its clock and its cell.
 pub open linear struct AhciEnv derives Send {
     function: hw::PciFunction
     abar: hw::Mmio[Hba]
     disks: mem::List[Disk]
     irq: hw::IrqShared[Interrupt]
     signal: mem::Shared[hw::Signal[Unit]]
+    clock: sys::Clock
     alloc: mem::Alloc
 } AhciEnv
 
@@ -160,9 +179,11 @@ pub closed struct Waiting derives Encode {
     pub data: Option[mem::Bytes]
 } Waiting
 
-/// The driver's state: the requests waiting, at most one per unit issued.
+/// The driver's state: the requests waiting, at most one per unit issued, how many commands each unit has been issued, the last being the one its timer runs for, and whether the controller failed to come back from a reset.
 pub closed struct Ahci derives Encode {
     pub waiting: mem::List[Waiting]
+    pub handed: mem::List[u64]
+    pub lost: bool
 } Ahci
 
 impl Ahci: sys::Component[AhciEnv, AhciDevice]
@@ -177,7 +198,7 @@ pub interrupt fn Interrupt.on_irq(mut self, take irq: hw::IrqContext) -> hw::Irq
 } Interrupt.on_irq
 
 /// The Env over `function`: its ABAR mapped, AHCI mode on, attached to physical memory, each port holding an ATA disk set up and identified, and the controller's interrupt on its MSI vector of CPU 0; `None` when the controller does not allow it or holds no disk, the function then handed back.
-pub fn AhciEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[AhciEnv] {
+pub fn AhciEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem::Alloc) -> Option[AhciEnv] {
     var held = function
     let Ok(window) = attempt hw::Mmio[Hba].of_bar(mut held, index: 5, offset: 0) else {
         take held.release()
@@ -197,51 +218,51 @@ pub fn AhciEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[A
         if ((implemented >> port) & 1) == 0 {
             continue
         }
-        match set_up_port(mut held, port, heap, alloc) {
+        match set_up_port(mut held, port, heap, clock, alloc) {
             Some(disk) => mut disks.push(take disk)
             None => {
             }
         }
     }
     if disks.len() == 0 {
-        release(take held, take abar, take disks)
+        release(take held, take abar, take disks, clock)
         return None
     }
     let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
     let irq = match mut held.msi(cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
         Ok(shared) => shared
         Err(_) => {
-            release(take held, take abar, take disks)
+            release(take held, take abar, take disks, clock)
             return None
         }
     }
     mut abar.write(Hba.is, value: 0xFFFF_FFFF)
     mut abar.write(Hba.ghc, value: mut abar.read(Hba.ghc) | INTERRUPT_ENABLE)
-    return Some(AhciEnv(function: take held, abar: take abar, disks: take disks, irq: take irq, signal: take signal, alloc: alloc))
+    return Some(AhciEnv(function: take held, abar: take abar, disks: take disks, irq: take irq, signal: take signal, clock: clock, alloc: alloc))
 } AhciEnv.of
 
 /// Stops the ports, then releases the interrupt, the window and the buffers, and hands the function back.
 pub fn AhciEnv.abandon(take self) {
-    let AhciEnv(function: function, abar: abar, disks: disks, irq: irq, signal: _, alloc: _) = self
+    let AhciEnv(function: function, abar: abar, disks: disks, irq: irq, signal: _, clock: clock, alloc: _) = self
     discard take irq.uninstall()
-    release(take function, take abar, take disks)
+    release(take function, take abar, take disks, clock)
 } AhciEnv.abandon
 
 /// Stops each disk's port and frees its memory, then unmaps the window and hands the function back, cut off.
-fn release(take function: hw::PciFunction, take abar: hw::Mmio[Hba], take disks: mem::List[Disk]) {
+fn release(take function: hw::PciFunction, take abar: hw::Mmio[Hba], take disks: mem::List[Disk], clock: sys::Clock) {
     var window = abar
     for disk in take disks {
-        free_disk(take disk)
+        free_disk(take disk, clock)
     }
     mut window.write(Hba.ghc, value: mut window.read(Hba.ghc) & ~INTERRUPT_ENABLE)
     take window.unmap()
     take function.release()
 } release
 
-fn free_disk(take disk: Disk) {
+fn free_disk(take disk: Disk, clock: sys::Clock) {
     let Disk(regs: regs, info: _, area: area, list: _, table: _, segments: segments) = disk
     var held = regs
-    stop(mut held)
+    stop(mut held, clock)
     take held.unmap()
     discard take area.into_box()
     for segment in take segments {
@@ -250,21 +271,104 @@ fn free_disk(take disk: Disk) {
 } free_disk
 
 /// Clears the port's start and FIS receive bits and waits until its command list and FIS receive stop running.
-fn stop(mut regs: hw::Mmio[Port]) {
+fn stop(mut regs: hw::Mmio[Port], clock: sys::Clock) {
     mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) & ~RUN)
-    var polls: u32 = 0
-    while (mut regs.read(Port.cmd) & RUNNING) != 0 and polls < MOST_POLLS {
-        polls += 1
+    var until = deadline(clock, ms: STOP_MS)
+    while (mut regs.read(Port.cmd) & RUNNING) != 0 and not passed(clock, until) {
     }
     mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) & ~RECEIVE_FIS)
-    polls = 0
-    while (mut regs.read(Port.cmd) & RECEIVING) != 0 and polls < MOST_POLLS {
-        polls += 1
+    until = deadline(clock, ms: STOP_MS)
+    while (mut regs.read(Port.cmd) & RECEIVING) != 0 and not passed(clock, until) {
     }
 } stop
 
+/// Has the port receive FISes into memory from bus address `at`, its command list there and its received-FIS area after it, clears its errors and interrupts, enables its interrupts, and waits until its device is not busy: whether it got so.
+fn receive(mut regs: hw::Mmio[Port], at: u64, clock: sys::Clock) -> bool {
+    let fis = at + LIST_BYTES
+    mut regs.write(Port.clb, value: u32.truncate(at))
+    mut regs.write(Port.clbu, value: u32.truncate(at >> 32))
+    mut regs.write(Port.fb, value: u32.truncate(fis))
+    mut regs.write(Port.fbu, value: u32.truncate(fis >> 32))
+    mut regs.write(Port.serr, value: 0xFFFF_FFFF)
+    mut regs.write(Port.is, value: 0xFFFF_FFFF)
+    mut regs.write(Port.ie, value: PORT_INTERRUPTS)
+    mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) | RECEIVE_FIS)
+    let until = deadline(clock, ms: ANSWER_MS)
+    while (mut regs.read(Port.tfd) & (BUSY | DATA_REQUEST)) != 0 {
+        if passed(clock, until) {
+            return false
+        }
+    }
+    return true
+} receive
+
+/// Resets the disk's port with a COMRESET, which aborts its command, then starts it again once its device answers: whether it did.
+fn Disk.restart(mut self, clock: sys::Clock) -> bool {
+    stop(mut self.regs, clock)
+    let control = mut self.regs.read(Port.sctl) & ~DETECTION
+    mut self.regs.write(Port.sctl, value: control | COMRESET)
+    let held = deadline(clock, ms: HOLD_MS)
+    while not passed(clock, until: held) {
+    }
+    mut self.regs.write(Port.sctl, value: control)
+    let until = deadline(clock, ms: ANSWER_MS)
+    while (mut self.regs.read(Port.ssts) & DETECTION) != PRESENT {
+        if passed(clock, until) {
+            return false
+        }
+    }
+    if not receive(mut self.regs, at: self.area.bus_addr().value + self.list, clock) {
+        return false
+    }
+    mut self.regs.write(Port.cmd, value: mut self.regs.read(Port.cmd) | RUN)
+    return true
+} Disk.restart
+
+/// Resets the controller, then each disk's port: whether every one came back.
+fn AhciEnv.restart(mut self) -> bool {
+    mut self.abar.write(Hba.ghc, value: HBA_RESET)
+    let until = deadline(self.clock, ms: ANSWER_MS)
+    while (mut self.abar.read(Hba.ghc) & HBA_RESET) != 0 {
+        if passed(self.clock, until) {
+            return false
+        }
+    }
+    mut self.abar.write(Hba.ghc, value: AHCI_ENABLE)
+    var all = true
+    for unit in 0..<self.disks.len() {
+        if not mut self.disks.at_mut(unit).restart(self.clock) {
+            all = false
+        }
+    }
+    mut self.abar.write(Hba.is, value: 0xFFFF_FFFF)
+    mut self.abar.write(Hba.ghc, value: AHCI_ENABLE | INTERRUPT_ENABLE)
+    return all
+} AhciEnv.restart
+
+/// The monotonic time `ms` milliseconds from now on `clock`, 0 through a revoked clock.
+fn deadline(clock: sys::Clock, ms: u64) -> u64 {
+    return match attempt clock.elapsed_ns() {
+        Ok(now) => now.saturating_add(ms.saturating_mul(1_000_000))
+        Err(_) => 0
+    }
+} deadline
+
+/// Whether `until` has passed on `clock`, as it has through a revoked clock.
+fn passed(clock: sys::Clock, until: u64) -> bool {
+    return match attempt clock.elapsed_ns() {
+        Ok(now) => now >= until
+        Err(_) => true
+    }
+} passed
+
 /// The disk on `port` of `function` when it holds an ATA disk: its registers mapped, its memory drawn from `heap`, its port started, and the disk identified; `None` otherwise, what it took released.
-fn set_up_port(mut function: hw::PciFunction, port: u32, heap: mem::Heap, alloc: mem::Alloc) -> Option[Disk] {
+fn set_up_port(
+    mut function: hw::PciFunction,
+    port: u32,
+    heap: mem::Heap,
+    clock: sys::Clock,
+    alloc: mem::Alloc,
+    ) -> Option[Disk] {
     let Ok(window) = attempt hw::Mmio[Port].of_bar(mut function, index: 5, offset: PORT_BASE + PORT_STRIDE * u64.widen(port)) else {
         return None
     }
@@ -273,7 +377,7 @@ fn set_up_port(mut function: hw::PciFunction, port: u32, heap: mem::Heap, alloc:
         take regs.unmap()
         return None
     }
-    stop(mut regs)
+    stop(mut regs, clock)
     let area = hw::DmaShared.of(heap.boxed(Area.from_bits(Array[u8, 8_192].filled(0))), space: hw::IoSpace.physical())
     var segments = mem::List[hw::DmaShared[Segment]].empty(alloc)
     for _ in 0..<SEGMENT_COUNT {
@@ -281,23 +385,11 @@ fn set_up_port(mut function: hw::PciFunction, port: u32, heap: mem::Heap, alloc:
     }
     let base = area.bus_addr().value
     let list = align_up(base, to: LIST_BYTES) - base
-    let fis = list + LIST_BYTES
-    let table = align_up(base + fis + FIS_BYTES, to: TABLE_ALIGN) - base
-    mut regs.write(Port.clb, value: u32.truncate(base + list))
-    mut regs.write(Port.clbu, value: u32.truncate((base + list) >> 32))
-    mut regs.write(Port.fb, value: u32.truncate(base + fis))
-    mut regs.write(Port.fbu, value: u32.truncate((base + fis) >> 32))
-    mut regs.write(Port.serr, value: 0xFFFF_FFFF)
-    mut regs.write(Port.is, value: 0xFFFF_FFFF)
-    mut regs.write(Port.ie, value: PORT_INTERRUPTS)
-    mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) | RECEIVE_FIS)
-    var polls: u32 = 0
-    while (mut regs.read(Port.tfd) & (BUSY | DATA_REQUEST)) != 0 and polls < MOST_POLLS {
-        polls += 1
-    }
+    let table = align_up(base + list + LIST_BYTES + FIS_BYTES, to: TABLE_ALIGN) - base
+    discard receive(mut regs, at: base + list, clock)
     // The signature comes with the device's first FIS, which the port receives only once FIS receive is on.
     if mut regs.read(Port.sig) != ATA_SIGNATURE {
-        stop(mut regs)
+        stop(mut regs, clock)
         take regs.unmap()
         discard take area.into_box()
         for segment in take segments {
@@ -308,18 +400,19 @@ fn set_up_port(mut function: hw::PciFunction, port: u32, heap: mem::Heap, alloc:
     mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) | RUN)
     var disk = Disk(regs: take regs, info: devices::BlockInfo(units: 1, block_bytes: 512, blocks: 0, max_transfer_bytes: TRANSFER_BYTES, zone_blocks: 0, cache: false, fua: false, discards: false, read_only: false), area: take area, list: list, table: table, segments: take segments)
     issue(mut disk, command: IDENTIFY, lba: 0, sectors: 1, bytes: 512, write: false)
-    polls = 0
-    while (mut disk.regs.read(Port.ci) & 1) != 0 and polls < MOST_POLLS {
-        polls += 1
+    let until = deadline(clock, ms: ANSWER_MS)
+    var late = false
+    while (mut disk.regs.read(Port.ci) & 1) != 0 and not late {
+        late = passed(clock, until)
     }
-    let failed = (mut disk.regs.read(Port.tfd) & TASK_ERROR) != 0 or polls == MOST_POLLS
+    let failed = (mut disk.regs.read(Port.tfd) & TASK_ERROR) != 0 or late
     mut disk.regs.write(Port.is, value: 0xFFFF_FFFF)
     if failed {
-        free_disk(take disk)
+        free_disk(take disk, clock)
         return None
     }
     let Some(info) = identified(mut disk) else {
-        free_disk(take disk)
+        free_disk(take disk, clock)
         return None
     }
     disk.info = info
@@ -405,7 +498,13 @@ fn put(mut disk: Disk, at: usize, bits: u32) {
     mut disk.area.write_release_at(Area.words, index: at, value: bits)
 } put
 
-pub fn Ahci.start(mut env: AhciEnv) -> Ahci = Ahci(waiting: mem::List.empty(env.alloc))
+pub fn Ahci.start(mut env: AhciEnv) -> Ahci {
+    var handed = mem::List[u64].empty(env.alloc)
+    for _ in 0..<env.disks.len() {
+        mut handed.push(0)
+    }
+    return Ahci(waiting: mem::List.empty(env.alloc), handed: take handed, lost: false)
+} Ahci.start
 
 /// Once started, turns each interrupt into a completion.
 pub fn Ahci.resume(mut self, reason: sys::ResumeReason, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
@@ -486,7 +585,7 @@ fn AhciEnv.info_of(self, unit: u16) -> devices::BlockInfo fails devices::DeviceE
     return disk.info
 } AhciEnv.info_of
 
-/// Postpones the request and issues it once it is the first of its unit.
+/// Postpones the request and issues it once it is the first of its unit, failing it at once with `device.reset` once the controller is lost.
 fn Ahci.queue_request(
     mut self,
     unit: u16,
@@ -498,8 +597,13 @@ fn Ahci.queue_request(
     let Some(request) = mut cx.postpone() else {
         return
     }
-    mut self.waiting.push(Waiting(request: request, unit: unit, operation: operation, issued: false, data: take data))
-    mut self.submit(mut env)
+    let waiting = Waiting(request: request, unit: unit, operation: operation, issued: false, data: take data)
+    if self.lost {
+        refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
+        return
+    }
+    mut self.waiting.push(take waiting)
+    mut self.submit(mut env, mut cx)
 } Ahci.queue_request
 
 /// Clears the controller's and its ports' interrupt status, answers each issued command its disk has completed, then issues the next ones.
@@ -523,18 +627,72 @@ fn Ahci.completed(mut self, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
         }
         let Waiting(request: request, unit: _, operation: operation, issued: _, data: _) = mut self.waiting.remove(at)
         let failed = (errors & (1u32 << u32.fit(unit))) != 0 or (mut env.disks.at_mut(unit).regs.read(Port.tfd) & TASK_ERROR) != 0
-        var reply = sys::Encoded.empty(env.alloc)
         match operation {
-            Operation.Read(block: _, count: blocks) => mem::wire::Codec[Result[Untrusted[mem::Bytes], devices::DeviceError]].encode(read_outcome(failed, mut env, unit, count: blocks), out: mut reply.bytes)
-            else => mem::wire::Codec[Result[Unit, devices::DeviceError]].encode(outcome(failed), out: mut reply.bytes)
+            Operation.Read(block: _, count: blocks) => answer(request, result: read_outcome(failed, mut env, unit, count: blocks), alloc: env.alloc, mut cx)
+            else => answer(request, result: outcome(failed), alloc: env.alloc, mut cx)
         }
-        discard attempt mut cx.reply(request, reply)
+        mut cx.cancel(key: TIMING + u64.widen(unit))
     }
-    mut self.submit(mut env)
+    mut self.submit(mut env, mut cx)
 } Ahci.completed
 
-/// Issues the first waiting request of each unit with no command on its disk.
-fn Ahci.submit(mut self, mut env: AhciEnv) {
+/// Fails the command on unit `unit` with `device.timeout` once the time of the `handed`th it was issued has run out with the command still on its disk, resetting its port; when the port does not come back, resets the controller, failing every other request with `device.reset`.
+fn Ahci.expired(
+    mut self,
+    take unit: u16,
+    take handed: u64,
+    mut env: AhciEnv,
+    mut cx: sys::Cx[AhciDevice],
+    ) {
+    let index = usize.widen(unit)
+    if index >= self.handed.len() or self.handed[index] != handed {
+        return
+    }
+    let Some(at) = self.waiting.position(fn(waiting: Waiting) -> bool {
+        return waiting.unit == unit and waiting.issued
+    }) else {
+        return
+    }
+    let late = mut self.waiting.remove(at)
+    refuse(take late, error: devices::DeviceError.Timeout, alloc: env.alloc, mut cx)
+    if mut env.disks.at_mut(index).restart(env.clock) {
+        mut self.submit(mut env, mut cx)
+        return
+    }
+    self.lost = not mut env.restart()
+    for each in 0..<self.handed.len() {
+        mut cx.cancel(key: TIMING + u64.widen(each))
+    }
+    while self.waiting.len() > 0 {
+        let waiting = mut self.waiting.remove(0)
+        refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
+    }
+} Ahci.expired
+
+/// Answers the request `request` with `result`.
+fn answer[R: Encode](request: u64, take result: Result[R, devices::DeviceError], alloc: mem::Alloc, mut cx: sys::Cx[AhciDevice]) {
+    var reply = sys::Encoded.empty(alloc)
+    mem::wire::Codec[Result[R, devices::DeviceError]].encode(result, out: mut reply.bytes)
+    discard attempt mut cx.reply(request, reply)
+} answer
+
+/// Fails the request `waiting` holds with `error`.
+fn refuse(take waiting: Waiting, error: devices::DeviceError, alloc: mem::Alloc, mut cx: sys::Cx[AhciDevice]) {
+    let Waiting(request: request, unit: _, operation: operation, issued: _, data: _) = waiting
+    match operation {
+        Operation.Read(block: _, count: _) => {
+            let failed: Result[Untrusted[mem::Bytes], devices::DeviceError] = Err(error)
+            answer(request, result: take failed, alloc, mut cx)
+        }
+        else => {
+            let failed: Result[Unit, devices::DeviceError] = Err(error)
+            answer(request, result: failed, alloc, mut cx)
+        }
+    }
+} refuse
+
+/// Issues the first waiting request of each unit with no command on its disk, its time then starting.
+fn Ahci.submit(mut self, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
     for unit in 0..<env.disks.len() {
         let Some(chosen) = self.next_of(unit) else {
             continue
@@ -560,6 +718,14 @@ fn Ahci.submit(mut self, mut env: AhciEnv) {
             Operation.Flush => issue(mut env.disks.at_mut(unit), command: FLUSH_CACHE_EXT, lba: 0, sectors: 0, bytes: 0, write: false)
         }
         self.waiting[chosen].issued = true
+        self.handed[unit] += 1
+        let clock = env.clock
+        let disk = u16.fit(unit)
+        let handed = self.handed[unit]
+        mut cx.spawn(key: TIMING + u64.widen(unit), run: fn(out: sys::Outbox[AhciDevice]) fails task::Cancelled uses wait limits stack 8_192 {
+            try await clock.sleep(REQUEST_MS)
+            discard attempt await out.expired(unit: disk, handed)
+        })
     }
 } Ahci.submit
 

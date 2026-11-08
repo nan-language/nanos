@@ -1,7 +1,12 @@
-//! The `nvme` driver: an NVMe controller serving `Block`, a unit per namespace among its first four, one request at a time on one I/O queue pair, completed by MSI-X interrupt.
+//! The `nvme` driver: an NVMe controller serving `Block`, a unit per namespace among its first four, through an I/O queue pair per CPU, or the pairs the controller grants, CPU c using pair c mod their count, each holding one request at a time that an MSI-X interrupt on the pair's CPU completes. A request not completed in 30 s is aborted and fails with `device.timeout`; when the controller does not abort it, the controller is reset, its other requests failing with `device.reset`.
 
-/// The key of the keyed task turning interrupts into completions.
-const INTERRUPT_KEY: u64 = 1
+/// The keys of the keyed tasks turning each pair's interrupts into completions and timing its request, the pair's number added.
+const INTERRUPTS: u64 = 1
+
+const TIMING: u64 = 0x100
+
+/// How long the controller has to complete a request.
+const REQUEST_MS: u64 = 30_000
 
 /// The NVM opcodes.
 const FLUSH_OPCODE: u8 = 0x00
@@ -10,44 +15,49 @@ const WRITE_OPCODE: u8 = 0x01
 
 const READ_OPCODE: u8 = 0x02
 
-/// The doorbells of the I/O queue pair: its submission tail, its completion head.
-const SUBMISSION_DOORBELL: usize = 2
-
-const COMPLETION_DOORBELL: usize = 3
-
 /// The data pages of a transfer: 64 KiB.
 const DATA_PAGES: u32 = 16
 
 contribute devices::drivers nvme_driver = devices::Registration(name: text::Fixed[20].of("nvme"), matches: devices::matches(devices::DeviceMatch.PciClass(class: 0x01_0802, mask: 0xFF_FFFF), rest: devices::DeviceMatch.None), class: devices::Class.Block, component: text::Fixed[48].of("drivers::nvme::Nvme"), priority: 0)
 
-/// What the driver serves: `Block`'s operations, and its controller's completions.
+/// What the driver serves: `Block`'s operations, the completions of its queue pairs, and the ends of their requests' time.
 pub protocol NvmeDevice {
     pub fn info(unit: u16) -> devices::BlockInfo fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn read(unit: u16, block: u64, count: u32) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn write(unit: u16, block: u64, data: mem::Bytes, fua: bool) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn flush(unit: u16) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
     pub fn discard_blocks(unit: u16, block: u64, count: u32) fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
-    fn completed() limits irreversible(emit, actuate, erase, spend)
+    fn completed(pair: u16) limits irreversible(emit, actuate, erase, spend)
+    fn expired(pair: u16, handed: u64) limits irreversible(emit, actuate, erase, spend)
 } NvmeDevice
 
-/// The queues of the controller: the admin pair, the I/O pair, and the PRP list of a transfer.
-pub open linear struct Queues derives Send {
-    admin_submissions: Page
-    admin_completions: Page
+/// The admin queue pair: its submissions and completions, the page identify reads into, and where it stands.
+pub open linear struct Admin derives Send {
+    submissions: Page
+    completions: Page
+    scratch: Page
+    pair: Pair
+} Admin
+
+/// An I/O queue pair: its submissions and completions, the PRP list and the pages of the transfer on it, its interrupt, and the signal that interrupt posts.
+pub open linear struct Lane derives Send {
     submissions: Page
     completions: Page
     list: Page
-} Queues
+    pages: mem::List[Page]
+    irq: hw::IrqShared[virtio::Interrupt]
+    signal: mem::Shared[hw::Signal[Unit]]
+} Lane
 
-/// The driver's Env: what the controller reported, its function, its registers, its queues, the pages of a transfer, its interrupt, the signal that interrupt posts, and its cell.
+/// The driver's Env: what the controller reported, its function, its registers, its admin pair, its I/O pairs, the CPU each handler runs on, its clock and its cell.
 pub open linear struct NvmeEnv derives Send {
     identified: Identified
     function: hw::PciFunction
     regs: hw::Mmio[Controller]
-    queues: Queues
-    pages: mem::List[Page]
-    irq: hw::IrqShared[virtio::Interrupt]
-    signal: mem::Shared[hw::Signal[Unit]]
+    admin: Admin
+    lanes: mem::List[Lane]
+    here: hw::PerCpu[u32]
+    clock: sys::Clock
     alloc: mem::Alloc
 } NvmeEnv
 
@@ -65,32 +75,28 @@ pub closed struct Waiting derives Encode {
     pub data: Option[mem::Bytes]
 } Waiting
 
-/// The driver's state: the requests waiting, the first of them on the controller when `busy`, and the I/O queue pair's place.
-pub closed struct Nvme derives Encode {
+/// An I/O pair's requests: those waiting, the first of them on the controller when `busy`, where the pair stands, the slot of the command on it, how many requests it has handed the controller, the last being the one its timer runs for, and whether that one was aborted, its completion then owed no answer.
+pub closed struct Track derives Encode {
     pub waiting: mem::List[Waiting]
     pub busy: bool
     pub pair: Pair
+    pub slot: u16
+    pub handed: u64
+    pub aborted: bool
+} Track
+
+/// The driver's state: the requests of each I/O pair, and whether the controller failed to come back from a reset.
+pub closed struct Nvme derives Encode {
+    pub tracks: mem::List[Track]
+    pub lost: bool
 } Nvme
 
 impl Nvme: sys::Component[NvmeEnv, NvmeDevice]
 
 impl Nvme: sys::Resume[NvmeEnv, NvmeDevice]
 
-fn Queues.of(heap: mem::Heap) -> Queues {
-    return Queues(admin_submissions: Page.of(heap), admin_completions: Page.of(heap), submissions: Page.of(heap), completions: Page.of(heap), list: Page.of(heap))
-} Queues.of
-
-fn Queues.release(take self) {
-    let Queues(admin_submissions: a, admin_completions: b, submissions: c, completions: d, list: e) = self
-    take a.release()
-    take b.release()
-    take c.release()
-    take d.release()
-    take e.release()
-} Queues.release
-
-/// The Env over `function`: its registers mapped, attached to physical memory, the controller enabled over its admin queue, its namespaces identified, its interrupt on MSI-X entry 0 of CPU 0, then its I/O queue pair created, which signals completions only through vectors enabled before it; `None` when the controller does not allow it, the function then handed back.
-pub fn NvmeEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[NvmeEnv] {
+/// The Env over `function`: its registers mapped, attached to physical memory, the controller enabled over its admin pair, its namespaces identified, then an I/O pair per CPU up to those it grants, each created once the interrupt of its MSI-X entry is installed; `None` when the controller does not allow it, the function then handed back.
+pub fn NvmeEnv.of(take function: hw::PciFunction, clock: sys::Clock, alloc: mem::Alloc) -> Option[NvmeEnv] {
     var held = function
     let Ok(mapped) = attempt hw::Mmio[Controller].of_bar(mut held, index: 0, offset: 0) else {
         take held.release()
@@ -98,86 +104,165 @@ pub fn NvmeEnv.of(take function: hw::PciFunction, alloc: mem::Alloc) -> Option[N
     }
     var regs = mapped
     let heap = mem::Heap.of(alloc)
-    var queues = Queues.of(heap)
+    var control = Admin(submissions: Page.of(heap), completions: Page.of(heap), scratch: Page.of(heap), pair: Pair.fresh())
+    var lanes = mem::List[Lane].empty(alloc)
+    if (attempt mut held.attach_physical()).is_err() or not enable(mut regs, submissions: control.submissions, completions: control.completions) {
+        release_queues(take regs, take control, take lanes)
+        take held.release()
+        return None
+    }
+    let Some(identified) = identify(mut regs, pair: mut control.pair, submissions: mut control.submissions, completions: mut control.completions, scratch: mut control.scratch) else {
+        release_queues(take regs, take control, take lanes)
+        take held.release()
+        return None
+    }
+    var wanted = hw::cpu_count()
+    if wanted > MOST_PAIRS {
+        wanted = MOST_PAIRS
+    }
+    let granted = granted_pairs(mut regs, pair: mut control.pair, submissions: mut control.submissions, completions: mut control.completions, wanted)
+    for index in 0..<granted {
+        let Some(lane) = lane_of(mut held, mut regs, mut control, index: u16.fit(index), heap, alloc) else {
+            break
+        }
+        mut lanes.push(take lane)
+    }
+    if lanes.len() == 0 {
+        release_queues(take regs, take control, take lanes)
+        take held.release()
+        return None
+    }
+    return Some(NvmeEnv(identified: identified, function: take held, regs: take regs, admin: take control, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alloc: alloc))
+} NvmeEnv.of
+
+/// I/O pair `index` created with its pages and an interrupt on CPU `index`; `None`, nothing created, when there is no MSI-X entry for it or the controller refuses it.
+fn lane_of(
+    mut function: hw::PciFunction,
+    mut regs: hw::Mmio[Controller],
+    mut control: Admin,
+    index: u16,
+    heap: mem::Heap,
+    alloc: mem::Alloc,
+    ) -> Option[Lane] {
+    let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
+    let irq = match mut function.msix(entry: index, cpu: u32.widen(index), dev: virtio::Interrupt(signal: signal.share()), on_irq: virtio::Interrupt.on_irq) {
+        Ok(shared) => shared
+        Err(_) => return None
+    }
     var pages = mem::List[Page].empty(alloc)
     for _ in 0..<DATA_PAGES {
         mut pages.push(Page.of(heap))
     }
-    if (attempt mut held.attach_physical()).is_err() or not enable(mut regs, submissions: queues.admin_submissions, completions: queues.admin_completions) {
-        give_up(take held, take regs, take queues, take pages)
-        return None
-    }
-    var pair = Pair.fresh()
-    let Some(identified) = identify(mut regs, mut pair, submissions: mut queues.admin_submissions, completions: mut queues.admin_completions, scratch: mut queues.list) else {
-        give_up(take held, take regs, take queues, take pages)
-        return None
-    }
-    let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
-    let irq = match mut held.msix(entry: 0, cpu: 0, dev: virtio::Interrupt(signal: signal.share()), on_irq: virtio::Interrupt.on_irq) {
-        Ok(shared) => shared
-        Err(_) => {
-            give_up(take held, take regs, take queues, take pages)
-            return None
-        }
-    }
-    if not create_io_pair(mut regs, mut pair, submissions: mut queues.admin_submissions, completions: mut queues.admin_completions, io_submissions: queues.submissions, io_completions: queues.completions) {
+    let submissions = Page.of(heap)
+    let completions = Page.of(heap)
+    if not create_io_pair(mut regs, pair: mut control.pair, submissions: mut control.submissions, completions: mut control.completions, id: index + 1, vector: index, io_submissions: submissions, io_completions: completions) {
         discard take irq.uninstall()
-        give_up(take held, take regs, take queues, take pages)
+        take submissions.release()
+        take completions.release()
+        for page in take pages {
+            take page.release()
+        }
         return None
     }
-    return Some(NvmeEnv(identified: identified, function: take held, regs: take regs, queues: take queues, pages: take pages, irq: take irq, signal: take signal, alloc: alloc))
-} NvmeEnv.of
+    return Some(Lane(submissions: take submissions, completions: take completions, list: Page.of(heap), pages: take pages, irq: take irq, signal: take signal))
+} lane_of
 
-/// Disables the controller, then releases the interrupt, the registers and the pages, and hands the function back.
+/// Disables the controller, then releases the interrupts, the registers and the pages, and hands the function back.
 pub fn NvmeEnv.abandon(take self) {
-    let NvmeEnv(identified: _, function: function, regs: regs, queues: queues, pages: pages, irq: irq, signal: _, alloc: _) = self
-    discard take irq.uninstall()
-    var held = regs
-    discard disable(mut held)
-    take held.unmap()
-    let Queues(admin_submissions: a, admin_completions: b, submissions: c, completions: d, list: e) = queues
-    let Page(span: span_a, at: _) = a
-    discard take span_a.into_box()
-    let Page(span: span_b, at: _) = b
-    discard take span_b.into_box()
-    let Page(span: span_c, at: _) = c
-    discard take span_c.into_box()
-    let Page(span: span_d, at: _) = d
-    discard take span_d.into_box()
-    let Page(span: span_e, at: _) = e
-    discard take span_e.into_box()
-    for page in take pages {
-        let Page(span: span, at: _) = page
-        discard take span.into_box()
-    }
+    let NvmeEnv(identified: _, function: function, regs: regs, admin: control, lanes: lanes, here: _, clock: _, alloc: _) = self
+    release_queues(take regs, take control, take lanes)
     take function.release()
 } NvmeEnv.abandon
 
-/// Disables the controller, which stops using its queues, then frees them and the pages, unmaps the registers and hands the function back, cut off.
-fn give_up(take function: hw::PciFunction, take regs: hw::Mmio[Controller], take queues: Queues, take pages: mem::List[Page]) {
+/// Disables the controller, which stops using its queues, then releases its pairs and pages and unmaps the registers.
+fn release_queues(take regs: hw::Mmio[Controller], take control: Admin, take lanes: mem::List[Lane]) {
     var held = regs
     discard disable(mut held)
     take held.unmap()
-    take queues.release()
-    for page in take pages {
-        take page.release()
-    }
-    take function.release()
-} give_up
-
-pub fn Nvme.start(mut env: NvmeEnv) -> Nvme = Nvme(waiting: mem::List.empty(env.alloc), busy: false, pair: Pair.fresh())
-
-/// Once started, turns each interrupt into a completion.
-pub fn Nvme.resume(mut self, reason: sys::ResumeReason, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevice]) {
-    let signal = env.signal.share()
-    mut cx.spawn(key: INTERRUPT_KEY, run: fn[take signal](out: sys::Outbox[NvmeDevice]) fails task::Cancelled uses wait limits stack 8_192 {
-        loop {
-            try await signal.contents().wait()
-            if (attempt await out.completed()).is_err() {
-                return
-            }
+    let Admin(submissions: Page(span: submitted, at: _), completions: Page(span: completed, at: _), scratch: Page(span: scratched, at: _), pair: _) = control
+    discard take submitted.into_box()
+    discard take completed.into_box()
+    discard take scratched.into_box()
+    for lane in take lanes {
+        let Lane(submissions: Page(span: queued, at: _), completions: Page(span: posted, at: _), list: Page(span: listed, at: _), pages: pages, irq: irq, signal: _) = lane
+        discard take irq.uninstall()
+        discard take queued.into_box()
+        discard take posted.into_box()
+        discard take listed.into_box()
+        for page in take pages {
+            let Page(span: span, at: _) = page
+            discard take span.into_box()
         }
+    }
+} release_queues
+
+/// Resets the controller and creates its I/O pairs again over their emptied queues; false when it does not come back.
+fn NvmeEnv.restart(mut self) -> bool {
+    mut self.admin.completions.clear()
+    self.admin.pair = Pair.fresh()
+    if not enable(mut self.regs, submissions: self.admin.submissions, completions: self.admin.completions) {
+        return false
+    }
+    discard granted_pairs(mut self.regs, pair: mut self.admin.pair, submissions: mut self.admin.submissions, completions: mut self.admin.completions, wanted: u32.fit(self.lanes.len()))
+    for index in 0..<self.lanes.len() {
+        mut self.lanes.at_mut(index).completions.clear()
+        if not create_io_pair(mut self.regs, pair: mut self.admin.pair, submissions: mut self.admin.submissions, completions: mut self.admin.completions, id: u16.fit(index) + 1, vector: u16.fit(index), io_submissions: self.lanes[index].submissions, io_completions: self.lanes[index].completions) {
+            return false
+        }
+    }
+    return true
+} NvmeEnv.restart
+
+/// Asks the controller to abort the command in slot `slot` of I/O pair `lane`: whether it did.
+fn NvmeEnv.abort(mut self, lane: usize, slot: u16) -> bool {
+    return abort(mut self.regs, pair: mut self.admin.pair, submissions: mut self.admin.submissions, completions: mut self.admin.completions, queue: u16.fit(lane) + 1, command: slot)
+} NvmeEnv.abort
+
+/// The I/O pair of the CPU running the handler.
+fn NvmeEnv.lane_here(self) -> usize {
+    let cpu = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u32 limits notrap, terminates {
+        return self.here.with(t, body: fn(mut cpu: u32) -> u32 limits notrap, terminates, noalloc {
+            return cpu
+        })
     })
+    return usize.widen(cpu) % self.lanes.len()
+} NvmeEnv.lane_here
+
+/// The doorbells of I/O pair `lane`: its submission tail, then its completion head.
+fn submission_doorbell(lane: usize) -> usize
+    requires lane < usize.widen(MOST_PAIRS)
+{
+    return 2 * (lane + 1)
+} submission_doorbell
+
+fn completion_doorbell(lane: usize) -> usize
+    requires lane < usize.widen(MOST_PAIRS)
+{
+    return 2 * (lane + 1) + 1
+} completion_doorbell
+
+pub fn Nvme.start(mut env: NvmeEnv) -> Nvme {
+    var tracks = mem::List[Track].empty(env.alloc)
+    for _ in 0..<env.lanes.len() {
+        mut tracks.push(Track(waiting: mem::List.empty(env.alloc), busy: false, pair: Pair.fresh(), slot: 0, handed: 0, aborted: false))
+    }
+    return Nvme(tracks: take tracks, lost: false)
+} Nvme.start
+
+/// Once started, turns each pair's interrupts into its completions.
+pub fn Nvme.resume(mut self, reason: sys::ResumeReason, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevice]) {
+    for index in 0..<env.lanes.len() {
+        let signal = env.lanes[index].signal.share()
+        let pair = u16.fit(index)
+        mut cx.spawn(key: INTERRUPTS + u64.widen(index), run: fn[take signal](out: sys::Outbox[NvmeDevice]) fails task::Cancelled uses wait limits stack 8_192 {
+            loop {
+                try await signal.contents().wait()
+                if (attempt await out.completed(pair)).is_err() {
+                    return
+                }
+            }
+        })
+    }
 } Nvme.resume
 
 pub fn Nvme.info(mut self, take unit: u16, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevice]) -> devices::BlockInfo fails devices::DeviceError {
@@ -239,7 +324,7 @@ pub fn Nvme.discard_blocks(
     fail devices::DeviceError.Unsupported
 } Nvme.discard_blocks
 
-/// Postpones the request and hands it to the controller once it is first.
+/// Postpones the request and queues it on the handler's CPU's pair, failing it at once with `device.reset` once the controller is lost.
 fn Nvme.queue_request(
     mut self,
     operation: Operation,
@@ -250,65 +335,147 @@ fn Nvme.queue_request(
     let Some(request) = mut cx.postpone() else {
         return
     }
-    mut self.waiting.push(Waiting(request: request, operation: operation, data: take data))
-    mut self.submit(mut env)
+    let waiting = Waiting(request: request, operation: operation, data: take data)
+    if self.lost {
+        refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
+        return
+    }
+    let lane = env.lane_here()
+    mut self.tracks[lane].waiting.push(take waiting)
+    mut self.submit(lane, mut env, mut cx)
 } Nvme.queue_request
 
-/// Answers the request the controller completed, then submits the next.
-fn Nvme.completed(mut self, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevice]) {
-    let Some(status) = mut self.pair.completion(completions: mut env.queues.completions) else {
+/// Answers the request pair `pair` completed, unless it was aborted, then hands the pair its next.
+fn Nvme.completed(mut self, take pair: u16, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevice]) {
+    let lane = usize.widen(pair)
+    if lane >= self.tracks.len() {
         return
     }
-    self.pair.acknowledge(regs: mut env.regs, doorbell: COMPLETION_DOORBELL)
-    self.busy = false
-    if self.waiting.len() == 0 {
+    let Some(done) = mut self.tracks[lane].pair.completion(completions: mut env.lanes.at_mut(lane).completions) else {
         return
     }
-    let Waiting(request: request, operation: operation, data: _) = mut self.waiting.remove(0)
-    var reply = sys::Encoded.empty(env.alloc)
-    match operation {
-        Operation.Read(unit: unit, block: _, count: count) => mem::wire::Codec[Result[Untrusted[mem::Bytes], devices::DeviceError]].encode(read_outcome(status, mut env, unit, count), out: mut reply.bytes)
-        else => mem::wire::Codec[Result[Unit, devices::DeviceError]].encode(outcome(status), out: mut reply.bytes)
+    self.tracks[lane].pair.acknowledge(regs: mut env.regs, doorbell: completion_doorbell(lane))
+    if not self.tracks[lane].busy {
+        return
     }
-    discard attempt mut cx.reply(request, reply)
-    mut self.submit(mut env)
+    self.tracks[lane].busy = false
+    if self.tracks[lane].aborted {
+        self.tracks[lane].aborted = false
+    } else {
+        let Waiting(request: request, operation: operation, data: _) = mut self.tracks[lane].waiting.remove(0)
+        match operation {
+            Operation.Read(unit: unit, block: _, count: count) => answer(request, result: read_outcome(done.status, mut env, lane, unit, count), alloc: env.alloc, mut cx)
+            else => answer(request, result: outcome(done.status), alloc: env.alloc, mut cx)
+        }
+    }
+    if self.tracks[lane].waiting.len() == 0 {
+        mut cx.cancel(key: TIMING + u64.widen(lane))
+    }
+    mut self.submit(lane, mut env, mut cx)
 } Nvme.completed
 
-/// Hands the controller the first waiting request when none is on it: its data copied into the transfer's pages, which its PRPs list.
-fn Nvme.submit(mut self, mut env: NvmeEnv) {
-    if self.busy or self.waiting.len() == 0 {
+/// Fails the request on pair `pair` with `device.timeout` once the time of the `handed`th it took has run out with the request still on it, aborting it; when the controller does not abort it, resets the controller, failing every other request with `device.reset`.
+fn Nvme.expired(
+    mut self,
+    take pair: u16,
+    take handed: u64,
+    mut env: NvmeEnv,
+    mut cx: sys::Cx[NvmeDevice],
+    ) {
+    let lane = usize.widen(pair)
+    if lane >= self.tracks.len() or not self.tracks[lane].busy or self.tracks[lane].aborted or self.tracks[lane].handed != handed {
         return
     }
-    let operation = self.waiting[0].operation
-    match self.waiting[0].data {
+    let late = mut self.tracks[lane].waiting.remove(0)
+    refuse(take late, error: devices::DeviceError.Timeout, alloc: env.alloc, mut cx)
+    if mut env.abort(lane, slot: self.tracks[lane].slot) {
+        self.tracks[lane].aborted = true
+        return
+    }
+    self.lost = not mut env.restart()
+    for index in 0..<self.tracks.len() {
+        mut cx.cancel(key: TIMING + u64.widen(index))
+        self.tracks[index].busy = false
+        self.tracks[index].aborted = false
+        self.tracks[index].pair = Pair.fresh()
+        while self.tracks[index].waiting.len() > 0 {
+            let waiting = mut self.tracks[index].waiting.remove(0)
+            refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
+        }
+    }
+} Nvme.expired
+
+/// Answers the request `request` with `result`.
+fn answer[R: Encode](request: u64, take result: Result[R, devices::DeviceError], alloc: mem::Alloc, mut cx: sys::Cx[NvmeDevice]) {
+    var reply = sys::Encoded.empty(alloc)
+    mem::wire::Codec[Result[R, devices::DeviceError]].encode(result, out: mut reply.bytes)
+    discard attempt mut cx.reply(request, reply)
+} answer
+
+/// Fails the request `waiting` holds with `error`.
+fn refuse(take waiting: Waiting, error: devices::DeviceError, alloc: mem::Alloc, mut cx: sys::Cx[NvmeDevice]) {
+    let Waiting(request: request, operation: operation, data: _) = waiting
+    match operation {
+        Operation.Read(unit: _, block: _, count: _) => {
+            let failed: Result[Untrusted[mem::Bytes], devices::DeviceError] = Err(error)
+            answer(request, result: take failed, alloc, mut cx)
+        }
+        else => {
+            let failed: Result[Unit, devices::DeviceError] = Err(error)
+            answer(request, result: failed, alloc, mut cx)
+        }
+    }
+} refuse
+
+/// Hands pair `lane` its first waiting request when none is on it, its data copied into the pair's pages, its time then starting.
+fn Nvme.submit(mut self, lane: usize, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevice]) {
+    if self.tracks[lane].busy or self.tracks[lane].waiting.len() == 0 {
+        return
+    }
+    let operation = self.tracks[lane].waiting[0].operation
+    let data = mut self.tracks[lane].waiting[0].data.extract()
+    let command = mut env.lanes.at_mut(lane).load(operation, take data, identified: env.identified)
+    self.tracks[lane].slot = self.tracks[lane].pair.tail
+    mut self.tracks[lane].pair.submit(command, regs: mut env.regs, submissions: mut env.lanes.at_mut(lane).submissions, doorbell: submission_doorbell(lane))
+    self.tracks[lane].busy = true
+    self.tracks[lane].handed += 1
+    let clock = env.clock
+    let pair = u16.fit(lane)
+    let handed = self.tracks[lane].handed
+    mut cx.spawn(key: TIMING + u64.widen(lane), run: fn(out: sys::Outbox[NvmeDevice]) fails task::Cancelled uses wait limits stack 8_192 {
+        try await clock.sleep(REQUEST_MS)
+        discard attempt await out.expired(pair, handed)
+    })
+} Nvme.submit
+
+/// The command of `operation` on this pair, the data a write carries copied into its pages.
+fn Lane.load(mut self, operation: Operation, take data: Option[mem::Bytes], identified: Identified) -> Command {
+    match data {
         Some(bytes) => {
             var at: usize = 0
             for byte in bytes.view() {
-                mut env.pages.at_mut(at / usize.widen(PAGE_BYTES)).put8(at % usize.widen(PAGE_BYTES), byte)
+                mut self.pages.at_mut(at / usize.widen(PAGE_BYTES)).put8(at % usize.widen(PAGE_BYTES), byte)
                 at += 1
             }
         }
         None => {
         }
     }
-    let command = match operation {
-        Operation.Read(unit: unit, block: start, count: blocks) => mut env.transfer(READ_OPCODE, unit, start, blocks)
-        Operation.Write(unit: unit, block: start, count: blocks) => mut env.transfer(WRITE_OPCODE, unit, start, blocks)
-        Operation.Flush(unit: unit) => Command(opcode: FLUSH_OPCODE, namespace: env.identified.units[usize.widen(unit)].id, prp1: 0, prp2: 0, cdw10: 0, cdw11: 0, cdw12: 0)
+    return match operation {
+        Operation.Read(unit: unit, block: start, count: blocks) => mut self.transfer(READ_OPCODE, namespace: identified.units[usize.widen(unit)], start, blocks)
+        Operation.Write(unit: unit, block: start, count: blocks) => mut self.transfer(WRITE_OPCODE, namespace: identified.units[usize.widen(unit)], start, blocks)
+        Operation.Flush(unit: unit) => Command(opcode: FLUSH_OPCODE, namespace: identified.units[usize.widen(unit)].id, prp1: 0, prp2: 0, cdw10: 0, cdw11: 0, cdw12: 0)
     }
-    mut self.pair.submit(command, regs: mut env.regs, submissions: mut env.queues.submissions, doorbell: SUBMISSION_DOORBELL)
-    self.busy = true
-} Nvme.submit
+} Lane.load
 
-/// The command moving `blocks` blocks of unit `unit` from `start`, its PRPs listing the transfer's pages: the first, then the second or the PRP list of the others.
-fn NvmeEnv.transfer(
+/// The command moving `blocks` blocks of `namespace` from `start`, its PRPs listing the pair's pages: the first, then the second or the PRP list of the others.
+fn Lane.transfer(
     mut self,
     opcode: u8,
-    unit: u16,
+    namespace: Namespace,
     start: u64,
     blocks: u32,
     ) -> Command {
-    let namespace = self.identified.units[usize.widen(unit)]
     let bytes = blocks * namespace.block_bytes
     let used = usize.widen((bytes + PAGE_BYTES - 1) / PAGE_BYTES)
     var prp2: u64 = 0
@@ -316,12 +483,12 @@ fn NvmeEnv.transfer(
         prp2 = self.pages[1].bus()
     } else if used > 2 {
         for page in 1..<used {
-            mut self.queues.list.put64(8 * (page - 1), value: self.pages[page].bus())
+            mut self.list.put64(8 * (page - 1), value: self.pages[page].bus())
         }
-        prp2 = self.queues.list.bus()
+        prp2 = self.list.bus()
     }
     return Command(opcode: opcode, namespace: namespace.id, prp1: self.pages[0].bus(), prp2: prp2, cdw10: u32.truncate(start), cdw11: u32.truncate(start >> 32), cdw12: blocks - 1)
-} NvmeEnv.transfer
+} Lane.transfer
 
 /// The namespace unit `unit` serves.
 fn NvmeEnv.namespace(self, unit: u16) -> Namespace fails devices::DeviceError {
@@ -350,15 +517,21 @@ fn outcome(status: u16) -> Result[Unit, devices::DeviceError] {
     return Err(devices::DeviceError.Io)
 } outcome
 
-/// What a read of `count` blocks of unit `unit` whose completion carries `status` ends with: the blocks it moved.
-fn read_outcome(status: u16, mut env: NvmeEnv, unit: u16, count: u32) -> Result[Untrusted[mem::Bytes], devices::DeviceError] {
+/// What a read of `count` blocks of unit `unit` on pair `lane` whose completion carries `status` ends with: the blocks it moved.
+fn read_outcome(
+    status: u16,
+    mut env: NvmeEnv,
+    lane: usize,
+    unit: u16,
+    count: u32,
+    ) -> Result[Untrusted[mem::Bytes], devices::DeviceError] {
     if status != 0 {
         return Err(devices::DeviceError.Io)
     }
     let length = usize.widen(count * env.identified.units[usize.widen(unit)].block_bytes)
     var bytes = mem::Bytes.empty(env.alloc)
     for at in 0..<length {
-        mut bytes.push(mut env.pages.at_mut(at / usize.widen(PAGE_BYTES)).get8(at % usize.widen(PAGE_BYTES)))
+        mut bytes.push(mut env.lanes.at_mut(lane).pages.at_mut(at / usize.widen(PAGE_BYTES)).get8(at % usize.widen(PAGE_BYTES)))
     }
     return Ok(Untrusted.of(take bytes))
 } read_outcome

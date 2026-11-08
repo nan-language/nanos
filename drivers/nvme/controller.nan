@@ -30,6 +30,13 @@ const CREATE_COMPLETION_QUEUE: u8 = 0x05
 
 const IDENTIFY_OPCODE: u8 = 0x06
 
+const ABORT_OPCODE: u8 = 0x08
+
+const SET_FEATURES_OPCODE: u8 = 0x09
+
+/// The feature setting how many I/O queues the controller allocates.
+const NUMBER_OF_QUEUES: u32 = 0x07
+
 /// The identify structures: a namespace, the controller.
 const IDENTIFY_NAMESPACE: u32 = 0
 
@@ -38,7 +45,10 @@ const IDENTIFY_CONTROLLER: u32 = 1
 /// The most namespaces served as units.
 const MOST_UNITS: u32 = 4
 
-/// The controller's registers with a doorbell stride of 4 bytes: the admin submission and completion doorbells, then the I/O queue pair's.
+/// The most I/O queue pairs the driver creates.
+pub const MOST_PAIRS: u32 = 16
+
+/// The controller's registers with a doorbell stride of 4 bytes: the submission tail and completion head doorbells of the admin pair, then of each I/O pair.
 pub registers Controller {
     capabilities: u64 at 0x00 read
     configuration: u32 at 0x14 read write
@@ -46,7 +56,7 @@ pub registers Controller {
     admin_attributes: u32 at 0x24 read write
     admin_submissions: u64 at 0x28 read write
     admin_completions: u64 at 0x30 read write
-    doorbells: Array[u32, 4] at 0x1000 stride 4 write
+    doorbells: Array[u32, 34] at 0x1000 stride 4 write
 } Controller
 
 /// A span of memory a page-aligned page is cut from: twice a page always holds one.
@@ -77,6 +87,12 @@ pub closed struct Command derives Copy, Eq {
     pub cdw11: u32
     pub cdw12: u32
 } Command
+
+/// A completion: its status and its result.
+pub closed struct Completed derives Copy, Eq {
+    pub status: u16
+    pub result: u32
+} Completed
 
 /// Where a queue pair stands: the submission tail, the completion head, and the phase the next completion carries.
 pub closed struct Pair derives Copy, Eq, Encode {
@@ -157,8 +173,8 @@ pub fn Command.put(self, mut queue: Page, slot: u16) {
     mut queue.put32(at + 48, value: self.cdw12)
 } Command.put
 
-/// The status of the completion at the head of `completions` when its phase is the pair's, advancing the pair; `None` when the controller has posted none.
-pub fn Pair.completion(mut self, mut completions: Page) -> Option[u16] {
+/// The completion at the head of `completions` when its phase is the pair's, advancing the pair; `None` when the controller has posted none.
+pub fn Pair.completion(mut self, mut completions: Page) -> Option[Completed] {
     let at = usize.widen(self.head) * usize.widen(COMPLETION_BYTES)
     let flags = mut completions.get32(at + 12)
     if u8.truncate((flags >> 16) & 1) != self.phase {
@@ -169,7 +185,7 @@ pub fn Pair.completion(mut self, mut completions: Page) -> Option[u16] {
         self.head = 0
         self.phase ^= 1
     }
-    return Some(u16.truncate(flags >> 17))
+    return Some(Completed(status: u16.truncate(flags >> 17), result: mut completions.get32(at)))
 } Pair.completion
 
 /// Submits `command` on the queue pair whose doorbells are `doorbell` and `doorbell + 1`, advancing its tail.
@@ -231,26 +247,29 @@ pub fn enable(mut regs: hw::Mmio[Controller], submissions: Page, completions: Pa
     return false
 } enable
 
-/// Runs one admin command and waits for its completion: whether it succeeded.
+/// Runs one admin command and waits for its completion: its result once it succeeded.
 pub fn admin(
     mut regs: hw::Mmio[Controller],
     mut pair: Pair,
     mut submissions: Page,
     mut completions: Page,
     command: Command,
-    ) -> bool {
+    ) -> Option[u32] {
     mut pair.submit(command, mut regs, mut submissions, doorbell: 0)
     for _ in 0..<POLLS {
         match mut pair.completion(mut completions) {
-            Some(status) => {
+            Some(done) => {
                 pair.acknowledge(mut regs, doorbell: 1)
-                return status == 0
+                if done.status != 0 {
+                    return None
+                }
+                return Some(done.result)
             }
             None => {
             }
         }
     }
-    return false
+    return None
 } admin
 
 /// Identifies the controller and its first namespaces through the admin queue, reading each structure into `scratch`; `None` when an identify fails or no namespace has 512- or 4,096-byte blocks.
@@ -261,7 +280,7 @@ pub fn identify(
     mut completions: Page,
     mut scratch: Page,
     ) -> Option[Identified] {
-    if not admin(mut regs, mut pair, mut submissions, mut completions, command: Command(opcode: IDENTIFY_OPCODE, namespace: 0, prp1: scratch.bus(), prp2: 0, cdw10: IDENTIFY_CONTROLLER, cdw11: 0, cdw12: 0)) {
+    if admin(mut regs, mut pair, mut submissions, mut completions, command: Command(opcode: IDENTIFY_OPCODE, namespace: 0, prp1: scratch.bus(), prp2: 0, cdw10: IDENTIFY_CONTROLLER, cdw11: 0, cdw12: 0)).is_none() {
         return None
     }
     let limit = mut scratch.get8(77)
@@ -275,7 +294,7 @@ pub fn identify(
     var count: u32 = 0
     var id: u32 = 1
     while id <= namespaces and id <= MOST_UNITS {
-        if admin(mut regs, mut pair, mut submissions, mut completions, command: Command(opcode: IDENTIFY_OPCODE, namespace: id, prp1: scratch.bus(), prp2: 0, cdw10: IDENTIFY_NAMESPACE, cdw11: 0, cdw12: 0)) {
+        if admin(mut regs, mut pair, mut submissions, mut completions, command: Command(opcode: IDENTIFY_OPCODE, namespace: id, prp1: scratch.bus(), prp2: 0, cdw10: IDENTIFY_NAMESPACE, cdw11: 0, cdw12: 0)).is_some() {
             let blocks = mut scratch.get64(0)
             let format = usize.widen(mut scratch.get8(26) & 0xF)
             let shift = mut scratch.get8(128 + 4 * format + 2)
@@ -292,20 +311,66 @@ pub fn identify(
     return Some(Identified(units: units, count: count, max_transfer: max_transfer, cache: cache))
 } identify
 
-/// Creates I/O queue pair 1 over `submissions` and `completions`, its completions interrupting on vector 0: whether the controller accepted both.
+/// How many I/O queue pairs, at most `wanted`, the controller allocates, 1 when it does not say.
+pub fn granted_pairs(
+    mut regs: hw::Mmio[Controller],
+    mut pair: Pair,
+    mut submissions: Page,
+    mut completions: Page,
+    wanted: u32,
+    ) -> u32 {
+    let asked = wanted - 1
+    let Some(result) = admin(mut regs, mut pair, mut submissions, mut completions, command: Command(opcode: SET_FEATURES_OPCODE, namespace: 0, prp1: 0, prp2: 0, cdw10: NUMBER_OF_QUEUES, cdw11: asked | (asked << 16), cdw12: 0)) else {
+        return 1
+    }
+    var granted = wanted
+    if (result & 0xFFFF) + 1 < granted {
+        granted = (result & 0xFFFF) + 1
+    }
+    if (result >> 16) + 1 < granted {
+        granted = (result >> 16) + 1
+    }
+    return granted
+} granted_pairs
+
+/// Creates I/O queue pair `id` over `io_submissions` and `io_completions`, its completions interrupting on vector `vector`: whether the controller accepted both.
 pub fn create_io_pair(
     mut regs: hw::Mmio[Controller],
     mut pair: Pair,
     mut submissions: Page,
     mut completions: Page,
+    id: u16,
+    vector: u16,
     io_submissions: Page,
     io_completions: Page,
     ) -> bool {
     let size = (u32.widen(QUEUE_ENTRIES) - 1) << 16
-    let completion = Command(opcode: CREATE_COMPLETION_QUEUE, namespace: 0, prp1: io_completions.bus(), prp2: 0, cdw10: size | 1, cdw11: 0x3, cdw12: 0)
-    if not admin(mut regs, mut pair, mut submissions, mut completions, command: completion) {
+    let completion = Command(opcode: CREATE_COMPLETION_QUEUE, namespace: 0, prp1: io_completions.bus(), prp2: 0, cdw10: size | u32.widen(id), cdw11: (u32.widen(vector) << 16) | 0x3, cdw12: 0)
+    if admin(mut regs, mut pair, mut submissions, mut completions, command: completion).is_none() {
         return false
     }
-    let submission = Command(opcode: CREATE_SUBMISSION_QUEUE, namespace: 0, prp1: io_submissions.bus(), prp2: 0, cdw10: size | 1, cdw11: (1u32 << 16) | 1, cdw12: 0)
-    return admin(mut regs, mut pair, mut submissions, mut completions, command: submission)
+    let submission = Command(opcode: CREATE_SUBMISSION_QUEUE, namespace: 0, prp1: io_submissions.bus(), prp2: 0, cdw10: size | u32.widen(id), cdw11: (u32.widen(id) << 16) | 1, cdw12: 0)
+    return admin(mut regs, mut pair, mut submissions, mut completions, command: submission).is_some()
 } create_io_pair
+
+/// Asks the controller to abort the command `command` of submission queue `queue`: whether it reports the command aborted.
+pub fn abort(
+    mut regs: hw::Mmio[Controller],
+    mut pair: Pair,
+    mut submissions: Page,
+    mut completions: Page,
+    queue: u16,
+    command: u16,
+    ) -> bool {
+    let Some(result) = admin(mut regs, mut pair, mut submissions, mut completions, command: Command(opcode: ABORT_OPCODE, namespace: 0, prp1: 0, prp2: 0, cdw10: u32.widen(queue) | (u32.widen(command) << 16), cdw11: 0, cdw12: 0)) else {
+        return false
+    }
+    return (result & 1) == 0
+} abort
+
+/// Zeroes the page, as a completion queue is before the controller posts to it.
+pub fn Page.clear(mut self) {
+    for at in 0..<usize.widen(PAGE_BYTES) {
+        mut self.put8(at, byte: 0)
+    }
+} Page.clear
