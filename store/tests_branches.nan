@@ -1,0 +1,91 @@
+//! Tests of branches, reads at past commits, history, diffs, reverts and merges.
+
+fn level_on(
+    mut store: Store,
+    device: disk::MemoryVolume,
+    branch: Str,
+    text: Str,
+    alloc: mem::Alloc,
+    ) -> u32 fails StoreError uses wait {
+    let node = try await mut store.get(device, branch, path: path_of(text, alloc), now: at_second(100), alloc)
+    let Some(value) = node.value else {
+        return 0
+    }
+    return read_level(value.view(), alloc)
+} level_on
+
+fn level_then(
+    mut store: Store,
+    device: disk::MemoryVolume,
+    text: Str,
+    at: u64,
+    alloc: mem::Alloc,
+    ) -> u32 fails StoreError uses wait {
+    let node = try await mut store.get_at(device, branch: "main", path: path_of(text, alloc), at: ident::CommitId(number: at), now: at_second(100), alloc)
+    let Some(value) = node.value else {
+        return 0
+    }
+    return read_level(value.view(), alloc)
+} level_then
+
+fn commit_on(
+    mut store: Store,
+    device: disk::MemoryVolume,
+    branch: Str,
+    take writes: mem::List[Write],
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    return try await mut store.commit(device, branch, transaction: blind(take writes, alloc), stamp: system_stamp(alloc), now: at_second(20), alloc)
+} commit_on
+
+test past_commits_read_through_snapshots for Store.get_at {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put("/data/x", level: 1, alloc), alloc), alloc)
+    try await mut store.index_flush(device, now: at_second(21), alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put("/data/x", level: 2, alloc), alloc), alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put("/data/y", level: 3, alloc), alloc), alloc)
+    let flushed = try await level_then(mut store, device, text: "/data/x", at: 2, alloc)
+    let between = try await level_then(mut store, device, text: "/data/x", at: 3, alloc)
+    expect flushed == 1 and between == 2
+    let absent = attempt await mut store.get_at(device, branch: "main", path: path_of("/data/y", alloc), at: ident::CommitId(number: 3), now: at_second(30), alloc)
+    expect absent.is_err()
+    let unversioned = attempt await mut store.get_at(device, branch: "main", path: path_of("/state/x", alloc), at: ident::CommitId(number: 3), now: at_second(30), alloc)
+    let refused = match unversioned {
+        Err(StoreError.Unversioned) => true
+        else => false
+    }
+    expect refused
+    let changes = try await mut store.history(device, branch: "main", path: path_of("/data/x", alloc), before: None, limit: 10, now: at_second(30), alloc)
+    expect changes.len() == 2 and changes[0].number.number == 3 and changes[1].number.number == 2
+} past_commits_read_through_snapshots
+
+test branches_share_their_fork_then_diverge for Store.branch {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put("/data/x", level: 1, alloc), alloc), alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put("/data/x", level: 2, alloc), alloc), alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put("/data/y", level: 3, alloc), alloc), alloc)
+    let owner = ident::Principal(text: text::Fixed[64].of("agent.ops"))
+    discard try await mut store.branch(device, name: "feature", from: "main", at: None, by: owner, expires: None, system: false, now: at_second(30), alloc)
+    discard try await mut store.branch(device, name: "old", from: "main", at: Some(ident::CommitId(number: 3)), by: owner, expires: None, system: false, now: at_second(30), alloc)
+    discard try await commit_on(mut store, device, branch: "feature", writes: single(put("/data/x", level: 5, alloc), alloc), alloc)
+    let on_main = try await level_on(mut store, device, branch: "main", text: "/data/x", alloc)
+    let on_feature = try await level_on(mut store, device, branch: "feature", text: "/data/x", alloc)
+    let on_old = try await level_on(mut store, device, branch: "old", text: "/data/x", alloc)
+    expect on_main == 2 and on_feature == 5 and on_old == 2
+    let old_y = attempt await mut store.get(device, branch: "old", path: path_of("/data/y", alloc), now: at_second(30), alloc)
+    expect old_y.is_err()
+    let reserved = attempt await mut store.branch(device, name: "job/x", from: "main", at: None, by: owner, expires: None, system: false, now: at_second(30), alloc)
+    let taken = attempt await mut store.branch(device, name: "feature", from: "main", at: None, by: owner, expires: None, system: false, now: at_second(30), alloc)
+    expect reserved.is_err() and taken.is_err()
+    try await mut store.delete_branch(device, name: "old", now: at_second(31), alloc)
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(32), alloc)
+    let kept = try await level_on(mut mounted, device, branch: "feature", text: "/data/x", alloc)
+    let main_kept = try await level_on(mut mounted, device, branch: "main", text: "/data/x", alloc)
+    expect kept == 5 and main_kept == 2
+    let deleted = attempt mounted.branch_named("old", alloc)
+    expect deleted.is_err()
+} branches_share_their_fork_then_diverge

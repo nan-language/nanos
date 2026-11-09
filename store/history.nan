@@ -1,0 +1,129 @@
+//! Reads at past commits: a branch's versioned nodes as of a retained commit of its line, through its snapshot, and its recorded commits newest first.
+
+/// The node at `path` of `branch` as of retained commit `at`.
+pub fn Store.get_at[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    at: ident::CommitId,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Node fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    if at == self.heads[head].branch.head {
+        return try await mut self.get(device, branch, path, now, alloc)
+    }
+    let snapshot = try await mut self.snapshot(device, head, at: at.number, alloc)
+    let segments = path.segments(alloc)
+    let Some(entry) = try await mut self.snapshot_resolve(device, snapshot, segments: segments.view(), alloc) else {
+        fail StoreError.NotFound
+    }
+    let kind = NodeKind.of_code(entry.kind).value_or(NodeKind.Record)
+    var size: u64 = 0
+    var value: Option[Untrusted[mem::Bytes]] = None
+    match entry.content {
+        Content.Dir(id: id, declaration: _, digest: _, next: _) => {
+            let children = try await mut self.snapshot_children(device, snapshot, dir: id, alloc)
+            size = u64.widen(children.len())
+        }
+        Content.Blob(id: _, size: bytes) => {
+            size = bytes
+        }
+        Content.Stream(id: _, declaration: _, next: _, entries: entries, bytes: _) => {
+            size = entries
+        }
+        else => {
+            let bytes = try await mut self.record_bytes(device, entry, alloc)
+            size = u64.widen(bytes.len())
+            value = Some(Untrusted.of(take bytes))
+        }
+    }
+    let subtree = match kind == NodeKind.Dir {
+        true => Some(ident::CommitId(number: entry.subtree))
+        false => None
+    }
+    var declared: Option[TypeRef] = None
+    if entry.type != 0 {
+        declared = Some(try await mut self.type_of(device, id: entry.type, alloc))
+    }
+    return Node(path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), kind: kind, version: ident::CommitId(number: entry.version), subtree: subtree, declared: take declared, hash: entry.hash, size: size, origins: mem::List.empty(alloc), secret: false, expires: None, declaration: None, value: take value)
+} Store.get_at
+
+/// The names and kinds of the children of the dir at `path` of `branch` as of retained commit `at`, in name order.
+pub fn Store.list_at[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    at: ident::CommitId,
+    alloc: mem::Alloc,
+    ) -> mem::List[Entry] fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let snapshot = try await mut self.snapshot(device, head, at: at.number, alloc)
+    let segments = path.segments(alloc)
+    let Some(entry) = try await mut self.snapshot_resolve(device, snapshot, segments: segments.view(), alloc) else {
+        fail StoreError.NotFound
+    }
+    let Content.Dir(id: id, declaration: _, digest: _, next: _) = entry.content else {
+        fail StoreError.Kind
+    }
+    let children = try await mut self.snapshot_children(device, snapshot, dir: id, alloc)
+    var entries = mem::List[Entry].empty(alloc)
+    for child in children {
+        mut entries.push(Entry(name: text_of_name(child.name.view(), alloc), kind: NodeKind.of_code(child.entry.kind).value_or(NodeKind.Record), version: ident::CommitId(number: child.entry.version), size: 0, type: None))
+    }
+    return entries
+} Store.list_at
+
+/// The recorded commits of `branch`'s line that changed the node at `path` or a node below it, before commit `before` when given, newest first, at most `limit`.
+pub fn Store.history[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    before: Option[ident::CommitId],
+    limit: u32,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> mem::List[CommitMeta] fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let end = match before {
+        Some(commit) => commit.number
+        None => self.heads[head].branch.head.number + 1
+    }
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head, segments: segments.view(), now, alloc)
+    if segments.len() == 0 or resolution.found.len() + 1 < segments.len() {
+        return mem::List.empty(alloc)
+    }
+    var prefix = mem::Bytes.empty(alloc)
+    mut prefix.push(KIND_PATH_CHANGE)
+    mut prefix.push(TREE_VERSIONED)
+    mut prefix.append(entry_key(resolution.dir_of(segments.len() - 1), name: segments[segments.len() - 1].view(), alloc).view())
+    mut prefix.push(0)
+    let leaves = try await mut self.tree_scan(device, root: self.catalog, prefix: prefix.view(), from: prefix.view(), limit: 0xFFFF_FFFF, alloc)
+    var numbers = mem::List[u64].empty(alloc)
+    for leaf in leaves {
+        if leaf.key.len() == prefix.len() + 8 {
+            let number = leaf.key.view().u64_be(prefix.len())
+            if number < end {
+                mut numbers.push(number)
+            }
+        }
+    }
+    var found = mem::List[CommitMeta].empty(alloc)
+    while numbers.len() > 0 and found.len() < usize.widen(limit) {
+        let Some(number) = mut numbers.pop() else {
+            break
+        }
+        let Some(bytes) = try await mut self.catalog_get(device, key: number_key(KIND_COMMIT, number, width: 8, alloc).view(), alloc) else {
+            continue
+        }
+        let entry = try decode_commit_entry(bytes.view(), alloc)
+        if self.on_line(head, meta: entry.meta) {
+            mut found.push(take entry.meta)
+        }
+    }
+    return found
+} Store.history

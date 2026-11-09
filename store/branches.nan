@@ -1,0 +1,241 @@
+//! Branches and pins: a branch created by sharing its fork commit's trees, its unversioned nodes shared with its parent's, its fork commit pinned; deleted with its trees released; and pins holding commits, each pinned commit given a tree of its own.
+
+/// The most bytes of a branch name.
+const MOST_BRANCH_BYTES: usize = 64
+
+/// Creates branch `name` from branch `from` at its commit `at`, or its head, for `by`; `system` for the store's own branches, whose names `main`, `trial/`, `job/` and `preview/` reserve.
+pub fn Store.branch[D: disk::Device](
+    mut self,
+    device: D,
+    name: Str,
+    from: Str,
+    at: Option[ident::CommitId],
+    by: ident::Principal,
+    expires: Option[ident::WallTime],
+    system: bool,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Branch fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    try check_branch_name(name, system)
+    if self.head_of(name).is_some() {
+        fail StoreError.BranchExists
+    }
+    let source = try self.head_named(from)
+    let source_head = self.heads[source].branch.head.number
+    let fork = match at {
+        Some(commit) => commit.number
+        None => source_head
+    }
+    let snapshot = try await mut self.snapshot(device, head: source, at: fork, alloc)
+    let unversioned = self.heads[source].unversioned
+    mut self.index.retain(snapshot.root.node)
+    mut self.index.retain(unversioned.node)
+    let branch = Branch(name: text::String.of(name, alloc), head: ident::CommitId(number: fork), fork: ident::CommitId(number: fork), parent: Some(text::String.of(from, alloc)), created_by: ident::Principal(text: by.text), expires: expires)
+    let created = branch.copied(alloc)
+    mut self.heads.push(Head(branch: take branch, versioned: snapshot.root, unversioned: unversioned, written: 0, recent: mem::List.empty(alloc)))
+    let head = self.heads.len() - 1
+    var staged = Staged.empty(alloc)
+    for laid in snapshot.overlay.cursor() {
+        let Some(parts) = laid.key().view().split_at(8) else {
+            continue
+        }
+        let place = Place(head: head, tree: TREE_VERSIONED, dir: laid.key().view().u64_be(0), name: copied_bytes(parts.tail, alloc))
+        discard try await mut self.set_entry(device, place, entry: copied_entry(laid.value(), alloc), mut staged, alloc)
+    }
+    try await mut self.add_pin(device, pin: Pin(commit: ident::CommitId(number: fork), reason: PinReason.Branch, by: ident::Principal(text: by.text), note: None), alloc)
+    try await mut self.index_flush(device, now, alloc)
+    return created
+} Store.branch
+
+/// Deletes branch `name` and releases its trees; `store.branch-reserved` for `main`.
+pub fn Store.delete_branch[D: disk::Device](
+    mut self,
+    device: D,
+    name: Str,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    if name == "main" {
+        fail StoreError.BranchReserved
+    }
+    let head = try self.head_named(name)
+    let gone = mut self.heads.remove(head)
+    mut self.index.release(gone.versioned.node, tree: TREE_VERSIONED, pointer: gone.versioned.pointer)
+    mut self.index.release(gone.unversioned.node, tree: TREE_UNVERSIONED, pointer: gone.unversioned.pointer)
+    discard try await mut self.catalog_remove(device, key: catalog_key(KIND_BRANCH, key: name.as_bytes(), alloc).view(), alloc)
+    try await mut self.remove_pin(device, commit: gone.branch.fork.number, reason: PinReason.Branch, alloc)
+    try await mut self.index_flush(device, now, alloc)
+} Store.delete_branch
+
+/// Pins commit `commit` of `branch` for `by`, giving it a tree of its own when it has none; `store.thinned` when it is not retained.
+pub fn Store.pin[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    commit: ident::CommitId,
+    by: ident::Principal,
+    take note: Option[text::String],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let snapshot = try await mut self.snapshot(device, head, at: commit.number, alloc)
+    if not snapshot.live {
+        try await mut self.give_tree(device, head, take snapshot, alloc)
+    }
+    try await mut self.add_pin(device, pin: Pin(commit: commit, reason: PinReason.Explicit, by: ident::Principal(text: by.text), note: take note), alloc)
+    try await mut self.index_flush(device, now, alloc)
+} Store.pin
+
+/// Removes the explicit pins of commit `commit`; `store.not-found` when it has none.
+pub fn Store.unpin[D: disk::Device](
+    mut self,
+    device: D,
+    commit: ident::CommitId,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let pins = try await mut self.pins_of(device, commit: commit.number, alloc)
+    var removed = false
+    for pin in pins {
+        if pin.pin.reason == PinReason.Explicit {
+            discard try await mut self.catalog_remove(device, key: pin.key.view(), alloc)
+            removed = true
+        }
+    }
+    if not removed {
+        fail StoreError.NotFound
+    }
+    try await mut self.index_flush(device, now, alloc)
+} Store.unpin
+
+/// The branch named `name`.
+pub fn Store.branch_named(self, name: Str, alloc: mem::Alloc) -> Branch fails StoreError {
+    let head = try self.head_named(name)
+    return self.heads[head].branch.copied(alloc)
+} Store.branch_named
+
+/// A pin as the catalog holds it, with its key.
+pkg struct Held {
+    pkg key: mem::Bytes
+    pkg pin: Pin
+} Held
+
+/// The pins of commit `commit`.
+pkg fn Store.pins_of[D: disk::Device](mut self, device: D, commit: u64, alloc: mem::Alloc) -> mem::List[Held] fails StoreError uses wait {
+    let prefix = number_key(KIND_PIN, number: commit, width: 8, alloc)
+    let leaves = try await mut self.tree_scan(device, root: self.catalog, prefix: prefix.view(), from: prefix.view(), limit: 0xFFFF_FFFF, alloc)
+    var pins = mem::List[Held].empty(alloc)
+    for leaf in take leaves {
+        let pin = match attempt mem::wire::Codec[Pin].decode(Untrusted.of(leaf.value.view()), alloc) {
+            Ok(found) => found
+            Err(_) => fail StoreError.Corrupt
+        }
+        mut pins.push(Held(key: take leaf.key, pin: take pin))
+    }
+    return pins
+} Store.pins_of
+
+/// Adds `pin`, numbered after the pins its commit has.
+fn Store.add_pin[D: disk::Device](mut self, device: D, take pin: Pin, alloc: mem::Alloc) fails StoreError uses wait {
+    let held = try await mut self.pins_of(device, commit: pin.commit.number, alloc)
+    var key = number_key(KIND_PIN, number: pin.commit.number, width: 8, alloc)
+    var number = Array[u8, 8].filled(0)
+    var next: u64 = 1
+    if held.len() > 0 {
+        next = held[held.len() - 1].key.view().u64_be(9) + 1
+    }
+    mut number.view_mut().write_u64_be(0, value: next)
+    mut key.append(number.view())
+    try await mut self.catalog_put(device, key: key.view(), value: wire_of(pin, alloc).view(), alloc)
+} Store.add_pin
+
+/// Removes one pin of `reason` from commit `commit`.
+fn Store.remove_pin[D: disk::Device](
+    mut self,
+    device: D,
+    commit: u64,
+    reason: PinReason,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let pins = try await mut self.pins_of(device, commit, alloc)
+    for pin in pins {
+        if pin.pin.reason == reason {
+            discard try await mut self.catalog_remove(device, key: pin.key.view(), alloc)
+            return
+        }
+    }
+} Store.remove_pin
+
+/// Gives the commit a snapshot shows a tree of its own: the snapshot's laid over a copy of its flush commit's tree, which the commit's entry names.
+fn Store.give_tree[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    take snapshot: Snapshot,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let commit_key = number_key(KIND_COMMIT, number: snapshot.commit, width: 8, alloc)
+    let Some(held) = try await mut self.catalog_get(device, key: commit_key.view(), alloc) else {
+        fail StoreError.Thinned(retained: 0)
+    }
+    var entry = try decode_commit_entry(held.view(), alloc)
+    if entry.tree.is_some() {
+        return
+    }
+    var root = snapshot.root
+    mut self.index.retain(root.node)
+    let saved = self.heads[head].versioned
+    self.heads[head].versioned = root
+    var staged = Staged.empty(alloc)
+    for laid in snapshot.overlay.cursor() {
+        let Some(parts) = laid.key().view().split_at(8) else {
+            continue
+        }
+        let place = Place(head: head, tree: TREE_VERSIONED, dir: laid.key().view().u64_be(0), name: copied_bytes(parts.tail, alloc))
+        discard try await mut self.set_entry(device, place, entry: copied_entry(laid.value(), alloc), mut staged, alloc)
+    }
+    root = self.heads[head].versioned
+    self.heads[head].versioned = saved
+    let written = try mut self.write_tree(root, flush: self.flush + 1, now: entry.meta.time, alloc)
+    entry.tree = Some(written.pointer.to_list(alloc))
+    try await mut self.catalog_put(device, key: commit_key.view(), value: wire_of(entry, alloc).view(), alloc)
+} Store.give_tree
+
+/// `store.branch-reserved` for a malformed branch name, or a name the system reserves when the branch is not the system's.
+fn check_branch_name(name: Str, system: bool) fails StoreError {
+    let bytes = name.as_bytes()
+    if bytes.len() == 0 or bytes.len() > MOST_BRANCH_BYTES {
+        fail StoreError.BranchReserved
+    }
+    var start = true
+    for byte in bytes {
+        let lower_or_digit = (byte >= b'a' and byte <= b'z') or (byte >= b'0' and byte <= b'9')
+        if byte == b'/' {
+            if start {
+                fail StoreError.BranchReserved
+            }
+            start = true
+        } else if start {
+            if not lower_or_digit {
+                fail StoreError.BranchReserved
+            }
+            start = false
+        } else if not lower_or_digit and byte != b'.' and byte != b'_' and byte != b'-' {
+            fail StoreError.BranchReserved
+        }
+    }
+    if start {
+        fail StoreError.BranchReserved
+    }
+    let reserved = name == "main" or name.starts_with("trial/") or name.starts_with("job/") or name.starts_with("preview/")
+    if reserved and not system {
+        fail StoreError.BranchReserved
+    }
+} check_branch_name

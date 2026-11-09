@@ -1,0 +1,308 @@
+//! Snapshots: a branch's versioned nodes as of a retained commit, read through the tree of the latest flush commit before it on the branch's line with the writes of the commits since laid over it.
+
+/// The commits a snapshot's search looks back at once.
+const LOOKBACK: u64 = 256
+
+/// A branch's versioned nodes as of a commit: the tree of a flush commit and, laid over it, the entries the commits since wrote, `None` for those they deleted; `live` for the head itself.
+pkg struct Snapshot {
+    pkg head: usize
+    pkg commit: u64
+    pkg root: tree::Root
+    pkg overlay: mem::Map[mem::Bytes, Option[NodeEntry]]
+    pkg live: bool
+} Snapshot
+
+/// A commit on a branch's line, by its number, its entry's record and its entry's tree.
+struct LineCommit {
+    number: u64
+    record: Option[disk::Pointer]
+    tree: Option[disk::Pointer]
+} LineCommit
+
+/// The snapshot of the branch at `head` as of commit `at`: its head itself when `at` is the head, `store.thinned` naming the next retained commit when `at` is no retained commit of its line.
+pkg fn Store.snapshot[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    at: u64,
+    alloc: mem::Alloc,
+    ) -> Snapshot fails StoreError uses wait {
+    if at == self.heads[head].branch.head.number {
+        return Snapshot(head: head, commit: at, root: self.heads[head].versioned, overlay: mem::Map.empty(alloc), live: true)
+    }
+    if at > self.heads[head].branch.head.number {
+        fail StoreError.NotFound
+    }
+    let Some(target) = try await mut self.line_commit(device, head, number: at, alloc) else {
+        fail StoreError.Thinned(retained: try await mut self.retained_after(device, head, number: at, alloc))
+    }
+    let line = try await mut self.line_since_flush(device, head, take target, alloc)
+    var snapshot = Snapshot(head: head, commit: at, root: tree::Root(tree: TREE_VERSIONED, node: 0, pointer: disk::Pointer.none()), overlay: mem::Map.empty(alloc), live: false)
+    for commit in line {
+        match commit.tree {
+            Some(pointer) => {
+                snapshot.root = tree::Root(tree: TREE_VERSIONED, node: pointer.target, pointer: pointer)
+                mut snapshot.overlay.retain(fn(key: mem::Bytes, value: Option[NodeEntry]) => false)
+            }
+            None => try await mut self.lay_over(device, mut snapshot, commit, alloc)
+        }
+    }
+    if snapshot.root.node == 0 {
+        fail StoreError.Corrupt
+    }
+    return snapshot
+} Store.snapshot
+
+/// The entry of `name` in dir `dir` as `snapshot` shows it.
+pkg fn Store.snapshot_entry[D: disk::Device](
+    mut self,
+    device: D,
+    snapshot: Snapshot,
+    dir: u64,
+    name: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> Option[NodeEntry] fails StoreError uses wait {
+    let key = entry_key(dir, name, alloc)
+    match snapshot.overlay.get(key) {
+        Some(laid) => return copied_entry(laid, alloc)
+        None => {
+        }
+    }
+    let Some(bytes) = try await mut self.tree_get(device, root: snapshot.root, key: key.view(), alloc) else {
+        return None
+    }
+    return Some(try NodeEntry.decode_from(bytes.view(), alloc))
+} Store.snapshot_entry
+
+/// The children of dir `dir` as `snapshot` shows them, in name order, each with its name.
+pkg fn Store.snapshot_children[D: disk::Device](
+    mut self,
+    device: D,
+    snapshot: Snapshot,
+    dir: u64,
+    alloc: mem::Alloc,
+    ) -> mem::List[Child] fails StoreError uses wait {
+    let prefix = dir_prefix(dir, alloc)
+    let leaves = try await mut self.tree_scan(device, root: snapshot.root, prefix: prefix.view(), from: prefix.view(), limit: 0xFFFF_FFFF, alloc)
+    var merged = mem::Map[mem::Bytes, Option[NodeEntry]].empty(alloc)
+    for leaf in take leaves {
+        let entry = try NodeEntry.decode_from(leaf.value.view(), alloc)
+        discard mut merged.insert(take leaf.key, value: Some(take entry))
+    }
+    for laid in snapshot.overlay.cursor() {
+        if laid.key().view().prefix(8) == prefix.view().prefix(8) {
+            discard mut merged.insert(copied_bytes(laid.key().view(), alloc), value: copied_entry(laid.value(), alloc))
+        }
+    }
+    var children = mem::List[Child].empty(alloc)
+    for entry in take merged {
+        let Some(held) = entry.value else {
+            continue
+        }
+        let Some(parts) = entry.key.view().split_at(8) else {
+            continue
+        }
+        mut children.push(Child(name: copied_bytes(parts.tail, alloc), entry: take held))
+    }
+    return children
+} Store.snapshot_children
+
+/// A child of a dir in a snapshot: its name and entry.
+pkg struct Child {
+    pkg name: mem::Bytes
+    pkg entry: NodeEntry
+} Child
+
+/// Resolves `segments` in `snapshot`, `store.unversioned` for a path below `/state`, `/journal` or an ephemeral dir of a past commit.
+pkg fn Store.snapshot_resolve[D: disk::Device](
+    mut self,
+    device: D,
+    snapshot: Snapshot,
+    segments: Slice[mem::Bytes],
+    alloc: mem::Alloc,
+    ) -> Option[NodeEntry] fails StoreError uses wait {
+    if segments.len() == 0 {
+        return None
+    }
+    if try tree_of_top(segments[0].view()) != TREE_VERSIONED {
+        fail StoreError.Unversioned
+    }
+    var dir = TOP_DIR
+    for at in 0..<segments.len() {
+        let Some(entry) = try await mut self.snapshot_entry(device, snapshot, dir, name: segments[at].view(), alloc) else {
+            return None
+        }
+        if at + 1 == segments.len() {
+            return Some(take entry)
+        }
+        let children = try child_dir(entry, tree: TREE_VERSIONED, alloc)
+        if children.dir == 0 {
+            return None
+        }
+        if children.tree != TREE_VERSIONED {
+            fail StoreError.Unversioned
+        }
+        dir = children.dir
+    }
+    return None
+} Store.snapshot_resolve
+
+/// Lays the versioned writes of a commit's record over a snapshot.
+fn Store.lay_over[D: disk::Device](
+    mut self,
+    device: D,
+    mut snapshot: Snapshot,
+    commit: LineCommit,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let Some(pointer) = commit.record else {
+        fail StoreError.Corrupt
+    }
+    let record = try await mut self.commit_record(device, pointer, alloc)
+    for write in record.writes {
+        if write.tree != TREE_VERSIONED {
+            continue
+        }
+        discard mut snapshot.overlay.insert(entry_key(write.dir, name: write.name.view(), alloc), value: copied_entry(write.entry, alloc))
+    }
+} Store.lay_over
+
+/// The commit record a pointer names.
+pkg fn Store.commit_record[D: disk::Device](mut self, device: D, pointer: disk::Pointer, alloc: mem::Alloc) -> CommitRecord fails StoreError uses wait {
+    let record = match attempt await log::read_record(device, address: pointer.target, pointer, alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => fail StoreError.Corrupt
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    return try decode_commit_record(record.payload.view(), alloc)
+} Store.commit_record
+
+/// The commits of the branch's line from the latest flush commit at or before `target` up to `target`, in order.
+fn Store.line_since_flush[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    take target: LineCommit,
+    alloc: mem::Alloc,
+    ) -> mem::List[LineCommit] fails StoreError uses wait {
+    var line = mem::List[LineCommit].empty(alloc)
+    if target.tree.is_some() {
+        mut line.push(take target)
+        return line
+    }
+    let number = target.number
+    var low = number
+    loop {
+        low = low.saturating_sub(LOOKBACK)
+        let found = try await mut self.line_commits(device, head, from: low, to: number, alloc)
+        var flush_at: Option[usize] = None
+        for at in 0..<found.len() {
+            if found[at].tree.is_some() {
+                flush_at = Some(at)
+            }
+        }
+        match flush_at {
+            Some(start) => {
+                for at in start..<found.len() {
+                    mut line.push(LineCommit(number: found[at].number, record: found[at].record, tree: found[at].tree))
+                }
+                mut line.push(take target)
+                return line
+            }
+            None => {
+            }
+        }
+        if low <= 1 {
+            fail StoreError.Corrupt
+        }
+    }
+} Store.line_since_flush
+
+/// The retained commits of the branch's line numbered from `from` to below `to`, in order.
+fn Store.line_commits[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    from: u64,
+    to: u64,
+    alloc: mem::Alloc,
+    ) -> mem::List[LineCommit] fails StoreError uses wait {
+    var start = Array[u8, 8].filled(0)
+    mut start.view_mut().write_u64_be(0, value: from)
+    let leaves = try await mut self.catalog_scan(device, kind: KIND_COMMIT, from: start.view(), limit: usize.widen(to - from) + 1, alloc)
+    var commits = mem::List[LineCommit].empty(alloc)
+    for leaf in leaves {
+        let number = leaf.key.view().u64_be(1)
+        if number >= to {
+            break
+        }
+        let entry = try decode_commit_entry(leaf.value.view(), alloc)
+        if self.on_line(head, meta: entry.meta) {
+            mut commits.push(line_commit_of(entry))
+        }
+    }
+    return commits
+} Store.line_commits
+
+/// The commit numbered `number` when it is a retained commit of the line of the branch at `head`.
+fn Store.line_commit[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    number: u64,
+    alloc: mem::Alloc,
+    ) -> Option[LineCommit] fails StoreError uses wait {
+    let Some(bytes) = try await mut self.catalog_get(device, key: number_key(KIND_COMMIT, number, width: 8, alloc).view(), alloc) else {
+        return None
+    }
+    let entry = try decode_commit_entry(bytes.view(), alloc)
+    if not self.on_line(head, meta: entry.meta) {
+        return None
+    }
+    return Some(line_commit_of(entry))
+} Store.line_commit
+
+/// The number of the next retained commit of the branch's line after `number`, 0 for none.
+fn Store.retained_after[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    number: u64,
+    alloc: mem::Alloc,
+    ) -> u64 fails StoreError uses wait {
+    let found = try await mut self.line_commits(device, head, from: number + 1, to: self.heads[head].branch.head.number + 1, alloc)
+    if found.len() == 0 {
+        return 0
+    }
+    return found[0].number
+} Store.retained_after
+
+/// Whether a commit lies on the line of the branch at `head`: made on it after its fork, or on its parent's line up to its fork.
+pkg fn Store.on_line(self, head: usize, meta: CommitMeta) -> bool {
+    var at = head
+    loop {
+        let branch = self.heads[at].branch
+        if meta.number.number > branch.fork.number or branch.parent.is_none() {
+            return meta.branch == branch.name and meta.number.number <= branch.head.number
+        }
+        let Some(parent) = branch.parent else {
+            return false
+        }
+        let Some(next) = self.head_of(parent.as_str()) else {
+            return false
+        }
+        at = next
+    }
+} Store.on_line
+
+fn line_commit_of(entry: CommitEntry) -> LineCommit {
+    let record = match entry.record {
+        Some(bytes) => disk::Pointer.of_bytes(bytes.view())
+        None => None
+    }
+    let tree = match entry.tree {
+        Some(bytes) => disk::Pointer.of_bytes(bytes.view())
+        None => None
+    }
+    return LineCommit(number: entry.meta.number.number, record: record, tree: tree)
+} line_commit_of
