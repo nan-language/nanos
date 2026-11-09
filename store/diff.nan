@@ -1,7 +1,7 @@
 //! Diffs: the edits between a subtree at two points, in path order, each shared subtree skipped by its versions, a record's differing fields with their wire bytes.
 
 /// A point a diff compares: a branch's head, or a retained commit of a branch's line.
-pub closed enum Point {
+pub closed enum Point derives Encode {
     Head(text::String)
     Commit(branch: text::String, commit: ident::CommitId)
 } Point
@@ -20,12 +20,15 @@ pub fn Store.diff[D: disk::Device](
     let segments = path.segments(alloc)
     var edits = mem::List[Edit].empty(alloc)
     if segments.len() == 0 {
-        try await mut self.diff_dirs(device, old, new, path, before: TOP_DIR, after: TOP_DIR, mut edits, alloc)
+        let start = try await mut self.dir_comparisons(device, old, new, path, before: TOP_DIR, after: TOP_DIR, alloc)
+        try await mut self.diff_walk(device, old, new, take start, mut edits, alloc)
         return edits
     }
     let before = try await mut self.snapshot_resolve(device, snapshot: old, segments: segments.view(), alloc)
     let after = try await mut self.snapshot_resolve(device, snapshot: new, segments: segments.view(), alloc)
-    try await mut self.diff_entries(device, old, new, path, before, after, mut edits, alloc)
+    var start = mem::List[Comparing].empty(alloc)
+    mut start.push(Comparing(path: copied_path(path, alloc), before: take before, after: take after))
+    try await mut self.diff_walk(device, old, new, take start, mut edits, alloc)
     return edits
 } Store.diff
 
@@ -47,7 +50,55 @@ fn Store.point_snapshot[D: disk::Device](mut self, device: D, point: Point, allo
     return try await mut self.snapshot(device, head, at: number, alloc)
 } Store.point_snapshot
 
-/// Adds the edits between the node at `path` as `before` and as `after`.
+/// A node to compare: its path, and its entry at each point.
+struct Comparing {
+    path: ident::Path
+    before: Option[NodeEntry]
+    after: Option[NodeEntry]
+} Comparing
+
+/// The dirs whose children a comparison goes on to compare: the dir at each point.
+struct Descent derives Copy {
+    before: u64
+    after: u64
+} Descent
+
+/// Adds the edits of `start`, in order, and of everything below them, in path order: the comparisons left wait on a stack, the next in path order on top.
+fn Store.diff_walk[D: disk::Device](
+    mut self,
+    device: D,
+    old: Snapshot,
+    new: Snapshot,
+    take start: mem::List[Comparing],
+    mut edits: mem::List[Edit],
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    var pending = mem::List[Comparing].empty(alloc)
+    var ordered = start
+    loop {
+        let Some(last) = mut ordered.pop() else {
+            break
+        }
+        mut pending.push(take last)
+    }
+    loop {
+        let Some(Comparing(path: path, before: before, after: after)) = mut pending.pop() else {
+            return
+        }
+        let Some(descent) = try await mut self.diff_entries(device, old, new, path, before, after, mut edits, alloc) else {
+            continue
+        }
+        var below = try await mut self.dir_comparisons(device, old, new, path, before: descent.before, after: descent.after, alloc)
+        loop {
+            let Some(next) = mut below.pop() else {
+                break
+            }
+            mut pending.push(take next)
+        }
+    }
+} Store.diff_walk
+
+/// Adds the edit between the node at `path` as `before` and as `after`, and gives the dirs whose children follow when both are dirs of one declaration.
 fn Store.diff_entries[D: disk::Device](
     mut self,
     device: D,
@@ -58,44 +109,45 @@ fn Store.diff_entries[D: disk::Device](
     after: Option[NodeEntry],
     mut edits: mem::List[Edit],
     alloc: mem::Alloc,
-    ) fails StoreError uses wait {
+    ) -> Option[Descent] fails StoreError uses wait {
     let Some(was) = before else {
         let Some(now) = after else {
-            return
+            return None
         }
         let to = try await mut self.hash_in(device, snapshot: new, entry: now, tree: TREE_VERSIONED, alloc)
         mut edits.push(Edit(path: copied_path(path, alloc), change: Change.Added, from: None, to: Some(to), fields: mem::List.empty(alloc)))
-        return
+        return None
     }
     let Some(now) = after else {
         let from = try await mut self.hash_in(device, snapshot: old, entry: was, tree: TREE_VERSIONED, alloc)
         mut edits.push(Edit(path: copied_path(path, alloc), change: Change.Removed, from: Some(from), to: None, fields: mem::List.empty(alloc)))
-        return
+        return None
     }
     if was.version == now.version and was.subtree == now.subtree and was.kind == now.kind {
-        return
+        return None
     }
     let was_dir = try child_dir(was, tree: TREE_VERSIONED, alloc)
     let now_dir = try child_dir(now, tree: TREE_VERSIONED, alloc)
     let both_dirs = was_dir.dir != 0 and now_dir.dir != 0 and was_dir.tree == TREE_VERSIONED and now_dir.tree == TREE_VERSIONED
+    let descent = Descent(before: was_dir.dir, after: now_dir.dir)
     if both_dirs and same_declaration(was, now) {
-        try await mut self.diff_dirs(device, old, new, path, before: was_dir.dir, after: now_dir.dir, mut edits, alloc)
-        return
+        return Some(descent)
     }
     let from = try await mut self.hash_in(device, snapshot: old, entry: was, tree: TREE_VERSIONED, alloc)
     let to = try await mut self.hash_in(device, snapshot: new, entry: now, tree: TREE_VERSIONED, alloc)
     if from == to and not both_dirs {
-        return
+        return None
     }
     let fields = try await mut self.field_edits(device, was, now, alloc)
     mut edits.push(Edit(path: copied_path(path, alloc), change: Change.Changed, from: Some(from), to: Some(to), fields: take fields))
     if both_dirs {
-        try await mut self.diff_dirs(device, old, new, path, before: was_dir.dir, after: now_dir.dir, mut edits, alloc)
+        return Some(descent)
     }
+    return None
 } Store.diff_entries
 
-/// Adds the edits between the children of dir `before` and of dir `after`, in name order.
-fn Store.diff_dirs[D: disk::Device](
+/// The comparisons of the children of dir `before` and of dir `after`, below `path`, in name order.
+fn Store.dir_comparisons[D: disk::Device](
     mut self,
     device: D,
     old: Snapshot,
@@ -103,11 +155,11 @@ fn Store.diff_dirs[D: disk::Device](
     path: ident::Path,
     before: u64,
     after: u64,
-    mut edits: mem::List[Edit],
     alloc: mem::Alloc,
-    ) fails StoreError uses wait {
+    ) -> mem::List[Comparing] fails StoreError uses wait {
     let was = try await mut self.snapshot_children(device, snapshot: old, dir: before, alloc)
     let now = try await mut self.snapshot_children(device, snapshot: new, dir: after, alloc)
+    var comparisons = mem::List[Comparing].empty(alloc)
     var left: usize = 0
     var right: usize = 0
     while left < was.len() or right < now.len() {
@@ -129,9 +181,10 @@ fn Store.diff_dirs[D: disk::Device](
         let Some(child) = path.child(name.view(), alloc) else {
             fail StoreError.Corrupt
         }
-        try await mut self.diff_entries(device, old, new, path: child, before: before_entry, after: after_entry, mut edits, alloc)
+        mut comparisons.push(Comparing(path: take child, before: take before_entry, after: take after_entry))
     }
-} Store.diff_dirs
+    return comparisons
+} Store.dir_comparisons
 
 /// The differing fields of two records of one record type, each with its wire bytes on both sides.
 fn Store.field_edits[D: disk::Device](

@@ -146,7 +146,7 @@ fn Store.fast_forward[D: disk::Device](
     return Committed(number: self.heads[into].branch.head, branch: text::String.of(self.heads[into].branch.name.as_str(), alloc), time: now)
 } Store.fast_forward
 
-/// Merges the children of the dirs `dirs` names, at `path`, in name order.
+/// Merges the children of the dirs `dirs` names, at `path`, and everything below them, in name order: the dirs under way wait on a stack, each with the next child to merge and whether the merge entered it, its entry then among `ancestors`.
 fn Store.merge_dir[D: disk::Device](
     mut self,
     device: D,
@@ -157,6 +157,62 @@ fn Store.merge_dir[D: disk::Device](
     mut ancestors: mem::List[Found],
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
+    var stack = mem::List[MergedDir].empty(alloc)
+    mut stack.push(MergedDir(dir: dirs.target, children: try await mut self.merge_children(device, merging, path, dirs, alloc), next: 0, entered: false))
+    loop {
+        let Some(top) = mut stack.pop() else {
+            return
+        }
+        var walked = top
+        if walked.next >= walked.children.len() {
+            if walked.entered {
+                discard mut ancestors.pop()
+            }
+            continue
+        }
+        let at = walked.next
+        walked.next += 1
+        let nested = try await mut self.merge_entry(device, mut merging, mut staged, path: walked.children[at].path, name: walked.children[at].name.view(), sides: walked.children[at].sides, dir: walked.dir, mut ancestors, alloc)
+        let below = copied_path(walked.children[at].path, alloc)
+        mut stack.push(take walked)
+        let Some(Nested(dirs: inner, ancestor: found)) = nested else {
+            continue
+        }
+        mut ancestors.push(take found)
+        mut stack.push(MergedDir(dir: inner.target, children: try await mut self.merge_children(device, merging, path: below, dirs: inner, alloc), next: 0, entered: true))
+    }
+} Store.merge_dir
+
+/// A dir a merge walks: the target's dir, its children to merge in name order, the next to merge, and whether the merge entered it from its parent.
+struct MergedDir {
+    dir: u64
+    children: mem::List[MergedChild]
+    next: usize
+    entered: bool
+} MergedDir
+
+/// A child a merge compares: its name, its path and its node on each side.
+struct MergedChild {
+    name: mem::Bytes
+    path: ident::Path
+    sides: Sides
+} MergedChild
+
+/// A dir a merge enters: the dirs at its path, and its target entry, which joins the ancestors.
+struct Nested {
+    dirs: Dirs
+    ancestor: Found
+} Nested
+
+/// The children of the dirs `dirs` names, at `path`, in name order, each with its node on each side.
+fn Store.merge_children[D: disk::Device](
+    mut self,
+    device: D,
+    merging: Merging,
+    path: ident::Path,
+    dirs: Dirs,
+    alloc: mem::Alloc,
+    ) -> mem::List[MergedChild] fails StoreError uses wait {
     let base = try await mut self.children_map(device, snapshot: merging.base, dir: dirs.base, alloc)
     let source = try await mut self.children_map(device, snapshot: merging.source, dir: dirs.source, alloc)
     let target = try await mut self.children_map(device, snapshot: merging.target, dir: dirs.target, alloc)
@@ -170,14 +226,16 @@ fn Store.merge_dir[D: disk::Device](
     for entry in target.cursor() {
         discard mut names.insert(copied_bytes(entry.key().view(), alloc))
     }
+    var children = mem::List[MergedChild].empty(alloc)
     for name in names.cursor() {
         let Some(child) = path.child(name.view(), alloc) else {
             fail StoreError.Corrupt
         }
         let sides = Sides(base: copied_entry(base.get(name), alloc), source: copied_entry(source.get(name), alloc), target: copied_entry(target.get(name), alloc))
-        try await mut self.merge_entry(device, mut merging, mut staged, path: child, name: name.view(), sides, dir: dirs.target, mut ancestors, alloc)
+        mut children.push(MergedChild(name: copied_bytes(name.view(), alloc), path: take child, sides: take sides))
     }
-} Store.merge_dir
+    return children
+} Store.merge_children
 
 /// A node on the three sides of a merge.
 struct Sides {
@@ -186,7 +244,7 @@ struct Sides {
     target: Option[NodeEntry]
 } Sides
 
-/// Merges the node named `name` in the target's dir `dir`.
+/// Merges the node named `name` in the target's dir `dir`, giving the dirs below it to merge next when it is a dir on both sides.
 fn Store.merge_entry[D: disk::Device](
     mut self,
     device: D,
@@ -198,33 +256,33 @@ fn Store.merge_entry[D: disk::Device](
     dir: u64,
     mut ancestors: mem::List[Found],
     alloc: mem::Alloc,
-    ) fails StoreError uses wait {
+    ) -> Option[Nested] fails StoreError uses wait {
     if not changed_from(sides.base, now: sides.source) {
-        return
+        return None
     }
     if not changed_from(sides.base, now: sides.target) {
         try await mut self.take_source(device, mut merging, mut staged, name, sides, dir, mut ancestors, alloc)
-        return
+        return None
     }
     if try await mut self.same_on_both(device, merging, sides, alloc) {
-        return
+        return None
     }
     match taken_side(merging.takes.view(), path) {
         Some(Side.Source) => {
             try await mut self.take_source(device, mut merging, mut staged, name, sides, dir, mut ancestors, alloc)
-            return
+            return None
         }
-        Some(Side.Target) => return
+        Some(Side.Target) => return None
         None => {
         }
     }
     let Some(source) = sides.source else {
         try await mut self.add_conflict(device, mut merging, path, kind: ConflictKind.DeleteChange, sides, alloc)
-        return
+        return None
     }
     let Some(target) = sides.target else {
         try await mut self.add_conflict(device, mut merging, path, kind: ConflictKind.DeleteChange, sides, alloc)
-        return
+        return None
     }
     let source_dir = try child_dir(source, tree: TREE_VERSIONED, alloc)
     let target_dir = try child_dir(target, tree: TREE_VERSIONED, alloc)
@@ -240,12 +298,10 @@ fn Store.merge_entry[D: disk::Device](
             }
         }
         let held = try target.copied(alloc)
-        mut ancestors.push(Found(place: Place(head: merging.writing.head, tree: TREE_VERSIONED, dir: dir, name: copied_bytes(name, alloc)), entry: take held))
-        try await mut self.merge_dir(device, mut merging, mut staged, path, dirs: Dirs(base: base_dir, source: source_dir.dir, target: target_dir.dir), mut ancestors, alloc)
-        discard mut ancestors.pop()
-        return
+        return Some(Nested(dirs: Dirs(base: base_dir, source: source_dir.dir, target: target_dir.dir), ancestor: Found(place: Place(head: merging.writing.head, tree: TREE_VERSIONED, dir: dir, name: copied_bytes(name, alloc)), entry: take held)))
     }
     try await mut self.merge_records(device, mut merging, mut staged, path, name, sides, dir, mut ancestors, alloc)
+    return None
 } Store.merge_entry
 
 /// Merges two records changed on both sides, field by field when they have one record type; any other pair of nodes conflicts.

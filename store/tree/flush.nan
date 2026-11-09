@@ -23,7 +23,7 @@ struct Written derives Copy {
     pointer: disk::Pointer
 } Written
 
-/// Writes the dirty nodes of the tree under `root` to the log, children first, and gives the tree with its top node's pointer.
+/// Writes the dirty nodes of the tree under `root` to the log, children first, and gives the tree with its top node's pointer: the nodes under way wait on a stack, each with the next child to write.
 pkg fn Index.write_tree(
     mut self,
     mut log: log::Log,
@@ -32,9 +32,47 @@ pkg fn Index.write_tree(
     time: i64,
     alloc: mem::Alloc,
     ) -> Root fails TreeFailure {
-    let written = try mut self.write_node(mut log, tree: root.tree, id: root.node, pointer: root.pointer, flush, time, alloc)
-    return Root(tree: root.tree, node: written.id, pointer: written.pointer)
+    let tree = root.tree
+    var stack = mem::List[Writing].empty(alloc)
+    mut stack.push(Writing(id: root.node, pointer: root.pointer, next: 0))
+    loop {
+        let Some(top) = mut stack.pop() else {
+            fail TreeFailure.Corrupt
+        }
+        let below = match first self.node_at(tree, id: top.id) {
+            Some(node) if node.dirty and top.next < node.children.len() => Some(Writing(id: node.children[top.next].node, pointer: node.children[top.next].pointer, next: 0))
+            else => None
+        }
+        match below {
+            Some(child) => {
+                mut stack.push(top)
+                mut stack.push(child)
+                continue
+            }
+            None => {
+            }
+        }
+        let written = try mut self.write_node(mut log, tree, id: top.id, pointer: top.pointer, flush, time, alloc)
+        let Some(parent) = mut stack.pop() else {
+            return Root(tree: tree, node: written.id, pointer: written.pointer)
+        }
+        let Some(held) = mut self.withdraw(tree, id: parent.id) else {
+            fail TreeFailure.Corrupt
+        }
+        var node = held
+        node.children[parent.next].node = written.id
+        node.children[parent.next].pointer = written.pointer
+        discard mut self.keep(tree, id: parent.id, take node)
+        mut stack.push(Writing(id: parent.id, pointer: parent.pointer, next: parent.next + 1))
+    }
 } Index.write_tree
+
+/// A node an index flush writes once its children are written: its in-memory id, its pointer, and the next child to write.
+struct Writing derives Copy {
+    id: u64
+    pointer: disk::Pointer
+    next: usize
+} Writing
 
 /// Frees every item no entry names any more, each freeing what it names in turn: a node its children and the values of its leaves, by `values`.
 pkg fn Index.free_unnamed[D: disk::Device, V: Values](mut self, device: D, mut values: V, alloc: mem::Alloc) fails TreeFailure uses wait {
@@ -153,6 +191,7 @@ fn Index.free_item[D: disk::Device, V: Values](
     }
 } Index.free_item
 
+/// Writes the node `id` of `tree`, whose children are written, when it is dirty, and gives where it lies.
 fn Index.write_node(
     mut self,
     mut log: log::Log,
@@ -170,12 +209,6 @@ fn Index.write_node(
     if not node.dirty {
         discard mut self.keep(tree, id, take node)
         return Written(id: id, pointer: pointer)
-    }
-    for at in 0..<node.children.len() {
-        let child = node.children[at]
-        let written = try mut self.write_node(mut log, tree, id: child.node, pointer: child.pointer, flush, time, alloc)
-        node.children[at].node = written.id
-        node.children[at].pointer = written.pointer
     }
     let bytes = node.encode(flush, alloc)
     var key = Array[u8, 32].filled(0)

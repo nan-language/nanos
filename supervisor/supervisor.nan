@@ -1,29 +1,48 @@
-//! The supervisor: the base instance that starts the base instances in their order and stops and restarts instances.
+//! The supervisor: the base instance that starts the base instances in their order, then reconciles the instances that run with `/sys/instances` and `/sys/config`, and stops and restarts instances.
 
-/// The key of the keyed task that starts the base instances.
+/// The key of the keyed task that starts the base instances, then subscribes to the desired state.
 const STARTING: u64 = 1
+
+/// The key of the keyed task reconciling the instances with the desired state.
+const RECONCILING: u64 = 2
 
 /// The base instances `supervisor` starts after itself, one step per line, those of a step in parallel: chapter 20's start order, the lazy ones last. A moniker without a specification is passed over.
 const START_ORDER: Str = "devices\nfat\nkeys\nstore\njournal\npolicy\nboot\nnet link console\nadmission clock power infer\n"
 
+/// The specifications one listing gives at once.
+const PAGE: u32 = 256
+
+/// The credit of the port the store tells the supervisor's subscriptions through.
+const WATCH_CREDIT: u16 = 64
+
 pub protocol Supervisor {
-    /// Stops the instance `moniker`.
+    /// Stops the instance `moniker`, setting `stopped` in its specification when the store holds it.
     pub fn stop(moniker: ident::Moniker) limits restorable
     /// Restarts the instance `moniker`.
     pub fn restart(moniker: ident::Moniker) limits restorable
+    /// A commit changed the desired state below a subscription's prefix.
+    pub fn changed(subscription: u64, commit: ident::CommitId, paths: mem::List[ident::Path], more: u64) limits traceless
+    pub fn appended(subscription: u64, path: ident::Path, seq: u64) limits traceless
+    /// The store could not tell of `commits` commits.
+    pub fn lost(subscription: u64, commits: u64) limits traceless
+    fn reconciled(listed: mem::List[ident::Moniker]) limits traceless
 } Supervisor
 
 pub closed struct Env {
     pub control: os::Control
     pub devices: Option[os::Port[devices::Devices]]
+    pub tree: Option[store::service::View]
     pub exec: task::Executor
     pub alloc: mem::Alloc
 } Env
 
 impl Env: nanos::Environment
 
-/// The supervisor's state: it keeps none.
+/// The supervisor's state: the monikers whose specifications it last found in `/sys/instances`, which a later pass deletes when their specifications are gone, and whether a pass is under way and another is due after it.
 pub closed struct Supervision derives Encode {
+    pub listed: mem::List[ident::Moniker]
+    pub reconciling: bool
+    pub due: bool
 } Supervision
 
 impl Supervision: sys::Component[Env, Supervisor]
@@ -35,32 +54,129 @@ pub fn Env.build(take world: nanos::World) -> Env fails nanos::CapError {
         Ok(handle) => os::Port[devices::Devices].of(handle)
         Err(_) => None
     }
-    return Env(control: try nanos::Cap[os::Control].get(world.caps, key: "control"), devices: devices, exec: world.exec, alloc: world.alloc)
+    let tree = match attempt nanos::Cap[store::service::View].get(world.caps, key: "tree") {
+        Ok(view) => Some(view)
+        Err(_) => None
+    }
+    return Env(control: try nanos::Cap[os::Control].get(world.caps, key: "control"), devices: devices, tree: tree, exec: world.exec, alloc: world.alloc)
 } Env.build
 
-pub fn Supervision.start(mut env: Env) -> Supervision = Supervision()
+pub fn Supervision.start(mut env: Env) -> Supervision = Supervision(listed: mem::List.empty(env.alloc), reconciling: false, due: false)
 
-/// Once started, starts the base instances in their order.
+/// Once started, starts the base instances in their order, then subscribes to the desired state, whose commits since genesis each start a reconciling pass.
 pub fn Supervision.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Supervisor]) {
     if reason != sys::ResumeReason.Started {
         return
     }
     let control = env.control
     let manager = env.devices
+    let tree = env.tree
     let exec = env.exec
     let alloc = env.alloc
-    mut cx.spawn(key: STARTING, run: fn(out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
+    mut cx.spawn(key: STARTING, run: fn(out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 65_536 {
         try await start_in_order(control, devices: manager, exec, alloc)
+        let Some(view) = tree else {
+            return
+        }
+        try await subscribe(control, view, alloc)
     })
 } Supervision.resume
 
 pub fn Supervision.stop(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
-    carry_out(mut cx, control: env.control, take moniker, restart: false, alloc: env.alloc)
+    let Some(view) = env.tree else {
+        carry_out(mut cx, control: env.control, take moniker, restart: false, alloc: env.alloc)
+        return
+    }
+    let alloc = env.alloc
+    mut cx.spawn(key: keyed(moniker), run: fn[take moniker](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 65_536 {
+        try await mark_stopped(view, take moniker, alloc)
+    })
 } Supervision.stop
 
 pub fn Supervision.restart(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
     carry_out(mut cx, control: env.control, take moniker, restart: true, alloc: env.alloc)
 } Supervision.restart
+
+/// Reconciles the instances a commit's desired state names: a pass over every specification, and a restart of each instance whose configuration record it changed.
+pub fn Supervision.changed(
+    mut self,
+    take subscription: u64,
+    take commit: ident::CommitId,
+    take paths: mem::List[ident::Path],
+    take more: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Supervisor],
+    ) {
+    for path in paths {
+        let Some(moniker) = configured(path, alloc: env.alloc) else {
+            continue
+        }
+        carry_out(mut cx, control: env.control, take moniker, restart: true, alloc: env.alloc)
+    }
+    mut self.reconcile(mut env, mut cx)
+} Supervision.changed
+
+pub fn Supervision.appended(
+    mut self,
+    take subscription: u64,
+    take path: ident::Path,
+    take seq: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Supervisor],
+    ) {
+} Supervision.appended
+
+/// Reconciles every specification after the store could not tell of some commits.
+pub fn Supervision.lost(
+    mut self,
+    take subscription: u64,
+    take commits: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Supervisor],
+    ) {
+    mut self.reconcile(mut env, mut cx)
+} Supervision.lost
+
+/// Keeps the monikers a pass found, and starts the pass due after it.
+fn Supervision.reconciled(mut self, take listed: mem::List[ident::Moniker], mut env: Env, mut cx: sys::Cx[Supervisor]) {
+    self.listed = listed
+    self.reconciling = false
+    if self.due {
+        self.due = false
+        mut self.reconcile(mut env, mut cx)
+    }
+} Supervision.reconciled
+
+/// Starts a pass bringing the instances to `/sys/instances` from a keyed task, or marks one due when a pass is under way.
+fn Supervision.reconcile(mut self, mut env: Env, mut cx: sys::Cx[Supervisor]) {
+    let Some(view) = env.tree else {
+        return
+    }
+    if self.reconciling {
+        self.due = true
+        return
+    }
+    self.reconciling = true
+    var before = mem::List[ident::Moniker].empty(env.alloc)
+    for moniker in self.listed {
+        mut before.push(ident::Moniker(text: moniker.text))
+    }
+    let control = env.control
+    let alloc = env.alloc
+    mut cx.spawn(key: RECONCILING, run: fn[take before](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 65_536 {
+        let listed = try await reconcile(control, view, take before, alloc)
+        discard attempt await out.reconciled(listed: take listed)
+    })
+} Supervision.reconcile
+
+/// The key of the keyed task acting on the instance `moniker`, which a later order for the same instance does not cancel.
+fn keyed(moniker: ident::Moniker) -> u64 {
+    var key = STARTING
+    for byte in moniker.text.as_bytes() {
+        key = key.wrapping_mul(31).wrapping_add(u64.widen(byte))
+    }
+    return key | 0x8000_0000_0000_0000
+} keyed
 
 /// Has the runner stop, or restart when `restart`, the instance `moniker` from a keyed task of its own, which a later order for the same instance does not cancel.
 fn carry_out(
@@ -70,11 +186,7 @@ fn carry_out(
     restart: bool,
     alloc: mem::Alloc,
     ) {
-    var key = STARTING
-    for byte in moniker.text.as_bytes() {
-        key = key.wrapping_mul(31).wrapping_add(u64.widen(byte))
-    }
-    mut cx.spawn(key: key | 0x8000_0000_0000_0000, run: fn[take moniker](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
+    mut cx.spawn(key: keyed(moniker), run: fn[take moniker](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
         let ordered = match restart {
             false => attempt await control.stop(take moniker, alloc)
             true => attempt await control.restart(take moniker, alloc)
@@ -86,6 +198,168 @@ fn carry_out(
         }
     })
 } carry_out
+
+/// Subscribes the supervisor's own port to the commits changing `/instances` and `/config` of its View since genesis.
+fn subscribe(control: os::Control, view: store::service::View, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let port = match first attempt await control.port(ident::Moniker(text: text::Fixed[59].of("supervisor")), credit: os::Credit(messages: WATCH_CREDIT, calls: 1), alloc) {
+        Ok(handle) => handle
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return
+    }
+    try await watch(view, prefix: desired("/instances", alloc), port, alloc)
+    try await watch(view, prefix: desired("/config", alloc), port, alloc)
+} subscribe
+
+/// Has the store tell `port` of the commits since genesis that change nodes below `prefix`.
+fn watch(view: store::service::View, take prefix: ident::Path, port: os::PortHandle, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    match attempt await view.subscribe(take prefix, since: ident::CommitId(number: 0), port, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} watch
+
+fn desired(text: Str, alloc: mem::Alloc) -> ident::Path {
+    return ident::Path(text: text::String.of(text, alloc))
+} desired
+
+/// The instance whose configuration record `path` names below `/sys/config`.
+fn configured(path: ident::Path, alloc: mem::Alloc) -> Option[ident::Moniker] {
+    let segments = path.segments(alloc)
+    if segments.len() != 3 or segments[0].view() != b"sys" or segments[1].view() != b"config" {
+        return None
+    }
+    var name = text::Fixed[59].empty()
+    for byte in segments[2] {
+        let Some(c) = char.checked_from_bits(u32.widen(byte)) else {
+            return None
+        }
+        mut name.push(c)
+    }
+    if not ident::is_moniker(name) {
+        return None
+    }
+    return Some(ident::Moniker(text: name))
+} configured
+
+/// Brings the instances to the specifications of `/instances`: each stopped as its specification asks or started, created first when the runner has none, and each instance of `before` whose specification is gone deleted; gives the monikers it found.
+fn reconcile(control: os::Control, view: store::service::View, take before: mem::List[ident::Moniker], alloc: mem::Alloc) -> mem::List[ident::Moniker] fails task::Cancelled uses wait {
+    var listed = mem::List[ident::Moniker].empty(alloc)
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await view.list(desired("/instances", alloc), take after, limit: PAGE, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return before
+        }
+        for entry in listing.entries {
+            var name = text::Fixed[59].empty()
+            mut name.append(entry.name.as_str())
+            if not ident::is_moniker(name) {
+                continue
+            }
+            try await converge(control, view, moniker: ident::Moniker(text: name), alloc)
+            mut listed.push(ident::Moniker(text: name))
+        }
+        let Some(next) = listing.next else {
+            break
+        }
+        after = Some(take next)
+    }
+    for gone in take before {
+        if not holds(listed, moniker: gone) {
+            match attempt await control.delete(take gone, alloc) {
+                Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+                else => {
+                }
+            }
+        }
+    }
+    return listed
+} reconcile
+
+/// The specification of the instance `moniker` the View's `/instances` holds, `None` when it holds none that decodes.
+fn spec_of(view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) -> Option[os::InstanceSpec] fails task::Cancelled uses wait {
+    let Some(path) = desired("/instances", alloc).child(moniker.text.as_bytes(), alloc) else {
+        return None
+    }
+    let node = match first attempt await view.get(take path, at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(value) = node.value else {
+        return None
+    }
+    let Ok(spec) = attempt mem::wire::Codec[os::InstanceSpec].decode(value.view(), alloc) else {
+        return None
+    }
+    return Some(take spec)
+} spec_of
+
+/// Brings the instance `moniker` to its specification: stopped when it asks, else started, created first when the runner has none.
+fn converge(control: os::Control, view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(spec) = try await spec_of(view, moniker, alloc) else {
+        return
+    }
+    if spec.stopped {
+        try settled(attempt await control.stop(ident::Moniker(text: moniker.text), alloc))
+        return
+    }
+    match attempt await control.start(ident::Moniker(text: moniker.text), alloc) {
+        Err(os::ControlError.Missing) => {
+        }
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        else => return
+    }
+    match attempt await control.create(ident::Moniker(text: moniker.text), take spec, grants: mem::Map.empty(alloc), alloc) {
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+    try settled(attempt await control.start(ident::Moniker(text: moniker.text), alloc))
+} converge
+
+/// An order's outcome, which the next pass acts on again when it failed; a cancellation stays one.
+fn settled[T](take outcome: Result[T, os::ControlError]) fails task::Cancelled {
+    match outcome {
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} settled
+
+/// Sets `stopped` in the specification of the instance `moniker`, which the reconciling pass its commit starts then stops.
+fn mark_stopped(view: store::service::View, take moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(held) = try await spec_of(view, moniker, alloc) else {
+        return
+    }
+    let Some(path) = desired("/instances", alloc).child(moniker.text.as_bytes(), alloc) else {
+        return
+    }
+    var spec = held
+    spec.stopped = true
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::InstanceSpec].encode(spec, out: mut bytes)
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: take path, value: store::Value.Record(type: store::service::spec_type(alloc), bytes: take bytes, secret: false)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: Some(text::String.of("stop", alloc)))
+    match attempt await view.commit(take transaction, typed: true, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} mark_stopped
+
+/// Whether `monikers` holds `moniker`.
+fn holds(monikers: mem::List[ident::Moniker], moniker: ident::Moniker) -> bool {
+    for held in monikers {
+        if held == moniker {
+            return true
+        }
+    }
+    return false
+} holds
 
 /// Starts the base instances in their order, each step once every instance of the step before runs, hibernates or has failed, and the steps after those holding `devices` or `fat` once `devices` has settled the role holders they need.
 fn start_in_order(control: os::Control, devices: Option[os::Port[devices::Devices]], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {

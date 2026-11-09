@@ -23,20 +23,35 @@ const CMOS_DRIVER: Str = "drivers::cmos::Cmos"
 
 const AHCI: Str = "drivers::ahci::Ahci"
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, and where the MADT routes each ISA interrupt.
+const STORE_SERVICE: Str = "store::service::Service"
+
+/// The canonical paths of the record types genesis writes besides specifications.
+const GRANT_TYPE: Str = "os::Grant"
+
+const BOOT_STATE_TYPE: Str = "bootfmt::BootState"
+
+const STORE_CONFIG_TYPE: Str = "store::service::StoreConfig"
+
+/// The memory limit of `store`, whose engine keeps index nodes of 16 KiB in memory.
+const STORE_LIMIT: u64 = 67_108_864
+
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock and the handoff record.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
     bundle: ident::HashValue
     boot: devices::BootVolume
     isa: Array[acpi::IsaRoute, 16]
+    reporter: store::service::Reporter
+    wall: ident::Wall
+    handoff: bootfmt::Handoff
 } Base
 
 impl Base: runner::Components
 
 fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == SUPERVISOR {
-        return Some(os::Protocols(own: sys::Wire[supervisor::Supervisor].hash(), serves: None))
+        return Some(os::Protocols(own: sys::Wire[supervisor::Supervisor].hash(), serves: Some(sys::Wire[store::service::Watcher].hash())))
     }
     if component == DEVICES {
         return Some(os::Protocols(own: sys::Wire[devices::Devices].hash(), serves: None))
@@ -67,6 +82,9 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     }
     if component == AHCI {
         return Some(os::Protocols(own: sys::Wire[drivers::ahci::AhciDevice].hash(), serves: Some(sys::Wire[devices::Block].hash())))
+    }
+    if component == STORE_SERVICE {
+        return Some(os::Protocols(own: sys::Wire[store::service::Store].hash(), serves: None))
     }
     return None
 } Base.protocols
@@ -123,7 +141,18 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     if component == AHCI {
         return try await self.serve_ahci(take world, take serving)
     }
-    return try await runner::Served[supervisor::Supervision, supervisor::Env, supervisor::Supervisor].run(take world, take serving)
+    if component == STORE_SERVICE {
+        return try await self.serve_store(take world, take serving)
+    }
+    let exec = world.exec
+    let alloc = world.alloc
+    let Ok(env) = attempt supervisor::Env.build(take world) else {
+        return runner::Ended.EnvIncomplete
+    }
+    var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+    mut peers.push(sys::Wire[store::service::Watcher].schema(alloc))
+    return try await runner::Driven[supervisor::Supervision, supervisor::Env, supervisor::Supervisor].run(take env, exec, alloc, take serving, take peers, release: fn(take ended: supervisor::Env) limits stack 512 {
+    })
 } Base.serve
 
 /// Serves `virtio-rng` on the function its claim names.
@@ -269,6 +298,21 @@ fn Base.serve_ahci(self, take world: nanos::World, take serving: runner::Serving
     }
 } Base.serve_ahci
 
+/// Serves `store` on the port of the `store-volume` role, with the image's genesis record and the `/sys/boot` record of the handoff record.
+fn Base.serve_store(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Ok(handle) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "volume") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Some(volume) = os::Port[devices::Block].of(handle) else {
+        return runner::Ended.EnvIncomplete
+    }
+    let genesis = genesis_record(self.bundle, generation: self.handoff.generation, alloc)
+    let env = store::service::Env.of(volume, take genesis, boot: boot_record(self.handoff, alloc), clock: world.clock, wall: self.wall, random: world.random, reporter: self.reporter, alloc)
+    return try await runner::Driven[store::service::Service, store::service::Env, store::service::Store].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: store::service::Env) limits stack 8_192 {
+    })
+} Base.serve_store
+
 /// The schemas a block driver or view serves the calls of: `Block`'s.
 fn schema_of_block(alloc: mem::Alloc) -> mem::List[sys::ProtocolSchema] {
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
@@ -334,19 +378,79 @@ fn image_genesis(bundle: ident::HashValue, alloc: mem::Alloc) -> runner::Known {
     discard mut managing.grants.insert(text::String.of("control", alloc), value: 2)
     discard mut managing.grants.insert(text::String.of("clock", alloc), value: 3)
     discard mut managing.wiring.insert(text::String.of("fat", alloc), value: os::Wire.to(moniker("fat")))
+    discard mut supervising.grants.insert(text::String.of("tree", alloc), value: 6)
     var filing = os::InstanceSpec.of(principal: principal("system"), bundle, component: FAT, alloc)
     discard mut filing.wiring.insert(text::String.of("volume", alloc), value: os::Wire(target: os::Target.Role(os::Role.BootVolume), operations: None, credit: os::Credit(messages: 64, calls: 64)))
+    var storing = os::InstanceSpec.of(principal: principal("system"), bundle, component: STORE_SERVICE, alloc)
+    storing.budget = os::Budget(limit: STORE_LIMIT, reserved: false)
+    discard mut storing.grants.insert(text::String.of("clock", alloc), value: 4)
+    discard mut storing.grants.insert(text::String.of("random", alloc), value: 5)
+    discard mut storing.wiring.insert(text::String.of("volume", alloc), value: os::Wire(target: os::Target.Role(os::Role.StoreVolume), operations: None, credit: os::Credit(messages: 64, calls: 64)))
     var specs = mem::Map[ident::Moniker, os::InstanceSpec].empty(alloc)
     discard mut specs.insert(moniker("supervisor"), value: take supervising)
     discard mut specs.insert(moniker("devices"), value: take managing)
     discard mut specs.insert(moniker("fat"), value: take filing)
+    discard mut specs.insert(moniker("store"), value: take storing)
     var grants = mem::Map[u64, os::Grant].empty(alloc)
     discard mut grants.insert(0, value: os::Grant(holder: principal("system"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
     discard mut grants.insert(1, value: os::Grant(holder: principal("inst.supervisor"), object: os::Object.Machine, rights: rights(every: false, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
     discard mut grants.insert(2, value: os::Grant(holder: principal("inst.devices"), object: os::Object.Instance(prefix: moniker("devices")), rights: rights(every: false, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
     discard mut grants.insert(3, value: os::Grant(holder: principal("inst.devices"), object: os::Object.Clock, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    discard mut grants.insert(4, value: os::Grant(holder: principal("inst.store"), object: os::Object.Clock, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    discard mut grants.insert(5, value: os::Grant(holder: principal("inst.store"), object: os::Object.Random, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    discard mut grants.insert(6, value: os::Grant(holder: principal("inst.supervisor"), object: os::Object.Tree(prefix: tree_path("/sys", alloc), branch: text::String.of("main", alloc)), rights: tree_rights(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
     return runner::Known(specs: take specs, grants: take grants)
 } image_genesis
+
+/// The genesis record of generation `generation`: the dirs of `/sys`, `/data` and `/state`, the base instances' specifications and grants of the image's genesis, running `bundle`, and the store's retention defaults.
+fn genesis_record(bundle: ident::HashValue, generation: u64, alloc: mem::Alloc) -> store::service::Genesis {
+    let runner::Known(specs: specs, grants: grants) = image_genesis(bundle, alloc)
+    var granted = mem::List[store::service::TypedValue].empty(alloc)
+    for entry in take grants {
+        let mem::KeyValue(key: _, value: grant) = entry
+        var bytes = mem::Bytes.empty(alloc)
+        mem::wire::Codec[os::Grant].encode(grant, out: mut bytes)
+        mut granted.push(store::service::TypedValue(type: store::TypeRef.of(GRANT_TYPE, schema: mem::wire::Codec[os::Grant].schema_hash(), alloc), bytes: take bytes))
+    }
+    var stored = mem::Bytes.empty(alloc)
+    mem::wire::Codec[store::service::StoreConfig].encode(store::service::StoreConfig(retention: store::Retention.default_of(alloc)), out: mut stored)
+    var config = mem::Map[ident::Moniker, store::service::TypedValue].empty(alloc)
+    discard mut config.insert(moniker("store"), value: store::service::TypedValue(type: store::TypeRef.of(STORE_CONFIG_TYPE, schema: mem::wire::Codec[store::service::StoreConfig].schema_hash(), alloc), bytes: take stored))
+    return store::service::Genesis(format: 1, generation: generation, nodes: genesis_nodes(alloc), instances: take specs, config: take config, grants: take granted)
+} genesis_record
+
+/// The dirs genesis declares: `/sys` and the dirs below it, their children records of the type each holds where it is one, `/data` and `/state`.
+fn genesis_nodes(alloc: mem::Alloc) -> mem::Map[ident::Path, store::Declaration] {
+    var nodes = mem::Map[ident::Path, store::Declaration].empty(alloc)
+    discard mut nodes.insert(tree_path("/sys", alloc), value: dir_of(None))
+    discard mut nodes.insert(tree_path("/sys/instances", alloc), value: dir_of(Some(store::Element(kind: store::NodeKind.Record, type: Some(store::service::spec_type(alloc))))))
+    discard mut nodes.insert(tree_path("/sys/grants", alloc), value: dir_of(Some(store::Element(kind: store::NodeKind.Record, type: Some(store::TypeRef.of(GRANT_TYPE, schema: mem::wire::Codec[os::Grant].schema_hash(), alloc))))))
+    discard mut nodes.insert(tree_path("/sys/code", alloc), value: dir_of(Some(store::Element(kind: store::NodeKind.Dir, type: None))))
+    discard mut nodes.insert(tree_path("/sys/config", alloc), value: records_dir())
+    discard mut nodes.insert(tree_path("/sys/principals", alloc), value: records_dir())
+    discard mut nodes.insert(tree_path("/sys/approvals", alloc), value: records_dir())
+    discard mut nodes.insert(tree_path("/sys/plans", alloc), value: records_dir())
+    discard mut nodes.insert(tree_path("/sys/outbox", alloc), value: records_dir())
+    discard mut nodes.insert(tree_path("/sys/schedule", alloc), value: records_dir())
+    discard mut nodes.insert(tree_path("/data", alloc), value: dir_of(None))
+    discard mut nodes.insert(tree_path("/state", alloc), value: dir_of(None))
+    return nodes
+} genesis_nodes
+
+/// The declaration of a versioned dir whose children are of `element`, any when `None`.
+fn dir_of(take element: Option[store::Element]) -> store::Declaration {
+    return store::Declaration.Dir(store::DirDecl(element: take element, ephemeral: false, secret: false, numbered: false, keep: None))
+} dir_of
+
+/// The declaration of a dir of records of any type.
+fn records_dir() -> store::Declaration = dir_of(Some(store::Element(kind: store::NodeKind.Record, type: None)))
+
+/// The record of `/sys/boot` the handoff record tells.
+fn boot_record(handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::TypedValue {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[bootfmt::BootState].encode(bootfmt::BootState.of_handoff(handoff, alloc), out: mut bytes)
+    return store::service::TypedValue(type: store::TypeRef.of(BOOT_STATE_TYPE, schema: mem::wire::Codec[bootfmt::BootState].schema_hash(), alloc), bytes: take bytes)
+} boot_record
 
 /// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames` and prints each event `rings` record; it never ends unless cancelled.
 fn run_base(
@@ -355,6 +459,7 @@ fn run_base(
     bundle: ident::HashValue,
     boot: devices::BootVolume,
     isa: Array[acpi::IsaRoute, 16],
+    handoff: bootfmt::Handoff,
     config: runner::Config,
     rings: journal::Rings,
     mut frames: frames::Frames,
@@ -363,16 +468,22 @@ fn run_base(
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
     let minted = devices::MintedRoot.of(orders, alloc: config.alloc)
     defer take minted.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa)
+    let task::Channel(sender: reported, receiver: reports) = task::Channel[store::service::Report].bounded(16, alloc: config.alloc)
+    let reporting = store::service::MintedReporter.of(reported, alloc: config.alloc)
+    defer take reporting.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), wall: config.wall, handoff: handoff)
     var requested = incoming
-    var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered))
+    var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports))
     defer abandon_given(take given)
     try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Given(known: genesis, reservations: reserver, keeper: held, orders: root_orders)) = mut given.extract() else {
+        let Some(Given(known: genesis, reservations: reserver, keeper: held, orders: root_orders, store_events: store_events)) = mut given.extract() else {
             return
         }
         discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
             try await print_events(rings, exec: config.exec, alloc: config.alloc)
+        })
+        discard s.spawn(fn[take store_events]() fails task::Cancelled uses wait limits stack 8_192 {
+            try await record_store_events(take store_events, rings)
         })
         let signal = held.slot_signal()
         let task::Channel(sender: inputs, receiver: received) = task::Channel[keeper::Input].bounded(16, alloc: config.alloc)
@@ -401,11 +512,25 @@ fn run_base(
     })
 } run_base
 
+/// Writes each event the store reports to the core rings, and halts the kernel with the code of a failed mount.
+fn record_store_events(take reports: task::Receiver[store::service::Report], rings: journal::Rings) fails task::Cancelled uses wait {
+    var receiver = reports
+    loop {
+        let Some(report) = try await mut receiver.receive() else {
+            return
+        }
+        match report {
+            store::service::Report.Event(event) => rings.record_store(event)
+            store::service::Report.MountFailed(code: code) => halt(code: code.as_str(), subject: "store")
+        }
+    }
+} record_store_events
+
 /// Releases the keeper when the scope never took it.
 fn abandon_given(take given: Option[Given]) {
     match given {
         Some(left) => {
-            let Given(known: _, reservations: _, keeper: kept, orders: _) = left
+            let Given(known: _, reservations: _, keeper: kept, orders: _, store_events: _) = left
             take kept.release()
         }
         None => {
@@ -413,12 +538,13 @@ fn abandon_given(take given: Option[Given]) {
     }
 } abandon_given
 
-/// What the tasks of `run_base` take: the genesis record and the reservations the runner makes, and the keeper with the device root's orders.
+/// What the tasks of `run_base` take: the genesis record and the reservations the runner makes, the keeper with the device root's orders, and the events the store reports.
 linear struct Given {
     known: runner::Known
     reservations: Reserver
     keeper: keeper::Keeper
     orders: task::Receiver[devices::RootOrder]
+    store_events: task::Receiver[store::service::Report]
 } Given
 
 /// A reserved instance's request for a region of `bytes`, and where the store over it goes, `None` when no free range holds one.
@@ -490,12 +616,24 @@ fn principal(text: Str) -> ident::Principal {
     return ident::Principal(text: text::Fixed[64].of(text))
 } principal
 
+fn tree_path(text: Str, alloc: mem::Alloc) -> ident::Path {
+    return ident::Path(text: text::String.of(text, alloc))
+} tree_path
+
+/// The rights of a `Tree` grant reading and writing its subtree.
+fn tree_rights(alloc: mem::Alloc) -> mem::Set[os::Right] {
+    var set = mem::Set[os::Right].empty(alloc)
+    discard mut set.insert(os::Right.Read)
+    discard mut set.insert(os::Right.Write)
+    return set
+} tree_rights
+
 test supervisor_starts_from_the_image_genesis for image_genesis {
     let world = testing::world()
     let alloc = world.alloc
     var bundle = Array[u8, 33].filled(0)
     bundle[0] = 0x01
-    let config = runner::Config(exec: world.exec, pool: alloc, alloc: alloc, clock: world.clock, wall: runner::Wall(at: ident::WallTime.unknown(), since_ns: 0), random: world.random, classes: sched::classes())
+    let config = runner::Config(exec: world.exec, pool: alloc, alloc: alloc, clock: world.clock, wall: ident::Wall(at: ident::WallTime.unknown(), since_ns: 0), random: world.random, classes: sched::classes())
     let rings = journal::Rings.of(cpus: hw::cpu_count(), clock: world.clock, alloc)
     let task::Channel(sender: requests, receiver: unanswered) = task::Channel[Reservation].bounded(1, alloc)
     discard unanswered
@@ -503,7 +641,11 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unserved
     let minted = devices::MintedRoot.of(orders, alloc)
     defer take minted.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)))
+    let task::Channel(sender: reported, receiver: unreported) = task::Channel[store::service::Report].bounded(1, alloc)
+    discard unreported
+    let reporting = store::service::MintedReporter.of(reported, alloc)
+    defer take reporting.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty())
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)

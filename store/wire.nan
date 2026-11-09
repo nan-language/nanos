@@ -57,10 +57,10 @@ pkg fn map_parts(
     var parts = mem::List[Part].empty(alloc)
     var at = count.next
     for _ in 0..<count.value {
-        let Some(key_end) = skip_value(schema, node: key, bytes, at, depth: 0) else {
+        let Some(key_end) = skip_value(schema, node: key, bytes, at, alloc) else {
             return None
         }
-        let Some(value_end) = skip_value(schema, node: value, bytes, at: key_end, depth: 0) else {
+        let Some(value_end) = skip_value(schema, node: value, bytes, at: key_end, alloc) else {
             return None
         }
         mut parts.push(Part(key: disk::copy_range(bytes, at, count: key_end - at, alloc), value: disk::copy_range(bytes, at: key_end, count: value_end - key_end, alloc)))
@@ -89,61 +89,97 @@ pkg fn joined(parts: Slice[Part], record: bool, alloc: mem::Alloc) -> mem::Bytes
     return bytes
 } joined
 
-/// The offset after the value of schema node `node` at `at` of `bytes`, `None` when it does not lie there whole.
+/// The offset after the value of schema node `node` at `at` of `bytes`, `None` when it does not lie there whole: the sequences and maps under way wait on a stack, each with the values it has left.
 fn skip_value(
     schema: mem::wire::Schema,
     node: usize,
     bytes: Slice[u8],
     at: usize,
-    depth: u32,
+    alloc: mem::Alloc,
     ) -> Option[usize] {
-    if depth > MOST_DEPTH or node >= schema.nodes.len() {
-        return None
+    var next = at
+    var stack = mem::List[Skipping].empty(alloc)
+    var current = Some(Skip(node: node, depth: 0))
+    loop {
+        match current {
+            Some(skip) => {
+                current = None
+                if skip.depth > MOST_DEPTH or skip.node >= schema.nodes.len() {
+                    return None
+                }
+                let opened = match schema.nodes[skip.node] {
+                    mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => Some(Skipping(lead: element, follower: None, left: 0, following: false, depth: skip.depth + 1))
+                    mem::wire::SchemaNode.Map(key: key, value: value) => Some(Skipping(lead: key, follower: Some(value), left: 0, following: false, depth: skip.depth + 1))
+                    else => None
+                }
+                match opened {
+                    Some(many) => {
+                        let Some(count) = uvar_at(bytes, at: next) else {
+                            return None
+                        }
+                        next = count.next
+                        var frame = many
+                        frame.left = count.value
+                        mut stack.push(frame)
+                    }
+                    None => {
+                        let Some(end) = flat_end(schema, node: skip.node, bytes, at: next) else {
+                            return None
+                        }
+                        next = end
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        let Some(top) = mut stack.pop() else {
+            return Some(next)
+        }
+        var frame = top
+        if frame.following {
+            frame.following = false
+            current = Some(Skip(node: frame.follower.value_or(schema.nodes.len()), depth: frame.depth))
+            mut stack.push(frame)
+            continue
+        }
+        if frame.left == 0 {
+            continue
+        }
+        frame.left -= 1
+        frame.following = frame.follower.is_some()
+        current = Some(Skip(node: frame.lead, depth: frame.depth))
+        mut stack.push(frame)
     }
+} skip_value
+
+/// A value to skip: its schema node and its depth.
+struct Skip derives Copy {
+    node: usize
+    depth: u32
+} Skip
+
+/// A sequence or map a skip goes through: the schema nodes of its lead values and of the follower each map key has, the values left, whether a follower comes next, and the depth of its values.
+struct Skipping derives Copy {
+    lead: usize
+    follower: Option[usize]
+    left: u64
+    following: bool
+    depth: u32
+} Skipping
+
+/// The offset after a value of schema node `node` that holds no sequence or map of its own to go through, `None` when it does not lie there whole.
+fn flat_end(schema: mem::wire::Schema, node: usize, bytes: Slice[u8], at: usize) -> Option[usize] {
     return match schema.nodes[node] {
         mem::wire::SchemaNode.Bool => bounded(at + 1, bytes)
         mem::wire::SchemaNode.Float(width: _) => bounded(at + 8, bytes)
         mem::wire::SchemaNode.Char or mem::wire::SchemaNode.Unsigned(width: _) or mem::wire::SchemaNode.Signed(width: _) => next_of(uvar_at(bytes, at))
         mem::wire::SchemaNode.Text or mem::wire::SchemaNode.Bytes or mem::wire::SchemaNode.BoundedText(capacity: _) => sized_end(bytes, at)
-        mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => skip_many(schema, lead: element, follower: None, bytes, at, depth)
-        mem::wire::SchemaNode.Map(key: key, value: value) => skip_many(schema, lead: key, follower: Some(value), bytes, at, depth)
         mem::wire::SchemaNode.Record(open: _, fields: _) => skip_record(bytes, at)
         mem::wire::SchemaNode.Variant(open: _, variants: _) => skip_variant(bytes, at)
-        mem::wire::SchemaNode.Back(depth: _) => None
+        else => None
     }
-} skip_value
-
-/// The offset after a count and that many values of `lead`, each followed by one of `follower` when given.
-fn skip_many(
-    schema: mem::wire::Schema,
-    lead: usize,
-    follower: Option[usize],
-    bytes: Slice[u8],
-    at: usize,
-    depth: u32,
-    ) -> Option[usize] {
-    let Some(count) = uvar_at(bytes, at) else {
-        return None
-    }
-    var next = count.next
-    for _ in 0..<count.value {
-        let Some(after) = skip_value(schema, node: lead, bytes, at: next, depth: depth + 1) else {
-            return None
-        }
-        next = after
-        match follower {
-            Some(node) => {
-                let Some(value_end) = skip_value(schema, node, bytes, at: next, depth: depth + 1) else {
-                    return None
-                }
-                next = value_end
-            }
-            None => {
-            }
-        }
-    }
-    return Some(next)
-} skip_many
+} flat_end
 
 /// The offset after a record: its count, then per field its key text and its length-prefixed value.
 fn skip_record(bytes: Slice[u8], at: usize) -> Option[usize] {
@@ -255,48 +291,78 @@ test records_split_and_join_by_their_wire_bytes for record_parts {
     expect joined_map == encoded
 } records_split_and_join_by_their_wire_bytes
 
-/// Whether values of schema node `node` have an order: scalars but floats, and sequences, records and variants of ordered values.
-pkg fn has_order(schema: mem::wire::Schema, node: usize, depth: u32) -> bool {
-    if depth > MOST_DEPTH or node >= schema.nodes.len() {
-        return false
-    }
-    return match schema.nodes[node] {
-        mem::wire::SchemaNode.Float(width: _) or mem::wire::SchemaNode.Map(key: _, value: _) or mem::wire::SchemaNode.Back(depth: _) => false
-        mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => has_order(schema, node: element, depth: depth + 1)
-        mem::wire::SchemaNode.Record(open: _, fields: fields) => fields_ordered(schema, fields: fields.view(), depth)
-        mem::wire::SchemaNode.Variant(open: _, variants: variants) => variants_ordered(schema, variants: variants.view(), depth)
-        else => true
+/// Whether values of schema node `node` have an order: scalars but floats, and sequences, records and variants of ordered values; the nodes left to judge wait on a list.
+pkg fn has_order(schema: mem::wire::Schema, node: usize, alloc: mem::Alloc) -> bool {
+    var pending = mem::List[Skip].empty(alloc)
+    mut pending.push(Skip(node: node, depth: 0))
+    loop {
+        let Some(next) = mut pending.pop() else {
+            return true
+        }
+        if next.depth > MOST_DEPTH or next.node >= schema.nodes.len() {
+            return false
+        }
+        match schema.nodes[next.node] {
+            mem::wire::SchemaNode.Float(width: _) or mem::wire::SchemaNode.Map(key: _, value: _) or mem::wire::SchemaNode.Back(depth: _) => return false
+            mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => mut pending.push(Skip(node: element, depth: next.depth + 1))
+            mem::wire::SchemaNode.Record(open: _, fields: fields) => {
+                for field in fields {
+                    mut pending.push(Skip(node: field.value, depth: next.depth + 1))
+                }
+            }
+            mem::wire::SchemaNode.Variant(open: _, variants: variants) => {
+                for variant in variants {
+                    match variant.payload {
+                        Some(payload) => mut pending.push(Skip(node: payload, depth: next.depth + 1))
+                        None => {
+                        }
+                    }
+                }
+            }
+            else => {
+            }
+        }
     }
 } has_order
 
-fn fields_ordered(schema: mem::wire::Schema, fields: Slice[mem::wire::SchemaField], depth: u32) -> bool {
-    for field in fields {
-        if not has_order(schema, node: field.value, depth: depth + 1) {
-            return false
-        }
-    }
-    return true
-} fields_ordered
-
-fn variants_ordered(schema: mem::wire::Schema, variants: Slice[mem::wire::SchemaVariant], depth: u32) -> bool {
-    for variant in variants {
-        let Some(payload) = variant.payload else {
-            continue
-        }
-        if not has_order(schema, node: payload, depth: depth + 1) {
-            return false
-        }
-    }
-    return true
-} variants_ordered
-
-/// The order of the wire values `left` and `right` of schema node `node` as their type orders them: records by their fields in declaration order, variants by their declaration order then payload, sequences element by element; bytes it cannot read compare equal.
+/// The order of the wire values `left` and `right` of schema node `node` as their type orders them: records by their fields in declaration order, variants by their declaration order then payload, sequences element by element; bytes it cannot read compare equal. The comparisons left wait on a stack, the next to decide on top.
 pkg fn wire_order(
     schema: mem::wire::Schema,
     node: usize,
     left: Slice[u8],
     right: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> core::Ordering {
+    var pending = mem::List[Comparison].empty(alloc)
+    mut pending.push(Comparison.Values(node: node, left: disk::copy_range(left, at: 0, count: left.len(), alloc), right: disk::copy_range(right, at: 0, count: right.len(), alloc), depth: 0))
+    loop {
+        let Some(next) = mut pending.pop() else {
+            return core::Ordering.Equal
+        }
+        let order = match next {
+            Comparison.Decided(decided) => decided
+            Comparison.Values(node: compared, left: left_value, right: right_value, depth: depth) => compare_values(schema, node: compared, left: left_value.view(), right: right_value.view(), depth, mut pending, alloc)
+        }
+        if order != core::Ordering.Equal {
+            return order
+        }
+    }
+} wire_order
+
+/// A comparison left to decide: two values of a schema node at a depth, or an order already known.
+enum Comparison {
+    Values(node: usize, left: mem::Bytes, right: mem::Bytes, depth: u32)
+    Decided(core::Ordering)
+} Comparison
+
+/// The order of two values that their bytes alone decide, `Equal` for a sequence, record or variant, whose parts it pushes onto `pending` to decide next in order.
+fn compare_values(
+    schema: mem::wire::Schema,
+    node: usize,
+    left: Slice[u8],
+    right: Slice[u8],
     depth: u32,
+    mut pending: mem::List[Comparison],
     alloc: mem::Alloc,
     ) -> core::Ordering {
     if depth > MOST_DEPTH or node >= schema.nodes.len() {
@@ -307,12 +373,12 @@ pkg fn wire_order(
         mem::wire::SchemaNode.Char or mem::wire::SchemaNode.Unsigned(width: _) => uvar_value(left).cmp(uvar_value(right))
         mem::wire::SchemaNode.Signed(width: _) => signed_value(left).cmp(signed_value(right))
         mem::wire::SchemaNode.Text or mem::wire::SchemaNode.Bytes or mem::wire::SchemaNode.BoundedText(capacity: _) => sized_tail(left, alloc).view().cmp(sized_tail(right, alloc).view())
-        mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => sequence_order(schema, element, left, right, depth, alloc)
-        mem::wire::SchemaNode.Record(open: _, fields: fields) => record_order(schema, fields: fields.view(), left, right, depth, alloc)
-        mem::wire::SchemaNode.Variant(open: _, variants: variants) => variant_order(schema, variants: variants.view(), left, right, depth, alloc)
+        mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => push_sequence(schema, element, left, right, depth, mut pending, alloc)
+        mem::wire::SchemaNode.Record(open: _, fields: fields) => push_record(fields: fields.view(), left, right, depth, mut pending, alloc)
+        mem::wire::SchemaNode.Variant(open: _, variants: variants) => push_variant(variants: variants.view(), left, right, depth, mut pending, alloc)
         else => core::Ordering.Equal
     }
-} wire_order
+} compare_values
 
 fn uvar_value(bytes: Slice[u8]) -> u64 {
     return match uvar_at(bytes, at: 0) {
@@ -343,12 +409,14 @@ fn sized_tail(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
     return disk::copy_range(bytes, at: length.next, count: end - length.next, alloc)
 } sized_tail
 
-fn sequence_order(
+/// Pushes the comparisons of two sequences: element by element, then their counts when every element compared reads; `Equal` when a count does not read.
+fn push_sequence(
     schema: mem::wire::Schema,
     element: usize,
     left: Slice[u8],
     right: Slice[u8],
     depth: u32,
+    mut pending: mem::List[Comparison],
     alloc: mem::Alloc,
     ) -> core::Ordering {
     let Some(left_count) = uvar_at(left, at: 0) else {
@@ -357,35 +425,43 @@ fn sequence_order(
     let Some(right_count) = uvar_at(right, at: 0) else {
         return core::Ordering.Equal
     }
+    var pairs = mem::List[Comparison].empty(alloc)
     var left_at = left_count.next
     var right_at = right_count.next
     var index: u64 = 0
+    var read = true
     while index < left_count.value and index < right_count.value {
-        let Some(left_end) = skip_value(schema, node: element, bytes: left, at: left_at, depth: depth + 1) else {
-            return core::Ordering.Equal
+        let Some(left_end) = skip_value(schema, node: element, bytes: left, at: left_at, alloc) else {
+            read = false
+            break
         }
-        let Some(right_end) = skip_value(schema, node: element, bytes: right, at: right_at, depth: depth + 1) else {
-            return core::Ordering.Equal
+        let Some(right_end) = skip_value(schema, node: element, bytes: right, at: right_at, alloc) else {
+            read = false
+            break
         }
-        let left_element = disk::copy_range(left, at: left_at, count: left_end - left_at, alloc)
-        let right_element = disk::copy_range(right, at: right_at, count: right_end - right_at, alloc)
-        let order = wire_order(schema, node: element, left: left_element.view(), right: right_element.view(), depth: depth + 1, alloc)
-        if order != core::Ordering.Equal {
-            return order
-        }
+        mut pairs.push(Comparison.Values(node: element, left: disk::copy_range(left, at: left_at, count: left_end - left_at, alloc), right: disk::copy_range(right, at: right_at, count: right_end - right_at, alloc), depth: depth + 1))
         left_at = left_end
         right_at = right_end
         index += 1
     }
-    return left_count.value.cmp(right_count.value)
-} sequence_order
+    if read {
+        mut pending.push(Comparison.Decided(left_count.value.cmp(right_count.value)))
+    }
+    loop {
+        let Some(pair) = mut pairs.pop() else {
+            return core::Ordering.Equal
+        }
+        mut pending.push(take pair)
+    }
+} push_sequence
 
-fn record_order(
-    schema: mem::wire::Schema,
+/// Pushes the comparisons of two records field by field in declaration order, a field only one side holds ordering that side after; `Equal` when a record does not read.
+fn push_record(
     fields: Slice[mem::wire::SchemaField],
     left: Slice[u8],
     right: Slice[u8],
     depth: u32,
+    mut pending: mem::List[Comparison],
     alloc: mem::Alloc,
     ) -> core::Ordering {
     let Some(left_parts) = record_parts(left, alloc) else {
@@ -394,26 +470,23 @@ fn record_order(
     let Some(right_parts) = record_parts(right, alloc) else {
         return core::Ordering.Equal
     }
-    for field in fields {
+    var at = fields.len()
+    while at > 0 {
+        at -= 1
+        let field = fields[at]
         let key = field.key.as_str().as_bytes()
         let left_at = part_index(left_parts.view(), key)
         let right_at = part_index(right_parts.view(), key)
-        let order = match left_at < left_parts.len() {
-            true => match right_at < right_parts.len() {
-                true => wire_order(schema, node: field.value, left: left_parts[left_at].value.view(), right: right_parts[right_at].value.view(), depth: depth + 1, alloc)
-                false => core::Ordering.Greater
-            }
-            false => match right_at < right_parts.len() {
-                true => core::Ordering.Less
-                false => core::Ordering.Equal
-            }
-        }
-        if order != core::Ordering.Equal {
-            return order
+        if left_at < left_parts.len() and right_at < right_parts.len() {
+            mut pending.push(Comparison.Values(node: field.value, left: disk::copy_range(left_parts[left_at].value.view(), at: 0, count: left_parts[left_at].value.len(), alloc), right: disk::copy_range(right_parts[right_at].value.view(), at: 0, count: right_parts[right_at].value.len(), alloc), depth: depth + 1))
+        } else if left_at < left_parts.len() {
+            mut pending.push(Comparison.Decided(core::Ordering.Greater))
+        } else if right_at < right_parts.len() {
+            mut pending.push(Comparison.Decided(core::Ordering.Less))
         }
     }
     return core::Ordering.Equal
-} record_order
+} push_record
 
 /// The index of the part of key `key`, past the last for none.
 fn part_index(parts: Slice[Part], key: Slice[u8]) -> usize {
@@ -425,12 +498,13 @@ fn part_index(parts: Slice[Part], key: Slice[u8]) -> usize {
     return parts.len()
 } part_index
 
-fn variant_order(
-    schema: mem::wire::Schema,
+/// The order of two variants by their declaration order, pushing the comparison of their payloads when they are the same variant with one.
+fn push_variant(
     variants: Slice[mem::wire::SchemaVariant],
     left: Slice[u8],
     right: Slice[u8],
     depth: u32,
+    mut pending: mem::List[Comparison],
     alloc: mem::Alloc,
     ) -> core::Ordering {
     let left_index = variant_index(variants, key: sized_tail(left, alloc).view())
@@ -444,8 +518,9 @@ fn variant_order(
     let Some(payload) = variants[left_index].payload else {
         return core::Ordering.Equal
     }
-    return wire_order(schema, node: payload, left: variant_payload(left, alloc).view(), right: variant_payload(right, alloc).view(), depth: depth + 1, alloc)
-} variant_order
+    mut pending.push(Comparison.Values(node: payload, left: variant_payload(left, alloc), right: variant_payload(right, alloc), depth: depth + 1))
+    return core::Ordering.Equal
+} push_variant
 
 fn variant_index(variants: Slice[mem::wire::SchemaVariant], key: Slice[u8]) -> usize {
     for at in 0..<variants.len() {

@@ -1,0 +1,99 @@
+//! The store's volume: unit 0 of the `store-volume` role's port, in store blocks of 4 KiB over the device's own blocks.
+
+/// The most bytes one call to the volume moves.
+const MOST_TRANSFER_BYTES: u64 = 1_048_576
+
+/// The volume behind a `Block` port: the device blocks each store block spans, the store blocks it holds, the store blocks one call moves at most, and whether it discards.
+pub closed struct Volume derives Copy {
+    pub port: os::Port[devices::Block]
+    pub spans: u64
+    pub size: u64
+    pub transfer: u32
+    pub discarding: bool
+} Volume
+
+impl Volume: disk::Device
+
+/// The volume behind `port`'s unit 0, `store.no-volume` when its blocks do not tile a store block or it is read-only, `store.io` when it does not answer.
+pub fn Volume.of(port: os::Port[devices::Block], alloc: mem::Alloc) -> Volume fails store::StoreError uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Block].info(mut call, unit: 0)
+    let info = match first attempt await port.call(take call, reply, alloc) {
+        Ok(info) => info
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail store::StoreError.Io
+    }
+    let store_bytes = u64.widen(disk::BLOCK_BYTES)
+    let block_bytes = u64.widen(info.block_bytes)
+    if block_bytes == 0 or block_bytes > store_bytes or store_bytes % block_bytes != 0 or info.read_only {
+        fail store::StoreError.NoVolume
+    }
+    var most = MOST_TRANSFER_BYTES
+    if info.max_transfer_bytes != 0 and u64.widen(info.max_transfer_bytes) < most {
+        most = u64.widen(info.max_transfer_bytes)
+    }
+    let transfer = most / store_bytes
+    if transfer == 0 {
+        fail store::StoreError.NoVolume
+    }
+    let spans = store_bytes / block_bytes
+    return Volume(port: port, spans: spans, size: info.blocks / spans, transfer: u32.fit(transfer), discarding: info.discards)
+} Volume.of
+
+pub fn Volume.blocks(self) -> u64 = self.size
+
+pub fn Volume.discards(self) -> bool = self.discarding
+
+pub fn Volume.read(self, block: u64, count: u32, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails disk::DeviceFailure uses wait {
+    var bytes = Untrusted.of(mem::Bytes.empty(alloc))
+    var done: u32 = 0
+    while done < count {
+        var part = count - done
+        if part > self.transfer {
+            part = self.transfer
+        }
+        var call = sys::Encoded.empty(alloc)
+        let reply = sys::Wire[devices::Block].read(mut call, unit: 0, block: (block + u64.widen(done)) * self.spans, count: u32.fit(u64.widen(part) * self.spans))
+        let read = try answer(attempt await self.port.call(take call, reply, alloc))
+        mut bytes.append(read.view())
+        done += part
+    }
+    return bytes
+} Volume.read
+
+pub fn Volume.write(self, block: u64, take data: mem::Bytes, alloc: mem::Alloc) fails disk::DeviceFailure uses wait {
+    let per_call = usize.widen(self.transfer) * disk::BLOCK_BYTES
+    var at: usize = 0
+    while at < data.len() {
+        var part = data.len() - at
+        if part > per_call {
+            part = per_call
+        }
+        let piece = disk::copy_range(data.view(), at, count: part, alloc)
+        var call = sys::Encoded.empty(alloc)
+        let reply = sys::Wire[devices::Block].write(mut call, unit: 0, block: (block + u64.widen(at / disk::BLOCK_BYTES)) * self.spans, data: take piece, fua: false)
+        try answer(attempt await self.port.call(take call, reply, alloc))
+        at += part
+    }
+} Volume.write
+
+pub fn Volume.flush(self, alloc: mem::Alloc) fails disk::DeviceFailure uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Block].flush(mut call, unit: 0)
+    try answer(attempt await self.port.call(take call, reply, alloc))
+} Volume.flush
+
+pub fn Volume.discard_blocks(self, block: u64, count: u32, alloc: mem::Alloc) fails disk::DeviceFailure uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Block].discard_blocks(mut call, unit: 0, block: block * self.spans, count: u32.fit(u64.widen(count) * self.spans))
+    try answer(attempt await self.port.call(take call, reply, alloc))
+} Volume.discard_blocks
+
+/// A call's result, or `Io` for any failure but a cancellation.
+fn answer[T](take outcome: Result[T, os::PortError[devices::DeviceError]]) -> T fails disk::DeviceFailure {
+    return match first outcome {
+        Ok(value) => value
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail disk::DeviceFailure.Io
+    }
+} answer

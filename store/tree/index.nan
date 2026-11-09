@@ -78,11 +78,10 @@ struct Changed {
     split: Option[Child]
 } Changed
 
-/// What removing a key below a node gives its parent: its totals, whether it is left without entries, and the value removed.
-struct Removed {
+/// What removing a key below a node gives its parent: its totals, and whether it is left without entries.
+struct Removed derives Copy {
     totals: Totals
     empty: bool
-    value: Option[mem::Bytes]
 } Removed
 
 /// The index: the item table's root, the next item id, the nodes in memory by item id and the item table's by address or dirty id, the item changes the next index flush applies, and the records gone stale since the last.
@@ -245,7 +244,7 @@ pkg fn Index.get[D: disk::Device](
     }
 } Index.get
 
-/// Inserts or replaces the value of `key` in the tree under `root`, copying every node on its path that another tree references.
+/// Inserts or replaces the value of `key` in the tree under `root`, copying every node on its path that another tree references: the path down to the leaf is made writable and recorded, then settled from the leaf up, each split entering its parent.
 pkg fn Index.put[D: disk::Device, V: Values](
     mut self,
     device: D,
@@ -258,15 +257,91 @@ pkg fn Index.put[D: disk::Device, V: Values](
     if disk::BLOCK_BYTES < leaf_bytes(key.len(), value: value.len()) {
         fail TreeFailure.TooLarge
     }
-    root.node = try await mut self.writable(device, tree: root.tree, id: root.node, pointer: root.pointer, mut values, alloc)
-    let changed = try await mut self.put_in(device, tree: root.tree, id: root.node, key, value, mut values, alloc)
-    let Some(sibling) = changed.split else {
+    let tree = root.tree
+    root.node = try await mut self.writable(device, tree, id: root.node, pointer: root.pointer, mut values, alloc)
+    var path = try await mut self.writable_path(device, tree, top: root.node, key, mut values, alloc)
+    let Some(bottom) = mut path.pop() else {
+        fail TreeFailure.Corrupt
+    }
+    let Some(leaf) = mut self.withdraw(tree, id: bottom.child) else {
+        fail TreeFailure.Corrupt
+    }
+    var node = leaf
+    mut node.set_leaf(key, value, alloc)
+    let Changed(totals: leaf_totals, split: leaf_split) = mut self.settle_node(tree, id: bottom.child, take node, alloc)
+    var totals = leaf_totals
+    var split = leaf_split
+    loop {
+        let Some(step) = mut path.pop() else {
+            break
+        }
+        let Some(held) = mut self.withdraw(tree, id: step.parent) else {
+            fail TreeFailure.Corrupt
+        }
+        var parent = held
+        parent.children[step.at].node = step.child
+        parent.children[step.at].count = totals.count
+        parent.children[step.at].bytes = totals.bytes
+        if step.at == 0 and key < parent.children[0].key.view() {
+            parent.children[0].key = disk::copy_range(key, at: 0, count: key.len(), alloc)
+        }
+        match split {
+            Some(sibling) => {
+                if tree != ITEM_TABLE {
+                    mut self.retain_new(sibling.node, tree, heads: values.reaches_heads())
+                }
+                mut parent.children.insert(step.at + 1, value: take sibling)
+            }
+            None => {
+            }
+        }
+        let Changed(totals: settled, split: rest) = mut self.settle_node(tree, id: step.parent, node: take parent, alloc)
+        totals = settled
+        split = rest
+    }
+    let Some(sibling) = split else {
         return
     }
-    mut self.grow(mut root, take sibling, totals: changed.totals, heads: values.reaches_heads(), alloc)
+    mut self.grow(mut root, take sibling, totals, heads: values.reaches_heads(), alloc)
 } Index.put
 
-/// Removes `key` from the tree under `root` and gives the value it held.
+/// A step of a path down a tree: the node, the position of the child the path takes in it, and that child's writable id; the bottom step names the leaf alone, as its child.
+struct Step derives Copy {
+    parent: u64
+    at: usize
+    child: u64
+} Step
+
+/// The path from the writable node `top` down to the leaf where `key` lies, each child on it made writable.
+fn Index.writable_path[D: disk::Device, V: Values](
+    mut self,
+    device: D,
+    tree: u8,
+    top: u64,
+    key: Slice[u8],
+    mut values: V,
+    alloc: mem::Alloc,
+    ) -> mem::List[Step] fails TreeFailure uses wait {
+    var path = mem::List[Step].empty(alloc)
+    var id = top
+    loop {
+        let Some(node) = self.node_at(tree, id) else {
+            fail TreeFailure.Corrupt
+        }
+        if node.is_leaf() {
+            mut path.push(Step(parent: 0, at: 0, child: id))
+            return path
+        }
+        let at = node.route(key)
+        let below = node.children[at].node
+        let pointer = node.children[at].pointer
+        let writable = try await mut self.writable(device, tree, id: below, pointer, mut values, alloc)
+        mut path.push(Step(parent: id, at: at, child: writable))
+        id = writable
+    }
+} Index.writable_path
+
+/// Removes `key` from the tree under `root` and gives the value it held: the path down to the leaf is made writable and recorded, then settled from the leaf up, each child left without entries removed from its parent.
 pkg fn Index.remove[D: disk::Device, V: Values](
     mut self,
     device: D,
@@ -279,19 +354,66 @@ pkg fn Index.remove[D: disk::Device, V: Values](
     if held.is_none() {
         return None
     }
-    root.node = try await mut self.writable(device, tree: root.tree, id: root.node, pointer: root.pointer, mut values, alloc)
-    let removed = try await mut self.remove_in(device, tree: root.tree, id: root.node, key, mut values, alloc)
+    let tree = root.tree
+    root.node = try await mut self.writable(device, tree, id: root.node, pointer: root.pointer, mut values, alloc)
+    var path = try await mut self.writable_path(device, tree, top: root.node, key, mut values, alloc)
+    let Some(bottom) = mut path.pop() else {
+        fail TreeFailure.Corrupt
+    }
+    let Some(leaf) = mut self.withdraw(tree, id: bottom.child) else {
+        fail TreeFailure.Corrupt
+    }
+    var node = leaf
+    var value: Option[mem::Bytes] = None
+    let at = node.search(key)
+    if at < node.leaves.len() and node.leaves[at].key.view() == key {
+        let Leaf(key: _, value: old) = mut node.leaves.remove(at)
+        value = Some(take old)
+    }
+    var removed = mut self.settle_removal(tree, id: bottom.child, take node)
+    loop {
+        let Some(step) = mut path.pop() else {
+            break
+        }
+        let Some(above) = mut self.withdraw(tree, id: step.parent) else {
+            fail TreeFailure.Corrupt
+        }
+        var parent = above
+        parent.children[step.at].node = step.child
+        parent.children[step.at].count = removed.totals.count
+        parent.children[step.at].bytes = removed.totals.bytes
+        if removed.empty {
+            let gone = mut parent.children.remove(step.at)
+            if tree != ITEM_TABLE {
+                mut self.release(step.child, tree, pointer: gone.pointer)
+                if values.reaches_heads() {
+                    mut self.reach(step.child, delta: -1)
+                }
+            }
+        }
+        removed = mut self.settle_removal(tree, id: step.parent, node: take parent)
+    }
     if removed.empty {
-        let Some(top) = mut self.withdraw(root.tree, id: root.node) else {
+        let Some(top) = mut self.withdraw(tree, id: root.node) else {
             fail TreeFailure.Corrupt
         }
         var emptied = top
         emptied.level = 0
         mut emptied.children.truncate(0)
-        discard mut self.keep(root.tree, id: root.node, node: take emptied)
+        discard mut self.keep(tree, id: root.node, node: take emptied)
     }
-    return removed.value
+    return value
 } Index.remove
+
+/// Puts a node a removal changed back, dirty, giving its totals and whether it is left without entries.
+fn Index.settle_removal(mut self, tree: u8, id: u64, take node: Node) -> Removed {
+    var held = node
+    let totals = held.totals()
+    let empty = held.count() == 0
+    held.dirty = true
+    discard mut self.keep(tree, id, node: take held)
+    return Removed(totals: totals, empty: empty)
+} Index.settle_removal
 
 /// The totals of the tree under `root`.
 pkg fn Index.totals[D: disk::Device](mut self, device: D, root: Root, alloc: mem::Alloc) -> Totals fails TreeFailure uses wait {
@@ -361,94 +483,6 @@ fn Index.dirty_table_node(mut self, id: u64) -> u64 {
     return dirty
 } Index.dirty_table_node
 
-/// Inserts or replaces `key` below the writable node `id`.
-fn Index.put_in[D: disk::Device, V: Values](
-    mut self,
-    device: D,
-    tree: u8,
-    id: u64,
-    key: Slice[u8],
-    value: Slice[u8],
-    mut values: V,
-    alloc: mem::Alloc,
-    ) -> Changed fails TreeFailure uses wait {
-    let Some(held) = mut self.withdraw(tree, id) else {
-        fail TreeFailure.Corrupt
-    }
-    var node = held
-    if node.is_leaf() {
-        mut node.set_leaf(key, value, alloc)
-    } else {
-        let at = node.route(key)
-        let child = node.children[at]
-        let writable = try await mut self.writable(device, tree, id: child.node, pointer: child.pointer, mut values, alloc)
-        let changed = try await mut self.put_in(device, tree, id: writable, key, value, mut values, alloc)
-        node.children[at].node = writable
-        node.children[at].count = changed.totals.count
-        node.children[at].bytes = changed.totals.bytes
-        if at == 0 and key < node.children[0].key.view() {
-            node.children[0].key = disk::copy_range(key, at: 0, count: key.len(), alloc)
-        }
-        if changed.split.is_some() {
-            let Some(sibling) = changed.split else {
-                fail TreeFailure.Corrupt
-            }
-            if tree != ITEM_TABLE {
-                mut self.retain_new(sibling.node, tree, heads: values.reaches_heads())
-            }
-            mut node.children.insert(at + 1, value: take sibling)
-        }
-    }
-    return mut self.settle_node(tree, id, take node, alloc)
-} Index.put_in
-
-/// Removes `key` below the writable node `id`, removing children left without entries.
-fn Index.remove_in[D: disk::Device, V: Values](
-    mut self,
-    device: D,
-    tree: u8,
-    id: u64,
-    key: Slice[u8],
-    mut values: V,
-    alloc: mem::Alloc,
-    ) -> Removed fails TreeFailure uses wait {
-    let Some(held) = mut self.withdraw(tree, id) else {
-        fail TreeFailure.Corrupt
-    }
-    var node = held
-    var value: Option[mem::Bytes] = None
-    if node.is_leaf() {
-        let at = node.search(key)
-        if at < node.leaves.len() and node.leaves[at].key.view() == key {
-            let Leaf(key: _, value: old) = mut node.leaves.remove(at)
-            value = Some(take old)
-        }
-    } else {
-        let at = node.route(key)
-        let child = node.children[at]
-        let writable = try await mut self.writable(device, tree, id: child.node, pointer: child.pointer, mut values, alloc)
-        let removed = try await mut self.remove_in(device, tree, id: writable, key, mut values, alloc)
-        node.children[at].node = writable
-        node.children[at].count = removed.totals.count
-        node.children[at].bytes = removed.totals.bytes
-        if removed.empty {
-            let gone = mut node.children.remove(at)
-            if tree != ITEM_TABLE {
-                mut self.release(writable, tree, pointer: gone.pointer)
-                if values.reaches_heads() {
-                    mut self.reach(writable, delta: -1)
-                }
-            }
-        }
-        value = removed.value
-    }
-    let totals = node.totals()
-    let empty = node.count() == 0
-    node.dirty = true
-    discard mut self.keep(tree, id, take node)
-    return Removed(totals: totals, empty: empty, value: take value)
-} Index.remove_in
-
 /// Puts a changed node back, split in two when it outgrew 16 KiB, and gives its totals and the split-off node.
 fn Index.settle_node(
     mut self,
@@ -500,7 +534,7 @@ fn Index.grow(
     root.node = top
 } Index.grow
 
-/// Loads the node `id` of `tree` into memory, read through `pointer` when it is not there.
+/// Loads the node `id` of `tree` into memory, read through `pointer` when it is not there: an item-table node at its address, any other at the address its item's entry gives.
 pkg fn Index.load[D: disk::Device](
     mut self,
     device: D,
@@ -509,16 +543,43 @@ pkg fn Index.load[D: disk::Device](
     pointer: disk::Pointer,
     alloc: mem::Alloc,
     ) fails TreeFailure uses wait {
+    if tree == ITEM_TABLE {
+        try await mut self.load_table(device, id, pointer, alloc)
+        return
+    }
     if self.node_at(tree, id).is_some() {
         return
     }
-    let address = match tree == ITEM_TABLE {
-        true => id
-        false => match try await mut self.item_entry(device, item: id, alloc) {
-            Some(entry) => entry.address
-            None => fail TreeFailure.Corrupt
-        }
+    let Some(entry) = try await mut self.item_entry(device, item: id, alloc) else {
+        fail TreeFailure.Corrupt
     }
+    try await mut self.read_node(device, tree, id, address: entry.address, pointer, alloc)
+} Index.load
+
+/// Loads the item-table node `id`, which lies at its address, into memory when it is not there.
+fn Index.load_table[D: disk::Device](
+    mut self,
+    device: D,
+    id: u64,
+    pointer: disk::Pointer,
+    alloc: mem::Alloc,
+    ) fails TreeFailure uses wait {
+    if self.node_at(ITEM_TABLE, id).is_some() {
+        return
+    }
+    try await mut self.read_node(device, tree: ITEM_TABLE, id, address: id, pointer, alloc)
+} Index.load_table
+
+/// Reads the node `id` of `tree` at `address` through `pointer` and keeps it in memory.
+fn Index.read_node[D: disk::Device](
+    mut self,
+    device: D,
+    tree: u8,
+    id: u64,
+    address: u64,
+    pointer: disk::Pointer,
+    alloc: mem::Alloc,
+    ) fails TreeFailure uses wait {
     let record = match attempt await log::read_record(device, address, pointer, alloc) {
         Ok(Some(found)) => found
         Ok(None) => fail TreeFailure.Corrupt
@@ -529,7 +590,7 @@ pkg fn Index.load[D: disk::Device](
         fail TreeFailure.Corrupt
     }
     discard mut self.keep(tree, id, take node)
-} Index.load
+} Index.read_node
 
 /// The node `id` of `tree` in memory.
 pkg proj fn Index.node_at(self, tree: u8, id: u64) -> Option[Node] {
@@ -584,11 +645,25 @@ fn Index.change_of(self, item: u64) -> ItemChange {
 fn Index.stored_entry[D: disk::Device](mut self, device: D, item: u64, alloc: mem::Alloc) -> Option[ItemEntry] fails TreeFailure uses wait {
     var key = Array[u8, 8].filled(0)
     mut key.view_mut().write_u64_be(0, value: item)
-    let Some(bytes) = try await mut self.get(device, root: self.items, key: key.view(), alloc) else {
-        return None
-    }
-    return match attempt mem::wire::Codec[ItemEntry].decode(Untrusted.of(bytes.view()), alloc) {
-        Ok(entry) => Some(entry)
-        Err(_) => fail TreeFailure.Corrupt
+    var id = self.items.node
+    var pointer = self.items.pointer
+    loop {
+        try await mut self.load_table(device, id, pointer, alloc)
+        let Some(node) = self.node_at(ITEM_TABLE, id) else {
+            fail TreeFailure.Corrupt
+        }
+        if node.is_leaf() {
+            let at = node.search(key.view())
+            if at >= node.leaves.len() or node.leaves[at].key.view() != key.view() {
+                return None
+            }
+            return match attempt mem::wire::Codec[ItemEntry].decode(Untrusted.of(node.leaves[at].value.view()), alloc) {
+                Ok(entry) => Some(entry)
+                Err(_) => fail TreeFailure.Corrupt
+            }
+        }
+        let child = node.children[node.route(key.view())]
+        id = child.node
+        pointer = child.pointer
     }
 } Index.stored_entry

@@ -20,26 +20,43 @@ pkg fn Store.hash_in[D: disk::Device](
     tree: u8,
     alloc: mem::Alloc,
     ) -> ident::HashValue fails StoreError uses wait {
-    match entry.hash {
+    match try await mut self.known_hash(device, entry, tree, alloc) {
         Some(hash) => return hash
         None => {
         }
     }
+    let Content.Dir(id: id, declaration: declaration, digest: _, next: _) = entry.content else {
+        fail StoreError.Corrupt
+    }
+    let digest = try await mut self.digest_in(device, snapshot, dir: id, tree, alloc)
+    return dir_hash(declaration.view(), digest, alloc)
+} Store.hash_in
+
+/// The hash of the node of `entry` when no entry digest needs computing for it: the one its entry holds, a blob's id, a stream's or an ephemeral dir's from its declaration, a dir's from its declaration and the digest its entry holds, a record's from its type and bytes; `None` for a dir whose entry holds no digest.
+fn Store.known_hash[D: disk::Device](
+    mut self,
+    device: D,
+    entry: NodeEntry,
+    tree: u8,
+    alloc: mem::Alloc,
+    ) -> Option[ident::HashValue] fails StoreError uses wait {
+    match entry.hash {
+        Some(hash) => return Some(hash)
+        None => {
+        }
+    }
     match entry.content {
-        Content.Blob(id: id, size: _) => return id
-        Content.Stream(id: _, declaration: declaration, next: _, entries: _, bytes: _) => return ident::HashValue.of_object(ident::Kind.Stream, bytes: declaration.view())
-        Content.Dir(id: id, declaration: declaration, digest: digest, next: _) => {
+        Content.Blob(id: id, size: _) => return Some(id)
+        Content.Stream(id: _, declaration: declaration, next: _, entries: _, bytes: _) => return Some(ident::HashValue.of_object(ident::Kind.Stream, bytes: declaration.view()))
+        Content.Dir(id: _, declaration: declaration, digest: digest, next: _) => {
             let children = try child_dir(entry, tree, alloc)
             if children.tree != tree {
-                return ident::HashValue.of_object(ident::Kind.Ephemeral, bytes: declaration.view())
+                return Some(ident::HashValue.of_object(ident::Kind.Ephemeral, bytes: declaration.view()))
             }
-            let held = match digest {
-                Some(found) => found
-                None => try await mut self.digest_in(device, snapshot, dir: id, tree, alloc)
+            return match digest {
+                Some(held) => Some(dir_hash(declaration.view(), digest: held, alloc))
+                None => None
             }
-            var bytes = copied_bytes(declaration.view(), alloc)
-            mut bytes.append(held.bytes.view())
-            return ident::HashValue.of_object(ident::Kind.Dir, bytes: bytes.view())
         }
         else => {
         }
@@ -48,10 +65,25 @@ pkg fn Store.hash_in[D: disk::Device](
     var bytes = copied_bytes(type.schema.bytes.view(), alloc)
     let record = try await mut self.record_bytes(device, entry, alloc)
     mut bytes.append(record.view())
-    return ident::HashValue.of_object(ident::Kind.Record, bytes: bytes.view())
-} Store.hash_in
+    return Some(ident::HashValue.of_object(ident::Kind.Record, bytes: bytes.view()))
+} Store.known_hash
 
-/// The entry digest of dir `dir` of `tree` read through `snapshot`: its entry hashes in name order, cut into runs after each hash whose last byte is below 16 and after the last, level by level until one remains.
+/// The hash of a dir of declaration `declaration` and entry digest `digest`.
+fn dir_hash(declaration: Slice[u8], digest: ident::HashValue, alloc: mem::Alloc) -> ident::HashValue {
+    var bytes = copied_bytes(declaration, alloc)
+    mut bytes.append(digest.bytes.view())
+    return ident::HashValue.of_object(ident::Kind.Dir, bytes: bytes.view())
+} dir_hash
+
+/// A dir whose entry digest is being computed: its children read through the snapshot, the next to hash, the entry hashes of those hashed, and its declaration.
+struct Digesting {
+    children: mem::List[Child]
+    next: usize
+    level: mem::List[ident::HashValue]
+    declaration: mem::Bytes
+} Digesting
+
+/// The entry digest of dir `dir` of `tree` read through `snapshot`: its entry hashes in name order, cut into runs after each hash whose last byte is below 16 and after the last, level by level until one remains. A child dir whose entry holds no digest has its own computed first, the dirs under way waiting on a stack.
 pkg fn Store.digest_in[D: disk::Device](
     mut self,
     device: D,
@@ -60,25 +92,66 @@ pkg fn Store.digest_in[D: disk::Device](
     tree: u8,
     alloc: mem::Alloc,
     ) -> ident::HashValue fails StoreError uses wait {
-    let children = try await mut self.snapshot_children(device, snapshot, dir, alloc)
-    var level = mem::List[ident::HashValue].empty(alloc)
-    for child in children {
-        let hash = try await mut self.hash_in(device, snapshot, entry: child.entry, tree, alloc)
-        var bytes = wire_of(text_of(child.name.view(), alloc), alloc)
-        mut bytes.push(child.entry.kind)
-        mut bytes.append(hash.bytes.view())
-        mut level.push(ident::HashValue.of_object(ident::Kind.Entry, bytes: bytes.view()))
+    var stack = mem::List[Digesting].empty(alloc)
+    mut stack.push(Digesting(children: try await mut self.snapshot_children(device, snapshot, dir, alloc), next: 0, level: mem::List.empty(alloc), declaration: mem::Bytes.empty(alloc)))
+    loop {
+        let Some(top) = mut stack.pop() else {
+            fail StoreError.Corrupt
+        }
+        var digesting = top
+        if digesting.next < digesting.children.len() {
+            let child = digesting.children[digesting.next]
+            let found = try await mut self.known_hash(device, entry: child.entry, tree, alloc)
+            match found {
+                Some(hash) => {
+                    mut digesting.level.push(entry_hash(child.name.view(), kind: child.entry.kind, hash, alloc))
+                    digesting.next += 1
+                    mut stack.push(take digesting)
+                }
+                None => {
+                    let Content.Dir(id: id, declaration: declaration, digest: _, next: _) = child.entry.content else {
+                        fail StoreError.Corrupt
+                    }
+                    let nested = Digesting(children: try await mut self.snapshot_children(device, snapshot, dir: id, alloc), next: 0, level: mem::List.empty(alloc), declaration: copied_bytes(declaration.view(), alloc))
+                    mut stack.push(take digesting)
+                    mut stack.push(take nested)
+                }
+            }
+            continue
+        }
+        let digest = digest_of(digesting.level.view(), alloc)
+        let Some(above) = mut stack.pop() else {
+            return digest
+        }
+        var parent = above
+        let child = parent.children[parent.next]
+        mut parent.level.push(entry_hash(child.name.view(), kind: child.entry.kind, hash: dir_hash(digesting.declaration.view(), digest, alloc), alloc))
+        parent.next += 1
+        mut stack.push(take parent)
     }
+} Store.digest_in
+
+/// The entry hash of a child named `name` of kind `kind` and hash `hash`.
+fn entry_hash(name: Slice[u8], kind: u8, hash: ident::HashValue, alloc: mem::Alloc) -> ident::HashValue {
+    var bytes = wire_of(text_of(name, alloc), alloc)
+    mut bytes.push(kind)
+    mut bytes.append(hash.bytes.view())
+    return ident::HashValue.of_object(ident::Kind.Entry, bytes: bytes.view())
+} entry_hash
+
+/// The entry digest of the entry hashes `level`: the hash of an empty run when there are none, else the runs cut level by level until one remains.
+fn digest_of(level: Slice[ident::HashValue], alloc: mem::Alloc) -> ident::HashValue {
     if level.len() == 0 {
         return ident::HashValue.of_object(ident::Kind.Run, bytes: b"")
     }
+    var hashes = runs_of_level(level, alloc)
     loop {
-        level = runs_of_level(level.view(), alloc)
-        if level.len() == 1 {
-            return level[0]
+        if hashes.len() == 1 {
+            return hashes[0]
         }
+        hashes = runs_of_level(hashes.view(), alloc)
     }
-} Store.digest_in
+} digest_of
 
 /// The root hash of the head of the branch at `head`: the hash of a dir of empty declaration holding only its `data` and `sys`.
 pub fn Store.root_hash[D: disk::Device](mut self, device: D, branch: Str, alloc: mem::Alloc) -> ident::HashValue fails StoreError uses wait {

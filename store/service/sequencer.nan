@@ -1,0 +1,327 @@
+//! The sequencer: the one task holding the engine, which mounts the volume, commits genesis or the generation's base instances, then serves the requests handed to it in their order, committing each run of commits through one log flush and telling subscriptions of the commits they watch.
+
+/// The most paths one `changed` message names.
+const MOST_PATHS: usize = 64
+
+/// The commits a subscription catches up on at most.
+const CAUGHT_UP: u32 = 64
+
+/// What the sequencer draws on besides its hand-off: the volume's port, the clocks, the random source, the reporter and its cell.
+struct Surroundings derives Copy {
+    volume: os::Port[devices::Block]
+    clock: sys::Clock
+    wall: ident::Wall
+    random: sys::Random
+    reporter: Reporter
+    alloc: mem::Alloc
+} Surroundings
+
+/// A subscription: its number, the subtree and branch it watches, and its port.
+struct Subscription {
+    number: u64
+    prefix: ident::Path
+    branch: text::String
+    port: os::PortHandle
+} Subscription
+
+/// The engine on its volume, and the subscriptions.
+struct Sequencer {
+    engine: store::Store
+    volume: Volume
+    subscriptions: mem::List[Subscription]
+} Sequencer
+
+/// What a request needs of its View.
+enum Need derives Copy, Eq {
+    Read
+    Write
+    Admin
+} Need
+
+/// A run of commits waiting for their log flush: their requests, their transactions with their stamps, and the paths each writes.
+struct Run {
+    requests: mem::List[u64]
+    commits: mem::List[store::Request]
+    paths: mem::List[mem::List[ident::Path]]
+} Run
+
+fn Surroundings.now(self) -> ident::WallTime {
+    return self.wall.now(self.clock)
+} Surroundings.now
+
+/// Mounts the volume and commits genesis or the generation's base instances, tells the component, then serves the requests the hand-off brings until cancelled; after a failed mount, every request fails as the mount did.
+fn sequence(
+    world: Surroundings,
+    take genesis: Genesis,
+    take boot: TypedValue,
+    take handoff: Handoff,
+    out: sys::Outbox[Store],
+    ) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let mounted: Result[Sequencer, Failure] = match first attempt await mount(world, take genesis, boot) {
+        Ok(sequencer) => Ok(take sequencer)
+        Err(store::StoreError.Cancelled(cancelled)) => fail cancelled
+        Err(failure) => Err(Failure.of(take failure))
+    }
+    match mounted {
+        Ok(ready) => {
+            discard attempt await out.mounted(failure: None)
+            var sequencer = ready
+            try await mut sequencer.report(world)
+            loop {
+                let batch = try await handoff.take_all(alloc)
+                try await mut sequencer.serve(take batch, world, out)
+                try await mut sequencer.tend(world)
+            }
+        }
+        Err(failure) => {
+            try await world.reporter.report(Report.MountFailed(code: failure.code()))
+            let refusal: Result[Unit, Failure] = Err(take failure)
+            let reply = encoded(refusal, alloc)
+            let Err(told) = refusal else {
+                return
+            }
+            discard attempt await out.mounted(failure: Some(take told))
+            loop {
+                let batch = try await handoff.take_all(alloc)
+                for queued in take batch {
+                    var copy = mem::Bytes.empty(alloc)
+                    mut copy.append(reply.view())
+                    discard attempt await out.answered(request: queued.request, reply: take copy)
+                }
+            }
+        }
+    }
+} sequence
+
+/// The engine on the volume behind the port of `world`, which genesis fills when it holds no commit, its retention that of `/sys/config/store`, and the base instances of `main` brought up to date with `genesis` otherwise.
+fn mount(world: Surroundings, take genesis: Genesis, boot: TypedValue) -> Sequencer fails store::StoreError uses wait {
+    let alloc = world.alloc
+    let volume = try await Volume.of(world.volume, alloc)
+    var id = Array[u8, 16].filled(0)
+    discard attempt world.random.fill(mut id.view_mut())
+    var engine = try await store::Store.mount(volume, volume_id: id, now: world.now(), alloc)
+    let generation = genesis.generation
+    match first attempt engine.branch_named("main", alloc) {
+        Err(store::StoreError.NotFound) => {
+            discard try await mut engine.genesis(volume, writes: take genesis.writes(boot, alloc), stamp: system_stamp(alloc), intent: intent_of("genesis", number: generation, alloc), now: world.now(), alloc)
+        }
+        Ok(_) => {
+            let writes = try await genesis.changes(mut engine, device: volume, now: world.now(), alloc)
+            if writes.len() > 0 {
+                let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: Some(intent_of("generation", number: generation, alloc)))
+                discard try await mut engine.commit(volume, branch: "main", take transaction, stamp: system_stamp(alloc), now: world.now(), alloc)
+            }
+        }
+        Err(failure) => fail failure
+    }
+    let config = attempt await mut engine.get(volume, branch: "main", path: ident::Path(text: text::String.of("/sys/config/store", alloc)), now: world.now(), alloc)
+    match first config {
+        Ok(node) => {
+            match node.value {
+                Some(value) => {
+                    match attempt mem::wire::Codec[StoreConfig].decode(value.view(), alloc) {
+                        Ok(read) => mut engine.retain_by(take read.retention)
+                        Err(_) => {
+                        }
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        Err(store::StoreError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => {
+        }
+    }
+    return Sequencer(engine: take engine, volume: volume, subscriptions: mem::List.empty(alloc))
+} mount
+
+/// `word`, a space and the decimal `number`: the intent of a commit naming a generation.
+fn intent_of(word: Str, number: u64, alloc: mem::Alloc) -> text::String {
+    var intent = text::String.of(word, alloc)
+    mut intent.push(' ')
+    for digit in store::decimal_name(number, alloc) {
+        mut intent.push(char.checked_from_bits(u32.widen(digit)).value_or('0'))
+    }
+    return intent
+} intent_of
+
+/// What the store stamps on its own commits: the principal `system`.
+fn system_stamp(alloc: mem::Alloc) -> store::Stamp {
+    return store::Stamp(principal: ident::Principal(text: text::Fixed[64].of("system")), session: None, instance: None, cause: ident::Cause(bits: 0), origins: mem::List.empty(alloc), typed: true)
+} system_stamp
+
+/// The encoding of a request's reply.
+fn encoded[T: Encode](outcome: Result[T, Failure], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Result[T, Failure]].encode(outcome, out: mut bytes)
+    return bytes
+} encoded
+
+/// A store outcome as a reply: its value, or its failure; a cancellation stays one.
+fn settled[T](take outcome: Result[T, store::StoreError]) -> Result[T, Failure] fails task::Cancelled {
+    return match first outcome {
+        Ok(value) => Ok(take value)
+        Err(store::StoreError.Cancelled(cancelled)) => fail cancelled
+        Err(failure) => Err(Failure.of(take failure))
+    }
+} settled
+
+/// Reports the engine's events to the core.
+fn Sequencer.report(mut self, world: Surroundings) fails task::Cancelled uses wait {
+    let events = mut self.engine.take_events(world.alloc)
+    for event in take events {
+        try await world.reporter.report(Report.Event(take event))
+    }
+} Sequencer.report
+
+/// The upkeep after a batch: an index flush once one is due, the drafts unreferenced for an hour dropped, and the events reported.
+fn Sequencer.tend(mut self, world: Surroundings) fails task::Cancelled uses wait {
+    let now = world.now()
+    if self.engine.flush_due(now) {
+        discard try settled(attempt await mut self.engine.index_flush(self.volume, now, alloc: world.alloc))
+    }
+    discard try settled(attempt await mut self.engine.drop_drafts(self.volume, now, alloc: world.alloc))
+    try await mut self.report(world)
+} Sequencer.tend
+
+/// Serves `batch` in order, each run of commits through one log flush, answering every request.
+fn Sequencer.serve(mut self, take batch: mem::List[Queued], world: Surroundings, out: sys::Outbox[Store]) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    var run = Run.empty(alloc)
+    for queued in take batch {
+        let Queued(request: request, scope: scope, job: job) = queued
+        match job {
+            Job.Commit(transaction: transaction, typed: typed) => {
+                match attempt scope.transaction(take transaction, alloc) {
+                    Ok(resolved) => {
+                        mut run.paths.push(written_paths(resolved.writes, alloc))
+                        mut run.requests.push(request)
+                        mut run.commits.push(store::Request(branch: text::String.of(scope.branch.as_str(), alloc), transaction: take resolved, stamp: scope.stamp(typed, alloc)))
+                    }
+                    Err(failure) => {
+                        let outcome: Result[store::Committed, Failure] = Err(take failure)
+                        discard attempt await out.answered(request, reply: encoded(outcome, alloc))
+                    }
+                }
+            }
+            else => {
+                try await mut self.flush_run(take run, world, out)
+                run = Run.empty(alloc)
+                let reply = try await mut self.run(take scope, take job, world)
+                discard attempt await out.answered(request, take reply)
+            }
+        }
+    }
+    try await mut self.flush_run(take run, world, out)
+} Sequencer.serve
+
+fn Run.empty(alloc: mem::Alloc) -> Run {
+    return Run(requests: mem::List.empty(alloc), commits: mem::List.empty(alloc), paths: mem::List.empty(alloc))
+} Run.empty
+
+/// Commits the run of commits through one log flush, answers each and tells the subscriptions of those committed.
+fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::Outbox[Store]) fails task::Cancelled uses wait {
+    let Run(requests: requests, commits: commits, paths: paths) = run
+    if commits.len() == 0 {
+        return
+    }
+    let alloc = world.alloc
+    var branches = mem::List[text::String].empty(alloc)
+    for commit in commits {
+        mut branches.push(text::String.of(commit.branch.as_str(), alloc))
+    }
+    let outcomes = try await mut self.engine.commit_all(self.volume, requests: take commits, now: world.now(), alloc)
+    var at: usize = 0
+    for outcome in take outcomes {
+        var reply = mem::Bytes.empty(alloc)
+        match outcome {
+            Ok(done) => {
+                try await self.tell(branch: branches[at].as_str(), commit: done.number, paths: paths[at], alloc)
+                let accepted: Result[store::Committed, Failure] = Ok(take done)
+                reply = encoded(accepted, alloc)
+            }
+            Err(failure) => {
+                let refused: Result[store::Committed, Failure] = Err(Failure.of(take failure))
+                reply = encoded(refused, alloc)
+            }
+        }
+        discard attempt await out.answered(request: requests[at], take reply)
+        at += 1
+    }
+} Sequencer.flush_run
+
+/// Tells each subscription on `branch` of the commit `commit`, which wrote `paths`, naming those below its prefix.
+fn Sequencer.tell(
+    self,
+    branch: Str,
+    commit: ident::CommitId,
+    paths: mem::List[ident::Path],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    for subscription in self.subscriptions {
+        if subscription.branch.as_str() != branch {
+            continue
+        }
+        var watched = mem::List[ident::Path].empty(alloc)
+        for path in paths {
+            if within(path, prefix: subscription.prefix, alloc) {
+                mut watched.push(ident::Path(text: text::String.of(path.text.as_str(), alloc)))
+            }
+        }
+        if watched.len() > 0 {
+            try await changed(subscription.port, subscription: subscription.number, commit, paths: take watched, alloc)
+        }
+    }
+} Sequencer.tell
+
+/// Sends the port `port` the commit `commit` changing `paths`, at most 64 of them named; nothing when it is stale or serves no `Watcher`.
+fn changed(
+    port: os::PortHandle,
+    subscription: u64,
+    commit: ident::CommitId,
+    take paths: mem::List[ident::Path],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    let Some(watcher) = os::Port[Watcher].of(port) else {
+        return
+    }
+    var named = paths
+    var more: u64 = 0
+    while named.len() > MOST_PATHS {
+        discard mut named.pop()
+        more += 1
+    }
+    var call = sys::Encoded.empty(alloc)
+    sys::Wire[Watcher].changed(mut call, subscription, commit, paths: take named, more)
+    match attempt await watcher.post(take call) {
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} changed
+
+/// The paths a transaction's writes name.
+fn written_paths(writes: mem::List[store::Write], alloc: mem::Alloc) -> mem::List[ident::Path] {
+    var paths = mem::List[ident::Path].empty(alloc)
+    for write in writes {
+        mut paths.push(ident::Path(text: text::String.of(write.path().text.as_str(), alloc)))
+    }
+    return paths
+} written_paths
+
+/// Whether `path` is `prefix` or lies below it.
+fn within(path: ident::Path, prefix: ident::Path, alloc: mem::Alloc) -> bool {
+    let under = prefix.segments(alloc)
+    let named = path.segments(alloc)
+    if named.len() < under.len() {
+        return false
+    }
+    for at in 0..<under.len() {
+        if named[at].view() != under[at].view() {
+            return false
+        }
+    }
+    return true
+} within

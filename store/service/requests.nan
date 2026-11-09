@@ -1,0 +1,468 @@
+//! Requests: each checked against its View's rights and resolved within its subtree, then run on the engine, its reply encoded.
+
+/// The top-level nodes whose owning operations alone write them.
+fn is_owned(name: Slice[u8]) -> bool {
+    return name == b"sys" or name == b"state" or name == b"journal" or name == b"history" or name == b"live"
+} is_owned
+
+/// What the store stamps on a commit made through the View: its principal and instance, the typedness of its writes, no session, cause or origins yet.
+fn Scoped.stamp(self, typed: bool, alloc: mem::Alloc) -> store::Stamp {
+    let instance = match self.instance {
+        Some(moniker) => Some(ident::Moniker(text: moniker.text))
+        None => None
+    }
+    return store::Stamp(principal: ident::Principal(text: self.principal.text), session: None, instance: take instance, cause: ident::Cause(bits: 0), origins: mem::List.empty(alloc), typed: typed)
+} Scoped.stamp
+
+/// Fails `store.denied` unless the View holds what `need` asks.
+fn Scoped.check(self, need: Need) fails Failure {
+    let rights = Rights.from_bits(self.rights)
+    let held = match need {
+        Need.Read => rights.read
+        Need.Write => rights.write
+        Need.Admin => rights.admin
+    }
+    if not held {
+        fail Failure.Denied
+    }
+} Scoped.check
+
+/// The path `path` names within the View's subtree, after checking the View holds what `need` asks: `store.denied` for a write reaching a node its owning operations alone write, unless the View owns them.
+fn Scoped.resolve(self, path: ident::Path, need: Need, alloc: mem::Alloc) -> ident::Path fails Failure {
+    try self.check(need)
+    var segments = self.prefix.segments(alloc)
+    for segment in take path.segments(alloc) {
+        mut segments.push(take segment)
+    }
+    let Some(joined) = ident::Path.of_segments(segments.view(), alloc) else {
+        fail Failure.Denied
+    }
+    if need != Need.Read and not Rights.from_bits(self.rights).own and segments.len() > 0 and is_owned(segments[0].view()) {
+        fail Failure.Denied
+    }
+    return joined
+} Scoped.resolve
+
+/// `transaction` with its paths resolved within the View's subtree, its reads and expectations read and its writes written.
+fn Scoped.transaction(self, take transaction: store::Transaction, alloc: mem::Alloc) -> store::Transaction fails Failure {
+    let store::Transaction(base: base, reads: reads, expects: expects, writes: writes, key: key, plan: plan, intent: intent) = transaction
+    var read = mem::List[store::Read].empty(alloc)
+    for each in take reads {
+        let store::Read(path: path, version: version, scope: scope) = each
+        mut read.push(store::Read(path: try self.resolve(path, need: Need.Read, alloc), version: take version, scope: scope))
+    }
+    var expected = mem::List[store::Expect].empty(alloc)
+    for each in take expects {
+        let store::Expect(path: path, version: version) = each
+        mut expected.push(store::Expect(path: try self.resolve(path, need: Need.Read, alloc), version: take version))
+    }
+    var written = mem::List[store::Write].empty(alloc)
+    for write in take writes {
+        mut written.push(try self.write(take write, alloc))
+    }
+    return store::Transaction(base: base, reads: take read, expects: take expected, writes: take written, key: take key, plan: plan, intent: take intent)
+} Scoped.transaction
+
+/// `write` with its path resolved within the View's subtree for writing.
+fn Scoped.write(self, take write: store::Write, alloc: mem::Alloc) -> store::Write fails Failure {
+    return match write {
+        store::Write.Put(path: path, value: value) => store::Write.Put(path: try self.resolve(path, need: Need.Write, alloc), value: take value)
+        store::Write.Make(path: path, declaration: declaration) => store::Write.Make(path: try self.resolve(path, need: Need.Write, alloc), declaration: take declaration)
+        store::Write.Delete(path: path) => store::Write.Delete(path: try self.resolve(path, need: Need.Write, alloc))
+        store::Write.Add(path: path, value: value) => store::Write.Add(path: try self.resolve(path, need: Need.Write, alloc), value: take value)
+        store::Write.Append(path: path, entries: entries) => store::Write.Append(path: try self.resolve(path, need: Need.Write, alloc), entries: take entries)
+        store::Write.Expire(path: path, at: at) => store::Write.Expire(path: try self.resolve(path, need: Need.Write, alloc), at: at)
+        store::Write.Hold(path: path, on: on) => store::Write.Hold(path: try self.resolve(path, need: Need.Write, alloc), on: on)
+        store::Write.Trim(path: path, below: under) => store::Write.Trim(path: try self.resolve(path, need: Need.Write, alloc), below: under)
+    }
+} Scoped.write
+
+/// A point of a diff on the View's branch, `store.denied` for a point naming another branch.
+fn Scoped.point(self, take point: store::Point) -> store::Point fails Failure {
+    match point {
+        store::Point.Head(branch) => {
+            if branch.as_str() != self.branch.as_str() {
+                fail Failure.Denied
+            }
+            return store::Point.Head(take branch)
+        }
+        store::Point.Commit(branch: branch, commit: commit) => {
+            if branch.as_str() != self.branch.as_str() {
+                fail Failure.Denied
+            }
+            return store::Point.Commit(branch: take branch, commit: commit)
+        }
+    }
+} Scoped.point
+
+/// Runs a request other than a commit and gives its reply's encoding.
+fn Sequencer.run(mut self, take scope: Scoped, take job: Job, world: Surroundings) -> mem::Bytes fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    return match job {
+        Job.Get(path: path, at: at) => encoded(try await mut self.get(scope, path, at, world), alloc)
+        Job.List(path: path, at: at, after: after, limit: limit) => encoded(try await mut self.list(scope, path, at, take after, limit, world), alloc)
+        Job.Count(path: path, from: from, to: to) => encoded(try await mut self.count(scope, path, from, to, world), alloc)
+        Job.Scan(path: path, at: at, from: from, to: to, limit: limit) => encoded(try await mut self.scan(scope, path, at, from, to, limit, world), alloc)
+        Job.Read(path: path, offset: offset, length: length, verify: verify) => encoded(try await mut self.read(scope, path, offset, length, verify, world), alloc)
+        Job.Draft => encoded(mut self.draft(scope, world), alloc)
+        Job.DraftAppend(draft: draft, bytes: bytes) => encoded(try await mut self.draft_append(scope, draft, bytes, world), alloc)
+        Job.DraftClose(draft: draft, expected: expected) => encoded(try await mut self.draft_close(scope, draft, expected, world), alloc)
+        Job.Commit(transaction: _, typed: _) => encoded(Err[Unit, Failure](Failure.Kind), alloc)
+        Job.Append(path: path, entries: entries) => encoded(try await mut self.append(scope, path, take entries, world), alloc)
+        Job.ReadStream(path: path, from: from, limit: limit) => encoded(try await mut self.read_stream(scope, path, from, limit, world), alloc)
+        Job.Subscribe(subscription: subscription, prefix: prefix, since: since, port: port) => encoded(try await mut self.subscribe(scope, subscription, prefix, since, port, world), alloc)
+        Job.Unsubscribe(subscription: subscription) => encoded(mut self.unsubscribe(subscription), alloc)
+        Job.History(path: path, before: before, limit: limit) => encoded(try await mut self.history(scope, path, before, limit, world), alloc)
+        Job.Diff(from: from, to: to, path: path) => encoded(try await mut self.diff(scope, take from, take to, path, world), alloc)
+        Job.Branch(name: name, at: at) => encoded(try await mut self.branch(scope, name, at, world), alloc)
+        Job.DeleteBranch(name: name) => encoded(try await mut self.delete_branch(scope, name, world), alloc)
+        Job.Merge(source: source, takes: takes) => encoded(try await mut self.merge(scope, source, take takes, world), alloc)
+        Job.Revert(commit: commit, dry_run: dry_run) => encoded(try await mut self.revert(scope, commit, dry_run, world), alloc)
+        Job.Pin(commit: commit, note: note) => encoded(try await mut self.pin(scope, commit, take note, world), alloc)
+        Job.Unpin(commit: commit) => encoded(try await mut self.unpin(scope, commit, world), alloc)
+        Job.Scrub => encoded(try await mut self.scrub(scope, world), alloc)
+        Job.Gc => encoded(try await mut self.gc(scope, world), alloc)
+        Job.Stats => encoded(try await mut self.stats(scope, world), alloc)
+    }
+} Sequencer.run
+
+fn Sequencer.get(
+    mut self,
+    scope: Scoped,
+    path: ident::Path,
+    at: Option[ident::CommitId],
+    world: Surroundings,
+    ) -> Result[store::Node, Failure] fails task::Cancelled uses wait {
+    let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    return match at {
+        Some(commit) => try settled(attempt await mut self.engine.get_at(self.volume, branch: scope.branch.as_str(), path: resolved, at: commit, now: world.now(), alloc: world.alloc))
+        None => try settled(attempt await mut self.engine.get(self.volume, branch: scope.branch.as_str(), path: resolved, now: world.now(), alloc: world.alloc))
+    }
+} Sequencer.get
+
+fn Sequencer.list(
+    mut self,
+    scope: Scoped,
+    path: ident::Path,
+    at: Option[ident::CommitId],
+    take after: Option[text::String],
+    limit: u32,
+    world: Surroundings,
+    ) -> Result[store::Listing, Failure] fails task::Cancelled uses wait {
+    let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let Some(commit) = at else {
+        return try settled(attempt await mut self.engine.list(self.volume, branch: scope.branch.as_str(), path: resolved, after, limit, now: world.now(), alloc: world.alloc))
+    }
+    return match try settled(attempt await mut self.engine.list_at(self.volume, branch: scope.branch.as_str(), path: resolved, at: commit, alloc: world.alloc)) {
+        Ok(entries) => Ok(store::Listing(entries: take entries, next: None))
+        Err(failure) => Err(take failure)
+    }
+} Sequencer.list
+
+fn Sequencer.count(
+    mut self,
+    scope: Scoped,
+    path: ident::Path,
+    from: text::String,
+    to: text::String,
+    world: Surroundings,
+    ) -> Result[store::Count, Failure] fails task::Cancelled uses wait {
+    let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    return try settled(attempt await mut self.engine.count(self.volume, branch: scope.branch.as_str(), path: resolved, from: from.as_str(), to: to.as_str(), now: world.now(), alloc: world.alloc))
+} Sequencer.count
+
+fn Sequencer.scan(
+    mut self,
+    scope: Scoped,
+    path: ident::Path,
+    at: Option[ident::CommitId],
+    from: text::String,
+    to: text::String,
+    limit: u32,
+    world: Surroundings,
+    ) -> Result[mem::List[store::Node], Failure] fails task::Cancelled uses wait {
+    if at.is_some() {
+        return Err(Failure.Kind)
+    }
+    let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    return try settled(attempt await mut self.engine.scan(self.volume, branch: scope.branch.as_str(), path: resolved, from: from.as_str(), to: to.as_str(), limit, now: world.now(), alloc: world.alloc))
+} Sequencer.scan
+
+fn Sequencer.read(
+    mut self,
+    scope: Scoped,
+    path: ident::Path,
+    offset: u64,
+    length: u32,
+    verify: bool,
+    world: Surroundings,
+    ) -> Result[Untrusted[mem::Bytes], Failure] fails task::Cancelled uses wait {
+    let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    return try settled(attempt await mut self.engine.read(self.volume, branch: scope.branch.as_str(), path: resolved, offset, length, verify, now: world.now(), alloc: world.alloc))
+} Sequencer.read
+
+fn Sequencer.draft(mut self, scope: Scoped, world: Surroundings) -> Result[u64, Failure] {
+    if (attempt scope.check(need: Need.Write)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return Ok(mut self.engine.draft(now: world.now(), alloc: world.alloc))
+} Sequencer.draft
+
+fn Sequencer.draft_append(
+    mut self,
+    scope: Scoped,
+    draft: u64,
+    bytes: mem::Bytes,
+    world: Surroundings,
+    ) -> Result[Unit, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Write)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.draft_append(self.volume, draft, bytes: bytes.view(), by: scope.principal, now: world.now(), alloc: world.alloc))
+} Sequencer.draft_append
+
+fn Sequencer.draft_close(
+    mut self,
+    scope: Scoped,
+    draft: u64,
+    expected: Option[ident::HashValue],
+    world: Surroundings,
+    ) -> Result[store::Closed, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Write)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.draft_close(self.volume, draft, expected, now: world.now(), alloc: world.alloc))
+} Sequencer.draft_close
+
+/// Appends to a stream as a blind commit of one `Append`, its typed entries checked as the stream's type.
+fn Sequencer.append(
+    mut self,
+    scope: Scoped,
+    path: ident::Path,
+    take entries: mem::List[mem::Bytes],
+    world: Surroundings,
+    ) -> Result[u64, Failure] fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let resolved = match attempt scope.resolve(path, need: Need.Write, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let earliest = match try settled(attempt await mut self.engine.next_seq(self.volume, branch: scope.branch.as_str(), path: ident::Path(text: text::String.of(resolved.text.as_str(), alloc)), now: world.now(), alloc)) {
+        Ok(next) => next
+        Err(failure) => return Err(take failure)
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Append(path: take resolved, entries: take entries))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+    return match try settled(attempt await mut self.engine.commit(self.volume, branch: scope.branch.as_str(), take transaction, stamp: scope.stamp(typed: false, alloc), now: world.now(), alloc)) {
+        Ok(_) => Ok(earliest)
+        Err(failure) => Err(take failure)
+    }
+} Sequencer.append
+
+fn Sequencer.read_stream(
+    mut self,
+    scope: Scoped,
+    path: ident::Path,
+    from: u64,
+    limit: u32,
+    world: Surroundings,
+    ) -> Result[store::StreamRead, Failure] fails task::Cancelled uses wait {
+    let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    return try settled(attempt await mut self.engine.read_stream(self.volume, branch: scope.branch.as_str(), path: resolved, from, limit, now: world.now(), alloc: world.alloc))
+} Sequencer.read_stream
+
+/// Adds a subscription, then tells it of the retained commits after `since` that changed nodes below its prefix, oldest first.
+fn Sequencer.subscribe(
+    mut self,
+    scope: Scoped,
+    subscription: u64,
+    prefix: ident::Path,
+    since: ident::CommitId,
+    port: os::PortHandle,
+    world: Surroundings,
+    ) -> Result[u64, Failure] fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let resolved = match attempt scope.resolve(prefix, need: Need.Read, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let recent = match first try settled(attempt await mut self.engine.history(self.volume, branch: scope.branch.as_str(), path: ident::Path(text: text::String.of(resolved.text.as_str(), alloc)), before: None, limit: CAUGHT_UP, now: world.now(), alloc)) {
+        Ok(commits) => commits
+        Err(Failure.NotFound) => mem::List.empty(alloc)
+        Err(failure) => return Err(take failure)
+    }
+    var at = recent.len()
+    while at > 0 {
+        at -= 1
+        let meta = recent[at]
+        if meta.number.number <= since.number {
+            continue
+        }
+        var paths = mem::List[ident::Path].empty(alloc)
+        mut paths.push(ident::Path(text: text::String.of(resolved.text.as_str(), alloc)))
+        try await changed(port, subscription, commit: meta.number, take paths, alloc)
+    }
+    mut self.subscriptions.push(Subscription(number: subscription, prefix: take resolved, branch: text::String.of(scope.branch.as_str(), alloc), port: port))
+    return Ok(subscription)
+} Sequencer.subscribe
+
+fn Sequencer.unsubscribe(mut self, subscription: u64) -> Result[Unit, Failure] {
+    var at: usize = 0
+    while at < self.subscriptions.len() {
+        if self.subscriptions[at].number == subscription {
+            discard mut self.subscriptions.remove(at)
+            return Ok(Unit)
+        }
+        at += 1
+    }
+    return Err(Failure.NotFound)
+} Sequencer.unsubscribe
+
+fn Sequencer.history(
+    mut self,
+    scope: Scoped,
+    path: ident::Path,
+    before: Option[ident::CommitId],
+    limit: u32,
+    world: Surroundings,
+    ) -> Result[mem::List[store::CommitMeta], Failure] fails task::Cancelled uses wait {
+    let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    return try settled(attempt await mut self.engine.history(self.volume, branch: scope.branch.as_str(), path: resolved, before, limit, now: world.now(), alloc: world.alloc))
+} Sequencer.history
+
+fn Sequencer.diff(
+    mut self,
+    scope: Scoped,
+    take from: store::Point,
+    take to: store::Point,
+    path: ident::Path,
+    world: Surroundings,
+    ) -> Result[mem::List[store::Edit], Failure] fails task::Cancelled uses wait {
+    let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let Ok(old) = attempt scope.point(take from) else {
+        return Err(Failure.Denied)
+    }
+    let Ok(new) = attempt scope.point(take to) else {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.diff(self.volume, from: old, to: new, path: resolved, alloc: world.alloc))
+} Sequencer.diff
+
+fn Sequencer.branch(
+    mut self,
+    scope: Scoped,
+    name: text::String,
+    at: Option[ident::CommitId],
+    world: Surroundings,
+    ) -> Result[store::Branch, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Admin)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.branch(self.volume, name: name.as_str(), from: scope.branch.as_str(), at, by: scope.principal, expires: None, system: false, now: world.now(), alloc: world.alloc))
+} Sequencer.branch
+
+fn Sequencer.delete_branch(mut self, scope: Scoped, name: text::String, world: Surroundings) -> Result[Unit, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Admin)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.delete_branch(self.volume, name: name.as_str(), now: world.now(), alloc: world.alloc))
+} Sequencer.delete_branch
+
+fn Sequencer.merge(
+    mut self,
+    scope: Scoped,
+    source: Scoped,
+    take takes: mem::List[store::Take],
+    world: Surroundings,
+    ) -> Result[store::Committed, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Admin)).is_err() or (attempt source.check(need: Need.Read)).is_err() or scope.prefix != source.prefix {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.merge(self.volume, target: scope.branch.as_str(), source: source.branch.as_str(), take takes, fast_forward: true, stamp: scope.stamp(typed: false, alloc: world.alloc), now: world.now(), alloc: world.alloc))
+} Sequencer.merge
+
+fn Sequencer.revert(
+    mut self,
+    scope: Scoped,
+    commit: ident::CommitId,
+    dry_run: bool,
+    world: Surroundings,
+    ) -> Result[store::Reverted, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Write)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.revert(self.volume, branch: scope.branch.as_str(), commit, dry_run, stamp: scope.stamp(typed: true, alloc: world.alloc), now: world.now(), alloc: world.alloc))
+} Sequencer.revert
+
+fn Sequencer.pin(
+    mut self,
+    scope: Scoped,
+    commit: ident::CommitId,
+    take note: Option[text::String],
+    world: Surroundings,
+    ) -> Result[Unit, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Admin)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.pin(self.volume, branch: scope.branch.as_str(), commit, by: scope.principal, take note, now: world.now(), alloc: world.alloc))
+} Sequencer.pin
+
+fn Sequencer.unpin(mut self, scope: Scoped, commit: ident::CommitId, world: Surroundings) -> Result[Unit, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Admin)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.unpin(self.volume, commit, now: world.now(), alloc: world.alloc))
+} Sequencer.unpin
+
+fn Sequencer.scrub(mut self, scope: Scoped, world: Surroundings) -> Result[store::ScrubReport, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Admin)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.scrub(self.volume, alloc: world.alloc))
+} Sequencer.scrub
+
+fn Sequencer.gc(mut self, scope: Scoped, world: Surroundings) -> Result[store::Collected, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Admin)).is_err() {
+        return Err(Failure.Denied)
+    }
+    return try settled(attempt await mut self.engine.gc(self.volume, now: world.now(), alloc: world.alloc))
+} Sequencer.gc
+
+/// The store's usage as `/live/store` shows it.
+fn Sequencer.stats(mut self, scope: Scoped, world: Surroundings) -> Result[LiveStore, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Read)).is_err() {
+        return Err(Failure.Denied)
+    }
+    let alloc = world.alloc
+    let usage = match try settled(attempt await mut self.engine.stats(self.volume, alloc)) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let store::Usage(capacity: capacity, used: used, history: history, agents: agents, free: free, format: format, head: head, branches: branches, pins: pins, replayed: replayed, flushed: flushed, free_segments: free_segments, scrub: scrub) = usage
+    return Ok(LiveStore(placement: text::String.of("store-volume", alloc), others: mem::List.empty(alloc), capacity: capacity, used: used, history: history, agents: agents, free: free, format: format, encrypted: false, head: head.number, branches: branches, pins: pins, replayed: replayed, flushed: flushed, free_segments: free_segments, scrub: take scrub))
+} Sequencer.stats

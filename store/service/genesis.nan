@@ -1,0 +1,151 @@
+//! Genesis: the system definition a generation's genesis record commits into an empty store, and the base instances that a later boot brings up to date with its record.
+
+/// The canonical path of the specifications of `/sys/instances`.
+const INSTANCE_SPEC: Str = "os::InstanceSpec"
+
+/// The specifications a listing of `/sys/instances` gives at once.
+const LISTED: u32 = 256
+
+/// A record value with its type.
+pub closed struct TypedValue derives Encode {
+    pub type: store::TypeRef
+    pub bytes: mem::Bytes
+} TypedValue
+
+/// A generation's genesis record: its format, its generation, the dirs and streams it declares, the base instances' specifications and configuration records, and the grants, `/sys/grants/g<n>` holding the n-th.
+pub closed struct Genesis derives Encode {
+    pub format: u32
+    pub generation: u64
+    pub nodes: mem::Map[ident::Path, store::Declaration]
+    pub instances: mem::Map[ident::Moniker, os::InstanceSpec]
+    pub config: mem::Map[ident::Moniker, TypedValue]
+    pub grants: mem::List[TypedValue]
+} Genesis
+
+/// The configuration record of `store`, `/sys/config/store`.
+pub closed struct StoreConfig derives Encode {
+    pub retention: store::Retention
+} StoreConfig
+
+/// The type of the specifications of `/sys/instances`.
+pub fn spec_type(alloc: mem::Alloc) -> store::TypeRef {
+    return store::TypeRef.of(INSTANCE_SPEC, schema: mem::wire::Codec[os::InstanceSpec].schema_hash(), alloc)
+} spec_type
+
+/// The writes of genesis: the declared nodes, every specification, configuration record and grant, and `boot` at `/sys/boot`.
+pub fn Genesis.writes(take self, boot: TypedValue, alloc: mem::Alloc) -> mem::List[store::Write] {
+    let Genesis(format: _, generation: _, nodes: nodes, instances: instances, config: config, grants: grants) = self
+    var writes = mem::List[store::Write].empty(alloc)
+    for node in take nodes {
+        let mem::KeyValue(key: path, value: declaration) = node
+        mut writes.push(store::Write.Make(path: take path, declaration: take declaration))
+    }
+    for instance in take instances {
+        let mem::KeyValue(key: moniker, value: spec) = instance
+        mut writes.push(store::Write.Put(path: below("/sys/instances", name: moniker.text.as_bytes(), alloc), value: spec_value(spec, alloc)))
+    }
+    for entry in config {
+        mut writes.push(store::Write.Put(path: below("/sys/config", name: entry.key().text.as_bytes(), alloc), value: record_value(entry.value(), alloc)))
+    }
+    var number: u64 = 0
+    for grant in grants {
+        var name = mem::Bytes.empty(alloc)
+        mut name.push(b'g')
+        mut name.append(store::decimal_name(number, alloc).view())
+        mut writes.push(store::Write.Put(path: below("/sys/grants", name: name.view(), alloc), value: record_value(grant, alloc)))
+        number += 1
+    }
+    mut writes.push(store::Write.Put(path: ident::Path(text: text::String.of("/sys/boot", alloc)), value: record_value(boot, alloc)))
+    return writes
+} Genesis.writes
+
+/// The writes bringing the base instances of `main` to this record: the specifications and configuration records of the base monikers `main` lacks, the removal of the specifications of base monikers the record no longer lists, and the record's bundle in each base specification; none when they agree. A base moniker has one segment.
+pub fn Genesis.changes[D: disk::Device](
+    self,
+    mut engine: store::Store,
+    device: D,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> mem::List[store::Write] fails store::StoreError uses wait {
+    var writes = mem::List[store::Write].empty(alloc)
+    let dir = ident::Path(text: text::String.of("/sys/instances", alloc))
+    var bases = mem::Set[text::String].empty(alloc)
+    var after: Option[text::String] = None
+    loop {
+        let listing = try await mut engine.list(device, branch: "main", path: dir, after, limit: LISTED, now, alloc)
+        for entry in listing.entries {
+            if is_base(entry.name.as_str()) {
+                discard mut bases.insert(text::String.of(entry.name.as_str(), alloc))
+            }
+        }
+        let Some(next) = listing.next else {
+            break
+        }
+        after = Some(take next)
+    }
+    for name in bases {
+        let path = below("/sys/instances", name: name.as_str().as_bytes(), alloc)
+        let Some(wanted) = self.instances.get(ident::Moniker(text: text::Fixed[59].of(name.as_str()))) else {
+            mut writes.push(store::Write.Delete(path: take path))
+            continue
+        }
+        let node = try await mut engine.get(device, branch: "main", path, now, alloc)
+        let Some(value) = node.value else {
+            continue
+        }
+        let Ok(held) = attempt mem::wire::Codec[os::InstanceSpec].decode(value.view(), alloc) else {
+            continue
+        }
+        if held.bundle != wanted.bundle {
+            var updated = held
+            updated.bundle = wanted.bundle
+            mut writes.push(store::Write.Put(path: take path, value: spec_value(updated, alloc)))
+        }
+    }
+    for instance in self.instances {
+        let name = instance.key().text.as_str()
+        if bases.contains(text::String.of(name, alloc)) {
+            continue
+        }
+        mut writes.push(store::Write.Put(path: below("/sys/instances", name: name.as_bytes(), alloc), value: spec_value(instance.value(), alloc)))
+        match self.config.get(instance.key()) {
+            Some(config) => mut writes.push(store::Write.Put(path: below("/sys/config", name: name.as_bytes(), alloc), value: record_value(config, alloc)))
+            None => {
+            }
+        }
+    }
+    return writes
+} Genesis.changes
+
+/// Whether the moniker `name` names a base instance: it has one segment.
+fn is_base(name: Str) -> bool {
+    for byte in name.as_bytes() {
+        if byte == b'.' {
+            return false
+        }
+    }
+    return true
+} is_base
+
+/// The child `name` of the dir at `dir`.
+fn below(dir: Str, name: Slice[u8], alloc: mem::Alloc) -> ident::Path {
+    let parent = ident::Path(text: text::String.of(dir, alloc))
+    let Some(child) = parent.child(name, alloc) else {
+        return parent
+    }
+    return child
+} below
+
+/// The record value of a specification.
+fn spec_value(spec: os::InstanceSpec, alloc: mem::Alloc) -> store::Value {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::InstanceSpec].encode(spec, out: mut bytes)
+    return store::Value.Record(type: spec_type(alloc), bytes: take bytes, secret: false)
+} spec_value
+
+/// The record value of a typed value.
+fn record_value(typed: TypedValue, alloc: mem::Alloc) -> store::Value {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(typed.bytes.view())
+    return store::Value.Record(type: store::TypeRef(name: text::String.of(typed.type.name.as_str(), alloc), schema: typed.type.schema), bytes: take bytes, secret: false)
+} record_value

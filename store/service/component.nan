@@ -1,0 +1,466 @@
+//! The `store` component: its Env, the hand-off of each request to the sequencer, and the handlers, which postpone every request for the sequencer to answer.
+
+/// The key of the sequencer task.
+const SEQUENCING: u64 = 1
+
+/// The requests the hand-off to the sequencer holds at once.
+const HANDED: usize = 16
+
+/// The Env of `store`: the port of the `store-volume` role, the genesis record and the `/sys/boot` record genesis commits, the monotonic and wall clocks, the random source volume ids draw on, where it reports its events, its cell, the hand-off to its sequencer and the requests waiting for room in it.
+pub open struct Env derives Send {
+    volume: os::Port[devices::Block]
+    genesis: Option[Genesis]
+    boot: Option[TypedValue]
+    clock: sys::Clock
+    wall: ident::Wall
+    random: sys::Random
+    reporter: Reporter
+    alloc: mem::Alloc
+    handoff: Handoff
+    waiting: mem::List[Queued]
+} Env
+
+/// The requests handed to the sequencer, and the signal its waits end on.
+struct Handoff {
+    queued: mem::Shared[hw::SpinLock[mem::Bounded[Queued, HANDED]]]
+    signal: mem::Shared[hw::Signal[Unit]]
+} Handoff
+
+/// A request for the sequencer: the number its holder gave it, the scope of its View and what it asks.
+struct Queued {
+    request: u64
+    scope: Scoped
+    job: Job
+} Queued
+
+/// What a View gives a request: its subtree, branch and rights, and the principal and instance commits made through it name.
+struct Scoped derives Encode {
+    prefix: ident::Path
+    branch: text::String
+    rights: u8
+    principal: ident::Principal
+    instance: Option[ident::Moniker]
+} Scoped
+
+/// What a request asks, its paths within its View's subtree.
+enum Job {
+    Get(path: ident::Path, at: Option[ident::CommitId])
+    List(path: ident::Path, at: Option[ident::CommitId], after: Option[text::String], limit: u32)
+    Count(path: ident::Path, from: text::String, to: text::String)
+    Scan(path: ident::Path, at: Option[ident::CommitId], from: text::String, to: text::String, limit: u32)
+    Read(path: ident::Path, offset: u64, length: u32, verify: bool)
+    Draft
+    DraftAppend(draft: u64, bytes: mem::Bytes)
+    DraftClose(draft: u64, expected: Option[ident::HashValue])
+    Commit(transaction: store::Transaction, typed: bool)
+    Append(path: ident::Path, entries: mem::List[mem::Bytes])
+    ReadStream(path: ident::Path, from: u64, limit: u32)
+    Subscribe(subscription: u64, prefix: ident::Path, since: ident::CommitId, port: os::PortHandle)
+    Unsubscribe(subscription: u64)
+    History(path: ident::Path, before: Option[ident::CommitId], limit: u32)
+    Diff(from: store::Point, to: store::Point, path: ident::Path)
+    Branch(name: text::String, at: Option[ident::CommitId])
+    DeleteBranch(name: text::String)
+    Merge(source: Scoped, takes: mem::List[store::Take])
+    Revert(commit: ident::CommitId, dry_run: bool)
+    Pin(commit: ident::CommitId, note: Option[text::String])
+    Unpin(commit: ident::CommitId)
+    Scrub
+    Gc
+    Stats
+} Job
+
+/// The state of `store`: whether its sequencer has mounted the volume, the mount's failure, and the number of the next subscription.
+pub open struct Service derives Encode {
+    ready: bool
+    failure: Option[Failure]
+    next_subscription: u64
+} Service
+
+impl Service: sys::Component[Env, Store]
+
+impl Service: sys::Resume[Env, Store]
+
+/// The Env of a store on the volume behind `volume`, committing `genesis` and `boot` on an empty one.
+pub fn Env.of(
+    volume: os::Port[devices::Block],
+    take genesis: Genesis,
+    take boot: TypedValue,
+    clock: sys::Clock,
+    wall: ident::Wall,
+    random: sys::Random,
+    reporter: Reporter,
+    alloc: mem::Alloc,
+    ) -> Env {
+    let handoff = Handoff(queued: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Queued, HANDED].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
+    return Env(volume: volume, genesis: Some(take genesis), boot: Some(take boot), clock: clock, wall: wall, random: random, reporter: reporter, alloc: alloc, handoff: take handoff, waiting: mem::List.empty(alloc))
+} Env.of
+
+/// Hands the waiting requests to the sequencer while the hand-off has room, signalling it when it took any.
+fn Env.feed(mut self) {
+    var signalled = false
+    while self.waiting.len() > 0 {
+        var next = Some(mut self.waiting.remove(0))
+        let queued = self.handoff.queued.share()
+        let left = hw::without_irqs(fn[mut next](t: hw::IrqsDisabled) -> Option[Queued] limits notrap, terminates {
+            return queued.contents().with(t, body: fn[mut next](mut held: mem::Bounded[Queued, HANDED]) -> Option[Queued] limits notrap, terminates, noalloc {
+                let Some(taken) = mut next.extract() else {
+                    return None
+                }
+                if held.is_full() {
+                    return Some(take taken)
+                }
+                mut held.push(take taken)
+                return None
+            })
+        })
+        match left {
+            Some(kept) => {
+                mut self.waiting.insert(0, value: take kept)
+                break
+            }
+            None => {
+                signalled = true
+            }
+        }
+    }
+    if signalled {
+        let signal = self.handoff.signal.share()
+        hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+            signal.contents().post(t, value: Unit)
+        })
+    }
+} Env.feed
+
+/// The hand-off's requests, oldest first, waiting until there are some.
+fn Handoff.take_all(self, alloc: mem::Alloc) -> mem::List[Queued] fails task::Cancelled uses wait {
+    loop {
+        var taken = mem::List[Queued].empty(alloc)
+        loop {
+            let queued = self.queued.share()
+            let next = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Queued] limits notrap, terminates {
+                return queued.contents().with(t, body: fn(mut held: mem::Bounded[Queued, HANDED]) -> Option[Queued] limits notrap, terminates, noalloc {
+                    return mut held.pop()
+                })
+            })
+            let Some(queued_request) = next else {
+                break
+            }
+            mut taken.insert(0, value: take queued_request)
+        }
+        if taken.len() > 0 {
+            return taken
+        }
+        try await self.signal.contents().wait()
+    }
+} Handoff.take_all
+
+fn Handoff.share(self) -> Handoff {
+    return Handoff(queued: self.queued.share(), signal: self.signal.share())
+} Handoff.share
+
+pub fn Service.start(mut env: Env) -> Service = Service(ready: false, failure: None, next_subscription: 1)
+
+/// Once started, has the sequencer mount the volume and serve the requests handed to it.
+pub fn Service.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Store]) {
+    if reason != sys::ResumeReason.Started {
+        return
+    }
+    let Some(genesis) = mut env.genesis.extract() else {
+        return
+    }
+    let Some(boot) = mut env.boot.extract() else {
+        return
+    }
+    let world = Surroundings(volume: env.volume, clock: env.clock, wall: env.wall, random: env.random, reporter: env.reporter, alloc: env.alloc)
+    let handoff = env.handoff.share()
+    mut cx.spawn(key: SEQUENCING, run: fn[take genesis, take boot, take handoff](out: sys::Outbox[Store]) fails task::Cancelled uses wait limits stack 262_144 {
+        try await sequence(world, take genesis, take boot, take handoff, out)
+    })
+} Service.resume
+
+fn Service.mounted(mut self, take failure: Option[Failure], mut env: Env, mut cx: sys::Cx[Store]) {
+    self.ready = failure.is_none()
+    self.failure = failure
+} Service.mounted
+
+/// Answers the request the sequencer served, and hands it the requests waiting for room.
+fn Service.answered(
+    mut self,
+    take request: u64,
+    take reply: mem::Bytes,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) {
+    discard attempt mut cx.reply(request, reply: sys::Encoded(bytes: take reply, handles: mem::List.empty(env.alloc)))
+    mut env.feed()
+} Service.answered
+
+/// Postpones the request for the sequencer with the scope of `view`, giving the failure its handler ends with, which the runner releases once the request is postponed: `Revoked` for a stale View, `store.io` when nothing postpones it.
+fn Service.queue(
+    mut self,
+    view: View,
+    take job: Job,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> Failure {
+    let Some(scope) = view.scoped(env.alloc) else {
+        return Failure.Revoked
+    }
+    let Some(request) = mut cx.postpone() else {
+        return Failure.Io
+    }
+    mut env.waiting.push(Queued(request: request, scope: take scope, job: take job))
+    mut env.feed()
+    return Failure.Io
+} Service.queue
+
+pub fn Service.get(
+    mut self,
+    take view: View,
+    take path: ident::Path,
+    take at: Option[ident::CommitId],
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::Node fails Failure {
+    fail mut self.queue(view, job: Job.Get(path: take path, at: at), mut env, mut cx)
+} Service.get
+
+pub fn Service.list(
+    mut self,
+    take view: View,
+    take path: ident::Path,
+    take at: Option[ident::CommitId],
+    take after: Option[text::String],
+    take limit: u32,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::Listing fails Failure {
+    fail mut self.queue(view, job: Job.List(path: take path, at: at, after: take after, limit: limit), mut env, mut cx)
+} Service.list
+
+pub fn Service.count(
+    mut self,
+    take view: View,
+    take path: ident::Path,
+    take from: text::String,
+    take to: text::String,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::Count fails Failure {
+    fail mut self.queue(view, job: Job.Count(path: take path, from: take from, to: take to), mut env, mut cx)
+} Service.count
+
+pub fn Service.scan(
+    mut self,
+    take view: View,
+    take path: ident::Path,
+    take at: Option[ident::CommitId],
+    take from: text::String,
+    take to: text::String,
+    take limit: u32,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> mem::List[store::Node] fails Failure {
+    fail mut self.queue(view, job: Job.Scan(path: take path, at: at, from: take from, to: take to, limit: limit), mut env, mut cx)
+} Service.scan
+
+pub fn Service.read(
+    mut self,
+    take view: View,
+    take path: ident::Path,
+    take offset: u64,
+    take length: u32,
+    take verify: bool,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> Untrusted[mem::Bytes] fails Failure {
+    fail mut self.queue(view, job: Job.Read(path: take path, offset: offset, length: length, verify: verify), mut env, mut cx)
+} Service.read
+
+pub fn Service.draft(mut self, take view: View, mut env: Env, mut cx: sys::Cx[Store]) -> u64 fails Failure {
+    fail mut self.queue(view, job: Job.Draft, mut env, mut cx)
+} Service.draft
+
+pub fn Service.draft_append(
+    mut self,
+    take view: View,
+    take draft: u64,
+    take bytes: mem::Bytes,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) fails Failure {
+    fail mut self.queue(view, job: Job.DraftAppend(draft: draft, bytes: take bytes), mut env, mut cx)
+} Service.draft_append
+
+pub fn Service.draft_close(
+    mut self,
+    take view: View,
+    take draft: u64,
+    take expected: Option[ident::HashValue],
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::Closed fails Failure {
+    fail mut self.queue(view, job: Job.DraftClose(draft: draft, expected: expected), mut env, mut cx)
+} Service.draft_close
+
+pub fn Service.commit(
+    mut self,
+    take view: View,
+    take transaction: store::Transaction,
+    take typed: bool,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::Committed fails Failure {
+    fail mut self.queue(view, job: Job.Commit(transaction: take transaction, typed: typed), mut env, mut cx)
+} Service.commit
+
+pub fn Service.append(
+    mut self,
+    take view: View,
+    take path: ident::Path,
+    take entries: mem::List[mem::Bytes],
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> u64 fails Failure {
+    fail mut self.queue(view, job: Job.Append(path: take path, entries: take entries), mut env, mut cx)
+} Service.append
+
+pub fn Service.read_stream(
+    mut self,
+    take view: View,
+    take path: ident::Path,
+    take from: u64,
+    take limit: u32,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::StreamRead fails Failure {
+    fail mut self.queue(view, job: Job.ReadStream(path: take path, from: from, limit: limit), mut env, mut cx)
+} Service.read_stream
+
+pub fn Service.subscribe(
+    mut self,
+    take view: View,
+    take prefix: ident::Path,
+    take since: ident::CommitId,
+    take port: os::PortHandle,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> u64 fails Failure {
+    let subscription = self.next_subscription
+    self.next_subscription += 1
+    fail mut self.queue(view, job: Job.Subscribe(subscription: subscription, prefix: take prefix, since: since, port: port), mut env, mut cx)
+} Service.subscribe
+
+pub fn Service.unsubscribe(
+    mut self,
+    take view: View,
+    take subscription: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) fails Failure {
+    fail mut self.queue(view, job: Job.Unsubscribe(subscription: subscription), mut env, mut cx)
+} Service.unsubscribe
+
+pub fn Service.history(
+    mut self,
+    take view: View,
+    take path: ident::Path,
+    take before: Option[ident::CommitId],
+    take limit: u32,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> mem::List[store::CommitMeta] fails Failure {
+    fail mut self.queue(view, job: Job.History(path: take path, before: before, limit: limit), mut env, mut cx)
+} Service.history
+
+pub fn Service.diff(
+    mut self,
+    take view: View,
+    take from: store::Point,
+    take to: store::Point,
+    take path: ident::Path,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> mem::List[store::Edit] fails Failure {
+    fail mut self.queue(view, job: Job.Diff(from: take from, to: take to, path: take path), mut env, mut cx)
+} Service.diff
+
+pub fn Service.branch(
+    mut self,
+    take view: View,
+    take name: text::String,
+    take at: Option[ident::CommitId],
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::Branch fails Failure {
+    fail mut self.queue(view, job: Job.Branch(name: take name, at: at), mut env, mut cx)
+} Service.branch
+
+pub fn Service.delete_branch(
+    mut self,
+    take view: View,
+    take name: text::String,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) fails Failure {
+    fail mut self.queue(view, job: Job.DeleteBranch(name: take name), mut env, mut cx)
+} Service.delete_branch
+
+pub fn Service.merge(
+    mut self,
+    take view: View,
+    take source: View,
+    take takes: mem::List[store::Take],
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::Committed fails Failure {
+    let Some(from) = source.scoped(env.alloc) else {
+        fail Failure.Revoked
+    }
+    fail mut self.queue(view, job: Job.Merge(source: take from, takes: take takes), mut env, mut cx)
+} Service.merge
+
+pub fn Service.revert(
+    mut self,
+    take view: View,
+    take commit: ident::CommitId,
+    take dry_run: bool,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> store::Reverted fails Failure {
+    fail mut self.queue(view, job: Job.Revert(commit: commit, dry_run: dry_run), mut env, mut cx)
+} Service.revert
+
+pub fn Service.pin(
+    mut self,
+    take view: View,
+    take commit: ident::CommitId,
+    take note: Option[text::String],
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) fails Failure {
+    fail mut self.queue(view, job: Job.Pin(commit: commit, note: take note), mut env, mut cx)
+} Service.pin
+
+pub fn Service.unpin(
+    mut self,
+    take view: View,
+    take commit: ident::CommitId,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) fails Failure {
+    fail mut self.queue(view, job: Job.Unpin(commit: commit), mut env, mut cx)
+} Service.unpin
+
+pub fn Service.scrub(mut self, take view: View, mut env: Env, mut cx: sys::Cx[Store]) -> store::ScrubReport fails Failure {
+    fail mut self.queue(view, job: Job.Scrub, mut env, mut cx)
+} Service.scrub
+
+pub fn Service.gc(mut self, take view: View, mut env: Env, mut cx: sys::Cx[Store]) -> store::Collected fails Failure {
+    fail mut self.queue(view, job: Job.Gc, mut env, mut cx)
+} Service.gc
+
+pub fn Service.stats(mut self, take view: View, mut env: Env, mut cx: sys::Cx[Store]) -> LiveStore fails Failure {
+    fail mut self.queue(view, job: Job.Stats, mut env, mut cx)
+} Service.stats

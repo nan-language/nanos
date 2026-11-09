@@ -151,7 +151,7 @@ fn Store.take_source[D: disk::Device](
     mut staged.touch(ancestors.view(), count: ancestors.len(), children_changed: sides.target.is_none(), alloc)
 } Store.take_source
 
-/// Writes every entry dir `dir` holds in `snapshot` into the versioned tree of the branch at `head`, and what each dir among them holds.
+/// Writes every entry dir `dir` holds in `snapshot` into the versioned tree of the branch at `head`, and what each dir among them holds, the dirs left to copy waiting on a list.
 fn Store.copy_subtree[D: disk::Device](
     mut self,
     device: D,
@@ -161,14 +161,21 @@ fn Store.copy_subtree[D: disk::Device](
     mut staged: Staged,
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
-    let children = try await mut self.snapshot_children(device, snapshot, dir, alloc)
-    for child in children {
-        let held = try child_dir(child.entry, tree: TREE_VERSIONED, alloc)
-        let place = Place(head: head, tree: TREE_VERSIONED, dir: dir, name: copied_bytes(child.name.view(), alloc))
-        let entry = try child.entry.copied(alloc)
-        discard try await mut self.set_entry(device, place, entry: Some(take entry), mut staged, alloc)
-        if held.dir != 0 and held.tree == TREE_VERSIONED {
-            try await mut self.copy_subtree(device, snapshot, head, dir: held.dir, mut staged, alloc)
+    var pending = mem::List[u64].empty(alloc)
+    mut pending.push(dir)
+    loop {
+        let Some(copied) = mut pending.pop() else {
+            return
+        }
+        let children = try await mut self.snapshot_children(device, snapshot, dir: copied, alloc)
+        for child in children {
+            let held = try child_dir(child.entry, tree: TREE_VERSIONED, alloc)
+            let place = Place(head: head, tree: TREE_VERSIONED, dir: copied, name: copied_bytes(child.name.view(), alloc))
+            let entry = try child.entry.copied(alloc)
+            discard try await mut self.set_entry(device, place, entry: Some(take entry), mut staged, alloc)
+            if held.dir != 0 and held.tree == TREE_VERSIONED {
+                mut pending.push(held.dir)
+            }
         }
     }
 } Store.copy_subtree
@@ -205,7 +212,7 @@ fn Store.write_merged[D: disk::Device](
     mut staged.touch(ancestors.view(), count: ancestors.len(), children_changed: false, alloc)
 } Store.write_merged
 
-/// The value of schema node `node` merged from its base, source and target wire bytes: a side changed alone taken, records and maps merged key by key, any other change on both sides a clash at `field`.
+/// The value of schema node `node` merged from its base, source and target wire bytes: a side changed alone taken, records and maps merged key by key, any other change on both sides a clash at `field`. The records and maps under way wait on a stack, each joined once every part of it is merged.
 fn merge_value(
     schema: mem::wire::Schema,
     node: usize,
@@ -215,33 +222,150 @@ fn merge_value(
     field: Str,
     alloc: mem::Alloc,
     ) -> Merged {
+    var stack = mem::List[Combining].empty(alloc)
+    match value_step(schema, node, base, source, target, field, key: mem::Bytes.empty(alloc), alloc) {
+        Step3.Done(merged) => return merged
+        Step3.Open(combining) => mut stack.push(take combining)
+    }
+    loop {
+        let Some(top) = mut stack.pop() else {
+            return Merged.Clash(text::String.of(field, alloc))
+        }
+        var combining = top
+        if combining.next < combining.parts.len() {
+            let at = combining.next
+            combining.next += 1
+            let step = part_step(schema, part: combining.parts[at], alloc)
+            match step {
+                Step3.Done(Merged.Clash(clash)) => return Merged.Clash(take clash)
+                Step3.Done(Merged.Value(bytes)) => {
+                    if not combining.parts[at].gone {
+                        mut combining.merged.push(Part(key: copied_bytes(combining.parts[at].key.view(), alloc), value: take bytes))
+                    }
+                    mut stack.push(take combining)
+                }
+                Step3.Open(nested) => {
+                    mut stack.push(take combining)
+                    mut stack.push(take nested)
+                }
+            }
+            continue
+        }
+        let Combining(key: key, record: record, parts: _, next: _, merged: merged) = combining
+        let bytes = joined(merged.view(), record, alloc)
+        let Some(above) = mut stack.pop() else {
+            return Merged.Value(take bytes)
+        }
+        var parent = above
+        mut parent.merged.push(Part(key: take key, value: take bytes))
+        mut stack.push(take parent)
+    }
+} merge_value
+
+/// A record or map being merged: its key in the value holding it, whether it is a record, its parts to merge, the next of them, and those merged.
+struct Combining {
+    key: mem::Bytes
+    record: bool
+    parts: mem::List[Sided]
+    next: usize
+    merged: mem::List[Part]
+} Combining
+
+/// A field or entry to merge: its key, its schema node, its three sides, its field path, and whether it is gone, from both sides or from the side that alone changed it.
+struct Sided {
+    key: mem::Bytes
+    node: usize
+    base: Option[mem::Bytes]
+    source: Option[mem::Bytes]
+    target: Option[mem::Bytes]
+    field: text::String
+    gone: bool
+} Sided
+
+/// A step of a merge: its outcome, or a record or map to merge part by part.
+enum Step3 {
+    Done(Merged)
+    Open(Combining)
+} Step3
+
+/// The first step of merging a value whose sides are `base`, `source` and `target`, the value of `key` in what holds it: a side changed alone taken, a record or map opened, or a clash at `field`.
+fn value_step(
+    schema: mem::wire::Schema,
+    node: usize,
+    base: Option[mem::Bytes],
+    source: Slice[u8],
+    target: Slice[u8],
+    field: Str,
+    take key: mem::Bytes,
+    alloc: mem::Alloc,
+    ) -> Step3 {
     if source == target {
-        return Merged.Value(copied_bytes(source, alloc))
+        return Step3.Done(Merged.Value(copied_bytes(source, alloc)))
     }
     match base {
         Some(held) => {
             if held.view() == source {
-                return Merged.Value(copied_bytes(target, alloc))
+                return Step3.Done(Merged.Value(copied_bytes(target, alloc)))
             }
             if held.view() == target {
-                return Merged.Value(copied_bytes(source, alloc))
+                return Step3.Done(Merged.Value(copied_bytes(source, alloc)))
             }
         }
         None => {
         }
     }
     if node >= schema.nodes.len() {
-        return Merged.Clash(text::String.of(field, alloc))
+        return Step3.Done(Merged.Clash(text::String.of(field, alloc)))
     }
-    return match schema.nodes[node] {
-        mem::wire::SchemaNode.Record(open: _, fields: fields) => merge_record_value(schema, fields: fields.view(), base, source, target, field, alloc)
-        mem::wire::SchemaNode.Map(key: key, value: value) => merge_map_value(schema, key, value, base, source, target, field, alloc)
-        else => Merged.Clash(text::String.of(field, alloc))
+    let opened = match schema.nodes[node] {
+        mem::wire::SchemaNode.Record(open: _, fields: fields) => record_sides(schema, fields: fields.view(), base, source, target, field, alloc)
+        mem::wire::SchemaNode.Map(key: keyed, value: valued) => map_sides(schema, key: keyed, value: valued, base, source, target, field, alloc)
+        else => None
     }
-} merge_value
+    let Some(parts) = opened else {
+        return Step3.Done(Merged.Clash(text::String.of(field, alloc)))
+    }
+    let record = match schema.nodes[node] {
+        mem::wire::SchemaNode.Record(open: _, fields: _) => true
+        else => false
+    }
+    return Step3.Open(Combining(key: take key, record: record, parts: take parts, next: 0, merged: mem::List.empty(alloc)))
+} value_step
 
-/// A record merged field by field, each field's value by its schema node.
-fn merge_record_value(
+/// The step of merging a field or entry from its three sides: kept or gone when a side changed alone, a clash when only one side holds it, else its value's step.
+fn part_step(schema: mem::wire::Schema, part: Sided, alloc: mem::Alloc) -> Step3 {
+    if part.source == part.target {
+        return taken_value(part.source, alloc)
+    }
+    if part.base == part.source {
+        return taken_value(part.target, alloc)
+    }
+    if part.base == part.target {
+        return taken_value(part.source, alloc)
+    }
+    let Some(from_source) = part.source else {
+        return Step3.Done(Merged.Clash(text::String.of(part.field.as_str(), alloc)))
+    }
+    let Some(from_target) = part.target else {
+        return Step3.Done(Merged.Clash(text::String.of(part.field.as_str(), alloc)))
+    }
+    let base = match part.base {
+        Some(held) => Some(copied_bytes(held.view(), alloc))
+        None => None
+    }
+    return value_step(schema, node: part.node, base, source: from_source.view(), target: from_target.view(), field: part.field.as_str(), key: copied_bytes(part.key.view(), alloc), alloc)
+} part_step
+
+/// A side's value kept, or an empty value for one gone, which its `Sided` marks.
+fn taken_value(value: Option[mem::Bytes], alloc: mem::Alloc) -> Step3 {
+    return match value {
+        Some(bytes) => Step3.Done(Merged.Value(copied_bytes(bytes.view(), alloc)))
+        None => Step3.Done(Merged.Value(mem::Bytes.empty(alloc)))
+    }
+} taken_value
+
+/// The fields of a record to merge, in key order, each with its schema node and its three sides; `None` when a side does not split into fields.
+fn record_sides(
     schema: mem::wire::Schema,
     fields: Slice[mem::wire::SchemaField],
     base: Option[mem::Bytes],
@@ -249,12 +373,12 @@ fn merge_record_value(
     target: Slice[u8],
     field: Str,
     alloc: mem::Alloc,
-    ) -> Merged {
+    ) -> Option[mem::List[Sided]] {
     let Some(source_parts) = record_parts(source, alloc) else {
-        return Merged.Clash(text::String.of(field, alloc))
+        return None
     }
     let Some(target_parts) = record_parts(target, alloc) else {
-        return Merged.Clash(text::String.of(field, alloc))
+        return None
     }
     var base_parts = mem::List[Part].empty(alloc)
     match base {
@@ -271,7 +395,7 @@ fn merge_record_value(
     for part in target_parts {
         discard mut keys.insert(copied_bytes(part.key.view(), alloc))
     }
-    var merged = mem::List[Part].empty(alloc)
+    var sides = mem::List[Sided].empty(alloc)
     for key in keys.cursor() {
         var node = schema.nodes.len()
         for described in fields {
@@ -279,20 +403,13 @@ fn merge_record_value(
                 node = described.value
             }
         }
-        let path = field_path(field, key: key.view(), alloc)
-        let value = merge_part(schema, node, base: value_of_key(base_parts.view(), key: key.view(), alloc), source: value_of_key(source_parts.view(), key: key.view(), alloc), target: value_of_key(target_parts.view(), key: key.view(), alloc), field: path.as_str(), alloc)
-        match value {
-            Part3.Clash(clash) => return Merged.Clash(take clash)
-            Part3.Kept(bytes) => mut merged.push(Part(key: copied_bytes(key.view(), alloc), value: take bytes))
-            Part3.Gone => {
-            }
-        }
+        mut sides.push(sided(key: key.view(), node, base: value_of_key(base_parts.view(), key: key.view(), alloc), source: value_of_key(source_parts.view(), key: key.view(), alloc), target: value_of_key(target_parts.view(), key: key.view(), alloc), field: field_path(field, key: key.view(), alloc), alloc))
     }
-    return Merged.Value(joined(merged.view(), record: true, alloc))
-} merge_record_value
+    return Some(take sides)
+} record_sides
 
-/// A map merged entry by entry, its entries in the order of its keys; a map whose keys have no order clashes whole.
-fn merge_map_value(
+/// The entries of a map to merge, in the order of their keys, each with the schema node of its value and its three sides; `None` when the map's keys have no order or a side does not split into entries.
+fn map_sides(
     schema: mem::wire::Schema,
     key: usize,
     value: usize,
@@ -301,15 +418,15 @@ fn merge_map_value(
     target: Slice[u8],
     field: Str,
     alloc: mem::Alloc,
-    ) -> Merged {
-    if not has_order(schema, node: key, depth: 0) {
-        return Merged.Clash(text::String.of(field, alloc))
+    ) -> Option[mem::List[Sided]] {
+    if not has_order(schema, node: key, alloc) {
+        return None
     }
     let Some(source_parts) = map_parts(schema, key, value, bytes: source, alloc) else {
-        return Merged.Clash(text::String.of(field, alloc))
+        return None
     }
     let Some(target_parts) = map_parts(schema, key, value, bytes: target, alloc) else {
-        return Merged.Clash(text::String.of(field, alloc))
+        return None
     }
     var base_parts = mem::List[Part].empty(alloc)
     match base {
@@ -328,63 +445,27 @@ fn merge_map_value(
             mut keys.push(copied_bytes(part.key.view(), alloc))
         }
     }
-    mut keys.sort_by(fn(left: mem::Bytes, right: mem::Bytes) => wire_order(schema, node: key, left: left.view(), right: right.view(), depth: 0, alloc))
-    var merged = mem::List[Part].empty(alloc)
+    mut keys.sort_by(fn(left: mem::Bytes, right: mem::Bytes) => wire_order(schema, node: key, left: left.view(), right: right.view(), alloc))
+    var sides = mem::List[Sided].empty(alloc)
     for entry in keys {
-        let entry_value = merge_part(schema, node: value, base: value_of_key(base_parts.view(), key: entry.view(), alloc), source: value_of_key(source_parts.view(), key: entry.view(), alloc), target: value_of_key(target_parts.view(), key: entry.view(), alloc), field, alloc)
-        match entry_value {
-            Part3.Clash(clash) => return Merged.Clash(take clash)
-            Part3.Kept(bytes) => mut merged.push(Part(key: copied_bytes(entry.view(), alloc), value: take bytes))
-            Part3.Gone => {
-            }
-        }
+        mut sides.push(sided(key: entry.view(), node: value, base: value_of_key(base_parts.view(), key: entry.view(), alloc), source: value_of_key(source_parts.view(), key: entry.view(), alloc), target: value_of_key(target_parts.view(), key: entry.view(), alloc), field: text::String.of(field, alloc), alloc))
     }
-    return Merged.Value(joined(merged.view(), record: false, alloc))
-} merge_map_value
+    return Some(take sides)
+} map_sides
 
-/// A field or entry merged from its three sides: kept with its bytes, gone from both or from the side that alone changed it, or a clash.
-enum Part3 {
-    Kept(mem::Bytes)
-    Gone
-    Clash(text::String)
-} Part3
-
-fn merge_part(
-    schema: mem::wire::Schema,
+/// A part to merge, gone when the side it takes holds none.
+fn sided(
+    key: Slice[u8],
     node: usize,
     take base: Option[mem::Bytes],
     take source: Option[mem::Bytes],
     take target: Option[mem::Bytes],
-    field: Str,
+    take field: text::String,
     alloc: mem::Alloc,
-    ) -> Part3 {
-    if source == target {
-        return kept_or_gone(take source)
-    }
-    if base == source {
-        return kept_or_gone(take target)
-    }
-    if base == target {
-        return kept_or_gone(take source)
-    }
-    let Some(from_source) = source else {
-        return Part3.Clash(text::String.of(field, alloc))
-    }
-    let Some(from_target) = target else {
-        return Part3.Clash(text::String.of(field, alloc))
-    }
-    return match merge_value(schema, node, base, source: from_source.view(), target: from_target.view(), field, alloc) {
-        Merged.Value(bytes) => Part3.Kept(take bytes)
-        Merged.Clash(clash) => Part3.Clash(take clash)
-    }
-} merge_part
-
-fn kept_or_gone(take value: Option[mem::Bytes]) -> Part3 {
-    return match value {
-        Some(bytes) => Part3.Kept(take bytes)
-        None => Part3.Gone
-    }
-} kept_or_gone
+    ) -> Sided {
+    let gone = (source == target and source.is_none()) or (base == source and target.is_none()) or (base == target and source.is_none())
+    return Sided(key: copied_bytes(key, alloc), node: node, base: take base, source: take source, target: take target, field: take field, gone: gone)
+} sided
 
 /// The path of field `key` within `field`.
 fn field_path(field: Str, key: Slice[u8], alloc: mem::Alloc) -> text::String {
