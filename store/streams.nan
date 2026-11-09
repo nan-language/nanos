@@ -1,4 +1,4 @@
-//! Streams: entries appended as runs logged with the commit appending them, read back from a sequence number on, and trimmed below one.
+//! Streams: entries appended as runs logged with the commit appending them, read back from a sequence number on, and trimmed below one; a branch that changes a stream another head shares since a fork takes a stream of its own, its runs copied, and a stream no head holds any more frees its runs.
 
 /// Appends entries to the stream at `segments`, numbering them from its next sequence number.
 pkg fn Store.append_entries[D: disk::Device](
@@ -14,12 +14,13 @@ pkg fn Store.append_entries[D: disk::Device](
     let Some(found) = resolution.node() else {
         fail StoreError.NotFound
     }
-    let Content.Stream(id: id, declaration: declared, next: next, entries: count, bytes: size) = found.entry.content else {
+    let Content.Stream(id: shared, declaration: declared, next: next, entries: count, bytes: size) = found.entry.content else {
         fail StoreError.Kind
     }
     let Declaration.Stream(stream) = try decode_declaration(declared.view(), alloc) else {
         fail StoreError.Corrupt
     }
+    let id = try await mut self.own_stream(device, place: found.place, id: shared, writing, mut staged, alloc)
     var run = mem::List[StreamEntry].empty(alloc)
     var added: u64 = 0
     for value in entries {
@@ -57,7 +58,7 @@ pkg fn Store.trim_stream[D: disk::Device](
     let Some(found) = resolution.node() else {
         fail StoreError.NotFound
     }
-    let Content.Stream(id: id, declaration: declared, next: next, entries: count, bytes: size) = found.entry.content else {
+    let Content.Stream(id: shared, declaration: declared, next: next, entries: count, bytes: size) = found.entry.content else {
         fail StoreError.Kind
     }
     let earliest = next - count
@@ -68,7 +69,8 @@ pkg fn Store.trim_stream[D: disk::Device](
         true => below
         false => next
     }
-    let dropped = try await mut self.entry_bytes_between(device, stream: id, from: earliest, to: cut, alloc)
+    let dropped = try await mut self.entry_bytes_between(device, stream: shared, from: earliest, to: cut, alloc)
+    let id = try await mut self.own_stream(device, place: found.place, id: shared, writing, mut staged, alloc)
     var entry = try found.entry.copied(alloc)
     entry.content = Content.Stream(id: id, declaration: copied_bytes(declared.view(), alloc), next: next, entries: count - (cut - earliest), bytes: size.saturating_sub(dropped))
     mut self.tended.push(Tended(place: found.place.copied(alloc), expires: 0))
@@ -222,3 +224,78 @@ pkg fn run_key(stream: u64, earliest: u64, alloc: mem::Alloc) -> mem::Bytes {
     mut key.view_mut().write_u64_be(9, value: earliest)
     return key
 } run_key
+
+/// The heads whose tree holds stream `id` at `place`.
+pkg fn Store.stream_holders[D: disk::Device](
+    mut self,
+    device: D,
+    place: Place,
+    id: u64,
+    alloc: mem::Alloc,
+    ) -> mem::List[usize] fails StoreError uses wait {
+    var holders = mem::List[usize].empty(alloc)
+    let key = entry_key(place.dir, name: place.name.view(), alloc)
+    for at in 0..<self.heads.len() {
+        let Some(bytes) = try await mut self.tree_get(device, root: self.root_at(at, tree: place.tree), key: key.view(), alloc) else {
+            continue
+        }
+        let entry = try NodeEntry.decode_from(bytes.view(), alloc)
+        match entry.content {
+            Content.Stream(id: held, declaration: _, next: _, entries: _, bytes: _) => {
+                if held == id {
+                    mut holders.push(at)
+                }
+            }
+            else => {
+            }
+        }
+    }
+    return holders
+} Store.stream_holders
+
+/// The stream id the commit changes the stream at `place`, of id `id`, under: `id`, unless another head holds it too, when the commit takes a new id and copies its runs to it.
+fn Store.own_stream[D: disk::Device](
+    mut self,
+    device: D,
+    place: Place,
+    id: u64,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> u64 fails StoreError uses wait {
+    let holders = try await mut self.stream_holders(device, place, id, alloc)
+    var shared = false
+    for at in holders {
+        shared = shared or at != writing.head
+    }
+    if not shared {
+        return id
+    }
+    let copy = self.counters.stream
+    self.counters.stream += 1
+    for run in try await mut self.runs_of(device, stream: id, alloc) {
+        let entries = try await mut self.run_entries(device, run: run.run, alloc)
+        mut staged.runs.push(PendingRun(stream: copy, earliest: run.earliest, entries: take entries, agent: run.run.agent))
+    }
+    return copy
+} Store.own_stream
+
+/// Frees the runs of each stream a durable commit stopped holding that no head holds any more.
+pkg fn Store.release_dropped[D: disk::Device](mut self, device: D, dropped: Slice[Dropped], alloc: mem::Alloc) fails StoreError uses wait {
+    for stream in dropped {
+        let holders = try await mut self.stream_holders(device, place: stream.place, id: stream.id, alloc)
+        if holders.len() > 0 {
+            continue
+        }
+        for run in try await mut self.runs_of(device, stream: stream.id, alloc) {
+            discard try await mut self.catalog_remove(device, key: run_key(stream.id, earliest: run.earliest, alloc).view(), alloc)
+            if run.run.agent {
+                mut self.count_bytes(history: 0, agents: 0 - i64.widen(run.run.bytes))
+            }
+            let Some(pointer) = disk::Pointer.of_bytes(run.run.record.view()) else {
+                continue
+            }
+            mut self.log.release(pointer.target, bytes: u64.widen(disk::record_span(pointer.length)))
+        }
+    }
+} Store.release_dropped
