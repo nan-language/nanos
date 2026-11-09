@@ -1,6 +1,6 @@
 # 0031. The store engine
 
-Status: accepted
+Status: superseded by 0033
 
 ## Context
 
