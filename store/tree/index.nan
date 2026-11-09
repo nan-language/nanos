@@ -12,10 +12,12 @@ pkg enum TreeFailure derives Render {
     Cancelled(task::Cancelled) from
 } TreeFailure
 
-/// What the index tells of the values of a tree's leaves: that a leaf holding one was copied or freed.
+/// What the index tells of the values of a tree's leaves: that a leaf holding one was copied or freed, or began or ceased to be reached from a branch head; and whether the tree being changed is a head's, whose nodes and values the heads reach.
 pkg interface Values {
     fn retain(mut self, tree: u8, value: Slice[u8])
     fn release(mut self, tree: u8, value: Slice[u8])
+    fn reach(mut self, tree: u8, value: Slice[u8], delta: i64)
+    fn reaches_heads(self) -> bool
 } Values
 
 /// A tree: its number and its top node by in-memory id, with the pointer it was last written under.
@@ -25,24 +27,38 @@ pkg struct Root derives Copy, Eq {
     pkg pointer: disk::Pointer
 } Root
 
-/// An item table entry: where an item's record lies, its length and kind, and the index and catalog entries naming it.
+/// An item table entry: where an item's record lies, its length and kind, the index and catalog entries naming it, those of them that branch heads reach, the tree of a node, 0 for a value, and whether an agent or child principal added the value.
 pkg struct ItemEntry derives Copy, Eq, Encode {
     pkg address: u64
     pkg length: u32
     pkg kind: u8
     pkg refcount: u32
+    pkg heads: u32
+    pkg tree: u8
+    pkg agent: bool
 } ItemEntry
 
-/// A change to an item's entry that collects until an index flush: a new place for its record, a change of its reference count, and, for a node, its tree and the pointer last naming it.
+/// A change to an item's entry that collects until an index flush: a new place for its record, a change of its reference count and of its references from what heads reach, its tree and whether an agent added it, for a node the pointer last naming it, and whether its children and values count it among what heads reach them through.
 struct ItemChange derives Copy {
     placed: bool
     address: u64
     length: u32
     kind: u8
     delta: i64
+    heads: i64
+    described: bool
+    agent: bool
     tree: u8
     pointer: disk::Pointer
+    reaching: Reaching
 } ItemChange
+
+/// Whether a node's children and values count it among the referrers that heads reach: as its entry's references say, or as decided since.
+enum Reaching derives Copy, Eq {
+    Stored
+    Reaches
+    Unreached
+} Reaching
 
 /// A record whose bytes no structure names any more.
 pkg struct Retired derives Copy, Eq {
@@ -78,11 +94,13 @@ pkg struct Index {
     next_dirty: u64
     changes: mem::HashMap[u64, ItemChange]
     pkg stale: mem::List[Retired]
+    pkg history_change: i64
+    pkg agents_change: i64
 } Index
 
 /// The index of a volume whose item table's top node `items` names.
 pkg fn Index.of(items: Root, next_item: u64, alloc: mem::Alloc) -> Index {
-    return Index(items: items, next_item: next_item, nodes: mem::HashMap.empty(seed: 0x5354_4F52, alloc), table: mem::HashMap.empty(seed: 0x5441_424C, alloc), next_dirty: DIRTY_BIT, changes: mem::HashMap.empty(seed: 0x4348_4E47, alloc), stale: mem::List.empty(alloc))
+    return Index(items: items, next_item: next_item, nodes: mem::HashMap.empty(seed: 0x5354_4F52, alloc), table: mem::HashMap.empty(seed: 0x5441_424C, alloc), next_dirty: DIRTY_BIT, changes: mem::HashMap.empty(seed: 0x4348_4E47, alloc), stale: mem::List.empty(alloc), history_change: 0, agents_change: 0)
 } Index.of
 
 /// The index of an empty volume: an item table of one empty leaf.
@@ -122,6 +140,36 @@ pkg fn Index.place(
     discard mut self.changes.insert(item, value: change)
 } Index.place
 
+/// Records that `item` is a node of `tree`, or a value for tree 0, added by an agent or child principal when `agent`.
+pkg fn Index.describe(mut self, item: u64, tree: u8, agent: bool) {
+    var change = self.change_of(item)
+    change.described = true
+    change.tree = tree
+    change.agent = agent
+    discard mut self.changes.insert(item, value: change)
+} Index.describe
+
+/// One more referrer that heads reach names `item`, or one fewer for a negative `delta`.
+pkg fn Index.reach(mut self, item: u64, delta: i64) {
+    var change = self.change_of(item)
+    change.heads += delta
+    discard mut self.changes.insert(item, value: change)
+} Index.reach
+
+/// One more entry names `item`, a new node of `tree` whose children and values count it among what heads reach when `heads`; one more referrer that heads reach too when `heads`.
+fn Index.retain_new(mut self, item: u64, tree: u8, heads: bool) {
+    var change = self.change_of(item)
+    change.delta += 1
+    change.tree = tree
+    if heads {
+        change.heads += 1
+        change.reaching = Reaching.Reaches
+    } else {
+        change.reaching = Reaching.Unreached
+    }
+    discard mut self.changes.insert(item, value: change)
+} Index.retain_new
+
 /// One more entry names `item`.
 pkg fn Index.retain(mut self, item: u64) {
     var change = self.change_of(item)
@@ -144,14 +192,18 @@ pkg fn Index.item_entry[D: disk::Device](mut self, device: D, item: u64, alloc: 
     let Some(change) = self.changes.get(item) else {
         return stored
     }
-    var entry = stored.value_or(ItemEntry(address: 0, length: 0, kind: 0, refcount: 0))
+    var entry = stored.value_or(ItemEntry(address: 0, length: 0, kind: 0, refcount: 0, heads: 0, tree: 0, agent: false))
     if change.placed {
         entry.address = change.address
         entry.length = change.length
         entry.kind = change.kind
     }
-    let count = i64.widen(entry.refcount) + change.delta
-    entry.refcount = u32.saturate(count)
+    if change.described {
+        entry.tree = change.tree
+        entry.agent = change.agent
+    }
+    entry.refcount = u32.saturate(i64.widen(entry.refcount) + change.delta)
+    entry.heads = u32.saturate(i64.widen(entry.heads) + change.heads)
     return Some(entry)
 } Index.item_entry
 
@@ -211,7 +263,7 @@ pkg fn Index.put[D: disk::Device, V: Values](
     let Some(sibling) = changed.split else {
         return
     }
-    mut self.grow(mut root, take sibling, totals: changed.totals, alloc)
+    mut self.grow(mut root, take sibling, totals: changed.totals, heads: values.reaches_heads(), alloc)
 } Index.put
 
 /// Removes `key` from the tree under `root` and gives the value it held.
@@ -276,13 +328,20 @@ fn Index.writable[D: disk::Device, V: Values](
     }
     let copy = mut self.new_node_id(tree)
     let duplicate = node.duplicate(item: copy, mut values, alloc)
+    let heads = values.reaches_heads()
     for child in duplicate.children {
         mut self.retain(child.node)
+        if heads {
+            mut self.reach(child.node, delta: 1)
+        }
     }
     discard mut self.keep(tree, id, take node)
     discard mut self.keep(tree, id: copy, node: take duplicate)
     mut self.release(id, tree, pointer)
-    mut self.retain(copy)
+    if heads {
+        mut self.reach(id, delta: -1)
+    }
+    mut self.retain_new(copy, tree, heads)
     return copy
 } Index.writable
 
@@ -335,7 +394,7 @@ fn Index.put_in[D: disk::Device, V: Values](
                 fail TreeFailure.Corrupt
             }
             if tree != ITEM_TABLE {
-                mut self.retain(sibling.node)
+                mut self.retain_new(sibling.node, tree, heads: values.reaches_heads())
             }
             mut node.children.insert(at + 1, value: take sibling)
         }
@@ -376,6 +435,9 @@ fn Index.remove_in[D: disk::Device, V: Values](
             let gone = mut node.children.remove(at)
             if tree != ITEM_TABLE {
                 mut self.release(writable, tree, pointer: gone.pointer)
+                if values.reaches_heads() {
+                    mut self.reach(writable, delta: -1)
+                }
             }
         }
         value = removed.value
@@ -417,6 +479,7 @@ fn Index.grow(
     mut root: Root,
     take sibling: Child,
     totals: Totals,
+    heads: bool,
     alloc: mem::Alloc,
     ) {
     let top = mut self.new_node_id(root.tree)
@@ -431,8 +494,8 @@ fn Index.grow(
     mut node.children.push(take sibling)
     discard mut self.keep(root.tree, id: top, take node)
     if root.tree != ITEM_TABLE {
-        mut self.retain(sibling_id)
-        mut self.retain(top)
+        mut self.retain_new(sibling_id, tree: root.tree, heads)
+        mut self.retain_new(top, tree: root.tree, heads)
     }
     root.node = top
 } Index.grow
@@ -513,7 +576,7 @@ fn item_of(tree: u8, id: u64) -> u64 {
 fn Index.change_of(self, item: u64) -> ItemChange {
     return match self.changes.get(item) {
         Some(change) => change
-        None => ItemChange(placed: false, address: 0, length: 0, kind: 0, delta: 0, tree: 0, pointer: disk::Pointer.none())
+        None => ItemChange(placed: false, address: 0, length: 0, kind: 0, delta: 0, heads: 0, described: false, agent: false, tree: 0, pointer: disk::Pointer.none(), reaching: Reaching.Stored)
     }
 } Index.change_of
 

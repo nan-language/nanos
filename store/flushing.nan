@@ -2,7 +2,15 @@
 
 /// Applies the reference changes collected since the last index flush: frees every item, blob, piece, origin set and type no entry names any more.
 pkg fn Store.settle_references[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    self.refs.heads = false
     loop {
+        mut self.settle_items()
+        match attempt await mut self.index.settle_heads(device, values: mut self.refs, alloc) {
+            Ok(_) => {
+            }
+            Err(failure) => fail StoreError.of_tree(take failure)
+        }
+        mut self.settle_items()
         match attempt await mut self.index.free_unnamed(device, values: mut self.refs, alloc) {
             Ok(_) => {
             }
@@ -11,7 +19,6 @@ pkg fn Store.settle_references[D: disk::Device](mut self, device: D, alloc: mem:
         if self.refs.items.len() == 0 {
             break
         }
-        mut self.settle_items()
     }
     try await mut self.settle_blobs(device, alloc)
     try await mut self.settle_counted(device, kind: KIND_ORIGIN_SET, alloc)
@@ -79,9 +86,13 @@ pkg fn Store.write_branch_entry[D: disk::Device](mut self, device: D, at: usize,
 fn Store.settle_blobs[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
     var changed = mem::List[BlobDelta].empty(alloc)
     for entry in self.refs.blobs.cursor() {
-        mut changed.push(BlobDelta(id: entry.key(), delta: entry.value()))
+        mut changed.push(BlobDelta(id: entry.key(), delta: entry.value(), heads: 0))
+    }
+    for entry in self.refs.blob_heads.cursor() {
+        mut changed.push(BlobDelta(id: entry.key(), delta: 0, heads: entry.value()))
     }
     mut self.refs.blobs.retain(fn(key: ident::HashValue, value: i64) => false)
+    mut self.refs.blob_heads.retain(fn(key: ident::HashValue, value: i64) => false)
     for change in changed {
         let key = catalog_key(KIND_BLOB, key: change.id.bytes.view(), alloc)
         let Some(held) = try await mut self.catalog_get(device, key: key.view(), alloc) else {
@@ -89,14 +100,33 @@ fn Store.settle_blobs[D: disk::Device](mut self, device: D, alloc: mem::Alloc) f
         }
         let stored = try decode_blob_entry(held.view(), alloc)
         let count = i64.fit(stored.refcount) + change.delta
+        let reached = i64.fit(stored.heads) + change.heads
         if count > 0 {
-            let updated = BlobEntry(size: stored.size, refcount: u64.fit(count))
+            let updated = BlobEntry(size: stored.size, refcount: u64.fit(count), heads: u64.saturate(reached), agent: stored.agent)
+            mut self.count_bytes(history: blob_history(updated) - blob_history(stored), agents: blob_agents(updated) - blob_agents(stored))
             try await mut self.catalog_put(device, key: key.view(), value: wire_of(updated, alloc).view(), alloc)
         } else {
+            mut self.count_bytes(history: 0 - blob_history(stored), agents: 0 - blob_agents(stored))
             try await mut self.free_blob(device, id: change.id, alloc)
         }
     }
 } Store.settle_blobs
+
+/// The bytes of a blob something names but no head reaches, unless an agent added it.
+fn blob_history(entry: BlobEntry) -> i64 {
+    if entry.refcount == 0 or entry.heads > 0 or entry.agent {
+        return 0
+    }
+    return i64.saturate(entry.size)
+} blob_history
+
+/// The bytes of a blob an agent or child principal added that something names.
+fn blob_agents(entry: BlobEntry) -> i64 {
+    if entry.refcount == 0 or not entry.agent {
+        return 0
+    }
+    return i64.saturate(entry.size)
+} blob_agents
 
 /// Frees blob `id`: its entry and piece entries, and each piece it alone named.
 pkg fn Store.free_blob[D: disk::Device](mut self, device: D, id: ident::HashValue, alloc: mem::Alloc) fails StoreError uses wait {
@@ -190,6 +220,7 @@ fn Store.recount[D: disk::Device](
 struct BlobDelta derives Copy {
     id: ident::HashValue
     delta: i64
+    heads: i64
 } BlobDelta
 
 /// A change of the references to an origin set or type.

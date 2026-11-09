@@ -12,6 +12,11 @@ pkg fn NoValues.retain(mut self, tree: u8, value: Slice[u8]) {
 pkg fn NoValues.release(mut self, tree: u8, value: Slice[u8]) {
 } NoValues.release
 
+pkg fn NoValues.reach(mut self, tree: u8, value: Slice[u8], delta: i64) {
+} NoValues.reach
+
+pkg fn NoValues.reaches_heads(self) -> bool = false
+
 /// A node as an index flush wrote it: its in-memory id and the pointer naming it.
 struct Written derives Copy {
     id: u64
@@ -70,6 +75,7 @@ pkg fn Index.write_items[D: disk::Device](
                 }
             }
         }
+        mut self.account(before: stored, after: Some(updated))
         var bytes = mem::Bytes.empty(alloc)
         mem::wire::Codec[ItemEntry].encode(updated, out: mut bytes)
         var table = self.items
@@ -116,6 +122,7 @@ fn Index.free_item[D: disk::Device, V: Values](
     ) fails TreeFailure uses wait {
     let change = self.change_of(item)
     let stored = try await mut self.stored_entry(device, item, alloc)
+    mut self.account(before: stored, after: None)
     discard mut self.changes.remove(item)
     var none = NoValues()
     match stored {
@@ -186,6 +193,7 @@ fn Index.write_node(
         return Written(id: appended.address, pointer: appended.pointer)
     }
     mut self.place(id, address: appended.address, length: appended.pointer.length, kind: disk::RecordKind.Index.code())
+    mut self.describe(id, tree, agent: false)
     discard mut self.keep(tree, id, take node)
     return Written(id: id, pointer: disk::Pointer(target: id, length: appended.pointer.length, kind: appended.pointer.kind, by_item: true, checksum: appended.pointer.checksum))
 } Index.write_node
@@ -254,3 +262,119 @@ fn Index.first_table_entry[D: disk::Device](mut self, device: D, below: Root, al
         at = Root(tree: ITEM_TABLE, node: node.children[0].node, pointer: node.children[0].pointer)
     }
 } Index.first_table_entry
+
+/// Applies the changes of what heads reach: a node that heads come to reach, or cease to, adds or removes one referrer that heads reach for each of its children and the values of its leaves, until no node changes.
+pkg fn Index.settle_heads[D: disk::Device, V: Values](mut self, device: D, mut values: V, alloc: mem::Alloc) fails TreeFailure uses wait {
+    loop {
+        let Some(turn) = try await mut self.next_turn(device, alloc) else {
+            return
+        }
+        var change = self.change_of(turn.item)
+        change.reaching = match turn.reaches {
+            true => Reaching.Reaches
+            false => Reaching.Unreached
+        }
+        discard mut self.changes.insert(turn.item, value: change)
+        let tree = match turn.tree {
+            0 => change.tree
+            else => turn.tree
+        }
+        if tree == 0 or tree == ITEM_TABLE {
+            continue
+        }
+        let delta: i64 = match turn.reaches {
+            true => 1
+            false => -1
+        }
+        try await mut self.load(device, tree, id: turn.item, pointer: change.pointer, alloc)
+        let Some(node) = mut self.withdraw(tree, id: turn.item) else {
+            continue
+        }
+        for leaf in node.leaves {
+            mut values.reach(tree, value: leaf.value.view(), delta)
+        }
+        for child in node.children {
+            mut self.reach(child.node, delta)
+        }
+        discard mut self.keep(tree, id: turn.item, take node)
+    }
+} Index.settle_heads
+
+/// A node whose children and values must start or stop counting it among what heads reach them through.
+struct Turn derives Copy {
+    item: u64
+    tree: u8
+    reaches: bool
+} Turn
+
+/// The next changed item whose being reached from heads differs from what its children and values count.
+fn Index.next_turn[D: disk::Device](mut self, device: D, alloc: mem::Alloc) -> Option[Turn] fails TreeFailure uses wait {
+    var items = mem::List[u64].empty(alloc)
+    for entry in self.changes.cursor() {
+        mut items.push(entry.key())
+    }
+    for item in items {
+        let change = self.change_of(item)
+        let stored = try await mut self.stored_entry(device, item, alloc)
+        let stored_heads = match stored {
+            Some(entry) => i64.widen(entry.heads)
+            None => 0
+        }
+        let counted = match change.reaching {
+            Reaching.Reaches => true
+            Reaching.Unreached => false
+            Reaching.Stored => stored_heads > 0
+        }
+        let reaches = stored_heads + change.heads > 0
+        if counted != reaches {
+            let tree = match stored {
+                Some(entry) => entry.tree
+                None => 0
+            }
+            return Some(Turn(item: item, tree: tree, reaches: reaches))
+        }
+    }
+    return None
+} Index.next_turn
+
+/// Counts the change of an item's entry from `before` to `after` in the bytes that only past commits reach and the bytes agents added.
+fn Index.account(mut self, before: Option[ItemEntry], after: Option[ItemEntry]) {
+    self.history_change += i64.widen(history_bytes(after)) - i64.widen(history_bytes(before))
+    self.agents_change += i64.widen(agent_bytes(after)) - i64.widen(agent_bytes(before))
+} Index.account
+
+/// The bytes of an item that something names but no head reaches: a value, or a node of tree 1, which past commits read.
+fn history_bytes(entry: Option[ItemEntry]) -> u32 {
+    let Some(held) = entry else {
+        return 0
+    }
+    if held.refcount == 0 or held.heads > 0 or held.agent or held.tree > 1 {
+        return 0
+    }
+    return held.length
+} history_bytes
+
+/// The bytes of a value an agent or child principal added that something names.
+fn agent_bytes(entry: Option[ItemEntry]) -> u32 {
+    let Some(held) = entry else {
+        return 0
+    }
+    if held.refcount == 0 or not held.agent {
+        return 0
+    }
+    return held.length
+} agent_bytes
+
+/// The changes of the bytes only past commits reach and of the bytes agents added since the last call.
+pkg fn Index.take_accounts(mut self) -> Accounts {
+    let accounts = Accounts(history: self.history_change, agents: self.agents_change)
+    self.history_change = 0
+    self.agents_change = 0
+    return accounts
+} Index.take_accounts
+
+/// Changes of the bytes only past commits reach and of the bytes agents added.
+pkg struct Accounts derives Copy {
+    pkg history: i64
+    pkg agents: i64
+} Accounts

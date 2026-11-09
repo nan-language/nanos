@@ -34,8 +34,8 @@ pub fn Store.branch[D: disk::Device](
     }
     let snapshot = try await mut self.snapshot(device, head: source, at: fork, alloc)
     let unversioned = self.heads[source].unversioned
-    mut self.index.retain(snapshot.root.node)
-    mut self.index.retain(unversioned.node)
+    mut self.hold_head_tree(snapshot.root)
+    mut self.hold_head_tree(unversioned)
     let branch = Branch(name: text::String.of(name, alloc), head: ident::CommitId(number: fork), fork: ident::CommitId(number: fork), parent: Some(text::String.of(from, alloc)), created_by: ident::Principal(text: by.text), expires: expires)
     let created = branch.copied(alloc)
     mut self.heads.push(Head(branch: take branch, versioned: snapshot.root, unversioned: unversioned, written: 0))
@@ -68,6 +68,25 @@ pub fn Store.preview[D: disk::Device](
     return try await mut self.branch(device, name: name.as_str(), from, at: None, by, expires: None, system: true, now, alloc)
 } Store.preview
 
+/// Holds the tree under `root`, which a branch head reaches.
+pkg fn Store.hold_head_tree(mut self, root: tree::Root) {
+    mut self.index.retain(root.node)
+    mut self.index.reach(root.node, delta: 1)
+    mut self.index.describe(root.node, tree: root.tree, agent: false)
+} Store.hold_head_tree
+
+/// Releases the tree under `root`, which a branch head reached.
+pkg fn Store.release_head_tree(mut self, root: tree::Root) {
+    mut self.index.release(root.node, tree: root.tree, pointer: root.pointer)
+    mut self.index.reach(root.node, delta: -1)
+} Store.release_head_tree
+
+/// Releases the trees of a branch head gone.
+pkg fn Store.drop_head_trees(mut self, gone: Head) {
+    mut self.release_head_tree(gone.versioned)
+    mut self.release_head_tree(gone.unversioned)
+} Store.drop_head_trees
+
 /// Deletes branch `name` and releases its trees; `store.branch-reserved` for `main`.
 pub fn Store.delete_branch[D: disk::Device](
     mut self,
@@ -84,8 +103,7 @@ pub fn Store.delete_branch[D: disk::Device](
     }
     let head = try self.head_named(name)
     let gone = mut self.heads.remove(head)
-    mut self.index.release(gone.versioned.node, tree: TREE_VERSIONED, pointer: gone.versioned.pointer)
-    mut self.index.release(gone.unversioned.node, tree: TREE_UNVERSIONED, pointer: gone.unversioned.pointer)
+    mut self.drop_head_trees(gone)
     discard try await mut self.catalog_remove(device, key: catalog_key(KIND_BRANCH, key: name.as_bytes(), alloc).view(), alloc)
     try await mut self.remove_pin(device, commit: gone.branch.fork.number, reason: PinReason.Branch, alloc)
     try await mut self.index_flush(device, now, alloc)
@@ -211,14 +229,24 @@ fn Store.give_tree[D: disk::Device](
     mut self.index.retain(root.node)
     let saved = self.heads[head].versioned
     self.heads[head].versioned = root
+    self.building = true
     var staged = Staged.empty(alloc)
     for laid in snapshot.overlay.cursor() {
         let Some(parts) = laid.key().view().split_at(8) else {
             continue
         }
         let place = Place(head: head, tree: TREE_VERSIONED, dir: laid.key().view().u64_be(0), name: copied_bytes(parts.tail, alloc))
-        discard try await mut self.set_entry(device, place, entry: copied_entry(laid.value(), alloc), mut staged, alloc)
+        match attempt await mut self.set_entry(device, place, entry: copied_entry(laid.value(), alloc), mut staged, alloc) {
+            Ok(_) => {
+            }
+            Err(failure) => {
+                self.building = false
+                self.heads[head].versioned = saved
+                fail failure
+            }
+        }
     }
+    self.building = false
     root = self.heads[head].versioned
     self.heads[head].versioned = saved
     let written = try mut self.write_tree(root, flush: self.flush + 1, now: entry.meta.time, alloc)

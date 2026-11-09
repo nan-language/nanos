@@ -62,6 +62,12 @@ pub open struct Store {
     pkg next_draft: u64
     pkg blob_records: mem::List[tree::Retired]
     pkg tended: mem::List[Tended]
+    pkg building: bool
+    pkg history_bytes: u64
+    pkg agent_bytes: u64
+    pkg agent_pending: u64
+    pkg history_records: u64
+    pkg thinning: Thinned
     pkg first_logged: i64
 } Store
 
@@ -99,16 +105,24 @@ pub fn Store.format[D: disk::Device](device: D, volume_id: Array[u8, 16], now: i
     return store
 } Store.format
 
+/// Changes the bytes only past commits reach and the bytes agents added by `history` and `agents`.
+pkg fn Store.count_bytes(mut self, history: i64, agents: i64) {
+    self.history_bytes = u64.saturate(i64.saturate(self.history_bytes) + history)
+    self.agent_bytes = u64.saturate(i64.saturate(self.agent_bytes) + agents)
+} Store.count_bytes
+
 /// Writes the index's changes, makes branch heads flush commits, and writes a flush record, after which a mount replays only what follows.
 pub fn Store.index_flush[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) fails StoreError uses wait {
     if self.read_only {
         fail StoreError.ReadOnly
     }
     let flush = self.flush + 1
+    let history = self.history_in_use()
     discard try await mut self.thin(device, now, tiers: true, most: 0xFFFF_FFFF_FFFF_FFFF, alloc)
     try await mut self.tend(device, now, alloc)
     try await mut self.keep_requests(device, alloc)
     try await mut self.settle_references(device, alloc)
+    try await mut self.thin_history(device, now, alloc)
     try await mut self.write_heads(device, flush, now, alloc)
     self.machine = try mut self.write_tree(root: self.machine, flush, now, alloc)
     var pointer = self.machine.pointer
@@ -119,9 +133,16 @@ pub fn Store.index_flush[D: disk::Device](mut self, device: D, now: ident::WallT
         Ok(root) => root
         Err(failure) => fail StoreError.of_tree(take failure)
     }
+    let accounts = mut self.index.take_accounts()
+    mut self.count_bytes(history: accounts.history, agents: accounts.agents)
+    self.agent_pending = 0
+    if self.thinning.commits > 0 {
+        mut self.events.push(Event.HistoryThinned(commits: self.thinning.commits, bytes: history.saturating_sub(self.history_in_use()), oldest: ident::CommitId(number: self.thinning.oldest)))
+        self.thinning = Thinned(commits: 0, oldest: 0)
+    }
     try await mut self.flush_log(device, alloc)
     let position = self.log.position
-    let record = disk::FlushRecord(flush: flush, batch: position.batch, segment: position.segment, block: position.block, commit: self.counters.commit - 1, next_item: self.index.next_item, next_dir: self.counters.dir, next_secret: self.counters.secret, next_stream: self.counters.stream, time: now.utc_ns, catalog: self.catalog.pointer, items: items.pointer, next_preview: self.counters.preview)
+    let record = disk::FlushRecord(flush: flush, batch: position.batch, segment: position.segment, block: position.block, commit: self.counters.commit - 1, next_item: self.index.next_item, next_dir: self.counters.dir, next_secret: self.counters.secret, next_stream: self.counters.stream, time: now.utc_ns, catalog: self.catalog.pointer, items: items.pointer, next_preview: self.counters.preview, history: self.history_bytes, agents: self.agent_bytes)
     try await mut self.guarded_write(device, block: disk::flush_slot(flush), data: record.to_block(alloc), alloc)
     try await mut self.guarded_flush(device, alloc)
     self.flush = flush
@@ -175,5 +196,5 @@ pkg fn Store.over(superblock: disk::Superblock, alloc: mem::Alloc) -> Store {
     let log = log::Log.of(superblock.volume_id, segments: take states, position: log::Position(segment: 0, sequence: 0, next: 0, block: 0, batch: 1), alloc)
     let empty = tree::Root(tree: 0, node: 0, pointer: disk::Pointer.none())
     let counters = Counters(commit: 1, dir: TOP_DIR + 1, stream: 1, secret: 1, origin: 1, type: 1, preview: 1)
-    return Store(superblock: superblock, log: take log, index: tree::Index.empty(next_item: 1, alloc), catalog: empty, machine: empty, heads: mem::List.empty(alloc), counters: counters, sealed: mem::List.empty(alloc), flush: 0, read_only: false, schemas: Registry.empty(alloc), retention: Retention.default_of(alloc), request_window: 1_024, refs: Refs.empty(alloc), events: mem::List.empty(alloc), segments_written: mem::List.empty(alloc), drafts: mem::Map.empty(alloc), next_draft: 1, blob_records: mem::List.empty(alloc), tended: mem::List.empty(alloc), first_logged: 0)
+    return Store(superblock: superblock, log: take log, index: tree::Index.empty(next_item: 1, alloc), catalog: empty, machine: empty, heads: mem::List.empty(alloc), counters: counters, sealed: mem::List.empty(alloc), flush: 0, read_only: false, schemas: Registry.empty(alloc), retention: Retention.default_of(alloc), request_window: 1_024, refs: Refs.empty(alloc), events: mem::List.empty(alloc), segments_written: mem::List.empty(alloc), drafts: mem::Map.empty(alloc), next_draft: 1, blob_records: mem::List.empty(alloc), tended: mem::List.empty(alloc), building: false, history_bytes: 0, agent_bytes: 0, agent_pending: 0, history_records: 0, thinning: Thinned(commits: 0, oldest: 0), first_logged: 0)
 } Store.over

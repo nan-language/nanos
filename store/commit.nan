@@ -14,13 +14,14 @@ pkg const MOST_STREAM_ENTRY_BYTES: usize = 65_536
 
 const MOST_INTENT_BYTES: usize = 1_024
 
-/// What applying a commit's writes needs: the branch, the commit's number and base, the origin set its nodes carry, whether its writes are typed, and the time.
+/// What applying a commit's writes needs: the branch, the commit's number and base, the origin set its nodes carry, whether its writes are typed, whether an agent or child principal makes it, and the time.
 pkg struct Writing derives Copy {
     pkg head: usize
     pkg number: u64
     pkg base: u64
     pkg origins: u32
     pkg typed: bool
+    pkg agent: bool
     pkg now: ident::WallTime
 } Writing
 
@@ -82,9 +83,10 @@ fn Store.stage[D: disk::Device](
     }
     try check_limits(transaction)
     try await mut self.bound_log(device, adding: transaction_bytes(transaction), now, alloc)
+    let adding = transaction_bytes(transaction)
+    try self.check_agent_share(adding, principal: stamp.principal)
     var staged = Staged.empty(alloc)
     var writing = try await mut self.validate(device, head, transaction, stamp, now, mut staged, alloc)
-    let adding = transaction_bytes(transaction)
     if self.free_bytes() < adding {
         try await mut self.undo(device, mut staged, alloc)
         try await mut self.make_space(device, adding, principal: stamp.principal, now, alloc)
@@ -117,7 +119,7 @@ fn Store.validate[D: disk::Device](
     let expected = try await mut self.expectations_hold(device, head, expects: transaction.expects.view(), now, alloc)
     let read = try await mut self.reads_hold(device, head, reads: transaction.reads.view(), now, alloc)
     let origins = try await mut self.origin_id(device, labels: stamp.origins.view(), mut staged, alloc)
-    let writing = Writing(head: head, number: self.counters.commit, base: base, origins: origins, typed: stamp.typed, now: now)
+    let writing = Writing(head: head, number: self.counters.commit, base: base, origins: origins, typed: stamp.typed, agent: adds_agent_bytes(stamp.principal), now: now)
     let outcome = attempt await mut self.apply_writes(device, writes: transaction.writes.view(), writing, mut staged, alloc)
     let serializable = transaction.plan.is_some() or touches_sys(transaction.writes.view(), alloc)
     let refused = match outcome {
@@ -264,6 +266,7 @@ fn Store.settle[D: disk::Device](mut self, device: D, take sealed: Sealed, alloc
         try await mut self.catalog_put(device, key: run.key.view(), value: value.view(), alloc)
     }
     mut self.logged(now: meta.time)
+    mut self.count_bytes(history: 0, agents: i64.saturate(logged.agent_runs))
     let committed = Committed(number: meta.number, branch: text::String.of(meta.branch.as_str(), alloc), time: meta.time)
     try await mut self.record_commit(device, take meta, record: logged.pointer, writes: staged.writes.view(), changes: staged.changes.view(), alloc)
     for place in staged.streams {
@@ -344,6 +347,7 @@ fn Store.place_flushed[D: disk::Device](
 pkg struct Logged {
     pkg pointer: disk::Pointer
     pkg runs: mem::List[CatalogWrite]
+    pkg agent_runs: u64
 } Logged
 
 /// Appends a commit's value records, stream runs and commit record to the log.
@@ -363,9 +367,19 @@ fn Store.log_commit(
             Err(failure) => fail StoreError.of_log(take failure)
         }
         mut self.index.place(value.item, address: placed.address, length: placed.pointer.length, kind: disk::RecordKind.Value.code())
+        mut self.index.describe(value.item, tree: 0, agent: value.agent)
+        if value.agent {
+            self.agent_pending += u64.widen(value.bytes.len())
+        }
     }
     var runs = mem::List[CatalogWrite].empty(alloc)
+    var agent_runs: u64 = 0
     for run in staged.runs {
+        if run.agent {
+            for entry in run.entries {
+                agent_runs += u64.widen(entry.value.len())
+            }
+        }
         mut runs.push(try mut self.log_run(run, time, alloc))
     }
     var key = Array[u8, 32].filled(0)
@@ -374,7 +388,7 @@ fn Store.log_commit(
         Ok(found) => found
         Err(failure) => fail StoreError.of_log(take failure)
     }
-    return Logged(pointer: placed.pointer, runs: take runs)
+    return Logged(pointer: placed.pointer, runs: take runs, agent_runs: agent_runs)
 } Store.log_commit
 
 /// Records a durable commit in the catalog: its entry naming its record, and the path changes of a recorded commit; the record's node entries hold references to what they name while the commit is retained.
@@ -395,7 +409,7 @@ pkg fn Store.record_commit[D: disk::Device](
         let Some(written) = writes[at].entry else {
             continue
         }
-        mut self.refs.count(written, delta: 1)
+        mut self.refs.count(written, delta: 1, heads: false)
     }
     mut self.settle_items()
     let entry = CommitEntry(meta: take meta, record: Some(record.to_list(alloc)), tree: None)

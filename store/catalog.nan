@@ -1,48 +1,51 @@
 //! The catalog's entries read and written through the index, and the reference changes of value items, blobs, origin sets and types that collect until an index flush.
 
-/// The reference changes node entries make as leaves holding them are copied, freed, written or replaced.
+/// The reference changes node entries make as leaves holding them are copied, freed, written or replaced, with the changes of the references that branch heads reach to value items and blobs, which a change of a head's tree makes when `heads` holds.
 pkg struct Refs {
     pkg items: mem::List[ItemRef]
     pkg blobs: mem::Map[ident::HashValue, i64]
+    pkg blob_heads: mem::Map[ident::HashValue, i64]
     pkg origins: mem::Map[u32, i64]
     pkg types: mem::Map[u32, i64]
+    pkg heads: bool
     alloc: mem::Alloc
 } Refs
 
-/// A change of the references to a value item, which the pointer naming it names.
+/// A change of the references to a value item, and of those of them that heads reach, which the pointer naming it names.
 pkg struct ItemRef derives Copy {
     pkg item: u64
     pkg delta: i64
+    pkg heads: i64
     pkg pointer: disk::Pointer
 } ItemRef
 
 impl Refs: tree::Values
 
 pkg fn Refs.empty(alloc: mem::Alloc) -> Refs {
-    return Refs(items: mem::List.empty(alloc), blobs: mem::Map.empty(alloc), origins: mem::Map.empty(alloc), types: mem::Map.empty(alloc), alloc: alloc)
+    return Refs(items: mem::List.empty(alloc), blobs: mem::Map.empty(alloc), blob_heads: mem::Map.empty(alloc), origins: mem::Map.empty(alloc), types: mem::Map.empty(alloc), heads: false, alloc: alloc)
 } Refs.empty
 
 pkg fn Refs.retain(mut self, tree: u8, value: Slice[u8]) {
-    mut self.count_bytes(tree, value, delta: 1)
+    mut self.count_bytes(tree, value, delta: 1, reach: false)
 } Refs.retain
 
 pkg fn Refs.release(mut self, tree: u8, value: Slice[u8]) {
-    mut self.count_bytes(tree, value, delta: -1)
+    mut self.count_bytes(tree, value, delta: -1, reach: false)
 } Refs.release
 
-/// Counts the references of `entry` by `delta`.
-pkg fn Refs.count(mut self, entry: NodeEntry, delta: i64) {
-    match entry.content {
-        Content.Value(bytes) => {
-            let Some(pointer) = disk::Pointer.of_bytes(bytes.view()) else {
-                return
-            }
-            mut self.items.push(ItemRef(item: pointer.target, delta: delta, pointer: pointer))
-        }
-        Content.Blob(id: id, size: _) => add_delta(mut self.blobs, key: id, delta)
-        else => {
-        }
+pkg fn Refs.reach(mut self, tree: u8, value: Slice[u8], delta: i64) {
+    mut self.count_bytes(tree, value, delta, reach: true)
+} Refs.reach
+
+pkg fn Refs.reaches_heads(self) -> bool = self.heads
+
+/// Counts the references of `entry` by `delta`, and those that heads reach when `heads`.
+pkg fn Refs.count(mut self, entry: NodeEntry, delta: i64, heads: bool) {
+    let reached: i64 = match heads {
+        true => delta
+        false => 0
     }
+    mut self.count_reached(entry, delta, reached)
     if entry.origins != 0 {
         add_delta(mut self.origins, key: entry.origins, delta)
     }
@@ -53,6 +56,28 @@ pkg fn Refs.count(mut self, entry: NodeEntry, delta: i64) {
         add_delta(mut self.types, key: entry.declared, delta)
     }
 } Refs.count
+
+/// Counts the references of the value item or blob `entry` names by `delta`, and those that heads reach by `reached`.
+fn Refs.count_reached(mut self, entry: NodeEntry, delta: i64, reached: i64) {
+    match entry.content {
+        Content.Value(bytes) => {
+            let Some(pointer) = disk::Pointer.of_bytes(bytes.view()) else {
+                return
+            }
+            mut self.items.push(ItemRef(item: pointer.target, delta: delta, heads: reached, pointer: pointer))
+        }
+        Content.Blob(id: id, size: _) => {
+            if delta != 0 {
+                add_delta(mut self.blobs, key: id, delta)
+            }
+            if reached != 0 {
+                add_delta(mut self.blob_heads, key: id, delta: reached)
+            }
+        }
+        else => {
+        }
+    }
+} Refs.count_reached
 
 /// Counts a change of `delta` to the references of blob `id`.
 pkg fn Refs.count_blob(mut self, id: ident::HashValue, delta: i64) {
@@ -68,7 +93,14 @@ pkg fn Refs.count_id(mut self, kind: u8, id: u32, delta: i64) {
     }
 } Refs.count_id
 
-fn Refs.count_bytes(mut self, tree: u8, value: Slice[u8], delta: i64) {
+/// Counts the references a leaf value `value` of `tree` makes by `delta`: those that heads reach alone when `reach`, else all of them, and those that heads reach too in a head's tree.
+fn Refs.count_bytes(
+    mut self,
+    tree: u8,
+    value: Slice[u8],
+    delta: i64,
+    reach: bool,
+    ) {
     if tree == TREE_CATALOG {
         return
     }
@@ -76,7 +108,11 @@ fn Refs.count_bytes(mut self, tree: u8, value: Slice[u8], delta: i64) {
     let Ok(entry) = attempt mem::wire::Codec[NodeEntry].decode(Untrusted.of(raw.view()), alloc: self.alloc) else {
         return
     }
-    mut self.count(entry, delta)
+    if reach {
+        mut self.count_reached(entry, delta: 0, reached: delta)
+        return
+    }
+    mut self.count(entry, delta, heads: self.heads)
 } Refs.count_bytes
 
 fn add_delta[K: Ord](mut deltas: mem::Map[K, i64], take key: K, delta: i64) {

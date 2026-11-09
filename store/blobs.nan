@@ -14,6 +14,7 @@ pkg struct Draft {
     pkg size: u64
     pkg touched: i64
     pkg closed: Option[ident::HashValue]
+    pkg agent: bool
 } Draft
 
 /// A blob's id and size, as closing its draft gives them.
@@ -26,7 +27,7 @@ pub closed struct Closed derives Copy, Eq {
 pub fn Store.draft(mut self, now: ident::WallTime, alloc: mem::Alloc) -> u64 {
     let id = self.next_draft
     self.next_draft += 1
-    let draft = Draft(filling: mem::Bytes.empty(alloc), keys: mem::List.empty(alloc), opening: mem::Bytes.empty(alloc), size: 0, touched: now.utc_ns, closed: None)
+    let draft = Draft(filling: mem::Bytes.empty(alloc), keys: mem::List.empty(alloc), opening: mem::Bytes.empty(alloc), size: 0, touched: now.utc_ns, closed: None, agent: false)
     discard mut self.drafts.insert(id, value: take draft)
     return id
 } Store.draft
@@ -53,6 +54,14 @@ pub fn Store.draft_append[D: disk::Device](
         discard mut self.drafts.insert(draft, value: take filling)
         fail StoreError.TooLarge
     }
+    match attempt self.check_agent_share(adding: u64.widen(bytes.len()), principal: by) {
+        Ok(_) => {
+        }
+        Err(failure) => {
+            discard mut self.drafts.insert(draft, value: take filling)
+            fail failure
+        }
+    }
     if self.free_bytes() < u64.widen(bytes.len()) {
         match attempt await mut self.make_space(device, adding: u64.widen(bytes.len()), principal: by, now, alloc) {
             Ok(_) => {
@@ -65,6 +74,7 @@ pub fn Store.draft_append[D: disk::Device](
     }
     mut filling.filling.append(bytes)
     filling.size += u64.widen(bytes.len())
+    filling.agent = filling.agent or adds_agent_bytes(by)
     filling.touched = now.utc_ns
     while filling.filling.len() >= ident::PIECE_BYTES {
         let piece = disk::copy_range(filling.filling.view(), at: 0, count: ident::PIECE_BYTES, alloc)
@@ -199,7 +209,7 @@ pkg fn Store.register_blob[D: disk::Device](
         digest[at + 1] = record.key[at]
     }
     mut self.blob_records.push(tree::Retired(address: pointer.target, length: pointer.length))
-    try await mut self.add_blob(device, id: ident::HashValue(bytes: digest), size: map.size, pieces: map.pieces.view(), alloc)
+    try await mut self.add_blob(device, id: ident::HashValue(bytes: digest), size: map.size, agent: map.agent, pieces: map.pieces.view(), alloc)
 } Store.register_blob
 
 /// Logs `piece`, the next piece of `draft`, unless a piece of its key is held already.
@@ -251,13 +261,13 @@ fn Store.store_blob[D: disk::Device](
     for at in 0..<32usize {
         key[at] = id.bytes[at + 1]
     }
-    let map = BlobMap(size: draft.size, pieces: copied_bytes(pieces.view(), alloc))
+    let map = BlobMap(size: draft.size, pieces: copied_bytes(pieces.view(), alloc), agent: draft.agent)
     let placed = match attempt mut self.log.append(disk::RecordKind.Blob, key, payload: wire_of(map, alloc).view(), time: now.utc_ns, alloc) {
         Ok(found) => found
         Err(failure) => fail StoreError.of_log(take failure)
     }
     mut self.blob_records.push(tree::Retired(address: placed.address, length: placed.pointer.length))
-    try await mut self.add_blob(device, id, size: draft.size, pieces: pieces.view(), alloc)
+    try await mut self.add_blob(device, id, size: draft.size, agent: draft.agent, pieces: pieces.view(), alloc)
 } Store.store_blob
 
 /// Adds the entry of blob `id` and its piece entries, each piece gaining its reference, unless the store holds the blob already.
@@ -266,6 +276,7 @@ fn Store.add_blob[D: disk::Device](
     device: D,
     id: ident::HashValue,
     size: u64,
+    agent: bool,
     pieces: Slice[u8],
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
@@ -274,7 +285,7 @@ fn Store.add_blob[D: disk::Device](
     if held.is_some() {
         return
     }
-    try await mut self.catalog_put(device, key: blob_key.view(), value: wire_of(BlobEntry(size: size, refcount: 0), alloc).view(), alloc)
+    try await mut self.catalog_put(device, key: blob_key.view(), value: wire_of(BlobEntry(size: size, refcount: 0, heads: 0, agent: agent), alloc).view(), alloc)
     mut self.refs.count_blob(id, delta: 0)
     let count = pieces.len() / 32
     for index in 0..<count {

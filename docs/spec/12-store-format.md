@@ -114,15 +114,15 @@ Records follow from offset 56, each starting at a multiple of 8; padding fills t
 | 2 value | the item id in bytes 0–7 | a record's stored bytes, ciphertext for a secret record |
 | 3 piece | the piece key | up to 64 KiB of blob bytes |
 | 4 index | the item id in bytes 0–7, zero for an item-table node | one 16 KiB index node |
-| 5 stream | the stream id in bytes 0–7, its earliest sequence number in bytes 8–15 | wire `mem::List[StreamEntry]` |
-| 6 blob | the blob id's 32-byte digest | wire `BlobMap { size: u64, pieces: mem::Bytes }`, the piece keys in order |
+| 5 stream | the stream id in bytes 0–7, its earliest sequence number in bytes 8–15, and 1 in byte 16 when an agent or child principal appended it | wire `mem::List[StreamEntry]` |
+| 6 blob | the blob id's 32-byte digest | wire `BlobMap { size: u64, pieces: mem::Bytes, agent: bool }`, the piece keys in order, `agent` when an agent or child principal drafted it |
 | 7 pad | zero | ignored |
 
 On a volume without encryption, a piece or index record is placed so that its payload begins at a block boundary, after a pad record when needed; a space too short for a pad record moves it one block further. `CommitRecord` is `{ meta: CommitMeta, writes: mem::List[LogWrite], catalog: mem::List[CatalogWrite] }`, with `LogWrite { tree: u8, dir: u64, name: mem::Bytes, entry: Option[NodeEntry] }`, `None` deleting the entry, and `CatalogWrite { key: mem::Bytes, value: Option[mem::Bytes] }` for each catalog entry the commit writes besides its own, such as its request key, origin sets and types, `None` removing it. The value, piece, stream and blob records a commit references precede its commit record, and a commit exists once its commit record is durable. A record the cleaner moves keeps its kind and key.
 
 ## Items
 
-An **item** is a log record reached through the item table: the index nodes of trees 1 to 4 and the value records. Item ids come from the counter `next_item` and are never reused. The **item table**, tree 5, maps an item id to `ItemEntry { address: u64, length: u32, kind: u8, refcount: u32 }`, `address` being the record's byte offset in the volume. Pointers inside the item table are byte offsets, so moving an item changes only its entry. Pieces, commit records and stream runs are reached by byte offset from the one catalog entry naming each, and item-table nodes from their parent or the flush record.
+An **item** is a log record reached through the item table: the index nodes of trees 1 to 4 and the value records. Item ids come from the counter `next_item` and are never reused. The **item table**, tree 5, maps an item id to `ItemEntry { address: u64, length: u32, kind: u8, refcount: u32, heads: u32, tree: u8, agent: bool }`, `address` being the record's byte offset in the volume, `heads` the references from what branch heads reach, `tree` a node's tree or 0 for a value record, and `agent` set for a value record an agent or child principal added. Pointers inside the item table are byte offsets, so moving an item changes only its entry. Pieces, commit records and stream runs are reached by byte offset from the one catalog entry naming each, and item-table nodes from their parent or the flush record.
 
 ## Index trees
 
@@ -166,7 +166,7 @@ Entries fill the node from its end downwards. A leaf entry is a key length (2 by
 | `expires` | `i64` | expiry in UTC nanoseconds, 0 for none |
 | `hash` | `Option[HashValue]` | the node's hash, once computed |
 | `held` | `bool` | the node is held beyond its dir's `keep` |
-| `content` | `Content` | `Inline(mem::Bytes)`, record bytes up to 1 KiB; `Value(pointer)`; `Blob { id: HashValue, size: u64 }`; `Dir { id: u64, declaration: mem::Bytes, digest: Option[HashValue], next: u64 }`, `next` being the number the next `Add` to a numbered dir names; `Stream { id: u64, declaration: mem::Bytes, next: u64, entries: u64, bytes: u64 }` |
+| `content` | `Content` | `Inline(mem::Bytes)`, record bytes up to 1 KiB of a principal other than an agent or a child principal; `Value(pointer)`; `Blob { id: HashValue, size: u64 }`; `Dir { id: u64, declaration: mem::Bytes, digest: Option[HashValue], next: u64 }`, `next` being the number the next `Add` to a numbered dir names; `Stream { id: u64, declaration: mem::Bytes, next: u64, entries: u64, bytes: u64 }` |
 
 ## The catalog
 
@@ -176,8 +176,8 @@ Entries fill the node from its end downwards. A leaf entry is a key length (2 by
 | 2 commit | number (8) | `CommitEntry { meta: CommitMeta, record: Option[pointer], tree: Option[pointer] }` |
 | 3 pin | commit (8) ‖ pin number (8) | `Pin` |
 | 4 request key | principal ‖ `0x00` ‖ the key's bytes | `RequestEntry { session: Option[SessionId], commit: u64, digest: HashValue, branch: text::String, time: WallTime }`, the branch and time of its commit |
-| 5 stream run | stream id (8) ‖ earliest sequence number (8) | `StreamRun { record: pointer, count: u32, bytes: u32, time: i64 }`, `time` being its newest entry's wall time |
-| 6 blob | blob id (33) | `BlobEntry { size: u64, refcount: u64 }` |
+| 5 stream run | stream id (8) ‖ earliest sequence number (8) | `StreamRun { record: pointer, count: u32, bytes: u32, time: i64, agent: bool }`, `time` being its newest entry's wall time |
+| 6 blob | blob id (33) | `BlobEntry { size: u64, refcount: u64, heads: u64, agent: bool }` |
 | 7 blob piece | blob id (33) ‖ piece index (8) | the piece key, 32 bytes |
 | 8 piece | piece key (32) | `PieceEntry { record: pointer, refcount: u64 }` |
 | 9 path change | tree (1) ‖ dir id (8) ‖ name ‖ `0x00` ‖ commit (8) | `PathChange { change: u8 }`: 1 created, 2 changed, 3 deleted |
@@ -228,7 +228,9 @@ A device failure at any step fails the index flush with `store.io` and leaves th
 | catalog | 80 | 32 | pointer to the catalog's top node |
 | items | 112 | 32 | pointer to the item table's top node |
 | next_preview | 144 | 8 | the number of the next preview branch |
-| reserved | 152 | 3,928 | |
+| history | 152 | 8 | the [history bytes](11-store.md#thinning) of items and blobs |
+| agents | 160 | 8 | the [agent bytes](11-store.md#thinning) of items, blobs and stream runs |
+| reserved | 168 | 3,912 | |
 | checksum | 4,080 | 16 | of bytes 0 to 4,079 |
 
 ## Mounting and recovery
@@ -247,7 +249,7 @@ A mount failure halts the kernel with its code as the cause ([04-kernel.md](04-k
 
 ## Reference counting
 
-Every item, blob entry, piece entry, origin set and type entry carries a reference count: the number of index and catalog entries of retained structures, and of node entries in the commit records of retained commits, that name it.
+Every item, blob entry, piece entry, origin set and type entry carries a reference count: the number of index and catalog entries of retained structures, and of node entries in the commit records of retained commits, that name it. An item and a blob entry also count the references from what branch heads reach: their roots, and the nodes those references reach; a node that heads come to reach, or cease to, adds or removes one such reference to each of its children and the values its leaves name. History bytes are those of the value records, versioned-tree nodes and blobs that something names but no head reaches, and of the commit records of retained commits other than heads; agent bytes are those of the value records, blobs and stream runs agents and child principals added, while something names them, and of their drafts. An agent's or child principal's record is always a value record.
 
 - When the store changes a node that more than one tree references, it writes a copy: each item, blob, origin set and type the copy names gains a reference, and the shared node loses the reference of the tree that changed. A blob entry holds one reference to each of its pieces.
 - Thinning a commit removes the references of its commit record's node entries and of its tree's top node; deleting a branch, those of its trees' top nodes.
