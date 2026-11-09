@@ -28,25 +28,16 @@ pkg fn Store.earlier_commit[D: disk::Device](
     if entry.digest != digest {
         fail StoreError.KeyReused
     }
-    let Some(commit) = try await mut self.catalog_get(device, key: number_key(KIND_COMMIT, number: entry.commit, width: 8, alloc).view(), alloc) else {
-        for sealed in self.sealed {
-            if sealed.meta.number.number == entry.commit {
-                return Some(Committed(number: sealed.meta.number, branch: text::String.of(sealed.meta.branch.as_str(), alloc), time: sealed.meta.time))
-            }
-        }
-        fail StoreError.KeyReused
-    }
-    let found = try decode_commit_entry(commit.view(), alloc)
-    return Some(Committed(number: found.meta.number, branch: take found.meta.branch, time: found.meta.time))
+    return Some(Committed(number: ident::CommitId(number: entry.commit), branch: take entry.branch, time: entry.time))
 } Store.earlier_commit
 
-/// Records the transaction's request key, when it has one, for its principal.
+/// Records the transaction's request key, when it has one, for its principal, with the commit it makes.
 pkg fn Store.request_entry[D: disk::Device](
     mut self,
     device: D,
     key: Option[text::String],
     stamp: Stamp,
-    number: u64,
+    writing: Writing,
     digest: ident::HashValue,
     mut staged: Staged,
     alloc: mem::Alloc,
@@ -54,9 +45,64 @@ pkg fn Store.request_entry[D: disk::Device](
     let Some(held) = key else {
         return
     }
-    let entry = RequestEntry(session: stamp.session, commit: number, digest: digest)
+    let entry = RequestEntry(session: stamp.session, commit: writing.number, digest: digest, branch: text::String.of(self.heads[writing.head].branch.name.as_str(), alloc), time: writing.now)
     try await mut self.stage_catalog(device, key: request_key(stamp.principal, key: held.as_str(), alloc).view(), value: wire_of(entry, alloc).view(), mut staged, alloc)
 } Store.request_entry
+
+/// The request keys kept: for each session, and for each principal of commits no session makes, those of its latest `window` keyed commits.
+pkg fn Store.keep_requests[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    let leaves = try await mut self.catalog_scan(device, kind: KIND_REQUEST, from: b"", limit: 0xFFFF_FFFF, alloc)
+    var kept = mem::List[Keyed].empty(alloc)
+    for leaf in leaves {
+        let entry = try decode_request_entry(leaf.value.view(), alloc)
+        mut kept.push(Keyed(group: request_group(leaf.key.view(), session: entry.session, alloc), commit: entry.commit, key: copied_bytes(leaf.key.view(), alloc)))
+    }
+    mut kept.sort_by(fn(left: Keyed, right: Keyed) => match left.group.view().cmp(right.group.view()) {
+        core::Ordering.Equal => right.commit.cmp(left.commit)
+        else => left.group.view().cmp(right.group.view())
+    })
+    var count: u64 = 0
+    for at in 0..<kept.len() {
+        if at == 0 or kept[at].group != kept[at - 1].group {
+            count = 0
+        }
+        count += 1
+        if count > u64.widen(self.request_window) {
+            discard try await mut self.catalog_remove(device, key: kept[at].key.view(), alloc)
+        }
+    }
+} Store.keep_requests
+
+/// A request entry as keeping weighs it: the session or principal it counts under, its commit and its catalog key.
+struct Keyed {
+    group: mem::Bytes
+    commit: u64
+    key: mem::Bytes
+} Keyed
+
+/// What a request entry counts under: its session, or the principal its catalog key names for a commit no session makes.
+fn request_group(key: Slice[u8], session: Option[ident::SessionId], alloc: mem::Alloc) -> mem::Bytes {
+    var group = mem::Bytes.empty(alloc)
+    match session {
+        Some(held) => {
+            mut group.push(1)
+            mut group.append(Array[u8, 8].filled(0).view())
+            mut group.view_mut().write_u64_be(1, value: held.boot)
+            mut group.append(Array[u8, 8].filled(0).view())
+            mut group.view_mut().write_u64_be(9, value: held.number)
+        }
+        None => {
+            mut group.push(0)
+            for byte in key {
+                if byte == 0 {
+                    break
+                }
+                mut group.push(byte)
+            }
+        }
+    }
+    return group
+} request_group
 
 /// Whether every expectation holds at the head of the branch at `head`.
 pkg fn Store.expectations_hold[D: disk::Device](

@@ -175,7 +175,7 @@ Entries fill the node from its end downwards. A leaf entry is a key length (2 by
 | 1 branch | name | `BranchEntry { branch: Branch, versioned: pointer, unversioned: pointer }` |
 | 2 commit | number (8) | `CommitEntry { meta: CommitMeta, record: Option[pointer], tree: Option[pointer] }` |
 | 3 pin | commit (8) ‖ pin number (8) | `Pin` |
-| 4 request key | principal ‖ `0x00` ‖ the key's bytes | `RequestEntry { session: Option[SessionId], commit: u64, digest: HashValue }` |
+| 4 request key | principal ‖ `0x00` ‖ the key's bytes | `RequestEntry { session: Option[SessionId], commit: u64, digest: HashValue, branch: text::String, time: WallTime }`, the branch and time of its commit |
 | 5 stream run | stream id (8) ‖ earliest sequence number (8) | `StreamRun { record: pointer, count: u32, bytes: u32, time: i64 }`, `time` being its newest entry's wall time |
 | 6 blob | blob id (33) | `BlobEntry { size: u64, refcount: u64 }` |
 | 7 blob piece | blob id (33) ‖ piece index (8) | the piece key, 32 bytes |
@@ -206,7 +206,7 @@ An **index flush** writes the index nodes changed since the previous one and a f
 1. Fix the set of dirty nodes; the replay position is the next log batch.
 2. Write the dirty nodes of the machine tree and of the trees of each branch whose head changed; that head becomes a **flush commit**, whose versioned tree its commit entry records. Write likewise the versioned trees of commits pinned since the previous flush.
 3. Compute the root hash of each new flush commit, reusing the digests of unchanged dirs.
-4. Apply the pending reference count changes, thinning, stream retention and expiries.
+4. Apply the pending reference count changes, thinning, stream retention, expiries and the retention of request keys: those of each session's latest `PlanConfig.key_results` keyed commits, and likewise of each principal's commits no session makes.
 5. Write the catalog's and the item table's dirty nodes, then perform a log flush.
 6. Write the flush record to ring slot (flush − 1) mod 64 and flush the device cache.
 
