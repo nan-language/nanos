@@ -1,0 +1,279 @@
+//! Reverts: each versioned node a commit wrote restored to its value in the commit's parent, unless a later commit changed it, in a commit of kind `Revert`; a dry run gives the writes instead.
+
+/// What a revert gives: its commit, or for a dry run the writes it would commit.
+pub closed enum Reverted {
+    Committed(Committed)
+    Writes(mem::List[Write])
+} Reverted
+
+/// A node a commit wrote: where it lies, its path, and its entry as the commit left it.
+struct Written {
+    dir: u64
+    name: mem::Bytes
+    path: ident::Path
+    entry: Option[NodeEntry]
+} Written
+
+/// Reverts commit `commit` of `branch`: `conflict.revert` listing each node a later commit changed, `store.thinned` naming the retained commit holding its changes when it is not retained.
+pub fn Store.revert[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    commit: ident::CommitId,
+    dry_run: bool,
+    take stamp: Stamp,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Reverted fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    let head = try self.head_named(branch)
+    let Some(found) = try await mut self.line_commit(device, head, number: commit.number, alloc) else {
+        fail StoreError.Thinned(retained: try await mut self.retained_after(device, head, number: commit.number, alloc))
+    }
+    let Some(pointer) = found.record else {
+        fail StoreError.Thinned(retained: commit.number)
+    }
+    let record = try await mut self.commit_record(device, pointer, alloc)
+    if record.meta.parents.len() == 0 {
+        fail StoreError.Kind
+    }
+    let parent = try await mut self.snapshot(device, head, at: record.meta.parents[0].number, alloc)
+    let written = try await mut self.reverted_nodes(device, parent, nodes: written_nodes(record, alloc), alloc)
+    let current = self.view_of(head, tree: TREE_VERSIONED, alloc)
+    var conflicts = mem::List[Conflict].empty(alloc)
+    for node in written {
+        let now_entry = try await mut self.snapshot_entry(device, snapshot: current, dir: node.dir, name: node.name.view(), alloc)
+        if changed_from(node.entry, now: now_entry) {
+            let before = try await mut self.snapshot_entry(device, snapshot: parent, dir: node.dir, name: node.name.view(), alloc)
+            let conflict = Conflict(path: copied_path(node.path, alloc), field: None, kind: ConflictKind.Both, base: try await mut self.side_hash(device, snapshot: parent, entry: before, alloc), source: None, target: try await mut self.side_hash(device, snapshot: current, entry: now_entry, alloc))
+            mut conflicts.push(take conflict)
+        }
+    }
+    if conflicts.len() > 0 {
+        fail StoreError.ConflictRevert(take conflicts)
+    }
+    if dry_run {
+        return Reverted.Writes(try await mut self.revert_writes(device, parent, written: written.view(), alloc))
+    }
+    var staged = Staged.empty(alloc)
+    let origins = try await mut self.origin_id(device, labels: stamp.origins.view(), mut staged, alloc)
+    let writing = Writing(head: head, number: self.counters.commit, base: self.heads[head].branch.head.number, origins: origins, typed: true, now: now)
+    let restored = attempt await mut self.restore(device, parent, written: written.view(), writing, mut staged, alloc)
+    match restored {
+        Ok(_) => {
+        }
+        Err(failure) => {
+            try await mut self.undo(device, mut staged, alloc)
+            fail failure
+        }
+    }
+    try await mut self.update_ancestors(device, number: writing.number, mut staged, alloc)
+    var meta = commit_meta(blind(mem::List.empty(alloc), alloc), stamp, writing, branch: self.heads[head].branch, recorded: true, alloc)
+    meta.kind = CommitKind.Revert(of: commit)
+    return Reverted.Committed(try await mut self.finish(device, take meta, take staged, alloc))
+} Store.revert
+
+/// Restores each node `written` names to its entry in `parent`, a dir with all it held there.
+fn Store.restore[D: disk::Device](
+    mut self,
+    device: D,
+    parent: Snapshot,
+    written: Slice[Written],
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    for node in written {
+        let before = try await mut self.snapshot_entry(device, snapshot: parent, dir: node.dir, name: node.name.view(), alloc)
+        let place = Place(head: writing.head, tree: TREE_VERSIONED, dir: node.dir, name: copied_bytes(node.name.view(), alloc))
+        let Some(held) = before else {
+            discard try await mut self.set_entry(device, place, entry: None, mut staged, alloc)
+            try await mut self.touch_path(device, path: node.path, head: writing.head, children_changed: true, mut staged, alloc)
+            continue
+        }
+        var entry = try held.copied(alloc)
+        entry.version = writing.number
+        entry.hash = None
+        let children = try child_dir(held, tree: TREE_VERSIONED, alloc)
+        let had = node.entry.is_some()
+        discard try await mut self.set_entry(device, place, entry: Some(take entry), mut staged, alloc)
+        if children.dir != 0 and children.tree == TREE_VERSIONED and not had {
+            try await mut self.copy_subtree(device, snapshot: parent, head: writing.head, dir: children.dir, mut staged, alloc)
+        }
+        try await mut self.touch_path(device, path: node.path, head: writing.head, children_changed: not had, mut staged, alloc)
+    }
+} Store.restore
+
+/// Records the ancestors of the node at `path` for the commit's subtree versions.
+fn Store.touch_path[D: disk::Device](
+    mut self,
+    device: D,
+    path: ident::Path,
+    head: usize,
+    children_changed: bool,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head, segments: segments.view(), now: ident::WallTime(utc_ns: 0, uncertainty_ns: 0), alloc)
+    let count = match resolution.found.len() >= segments.len() {
+        true => segments.len() - 1
+        false => resolution.found.len()
+    }
+    mut staged.touch(resolution.found.view(), count, children_changed, alloc)
+} Store.touch_path
+
+/// The writes a revert of the nodes `written` names to their entries in `parent` commits.
+fn Store.revert_writes[D: disk::Device](
+    mut self,
+    device: D,
+    parent: Snapshot,
+    written: Slice[Written],
+    alloc: mem::Alloc,
+    ) -> mem::List[Write] fails StoreError uses wait {
+    var writes = mem::List[Write].empty(alloc)
+    for node in written {
+        let before = try await mut self.snapshot_entry(device, snapshot: parent, dir: node.dir, name: node.name.view(), alloc)
+        let path = copied_path(node.path, alloc)
+        let Some(held) = before else {
+            mut writes.push(Write.Delete(path: take path))
+            continue
+        }
+        let write = match held.content {
+            Content.Blob(id: id, size: _) => Write.Put(path: take path, value: Value.Blob(id))
+            Content.Dir(id: _, declaration: bytes, digest: _, next: _) => Write.Make(path: take path, declaration: try decode_declaration(bytes.view(), alloc))
+            Content.Stream(id: _, declaration: bytes, next: _, entries: _, bytes: _) => Write.Make(path: take path, declaration: try decode_declaration(bytes.view(), alloc))
+            else => Write.Put(path: take path, value: Value.Record(type: try await mut self.type_of(device, id: held.type, alloc), bytes: try await mut self.record_bytes(device, entry: held, alloc), secret: false))
+        }
+        mut writes.push(take write)
+    }
+    return writes
+} Store.revert_writes
+
+/// The nodes among `nodes` a revert restores: neither a dir whose children alone changed, the dir and its declaration as they were in `parent`, nor a node below a dir the revert deletes.
+fn Store.reverted_nodes[D: disk::Device](
+    mut self,
+    device: D,
+    parent: Snapshot,
+    take nodes: mem::List[Written],
+    alloc: mem::Alloc,
+    ) -> mem::List[Written] fails StoreError uses wait {
+    var deleted = mem::List[ident::Path].empty(alloc)
+    var kept = mem::List[Written].empty(alloc)
+    for node in take nodes {
+        let before = try await mut self.snapshot_entry(device, snapshot: parent, dir: node.dir, name: node.name.view(), alloc)
+        if below_any(deleted.view(), path: node.path) {
+            continue
+        }
+        if unchanged_dir(before, after: node.entry) {
+            continue
+        }
+        if before.is_none() {
+            mut deleted.push(copied_path(node.path, alloc))
+        }
+        mut kept.push(take node)
+    }
+    return kept
+} Store.reverted_nodes
+
+/// Whether a node is the same dir before and after a commit, of one id and one declaration.
+fn unchanged_dir(before: Option[NodeEntry], after: Option[NodeEntry]) -> bool {
+    let Some(held) = before else {
+        return false
+    }
+    let Some(now) = after else {
+        return false
+    }
+    return held.kind == NodeKind.Dir.code() and now.kind == NodeKind.Dir.code() and same_declaration(held, now) and dir_id(held) == dir_id(now)
+} unchanged_dir
+
+/// Whether `path` lies below one of `dirs`.
+fn below_any(dirs: Slice[ident::Path], path: ident::Path) -> bool {
+    for dir in dirs {
+        let prefix = dir.text.as_str()
+        if path.text.as_str().starts_with(prefix) and path.text.byte_len() > dir.text.byte_len() and path.text.as_bytes()[dir.text.byte_len()] == b'/' {
+            return true
+        }
+    }
+    return false
+} below_any
+
+/// The id of a dir entry, 0 for any other.
+fn dir_id(entry: NodeEntry) -> u64 {
+    return match entry.content {
+        Content.Dir(id: id, declaration: _, digest: _, next: _) => id
+        else => 0
+    }
+} dir_id
+
+/// The versioned nodes a commit's record shows it wrote, each with its path, the dirs whose children alone it changed left out.
+fn written_nodes(record: CommitRecord, alloc: mem::Alloc) -> mem::List[Written] {
+    let number = record.meta.number.number
+    var places = mem::Map[u64, mem::Bytes].empty(alloc)
+    var parents = mem::Map[u64, u64].empty(alloc)
+    for write in record.writes {
+        let Some(entry) = write.entry else {
+            continue
+        }
+        match entry.content {
+            Content.Dir(id: id, declaration: _, digest: _, next: _) => {
+                discard mut places.insert(id, value: copied_bytes(write.name.view(), alloc))
+                discard mut parents.insert(id, value: write.dir)
+            }
+            else => {
+            }
+        }
+    }
+    var nodes = mem::List[Written].empty(alloc)
+    for write in record.writes {
+        if write.tree != TREE_VERSIONED {
+            continue
+        }
+        let wrote = match write.entry {
+            Some(entry) => entry.version == number and (entry.kind != NodeKind.Dir.code() or entry.subtree == number)
+            None => true
+        }
+        let Some(path) = path_in(places, parents, dir: write.dir, name: write.name.view(), alloc) else {
+            continue
+        }
+        if wrote and not listed(nodes.view(), path) {
+            mut nodes.push(Written(dir: write.dir, name: copied_bytes(write.name.view(), alloc), path: take path, entry: copied_entry(write.entry, alloc)))
+        }
+    }
+    return nodes
+} written_nodes
+
+/// The path of `name` in dir `dir`, whose ancestors `places` and `parents` name.
+fn path_in(
+    places: mem::Map[u64, mem::Bytes],
+    parents: mem::Map[u64, u64],
+    dir: u64,
+    name: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> Option[ident::Path] {
+    var segments = mem::List[mem::Bytes].empty(alloc)
+    mut segments.push(copied_bytes(name, alloc))
+    var at = dir
+    while at != TOP_DIR {
+        let Some(place) = places.get(at) else {
+            return None
+        }
+        mut segments.insert(0, value: copied_bytes(place.view(), alloc))
+        let Some(parent) = parents.get(at) else {
+            return None
+        }
+        at = parent
+    }
+    return ident::Path.of_segments(segments.view(), alloc)
+} path_in
+
+fn listed(nodes: Slice[Written], path: ident::Path) -> bool {
+    for node in nodes {
+        if node.path == path {
+            return true
+        }
+    }
+    return false
+} listed

@@ -1,0 +1,256 @@
+//! Wire values read by their schema trees: a record's fields and a map's entries split out of their wire bytes, for merges and diffs to compare them key by key.
+
+/// The deepest nesting the reader follows.
+const MOST_DEPTH: u32 = 128
+
+/// A field of a wire record, or an entry of a wire map: its key's wire bytes and its value's wire bytes.
+pkg struct Part {
+    pkg key: mem::Bytes
+    pkg value: mem::Bytes
+} Part
+
+/// An unsigned value read from wire bytes, and the offset after it.
+struct Uvar derives Copy {
+    value: u64
+    next: usize
+} Uvar
+
+/// The fields of the wire record `bytes`, `None` when they are no record of whole fields.
+pkg fn record_parts(bytes: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[Part]] {
+    let Some(count) = uvar_at(bytes, at: 0) else {
+        return None
+    }
+    var parts = mem::List[Part].empty(alloc)
+    var at = count.next
+    for _ in 0..<count.value {
+        let Some(key_length) = uvar_at(bytes, at) else {
+            return None
+        }
+        let key_end = key_length.next + usize.widen(key_length.value)
+        let Some(value_length) = uvar_at(bytes, at: key_end) else {
+            return None
+        }
+        let value_end = value_length.next + usize.widen(value_length.value)
+        if value_end > bytes.len() or key_end > bytes.len() {
+            return None
+        }
+        mut parts.push(Part(key: disk::copy_range(bytes, at: key_length.next, count: key_end - key_length.next, alloc), value: disk::copy_range(bytes, at: value_length.next, count: value_end - value_length.next, alloc)))
+        at = value_end
+    }
+    if at != bytes.len() {
+        return None
+    }
+    return Some(take parts)
+} record_parts
+
+/// The entries of the wire map `bytes` whose keys and values have schema nodes `key` and `value` of `schema`, `None` when they are no such map.
+pkg fn map_parts(
+    schema: mem::wire::Schema,
+    key: usize,
+    value: usize,
+    bytes: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> Option[mem::List[Part]] {
+    let Some(count) = uvar_at(bytes, at: 0) else {
+        return None
+    }
+    var parts = mem::List[Part].empty(alloc)
+    var at = count.next
+    for _ in 0..<count.value {
+        let Some(key_end) = skip_value(schema, node: key, bytes, at, depth: 0) else {
+            return None
+        }
+        let Some(value_end) = skip_value(schema, node: value, bytes, at: key_end, depth: 0) else {
+            return None
+        }
+        mut parts.push(Part(key: disk::copy_range(bytes, at, count: key_end - at, alloc), value: disk::copy_range(bytes, at: key_end, count: value_end - key_end, alloc)))
+        at = value_end
+    }
+    if at != bytes.len() {
+        return None
+    }
+    return Some(take parts)
+} map_parts
+
+/// The wire bytes of a record of `fields`, or a map of entries, whose parts are in key order.
+pkg fn joined(parts: Slice[Part], record: bool, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    put_uvar(mut bytes, value: u64.widen(parts.len()))
+    for part in parts {
+        if record {
+            put_uvar(mut bytes, value: u64.widen(part.key.len()))
+        }
+        mut bytes.append(part.key.view())
+        if record {
+            put_uvar(mut bytes, value: u64.widen(part.value.len()))
+        }
+        mut bytes.append(part.value.view())
+    }
+    return bytes
+} joined
+
+/// The offset after the value of schema node `node` at `at` of `bytes`, `None` when it does not lie there whole.
+fn skip_value(
+    schema: mem::wire::Schema,
+    node: usize,
+    bytes: Slice[u8],
+    at: usize,
+    depth: u32,
+    ) -> Option[usize] {
+    if depth > MOST_DEPTH or node >= schema.nodes.len() {
+        return None
+    }
+    return match schema.nodes[node] {
+        mem::wire::SchemaNode.Bool => bounded(at + 1, bytes)
+        mem::wire::SchemaNode.Float(width: _) => bounded(at + 8, bytes)
+        mem::wire::SchemaNode.Char or mem::wire::SchemaNode.Unsigned(width: _) or mem::wire::SchemaNode.Signed(width: _) => next_of(uvar_at(bytes, at))
+        mem::wire::SchemaNode.Text or mem::wire::SchemaNode.Bytes or mem::wire::SchemaNode.BoundedText(capacity: _) => sized_end(bytes, at)
+        mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => skip_many(schema, lead: element, follower: None, bytes, at, depth)
+        mem::wire::SchemaNode.Map(key: key, value: value) => skip_many(schema, lead: key, follower: Some(value), bytes, at, depth)
+        mem::wire::SchemaNode.Record(open: _, fields: _) => skip_record(bytes, at)
+        mem::wire::SchemaNode.Variant(open: _, variants: _) => skip_variant(bytes, at)
+        mem::wire::SchemaNode.Back(depth: _) => None
+    }
+} skip_value
+
+/// The offset after a count and that many values of `lead`, each followed by one of `follower` when given.
+fn skip_many(
+    schema: mem::wire::Schema,
+    lead: usize,
+    follower: Option[usize],
+    bytes: Slice[u8],
+    at: usize,
+    depth: u32,
+    ) -> Option[usize] {
+    let Some(count) = uvar_at(bytes, at) else {
+        return None
+    }
+    var next = count.next
+    for _ in 0..<count.value {
+        let Some(after) = skip_value(schema, node: lead, bytes, at: next, depth: depth + 1) else {
+            return None
+        }
+        next = after
+        match follower {
+            Some(node) => {
+                let Some(value_end) = skip_value(schema, node, bytes, at: next, depth: depth + 1) else {
+                    return None
+                }
+                next = value_end
+            }
+            None => {
+            }
+        }
+    }
+    return Some(next)
+} skip_many
+
+/// The offset after a record: its count, then per field its key text and its length-prefixed value.
+fn skip_record(bytes: Slice[u8], at: usize) -> Option[usize] {
+    let Some(count) = uvar_at(bytes, at) else {
+        return None
+    }
+    var next = count.next
+    for _ in 0..<count.value {
+        let Some(key_end) = sized_end(bytes, at: next) else {
+            return None
+        }
+        let Some(value_end) = sized_end(bytes, at: key_end) else {
+            return None
+        }
+        next = value_end
+    }
+    return Some(next)
+} skip_record
+
+/// The offset after a variant: its key text, then `0x00`, or `0x01` and its length-prefixed payload.
+fn skip_variant(bytes: Slice[u8], at: usize) -> Option[usize] {
+    let Some(key_end) = sized_end(bytes, at) else {
+        return None
+    }
+    if key_end >= bytes.len() {
+        return None
+    }
+    if bytes[key_end] == 0 {
+        return Some(key_end + 1)
+    }
+    return sized_end(bytes, at: key_end + 1)
+} skip_variant
+
+/// The offset after a length-prefixed value at `at`.
+fn sized_end(bytes: Slice[u8], at: usize) -> Option[usize] {
+    let Some(length) = uvar_at(bytes, at) else {
+        return None
+    }
+    return bounded(length.next.saturating_add(usize.widen(length.value)), bytes)
+} sized_end
+
+fn bounded(end: usize, bytes: Slice[u8]) -> Option[usize] {
+    if end > bytes.len() {
+        return None
+    }
+    return Some(end)
+} bounded
+
+fn next_of(found: Option[Uvar]) -> Option[usize] {
+    return match found {
+        Some(read) => Some(read.next)
+        None => None
+    }
+} next_of
+
+/// The LEB128 value at `at` of `bytes`.
+fn uvar_at(bytes: Slice[u8], at: usize) -> Option[Uvar] {
+    var value: u64 = 0
+    var shift: u32 = 0
+    var next = at
+    loop {
+        if next >= bytes.len() or shift > 63 {
+            return None
+        }
+        let byte = bytes[next]
+        value = value | (u64.widen(byte & 0x7F) << shift)
+        next += 1
+        if (byte & 0x80) == 0 {
+            return Some(Uvar(value: value, next: next))
+        }
+        shift += 7
+    }
+} uvar_at
+
+fn put_uvar(mut bytes: mem::Bytes, value: u64) {
+    var rest = value
+    loop {
+        let low = u8.truncate(rest & 0x7F)
+        rest = rest >> 7
+        if rest == 0 {
+            mut bytes.push(low)
+            return
+        }
+        mut bytes.push(low | 0x80)
+    }
+} put_uvar
+
+test records_split_and_join_by_their_wire_bytes for record_parts {
+    let alloc = testing::world().alloc
+    let bytes = wire_of(Setting(level: 300, label: text::String.of("dial", alloc)), alloc)
+    let Some(parts) = record_parts(bytes.view(), alloc) else {
+        expect false
+        return
+    }
+    expect parts.len() == 2 and parts[0].key.view() == b"label" and parts[1].key.view() == b"level"
+    let rejoined = joined(parts.view(), record: true, alloc)
+    expect rejoined == bytes
+    var map = mem::Map[u32, text::String].empty(alloc)
+    discard mut map.insert(1, value: text::String.of("one", alloc))
+    discard mut map.insert(2, value: text::String.of("two", alloc))
+    let encoded = wire_of(map, alloc)
+    let schema = mem::wire::Codec[mem::Map[u32, text::String]].schema(alloc)
+    let Some(entries) = map_parts(schema, key: 1, value: 2, bytes: encoded.view(), alloc) else {
+        expect false
+        return
+    }
+    expect entries.len() == 2 and entries[1].key.view() == b"\x02" and entries[1].value.view() == b"\x03two"
+    let joined_map = joined(entries.view(), record: false, alloc)
+    expect joined_map == encoded
+} records_split_and_join_by_their_wire_bytes

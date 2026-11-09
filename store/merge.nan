@@ -1,0 +1,309 @@
+//! Merges: a source branch's changes since the merge base brought into a target branch, nodes changed on one side taking that side, dirs merging child by child, records of one type field by field, and every other change on both sides a conflict a take resolves.
+
+/// What a merge walks with: the target's head and the snapshots of the base, the source and the target, the takes, the conflicts found, and how the merge commit writes.
+struct Merging {
+    base: Snapshot
+    source: Snapshot
+    target: Snapshot
+    takes: mem::List[Take]
+    conflicts: mem::List[Conflict]
+    writing: Writing
+} Merging
+
+/// A value merged field by field: its wire bytes, or the field both sides changed to different values.
+enum Merged {
+    Value(mem::Bytes)
+    Clash(text::String)
+} Merged
+
+/// Merges branch `source` into branch `target`, fast-forwarding the target when it did not move since the base and `fast_forward` allows; `conflict.merge` listing each conflict that `takes` leaves.
+pub fn Store.merge[D: disk::Device](
+    mut self,
+    device: D,
+    target: Str,
+    source: Str,
+    take takes: mem::List[Take],
+    fast_forward: bool,
+    take stamp: Stamp,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    let into = try self.head_named(target)
+    let from = try self.head_named(source)
+    let base = try await mut self.merge_base(device, into, from, alloc)
+    let target_head = self.heads[into].branch.head
+    let source_head = self.heads[from].branch.head
+    if fast_forward and target_head.number == base {
+        return try await mut self.fast_forward(device, into, from, now, alloc)
+    }
+    let base_snapshot = match first attempt await mut self.snapshot(device, head: into, at: base, alloc) {
+        Ok(found) => found
+        Err(StoreError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => try await mut self.snapshot(device, head: from, at: base, alloc)
+    }
+    var staged = Staged.empty(alloc)
+    let origins = try await mut self.origin_id(device, labels: stamp.origins.view(), mut staged, alloc)
+    let writing = Writing(head: into, number: self.counters.commit, base: target_head.number, origins: origins, typed: false, now: now)
+    var merging = Merging(base: take base_snapshot, source: self.view_of(head: from, tree: TREE_VERSIONED, alloc), target: self.view_of(head: into, tree: TREE_VERSIONED, alloc), takes: take takes, conflicts: mem::List.empty(alloc), writing: writing)
+    var ancestors = mem::List[Found].empty(alloc)
+    let outcome = attempt await mut self.merge_dir(device, mut merging, mut staged, path: ident::Path(text: text::String.of("/", alloc)), dirs: Dirs(base: TOP_DIR, source: TOP_DIR, target: TOP_DIR), mut ancestors, alloc)
+    match outcome {
+        Ok(_) => {
+        }
+        Err(failure) => {
+            try await mut self.undo(device, mut staged, alloc)
+            fail failure
+        }
+    }
+    if merging.conflicts.len() > 0 {
+        try await mut self.undo(device, mut staged, alloc)
+        fail StoreError.ConflictMerge(take merging.conflicts)
+    }
+    try await mut self.update_ancestors(device, number: writing.number, mut staged, alloc)
+    var meta = commit_meta(blind(mem::List.empty(alloc), alloc), stamp, writing, branch: self.heads[into].branch, recorded: true, alloc)
+    meta.kind = CommitKind.Merge(source: text::String.of(source, alloc))
+    mut meta.parents.push(source_head)
+    return try await mut self.finish(device, take meta, take staged, alloc)
+} Store.merge
+
+/// The dirs a merge compares at one path, 0 where a side has none.
+struct Dirs derives Copy {
+    base: u64
+    source: u64
+    target: u64
+} Dirs
+
+/// The latest commit both branches share: the fork of the one created from the other, or the earlier fork of two siblings, or the source head of the target's last merge of the source when later.
+fn Store.merge_base[D: disk::Device](
+    mut self,
+    device: D,
+    into: usize,
+    from: usize,
+    alloc: mem::Alloc,
+    ) -> u64 fails StoreError uses wait {
+    let target_name = text::String.of(self.heads[into].branch.name.as_str(), alloc)
+    let source_name = text::String.of(self.heads[from].branch.name.as_str(), alloc)
+    let target_fork = self.heads[into].branch.fork.number
+    let source_fork = self.heads[from].branch.fork.number
+    let target_head = self.heads[into].branch.head.number
+    let source_parent = copied_text(self.heads[from].branch.parent, alloc)
+    var base = min_of(source_fork, other: target_fork)
+    match source_parent {
+        Some(parent) => {
+            if parent == target_name {
+                base = source_fork
+            }
+        }
+        None => {
+            base = target_fork
+        }
+    }
+    let line = try await mut self.line_commits(device, head: into, from: base + 1, to: target_head + 1, alloc)
+    for commit in line {
+        let Some(pointer) = commit.record else {
+            continue
+        }
+        let record = try await mut self.commit_record(device, pointer, alloc)
+        match record.meta.kind {
+            CommitKind.Merge(source: name) => {
+                if name == source_name and record.meta.parents.len() == 2 and record.meta.parents[1].number > base {
+                    base = record.meta.parents[1].number
+                }
+            }
+            else => {
+            }
+        }
+    }
+    return base
+} Store.merge_base
+
+/// Moves the target to the source's head, taking its trees, the unversioned included, without a commit.
+fn Store.fast_forward[D: disk::Device](
+    mut self,
+    device: D,
+    into: usize,
+    from: usize,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    let versioned = self.heads[from].versioned
+    let unversioned = self.heads[from].unversioned
+    mut self.index.retain(versioned.node)
+    mut self.index.retain(unversioned.node)
+    let old_versioned = self.heads[into].versioned
+    let old_unversioned = self.heads[into].unversioned
+    mut self.index.release(old_versioned.node, tree: TREE_VERSIONED, pointer: old_versioned.pointer)
+    mut self.index.release(old_unversioned.node, tree: TREE_UNVERSIONED, pointer: old_unversioned.pointer)
+    self.heads[into].versioned = versioned
+    self.heads[into].unversioned = unversioned
+    self.heads[into].branch.head = self.heads[from].branch.head
+    self.heads[into].written = 0
+    try await mut self.index_flush(device, now, alloc)
+    return Committed(number: self.heads[into].branch.head, branch: text::String.of(self.heads[into].branch.name.as_str(), alloc), time: now)
+} Store.fast_forward
+
+/// Merges the children of the dirs `dirs` names, at `path`, in name order.
+fn Store.merge_dir[D: disk::Device](
+    mut self,
+    device: D,
+    mut merging: Merging,
+    mut staged: Staged,
+    path: ident::Path,
+    dirs: Dirs,
+    mut ancestors: mem::List[Found],
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let base = try await mut self.children_map(device, snapshot: merging.base, dir: dirs.base, alloc)
+    let source = try await mut self.children_map(device, snapshot: merging.source, dir: dirs.source, alloc)
+    let target = try await mut self.children_map(device, snapshot: merging.target, dir: dirs.target, alloc)
+    var names = mem::Set[mem::Bytes].empty(alloc)
+    for entry in base.cursor() {
+        discard mut names.insert(copied_bytes(entry.key().view(), alloc))
+    }
+    for entry in source.cursor() {
+        discard mut names.insert(copied_bytes(entry.key().view(), alloc))
+    }
+    for entry in target.cursor() {
+        discard mut names.insert(copied_bytes(entry.key().view(), alloc))
+    }
+    for name in names.cursor() {
+        let Some(child) = path.child(name.view(), alloc) else {
+            fail StoreError.Corrupt
+        }
+        let sides = Sides(base: copied_entry(base.get(name), alloc), source: copied_entry(source.get(name), alloc), target: copied_entry(target.get(name), alloc))
+        try await mut self.merge_entry(device, mut merging, mut staged, path: child, name: name.view(), sides, dir: dirs.target, mut ancestors, alloc)
+    }
+} Store.merge_dir
+
+/// A node on the three sides of a merge.
+struct Sides {
+    base: Option[NodeEntry]
+    source: Option[NodeEntry]
+    target: Option[NodeEntry]
+} Sides
+
+/// Merges the node named `name` in the target's dir `dir`.
+fn Store.merge_entry[D: disk::Device](
+    mut self,
+    device: D,
+    mut merging: Merging,
+    mut staged: Staged,
+    path: ident::Path,
+    name: Slice[u8],
+    sides: Sides,
+    dir: u64,
+    mut ancestors: mem::List[Found],
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    if not changed_from(sides.base, now: sides.source) {
+        return
+    }
+    if not changed_from(sides.base, now: sides.target) {
+        try await mut self.take_source(device, mut merging, mut staged, name, sides, dir, mut ancestors, alloc)
+        return
+    }
+    if try await mut self.same_on_both(device, merging, sides, alloc) {
+        return
+    }
+    match taken_side(merging.takes.view(), path) {
+        Some(Side.Source) => {
+            try await mut self.take_source(device, mut merging, mut staged, name, sides, dir, mut ancestors, alloc)
+            return
+        }
+        Some(Side.Target) => return
+        None => {
+        }
+    }
+    let Some(source) = sides.source else {
+        try await mut self.add_conflict(device, mut merging, path, kind: ConflictKind.DeleteChange, sides, alloc)
+        return
+    }
+    let Some(target) = sides.target else {
+        try await mut self.add_conflict(device, mut merging, path, kind: ConflictKind.DeleteChange, sides, alloc)
+        return
+    }
+    let source_dir = try child_dir(source, tree: TREE_VERSIONED, alloc)
+    let target_dir = try child_dir(target, tree: TREE_VERSIONED, alloc)
+    let both_dirs = source_dir.dir != 0 and target_dir.dir != 0 and source_dir.tree == TREE_VERSIONED and target_dir.tree == TREE_VERSIONED
+    if both_dirs and same_declaration(source, now: target) {
+        var base_dir: u64 = 0
+        match sides.base {
+            Some(held) => {
+                let found = try child_dir(held, tree: TREE_VERSIONED, alloc)
+                base_dir = found.dir
+            }
+            None => {
+            }
+        }
+        let held = try target.copied(alloc)
+        mut ancestors.push(Found(place: Place(head: merging.writing.head, tree: TREE_VERSIONED, dir: dir, name: copied_bytes(name, alloc)), entry: take held))
+        try await mut self.merge_dir(device, mut merging, mut staged, path, dirs: Dirs(base: base_dir, source: source_dir.dir, target: target_dir.dir), mut ancestors, alloc)
+        discard mut ancestors.pop()
+        return
+    }
+    try await mut self.merge_records(device, mut merging, mut staged, path, name, sides, dir, mut ancestors, alloc)
+} Store.merge_entry
+
+/// Merges two records changed on both sides, field by field when they have one record type; any other pair of nodes conflicts.
+fn Store.merge_records[D: disk::Device](
+    mut self,
+    device: D,
+    mut merging: Merging,
+    mut staged: Staged,
+    path: ident::Path,
+    name: Slice[u8],
+    sides: Sides,
+    dir: u64,
+    mut ancestors: mem::List[Found],
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let Some(source) = sides.source else {
+        return
+    }
+    let Some(target) = sides.target else {
+        return
+    }
+    if source.kind != target.kind {
+        try await mut self.add_conflict(device, mut merging, path, kind: ConflictKind.KindChange, sides, alloc)
+        return
+    }
+    if source.kind != NodeKind.Record.code() {
+        try await mut self.add_conflict(device, mut merging, path, kind: ConflictKind.Both, sides, alloc)
+        return
+    }
+    if source.type != target.type {
+        try await mut self.add_conflict(device, mut merging, path, kind: ConflictKind.TypeChange, sides, alloc)
+        return
+    }
+    let type = try await mut self.type_of(device, id: target.type, alloc)
+    let source_bytes = try await mut self.record_bytes(device, entry: source, alloc)
+    let target_bytes = try await mut self.record_bytes(device, entry: target, alloc)
+    var base_bytes: Option[mem::Bytes] = None
+    match sides.base {
+        Some(held) => {
+            if held.kind == NodeKind.Record.code() {
+                base_bytes = Some(try await mut self.record_bytes(device, entry: held, alloc))
+            }
+        }
+        None => {
+        }
+    }
+    if not self.schemas.knows(type.schema) {
+        try await mut self.add_conflict(device, mut merging, path, kind: ConflictKind.Both, sides, alloc)
+        return
+    }
+    let Some(schema) = self.schemas.schema_of(type.schema) else {
+        return
+    }
+    let merged = merge_value(schema, node: 0, base: base_bytes, source: source_bytes.view(), target: target_bytes.view(), field: "", alloc)
+    match merged {
+        Merged.Clash(field) => {
+            let conflict = try await mut self.conflict(device, merging, path, field: Some(take field), kind: ConflictKind.Both, sides, alloc)
+            mut merging.conflicts.push(take conflict)
+        }
+        Merged.Value(bytes) => try await mut self.write_merged(device, mut merging, mut staged, path, name, sides, dir, type, bytes: bytes.view(), mut ancestors, alloc)
+    }
+} Store.merge_records

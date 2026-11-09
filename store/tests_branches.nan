@@ -89,3 +89,130 @@ test branches_share_their_fork_then_diverge for Store.branch {
     let deleted = attempt mounted.branch_named("old", alloc)
     expect deleted.is_err()
 } branches_share_their_fork_then_diverge
+
+fn put_setting(text: Str, level: u32, label: Str, alloc: mem::Alloc) -> Write {
+    return Write.Put(path: path_of(text, alloc), value: setting(level, label, alloc))
+} put_setting
+
+validator fn read_label(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text::String {
+    return match attempt mem::wire::Codec[Setting].decode(raw, alloc) {
+        Ok(found) => found.label
+        Err(_) => text::String.empty(alloc)
+    }
+} read_label
+
+fn label_on(
+    mut store: Store,
+    device: disk::MemoryVolume,
+    branch: Str,
+    text: Str,
+    alloc: mem::Alloc,
+    ) -> text::String fails StoreError uses wait {
+    let node = try await mut store.get(device, branch, path: path_of(text, alloc), now: at_second(100), alloc)
+    let Some(value) = node.value else {
+        return text::String.empty(alloc)
+    }
+    return read_label(value.view(), alloc)
+} label_on
+
+test diffs_list_edits_in_path_order for Store.diff {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var opening = mem::List[Write].empty(alloc)
+    mut opening.push(put("/data/a", level: 1, alloc))
+    mut opening.push(put("/data/b", level: 2, alloc))
+    discard try await commit_on(mut store, device, branch: "main", writes: take opening, alloc)
+    var second = mem::List[Write].empty(alloc)
+    mut second.push(put("/data/a", level: 3, alloc))
+    mut second.push(Write.Delete(path: path_of("/data/b", alloc)))
+    mut second.push(put("/data/c", level: 4, alloc))
+    discard try await commit_on(mut store, device, branch: "main", writes: take second, alloc)
+    let edits = try await mut store.diff(device, from: Point.Commit(branch: text::String.of("main", alloc), commit: ident::CommitId(number: 2)), to: Point.Head(text::String.of("main", alloc)), path: path_of("/data", alloc), alloc)
+    expect edits.len() == 3
+    expect edits[0].path.text.as_str() == "/data/a" and edits[0].change == Change.Changed and edits[0].fields.len() == 1
+    expect edits[0].fields[0].field.as_str() == "level"
+    expect edits[1].path.text.as_str() == "/data/b" and edits[1].change == Change.Removed
+    expect edits[2].path.text.as_str() == "/data/c" and edits[2].change == Change.Added
+    let none = try await mut store.diff(device, from: Point.Head(text::String.of("main", alloc)), to: Point.Head(text::String.of("main", alloc)), path: path_of("/", alloc), alloc)
+    expect none.len() == 0
+} diffs_list_edits_in_path_order
+
+test reverts_restore_what_a_commit_changed for Store.revert {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put("/data/x", level: 1, alloc), alloc), alloc)
+    var changing = mem::List[Write].empty(alloc)
+    mut changing.push(put("/data/x", level: 2, alloc))
+    mut changing.push(put("/data/y/new", level: 5, alloc))
+    let changed = try await commit_on(mut store, device, branch: "main", writes: take changing, alloc)
+    let dry = try await mut store.revert(device, branch: "main", commit: changed.number, dry_run: true, stamp: system_stamp(alloc), now: at_second(30), alloc)
+    let Reverted.Writes(writes) = dry else {
+        expect false
+        return
+    }
+    expect writes.len() == 2
+    discard try await mut store.revert(device, branch: "main", commit: changed.number, dry_run: false, stamp: system_stamp(alloc), now: at_second(31), alloc)
+    let level = try await level_on(mut store, device, branch: "main", text: "/data/x", alloc)
+    expect level == 1
+    let gone = attempt await mut store.get(device, branch: "main", path: path_of("/data/y", alloc), now: at_second(32), alloc)
+    expect gone.is_err()
+    let later = try await commit_on(mut store, device, branch: "main", writes: single(put("/data/z", level: 1, alloc), alloc), alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put("/data/z", level: 2, alloc), alloc), alloc)
+    let refused = attempt await mut store.revert(device, branch: "main", commit: later.number, dry_run: false, stamp: system_stamp(alloc), now: at_second(33), alloc)
+    let conflicted = match refused {
+        Err(StoreError.ConflictRevert(conflicts)) => conflicts.len() == 1
+        else => false
+    }
+    expect conflicted
+} reverts_restore_what_a_commit_changed
+
+test merges_take_each_sides_changes for Store.merge {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put_setting("/data/shared", level: 1, label: "a", alloc), alloc), alloc)
+    let owner = ident::Principal(text: text::Fixed[64].of("agent.ops"))
+    discard try await mut store.branch(device, name: "feature", from: "main", at: None, by: owner, expires: None, system: false, now: at_second(30), alloc)
+    var on_main = mem::List[Write].empty(alloc)
+    mut on_main.push(put("/data/main-only", level: 1, alloc))
+    mut on_main.push(put_setting("/data/shared", level: 1, label: "main", alloc))
+    discard try await commit_on(mut store, device, branch: "main", writes: take on_main, alloc)
+    var on_feature = mem::List[Write].empty(alloc)
+    mut on_feature.push(put("/data/feature-only/deep", level: 2, alloc))
+    mut on_feature.push(put_setting("/data/shared", level: 9, label: "a", alloc))
+    discard try await commit_on(mut store, device, branch: "feature", writes: take on_feature, alloc)
+    discard try await mut store.merge(device, target: "main", source: "feature", takes: mem::List.empty(alloc), fast_forward: true, stamp: system_stamp(alloc), now: at_second(31), alloc)
+    let level = try await level_on(mut store, device, branch: "main", text: "/data/shared", alloc)
+    let label = try await label_on(mut store, device, branch: "main", text: "/data/shared", alloc)
+    let deep = try await level_on(mut store, device, branch: "main", text: "/data/feature-only/deep", alloc)
+    let kept = try await level_on(mut store, device, branch: "main", text: "/data/main-only", alloc)
+    expect level == 9 and label.as_str() == "main" and deep == 2 and kept == 1
+    discard try await commit_on(mut store, device, branch: "main", writes: single(put_setting("/data/shared", level: 10, label: "main", alloc), alloc), alloc)
+    discard try await commit_on(mut store, device, branch: "feature", writes: single(put_setting("/data/shared", level: 20, label: "a", alloc), alloc), alloc)
+    let clash = attempt await mut store.merge(device, target: "main", source: "feature", takes: mem::List.empty(alloc), fast_forward: true, stamp: system_stamp(alloc), now: at_second(32), alloc)
+    let field = match clash {
+        Err(StoreError.ConflictMerge(conflicts)) => conflicts.len() == 1 and conflicts[0].field == Some(text::String.of("level", alloc))
+        else => false
+    }
+    expect field
+    var takes = mem::List[Take].empty(alloc)
+    mut takes.push(Take(path: path_of("/data/shared", alloc), side: Side.Source))
+    discard try await mut store.merge(device, target: "main", source: "feature", take takes, fast_forward: true, stamp: system_stamp(alloc), now: at_second(33), alloc)
+    let taken = try await level_on(mut store, device, branch: "main", text: "/data/shared", alloc)
+    expect taken == 20
+} merges_take_each_sides_changes
+
+test fast_forwards_move_the_target for Store.merge {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    let owner = ident::Principal(text: text::Fixed[64].of("agent.ops"))
+    discard try await mut store.branch(device, name: "ahead", from: "main", at: None, by: owner, expires: None, system: false, now: at_second(30), alloc)
+    let made = try await commit_on(mut store, device, branch: "ahead", writes: single(put("/data/x", level: 4, alloc), alloc), alloc)
+    let merged = try await mut store.merge(device, target: "main", source: "ahead", takes: mem::List.empty(alloc), fast_forward: true, stamp: system_stamp(alloc), now: at_second(31), alloc)
+    expect merged.number == made.number
+    let level = try await level_on(mut store, device, branch: "main", text: "/data/x", alloc)
+    expect level == 4
+} fast_forwards_move_the_target
