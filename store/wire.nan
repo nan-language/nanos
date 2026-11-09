@@ -1,4 +1,4 @@
-//! Wire values read by their schema trees: a record's fields and a map's entries split out of their wire bytes, for merges and diffs to compare them key by key.
+//! Wire values read by their schema trees: a record's fields and a map's entries split out of their wire bytes, for merges and diffs to compare them key by key, and values ordered as their types order them.
 
 /// The deepest nesting the reader follows.
 const MOST_DEPTH: u32 = 128
@@ -254,3 +254,219 @@ test records_split_and_join_by_their_wire_bytes for record_parts {
     let joined_map = joined(entries.view(), record: false, alloc)
     expect joined_map == encoded
 } records_split_and_join_by_their_wire_bytes
+
+/// Whether values of schema node `node` have an order: scalars but floats, and sequences, records and variants of ordered values.
+pkg fn has_order(schema: mem::wire::Schema, node: usize, depth: u32) -> bool {
+    if depth > MOST_DEPTH or node >= schema.nodes.len() {
+        return false
+    }
+    return match schema.nodes[node] {
+        mem::wire::SchemaNode.Float(width: _) or mem::wire::SchemaNode.Map(key: _, value: _) or mem::wire::SchemaNode.Back(depth: _) => false
+        mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => has_order(schema, node: element, depth: depth + 1)
+        mem::wire::SchemaNode.Record(open: _, fields: fields) => fields_ordered(schema, fields: fields.view(), depth)
+        mem::wire::SchemaNode.Variant(open: _, variants: variants) => variants_ordered(schema, variants: variants.view(), depth)
+        else => true
+    }
+} has_order
+
+fn fields_ordered(schema: mem::wire::Schema, fields: Slice[mem::wire::SchemaField], depth: u32) -> bool {
+    for field in fields {
+        if not has_order(schema, node: field.value, depth: depth + 1) {
+            return false
+        }
+    }
+    return true
+} fields_ordered
+
+fn variants_ordered(schema: mem::wire::Schema, variants: Slice[mem::wire::SchemaVariant], depth: u32) -> bool {
+    for variant in variants {
+        let Some(payload) = variant.payload else {
+            continue
+        }
+        if not has_order(schema, node: payload, depth: depth + 1) {
+            return false
+        }
+    }
+    return true
+} variants_ordered
+
+/// The order of the wire values `left` and `right` of schema node `node` as their type orders them: records by their fields in declaration order, variants by their declaration order then payload, sequences element by element; bytes it cannot read compare equal.
+pkg fn wire_order(
+    schema: mem::wire::Schema,
+    node: usize,
+    left: Slice[u8],
+    right: Slice[u8],
+    depth: u32,
+    alloc: mem::Alloc,
+    ) -> core::Ordering {
+    if depth > MOST_DEPTH or node >= schema.nodes.len() {
+        return core::Ordering.Equal
+    }
+    return match schema.nodes[node] {
+        mem::wire::SchemaNode.Bool => left.cmp(right)
+        mem::wire::SchemaNode.Char or mem::wire::SchemaNode.Unsigned(width: _) => uvar_value(left).cmp(uvar_value(right))
+        mem::wire::SchemaNode.Signed(width: _) => signed_value(left).cmp(signed_value(right))
+        mem::wire::SchemaNode.Text or mem::wire::SchemaNode.Bytes or mem::wire::SchemaNode.BoundedText(capacity: _) => sized_tail(left, alloc).view().cmp(sized_tail(right, alloc).view())
+        mem::wire::SchemaNode.Sequence(element: element, length: _, capacity: _, unique: _) => sequence_order(schema, element, left, right, depth, alloc)
+        mem::wire::SchemaNode.Record(open: _, fields: fields) => record_order(schema, fields: fields.view(), left, right, depth, alloc)
+        mem::wire::SchemaNode.Variant(open: _, variants: variants) => variant_order(schema, variants: variants.view(), left, right, depth, alloc)
+        else => core::Ordering.Equal
+    }
+} wire_order
+
+fn uvar_value(bytes: Slice[u8]) -> u64 {
+    return match uvar_at(bytes, at: 0) {
+        Some(read) => read.value
+        None => 0
+    }
+} uvar_value
+
+/// The value of a signed integer's zigzag uvar.
+fn signed_value(bytes: Slice[u8]) -> i64 {
+    let zigzag = uvar_value(bytes)
+    let magnitude = zigzag >> 1
+    if (zigzag & 1) == 0 {
+        return i64.from_bits(magnitude)
+    }
+    return i64.from_bits(~magnitude)
+} signed_value
+
+/// The bytes of a text or byte string after its length.
+fn sized_tail(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    let Some(length) = uvar_at(bytes, at: 0) else {
+        return mem::Bytes.empty(alloc)
+    }
+    let end = usize.widen(length.value).saturating_add(length.next)
+    if end > bytes.len() {
+        return mem::Bytes.empty(alloc)
+    }
+    return disk::copy_range(bytes, at: length.next, count: end - length.next, alloc)
+} sized_tail
+
+fn sequence_order(
+    schema: mem::wire::Schema,
+    element: usize,
+    left: Slice[u8],
+    right: Slice[u8],
+    depth: u32,
+    alloc: mem::Alloc,
+    ) -> core::Ordering {
+    let Some(left_count) = uvar_at(left, at: 0) else {
+        return core::Ordering.Equal
+    }
+    let Some(right_count) = uvar_at(right, at: 0) else {
+        return core::Ordering.Equal
+    }
+    var left_at = left_count.next
+    var right_at = right_count.next
+    var index: u64 = 0
+    while index < left_count.value and index < right_count.value {
+        let Some(left_end) = skip_value(schema, node: element, bytes: left, at: left_at, depth: depth + 1) else {
+            return core::Ordering.Equal
+        }
+        let Some(right_end) = skip_value(schema, node: element, bytes: right, at: right_at, depth: depth + 1) else {
+            return core::Ordering.Equal
+        }
+        let left_element = disk::copy_range(left, at: left_at, count: left_end - left_at, alloc)
+        let right_element = disk::copy_range(right, at: right_at, count: right_end - right_at, alloc)
+        let order = wire_order(schema, node: element, left: left_element.view(), right: right_element.view(), depth: depth + 1, alloc)
+        if order != core::Ordering.Equal {
+            return order
+        }
+        left_at = left_end
+        right_at = right_end
+        index += 1
+    }
+    return left_count.value.cmp(right_count.value)
+} sequence_order
+
+fn record_order(
+    schema: mem::wire::Schema,
+    fields: Slice[mem::wire::SchemaField],
+    left: Slice[u8],
+    right: Slice[u8],
+    depth: u32,
+    alloc: mem::Alloc,
+    ) -> core::Ordering {
+    let Some(left_parts) = record_parts(left, alloc) else {
+        return core::Ordering.Equal
+    }
+    let Some(right_parts) = record_parts(right, alloc) else {
+        return core::Ordering.Equal
+    }
+    for field in fields {
+        let key = field.key.as_str().as_bytes()
+        let left_at = part_index(left_parts.view(), key)
+        let right_at = part_index(right_parts.view(), key)
+        let order = match left_at < left_parts.len() {
+            true => match right_at < right_parts.len() {
+                true => wire_order(schema, node: field.value, left: left_parts[left_at].value.view(), right: right_parts[right_at].value.view(), depth: depth + 1, alloc)
+                false => core::Ordering.Greater
+            }
+            false => match right_at < right_parts.len() {
+                true => core::Ordering.Less
+                false => core::Ordering.Equal
+            }
+        }
+        if order != core::Ordering.Equal {
+            return order
+        }
+    }
+    return core::Ordering.Equal
+} record_order
+
+/// The index of the part of key `key`, past the last for none.
+fn part_index(parts: Slice[Part], key: Slice[u8]) -> usize {
+    for at in 0..<parts.len() {
+        if parts[at].key.view() == key {
+            return at
+        }
+    }
+    return parts.len()
+} part_index
+
+fn variant_order(
+    schema: mem::wire::Schema,
+    variants: Slice[mem::wire::SchemaVariant],
+    left: Slice[u8],
+    right: Slice[u8],
+    depth: u32,
+    alloc: mem::Alloc,
+    ) -> core::Ordering {
+    let left_index = variant_index(variants, key: sized_tail(left, alloc).view())
+    let right_index = variant_index(variants, key: sized_tail(right, alloc).view())
+    if left_index != right_index {
+        return left_index.cmp(right_index)
+    }
+    if left_index >= variants.len() {
+        return core::Ordering.Equal
+    }
+    let Some(payload) = variants[left_index].payload else {
+        return core::Ordering.Equal
+    }
+    return wire_order(schema, node: payload, left: variant_payload(left, alloc).view(), right: variant_payload(right, alloc).view(), depth: depth + 1, alloc)
+} variant_order
+
+fn variant_index(variants: Slice[mem::wire::SchemaVariant], key: Slice[u8]) -> usize {
+    for at in 0..<variants.len() {
+        if variants[at].key.as_str().as_bytes() == key {
+            return at
+        }
+    }
+    return variants.len()
+} variant_index
+
+/// The payload of a wire variant, empty for none.
+fn variant_payload(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    let Some(key_end) = sized_end(bytes, at: 0) else {
+        return mem::Bytes.empty(alloc)
+    }
+    if key_end >= bytes.len() or bytes[key_end] == 0 {
+        return mem::Bytes.empty(alloc)
+    }
+    let Some(end) = sized_end(bytes, at: key_end + 1) else {
+        return mem::Bytes.empty(alloc)
+    }
+    let payload = disk::copy_range(bytes, at: key_end + 1, count: end - key_end - 1, alloc)
+    return sized_tail(payload.view(), alloc)
+} variant_payload
