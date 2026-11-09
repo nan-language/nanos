@@ -242,9 +242,10 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:**
   - a const schema hash and schema tree for each `Encode` type;
   - schema trees, with their type names, in code roots;
-  - type-erased decoders that bundles export, checking predicates.
+  - type-erased decoders that bundles export, checking predicates;
+  - decode failures naming the field path where the decoder rejected the bytes.
 - **Chapters:** [02](02-identifiers.md), [07](07-communication.md), [10](10-code.md), [11](11-store.md), [14](14-changes.md), [17](17-observability.md), [18](18-link.md), [19](19-oversight.md), [20](20-base.md).
-- **Issue:** [nan-language/nan#22](https://github.com/nan-language/nan/issues/22).
+- **Issues:** [nan-language/nan#22](https://github.com/nan-language/nan/issues/22), [nan-language/nan#130](https://github.com/nan-language/nan/issues/130).
 
 ## N21
 

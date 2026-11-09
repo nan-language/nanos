@@ -48,7 +48,7 @@ Each commit takes the next **commit number** `#<n>` ([02-identifiers.md](02-iden
 
 ## Transactions
 
-A transaction reads a snapshot, its base, and commits writes atomically to one branch; the store takes no locks. Its record is `Transaction { base: Option[CommitId], reads: mem::List[Read], expect: mem::List[Expect], writes: mem::List[Write], key: Option[text::String], plan: Option[HashValue], intent: Option[text::String] }`: `base` is the commit its reads saw, `None` making it blind, based on the head at commit; a `Read { path, version: Version, scope }` has the scope `Node` or `Subtree`; an `Expect { path, version: Version }` is an explicit condition; `writes` apply in order; `key` is its [request key](14-changes.md#request-keys); `plan` is the plan hash when it applies a step of a [plan](14-changes.md#plans-and-steps).
+A transaction reads a snapshot, its base, and commits writes atomically to one branch; the store takes no locks. Its record is `Transaction { base: Option[CommitId], reads: mem::List[Read], expects: mem::List[Expect], writes: mem::List[Write], key: Option[text::String], plan: Option[HashValue], intent: Option[text::String] }`: `base` is the commit its reads saw, `None` making it blind, based on the head at commit; a `Read { path, version: Version, scope }` has the scope `Node` or `Subtree`; an `Expect { path, version: Version }` is an explicit condition; `writes` apply in order; `key` is its [request key](14-changes.md#request-keys); `plan` is the plan hash when it applies a step of a [plan](14-changes.md#plans-and-steps).
 
 | Write | Effect |
 | --- | --- |
@@ -201,7 +201,7 @@ For an instance, each `write_all`, `remove` and release of a writing `File` is o
 | `map` | path, at, offset, length | a read-only mapping ([05-memory.md](05-memory.md#mapped-blobs)) | as `read` | `none` |
 | `draft` | — | a draft id | `store.full` | `none` |
 | `draft_append` | draft, bytes | — | `store.not-found`, `store.full`, `store.too-large` | `none` |
-| `draft_close` | draft, expect: `Option[HashValue]` | blob id and size | `store.not-found`, `store.hash-mismatch` | `none` |
+| `draft_close` | draft, expected: `Option[HashValue]` | blob id and size | `store.not-found`, `store.hash-mismatch` | `none` |
 | `commit` | `Transaction` | `Committed` | those of the [commit procedure](#commit-procedure) | `recorded`; `none` for unversioned writes |
 | `append` | path, entries | the sequence number of the earliest new entry | `store.kind`, `store.too-large`, `store.full`, `schema.*` | `none` |
 | `read_stream` | path, from: `u64`, limit | entries and `lost` | `store.not-found`, `store.kind` | `none` |
@@ -223,7 +223,7 @@ For an instance, each `write_all`, `remove` and release of a writing `File` is o
 
 `Node` is `{ path, kind, version: CommitId, subtree: Option[CommitId], declared: Option[TypeRef], hash: Option[HashValue], size: u64, origins: mem::List[OriginLabel], secret: bool, expires: Option[WallTime], declaration: Option[Declaration], value: Option[Untrusted[mem::Bytes]] }` (requires [N29](22-nan.md#n29)); `size` counts bytes, children or entries. `Listing` is `{ entries: mem::List[Entry], next: Option[text::String] }`, `Entry` holding a child's name, kind, version, size and type name. `count` reads the index's subtree counts ([12-store-format.md](12-store-format.md#index-trees)).
 
-A draft is a blob in the making that no node references: `draft_append` adds bytes, `draft_close` computes the blob id, failing with `store.hash-mismatch` when it differs from `expect`, and a `Put` or `Add` references it. A draft unreferenced 1 h after its last append is dropped, and no draft survives a reboot. A `read` with `verify` checks the blob id over the bytes it returns; the link and the [egress gate](16-network.md#egress-gate) set it for bytes leaving the machine.
+A draft is a blob in the making that no node references: `draft_append` adds bytes, `draft_close` computes the blob id, failing with `store.hash-mismatch` when it differs from `expected`, and a `Put` or `Add` references it. A draft unreferenced 1 h after its last append is dropped, and no draft survives a reboot. A `read` with `verify` checks the blob id over the bytes it returns; the link and the [egress gate](16-network.md#egress-gate) set it for bytes leaving the machine.
 
 `subscribe` sends one-way messages to the [port](07-communication.md#ports) it is given, for commits after `since`: `Changed { subscription, commit: CommitId, paths: mem::List[Path], more: u64 }` per commit changing a node below the prefix, with at most 64 paths and `more` counting the rest; `Appended { subscription, path, seq: u64 }` per stream append; and, once the subscriber's [credit](07-communication.md#credits) is spent, one `Lost { subscription, commits: u64 }` for what it could not send. What the store reports to a View names other commits by number only, and only paths inside the View.
 

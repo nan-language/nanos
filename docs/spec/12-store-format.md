@@ -118,7 +118,7 @@ Records follow from offset 56, each starting at a multiple of 8; padding fills t
 | 6 blob | the blob id's 32-byte digest | wire `BlobMap { size: u64, pieces: mem::Bytes }`, the piece keys in order |
 | 7 pad | zero | ignored |
 
-On a volume without encryption, a piece or index record is placed so that its payload begins at a block boundary, after a pad record when needed; a space too short for a pad record moves it one block further. `CommitRecord` is `{ meta: CommitMeta, writes: mem::List[LogWrite] }`, with `LogWrite { tree: u8, dir: u64, name: mem::Bytes, entry: Option[NodeEntry] }`, `None` deleting the entry. The value, piece, stream and blob records a commit references precede its commit record, and a commit exists once its commit record is durable. A record the cleaner moves keeps its kind and key.
+On a volume without encryption, a piece or index record is placed so that its payload begins at a block boundary, after a pad record when needed; a space too short for a pad record moves it one block further. `CommitRecord` is `{ meta: CommitMeta, writes: mem::List[LogWrite], catalog: mem::List[CatalogWrite] }`, with `LogWrite { tree: u8, dir: u64, name: mem::Bytes, entry: Option[NodeEntry] }`, `None` deleting the entry, and `CatalogWrite { key: mem::Bytes, value: Option[mem::Bytes] }` for each catalog entry the commit writes besides its own, such as its request key, origin sets and types, `None` removing it. The value, piece, stream and blob records a commit references precede its commit record, and a commit exists once its commit record is durable. A record the cleaner moves keeps its kind and key.
 
 ## Items
 
@@ -166,7 +166,7 @@ Entries fill the node from its end downwards. A leaf entry is a key length (2 by
 | `expires` | `i64` | expiry in UTC nanoseconds, 0 for none |
 | `hash` | `Option[HashValue]` | the node's hash, once computed |
 | `held` | `bool` | the node is held beyond its dir's `keep` |
-| `content` | `Content` | `Inline(mem::Bytes)`, record bytes up to 1 KiB; `Value(pointer)`; `Blob { id: HashValue, size: u64 }`; `Dir { id: u64, declaration: mem::Bytes, digest: Option[HashValue] }`; `Stream { id: u64, declaration: mem::Bytes, next: u64, entries: u64, bytes: u64 }` |
+| `content` | `Content` | `Inline(mem::Bytes)`, record bytes up to 1 KiB; `Value(pointer)`; `Blob { id: HashValue, size: u64 }`; `Dir { id: u64, declaration: mem::Bytes, digest: Option[HashValue], next: u64 }`, `next` being the number the next `Add` to a numbered dir names; `Stream { id: u64, declaration: mem::Bytes, next: u64, entries: u64, bytes: u64 }` |
 
 ## The catalog
 
@@ -175,7 +175,7 @@ Entries fill the node from its end downwards. A leaf entry is a key length (2 by
 | 1 branch | name | `BranchEntry { branch: Branch, versioned: pointer, unversioned: pointer }` |
 | 2 commit | number (8) | `CommitEntry { meta: CommitMeta, record: Option[pointer], tree: Option[pointer] }` |
 | 3 pin | commit (8) ‖ pin number (8) | `Pin` |
-| 4 request key | principal ‖ `0x00` ‖ the key's bytes | `RequestEntry { session: SessionId, commit: u64, digest: HashValue }` |
+| 4 request key | principal ‖ `0x00` ‖ the key's bytes | `RequestEntry { session: Option[SessionId], commit: u64, digest: HashValue }` |
 | 5 stream run | stream id (8) ‖ earliest sequence number (8) | `StreamRun { record: pointer, count: u32, bytes: u32, time: i64 }`, `time` being its newest entry's wall time |
 | 6 blob | blob id (33) | `BlobEntry { size: u64, refcount: u64 }` |
 | 7 blob piece | blob id (33) ‖ piece index (8) | the piece key, 32 bytes |
@@ -246,10 +246,10 @@ A mount failure halts the kernel with its code as the cause ([04-kernel.md](04-k
 
 ## Reference counting
 
-Every item, blob entry, piece entry, origin set and type entry carries a reference count: the number of index and catalog entries of retained structures that name it.
+Every item, blob entry, piece entry, origin set and type entry carries a reference count: the number of index and catalog entries of retained structures, and of node entries in the commit records of retained commits, that name it.
 
 - When the store changes a node that more than one tree references, it writes a copy: each item, blob, origin set and type the copy names gains a reference, and the shared node loses the reference of the tree that changed. A blob entry holds one reference to each of its pieces.
-- Thinning a commit or deleting a branch removes the references of its trees' top nodes.
+- Thinning a commit removes the references of its commit record's node entries and of its tree's top node; deleting a branch, those of its trees' top nodes.
 - An entry whose count reaches zero is freed, and everything it names loses one reference.
 
 Count changes collect in memory and apply at index flushes. Space freed at flush k is reused only after flush k + 1 is durable, so a mount from the latest durable flush record or the one before it stays possible. Commit records and stream runs have one naming catalog entry and are freed with it; blob records are freed at the index flush after them.
