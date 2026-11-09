@@ -1,0 +1,502 @@
+//! The writes of a transaction applied to a branch's trees: each checked against the node it replaces and the declaration of the dir holding it, missing ancestors created as dirs with an empty declaration.
+
+/// The most record bytes a node entry holds inline.
+const INLINE_BYTES: usize = 1_024
+
+/// Applies one write.
+pkg fn Store.apply_write[D: disk::Device](
+    mut self,
+    device: D,
+    write: Write,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let segments = write.path().segments(alloc)
+    if segments.len() == 0 {
+        fail StoreError.Kind
+    }
+    let top = segments[0].view()
+    if top == b"history" or top == b"live" {
+        fail StoreError.Denied
+    }
+    match write {
+        Write.Put(path: _, value: value) => try await mut self.put_value(device, segments: segments.view(), value, writing, mut staged, alloc)
+        Write.Make(path: _, declaration: declaration) => try await mut self.make_node(device, segments: segments.view(), declaration, writing, mut staged, alloc)
+        Write.Delete(path: _) => try await mut self.delete_node(device, segments: segments.view(), writing, mut staged, alloc)
+        Write.Add(path: _, value: value) => try await mut self.add_child(device, segments: segments.view(), value, writing, mut staged, alloc)
+        Write.Append(path: _, entries: entries) => try await mut self.append_entries(device, segments: segments.view(), entries: entries.view(), writing, mut staged, alloc)
+        Write.Expire(path: _, at: at) => try await mut self.expire_node(device, segments: segments.view(), at, writing, mut staged, alloc)
+        Write.Hold(path: _, on: on) => try await mut self.hold_node(device, segments: segments.view(), on, writing, mut staged, alloc)
+        Write.Trim(path: _, below: below) => try await mut self.trim_stream(device, segments: segments.view(), below, writing, mut staged, alloc)
+    }
+} Store.apply_write
+
+/// Creates or replaces a record or blob.
+fn Store.put_value[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    value: Value,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    if segments.len() < 2 {
+        fail StoreError.Kind
+    }
+    let resolution = try await mut self.ensure_parent(device, segments, writing, mut staged, alloc)
+    let parent = try parent_declaration(resolution, alloc)
+    var existing: Option[NodeEntry] = None
+    var place = Place(head: writing.head, tree: resolution.tree, dir: resolution.dir, name: copied_bytes(segments[segments.len() - 1].view(), alloc))
+    match resolution.node() {
+        Some(found) => {
+            existing = copied_entry(Some(found.entry), alloc)
+            place = found.place.copied(alloc)
+        }
+        None => {
+        }
+    }
+    try check_numbered_name(parent, name: place.name.view())
+    let entry = try await mut self.value_entry(device, value, parent, existing, writing, mut staged, alloc)
+    try await mut self.place_entry(device, place, take entry, existing, resolution, writing, mut staged, alloc)
+} Store.put_value
+
+/// Writes `entry` at `place` over `existing`, noting a write conflict and the ancestors whose subtree versions change.
+fn Store.place_entry[D: disk::Device](
+    mut self,
+    device: D,
+    place: Place,
+    take entry: NodeEntry,
+    existing: Option[NodeEntry],
+    resolution: Resolution,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let added = existing.is_none()
+    match existing {
+        Some(old) => {
+            if old.version > writing.base {
+                staged.conflict = true
+            }
+        }
+        None => {
+        }
+    }
+    discard try await mut self.set_entry(device, place, entry: Some(take entry), mut staged, alloc)
+    let count = resolution.found.len()
+    let ancestors = match added or count == 0 {
+        true => count
+        false => count - 1
+    }
+    mut staged.touch(resolution.found.view(), count: ancestors, children_changed: added, alloc)
+} Store.place_entry
+
+/// The entry a `Put` or `Add` of `value` writes over `existing`, below a dir of declaration `parent`.
+fn Store.value_entry[D: disk::Device](
+    mut self,
+    device: D,
+    value: Value,
+    parent: Option[DirDecl],
+    existing: Option[NodeEntry],
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> NodeEntry fails StoreError uses wait {
+    let kind = match value {
+        Value.Record(type: _, bytes: _, secret: _) => NodeKind.Record
+        Value.Blob(_) => NodeKind.Blob
+    }
+    try check_element(parent, kind)
+    match existing {
+        Some(old) => {
+            if old.kind != kind.code() {
+                fail StoreError.Kind
+            }
+        }
+        None => {
+        }
+    }
+    let secret_dir = match parent {
+        Some(declaration) => declaration.secret
+        None => false
+    }
+    let secret = match value {
+        Value.Record(type: _, bytes: _, secret: held) => held
+        Value.Blob(_) => false
+    }
+    if secret or secret_dir {
+        fail StoreError.Kind
+    }
+    return match value {
+        Value.Record(type: type, bytes: bytes, secret: _) => try await mut self.record_entry(device, type, bytes: bytes.view(), parent, existing, writing, mut staged, alloc)
+        Value.Blob(id) => try await mut self.blob_entry(device, id, writing, alloc)
+    }
+} Store.value_entry
+
+/// The entry of a record of `type` and wire bytes `bytes`, checked against its declared type: its dir's element type, else the node's own, else `type`.
+fn Store.record_entry[D: disk::Device](
+    mut self,
+    device: D,
+    type: TypeRef,
+    bytes: Slice[u8],
+    parent: Option[DirDecl],
+    existing: Option[NodeEntry],
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> NodeEntry fails StoreError uses wait {
+    let declared = try await mut self.declared_type(device, parent, existing, alloc)
+    match declared {
+        Some(held) => {
+            discard try self.schemas.fit(declared: held, written: type, alloc)
+        }
+        None => {
+        }
+    }
+    var record = copied_bytes(bytes, alloc)
+    if not writing.typed {
+        let canonical = try self.schemas.decode(type.schema, raw: Untrusted.of(record.view()), alloc)
+        record = accepted_bytes(canonical.view(), alloc)
+    }
+    if record.len() > MOST_RECORD_BYTES {
+        fail StoreError.TooLarge
+    }
+    let type_id = try await mut self.type_id(device, type, mut staged, alloc)
+    let content = mut self.record_content(take record, mut staged, alloc)
+    let held = match existing {
+        Some(old) => old.held
+        None => false
+    }
+    return NodeEntry(kind: NodeKind.Record.code(), version: writing.number, subtree: 0, origins: writing.origins, type: type_id, declared: 0, secret: 0, expires: 0, hash: None, held: held, content: take content)
+} Store.record_entry
+
+/// What holds a record's bytes: the entry itself up to 1 KiB, else a value record naming a new item.
+fn Store.record_content(mut self, take bytes: mem::Bytes, mut staged: Staged, alloc: mem::Alloc) -> Content {
+    if bytes.len() <= INLINE_BYTES {
+        return Content.Inline(take bytes)
+    }
+    let item = mut self.index.new_item()
+    var key = Array[u8, 32].filled(0)
+    mut key.view_mut().write_u64_le(0, value: item)
+    let pointer = disk::Pointer(target: item, length: u32.fit(bytes.len()), kind: disk::RecordKind.Value.code(), by_item: true, checksum: disk::record_checksum(key, payload: bytes.view(), alloc))
+    mut staged.values.push(PendingValue(item: item, bytes: take bytes))
+    return Content.Value(pointer.to_list(alloc))
+} Store.record_content
+
+/// The entry of the blob `id`, `store.not-found` unless the store holds it.
+fn Store.blob_entry[D: disk::Device](
+    mut self,
+    device: D,
+    id: ident::HashValue,
+    writing: Writing,
+    alloc: mem::Alloc,
+    ) -> NodeEntry fails StoreError uses wait {
+    let Some(bytes) = try await mut self.catalog_get(device, key: catalog_key(KIND_BLOB, key: id.bytes.view(), alloc).view(), alloc) else {
+        fail StoreError.NotFound
+    }
+    let blob = try decode_blob_entry(bytes.view(), alloc)
+    return NodeEntry(kind: NodeKind.Blob.code(), version: writing.number, subtree: 0, origins: writing.origins, type: 0, declared: 0, secret: 0, expires: 0, hash: None, held: false, content: Content.Blob(id: id, size: blob.size))
+} Store.blob_entry
+
+/// The declared type of a record node: its dir's element type, else the type the node holds, `None` for a new node of an untyped dir.
+fn Store.declared_type[D: disk::Device](
+    mut self,
+    device: D,
+    parent: Option[DirDecl],
+    existing: Option[NodeEntry],
+    alloc: mem::Alloc,
+    ) -> Option[TypeRef] fails StoreError uses wait {
+    match parent {
+        Some(declaration) => match declaration.element {
+            Some(element) => match element.type {
+                Some(type) => return Some(type.copied(alloc))
+                None => {
+                }
+            }
+            None => {
+            }
+        }
+        None => {
+        }
+    }
+    let Some(old) = existing else {
+        return None
+    }
+    let id = match old.declared {
+        0 => old.type
+        else => old.declared
+    }
+    if id == 0 {
+        return None
+    }
+    return Some(try await mut self.type_of(device, id, alloc))
+} Store.declared_type
+
+/// Creates a dir or stream, or changes a dir's element or a stream's retention.
+fn Store.make_node[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    declaration: Declaration,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let resolution = try await mut self.ensure_parent(device, segments, writing, mut staged, alloc)
+    let parent = try parent_declaration(resolution, alloc)
+    let kind = match declaration {
+        Declaration.Dir(_) => NodeKind.Dir
+        Declaration.Stream(_) => NodeKind.Stream
+    }
+    try check_element(parent, kind)
+    var place = Place(head: writing.head, tree: resolution.tree, dir: resolution.dir, name: copied_bytes(segments[segments.len() - 1].view(), alloc))
+    var existing: Option[NodeEntry] = None
+    match resolution.node() {
+        Some(found) => {
+            existing = copied_entry(Some(found.entry), alloc)
+            place = found.place.copied(alloc)
+        }
+        None => {
+        }
+    }
+    let entry = try await mut self.declared_entry(device, declaration, existing, tree: place.tree, writing, mut staged, alloc)
+    try await mut self.place_entry(device, place, take entry, existing, resolution, writing, mut staged, alloc)
+} Store.make_node
+
+/// The entry `declaration` makes over `existing`: a new dir or stream, or the existing one with its element or retention changed, its fixed fields kept.
+fn Store.declared_entry[D: disk::Device](
+    mut self,
+    device: D,
+    declaration: Declaration,
+    existing: Option[NodeEntry],
+    tree: u8,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> NodeEntry fails StoreError uses wait {
+    let bytes = wire_of(declaration, alloc)
+    match declaration {
+        Declaration.Dir(dir) => {
+            try check_keep(dir, tree)
+            let content = match existing {
+                Some(old) => try changed_dir(old, dir, bytes: bytes.view(), alloc)
+                None => mut self.new_dir_content(bytes: bytes.view(), alloc)
+            }
+            return NodeEntry(kind: NodeKind.Dir.code(), version: writing.number, subtree: writing.number, origins: writing.origins, type: 0, declared: 0, secret: 0, expires: 0, hash: None, held: false, content: take content)
+        }
+        Declaration.Stream(stream) => {
+            let type_id = try await mut self.type_id(device, type: stream.type, mut staged, alloc)
+            let content = match existing {
+                Some(old) => try changed_stream(old, stream, bytes: bytes.view(), alloc)
+                None => mut self.new_stream_content(bytes: bytes.view(), alloc)
+            }
+            return NodeEntry(kind: NodeKind.Stream.code(), version: writing.number, subtree: 0, origins: writing.origins, type: type_id, declared: 0, secret: 0, expires: 0, hash: None, held: false, content: take content)
+        }
+    }
+} Store.declared_entry
+
+/// Removes a node and its descendants.
+fn Store.delete_node[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    if segments.len() < 2 {
+        fail StoreError.Kind
+    }
+    let resolution = try await mut self.resolve(device, head: writing.head, segments, now: writing.now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    if found.entry.version > writing.base or found.entry.subtree > writing.base {
+        staged.conflict = true
+    }
+    discard try await mut self.set_entry(device, place: found.place.copied(alloc), entry: None, mut staged, alloc)
+    mut staged.touch(resolution.found.view(), count: resolution.found.len() - 1, children_changed: true, alloc)
+} Store.delete_node
+
+/// Resolves `segments`, creating each missing ancestor of the last as a dir with an empty declaration.
+fn Store.ensure_parent[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> Resolution fails StoreError uses wait {
+    var resolution = try await mut self.resolve(device, head: writing.head, segments, now: writing.now, alloc)
+    if resolution.missing >= segments.len() - 1 {
+        try check_dirs(resolution, alloc)
+        return resolution
+    }
+    try check_dirs(resolution, alloc)
+    let empty = wire_of(Declaration.Dir(DirDecl(element: None, ephemeral: false, secret: false, numbered: false, keep: None)), alloc)
+    while resolution.missing < segments.len() - 1 {
+        let at = resolution.missing
+        let content = mut self.new_dir_content(bytes: empty.view(), alloc)
+        let Content.Dir(id: id, declaration: _, digest: _, next: _) = content else {
+            fail StoreError.Corrupt
+        }
+        let place = Place(head: writing.head, tree: resolution.tree, dir: resolution.dir, name: copied_bytes(segments[at].view(), alloc))
+        let entry = NodeEntry(kind: NodeKind.Dir.code(), version: writing.number, subtree: writing.number, origins: writing.origins, type: 0, declared: 0, secret: 0, expires: 0, hash: None, held: false, content: take content)
+        let written = try entry.copied(alloc)
+        discard try await mut self.set_entry(device, place: place.copied(alloc), entry: Some(take written), mut staged, alloc)
+        mut staged.touch(resolution.found.view(), count: resolution.found.len(), children_changed: true, alloc)
+        mut resolution.found.push(Found(place: take place, entry: take entry))
+        resolution.missing += 1
+        resolution.dir = id
+    }
+    return resolution
+} Store.ensure_parent
+
+/// `store.kind` when an entry along the resolved path, before its last segment, is no dir.
+fn check_dirs(resolution: Resolution, alloc: mem::Alloc) fails StoreError {
+    for at in 0..<resolution.found.len() {
+        if at + 1 < resolution.wanted and resolution.found[at].entry.kind != NodeKind.Dir.code() {
+            fail StoreError.Kind
+        }
+    }
+} check_dirs
+
+/// The declaration of the dir holding the resolved path's last segment, its ancestors all found, `None` at the top.
+pkg fn parent_declaration(resolution: Resolution, alloc: mem::Alloc) -> Option[DirDecl] fails StoreError {
+    if resolution.wanted < 2 or resolution.found.len() + 1 < resolution.wanted {
+        return None
+    }
+    return Some(try dir_declaration(resolution.found[resolution.wanted - 2].entry, alloc))
+} parent_declaration
+
+/// The declaration of the dir of `entry`.
+pkg fn dir_declaration(entry: NodeEntry, alloc: mem::Alloc) -> DirDecl fails StoreError {
+    let Content.Dir(id: _, declaration: bytes, digest: _, next: _) = entry.content else {
+        fail StoreError.Kind
+    }
+    let Declaration.Dir(declaration) = try decode_declaration(bytes.view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    return declaration
+} dir_declaration
+
+/// `schema.mismatch` when a dir of declaration `parent` declares its children of another kind.
+fn check_element(parent: Option[DirDecl], kind: NodeKind) fails StoreError {
+    let Some(declaration) = parent else {
+        return
+    }
+    let Some(element) = declaration.element else {
+        return
+    }
+    if element.kind != kind {
+        fail StoreError.SchemaMismatch
+    }
+} check_element
+
+/// `store.kind` when a numbered dir of declaration `parent` would hold a child whose name is no decimal number.
+fn check_numbered_name(parent: Option[DirDecl], name: Slice[u8]) fails StoreError {
+    let Some(declaration) = parent else {
+        return
+    }
+    if declaration.numbered and decimal_value(name).is_none() {
+        fail StoreError.Kind
+    }
+} check_numbered_name
+
+/// `store.kind` for a `keep` on a dir that is not a numbered dir of unversioned nodes.
+fn check_keep(dir: DirDecl, tree: u8) fails StoreError {
+    if dir.keep.is_none() {
+        return
+    }
+    if not dir.numbered or (tree == TREE_VERSIONED and not dir.ephemeral) {
+        fail StoreError.Kind
+    }
+} check_keep
+
+/// A changed dir's content: its id, entry digest and next number kept, `schema.mismatch` when `ephemeral`, `secret` or `numbered` would change.
+fn changed_dir(old: NodeEntry, dir: DirDecl, bytes: Slice[u8], alloc: mem::Alloc) -> Content fails StoreError {
+    let Content.Dir(id: id, declaration: _, digest: _, next: next) = old.content else {
+        fail StoreError.Kind
+    }
+    let held = try dir_declaration(old, alloc)
+    if held.ephemeral != dir.ephemeral or held.secret != dir.secret or held.numbered != dir.numbered {
+        fail StoreError.SchemaMismatch
+    }
+    return Content.Dir(id: id, declaration: copied_bytes(bytes, alloc), digest: None, next: next)
+} changed_dir
+
+/// A changed stream's content: its entries kept, `schema.mismatch` when its type's name would change.
+fn changed_stream(old: NodeEntry, stream: StreamDecl, bytes: Slice[u8], alloc: mem::Alloc) -> Content fails StoreError {
+    let Content.Stream(id: id, declaration: held, next: next, entries: entries, bytes: size) = old.content else {
+        fail StoreError.Kind
+    }
+    let Declaration.Stream(previous) = try decode_declaration(held.view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    if previous.type.name != stream.type.name {
+        fail StoreError.SchemaMismatch
+    }
+    return Content.Stream(id: id, declaration: copied_bytes(bytes, alloc), next: next, entries: entries, bytes: size)
+} changed_stream
+
+/// The content of a new dir of declaration bytes `bytes`, under a new dir id.
+fn Store.new_dir_content(mut self, bytes: Slice[u8], alloc: mem::Alloc) -> Content {
+    let id = self.counters.dir
+    self.counters.dir += 1
+    return Content.Dir(id: id, declaration: copied_bytes(bytes, alloc), digest: None, next: 1)
+} Store.new_dir_content
+
+/// The content of a new stream of declaration bytes `bytes`, under a new stream id.
+fn Store.new_stream_content(mut self, bytes: Slice[u8], alloc: mem::Alloc) -> Content {
+    let id = self.counters.stream
+    self.counters.stream += 1
+    return Content.Stream(id: id, declaration: copied_bytes(bytes, alloc), next: 1, entries: 0, bytes: 0)
+} Store.new_stream_content
+
+/// The value of a decimal name without leading zeros, `None` for any other name.
+pkg fn decimal_value(name: Slice[u8]) -> Option[u64] {
+    if name.len() == 0 or name.len() > 20 or (name.len() > 1 and name[0] == b'0') {
+        return None
+    }
+    var value: u64 = 0
+    for byte in name {
+        if byte < b'0' or byte > b'9' {
+            return None
+        }
+        let Some(scaled) = value.checked_mul(10) else {
+            return None
+        }
+        let Some(next) = scaled.checked_add(u64.widen(byte - b'0')) else {
+            return None
+        }
+        value = next
+    }
+    return Some(value)
+} decimal_value
+
+/// The decimal name of `number`.
+pkg fn decimal_name(number: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var digits = mem::Bytes.empty(alloc)
+    var rest = number
+    loop {
+        mut digits.push(b'0' + u8.truncate(rest % 10))
+        rest = rest / 10
+        if rest == 0 {
+            break
+        }
+    }
+    var name = mem::Bytes.empty(alloc)
+    var at = digits.len()
+    while at > 0 {
+        at -= 1
+        mut name.push(digits[at])
+    }
+    return name
+} decimal_name
+
+/// The bytes of a record a decoder accepted, which the store keeps as they are.
+pkg validator fn accepted_bytes(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    return copied_bytes(raw.inspect(), alloc)
+} accepted_bytes

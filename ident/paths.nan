@@ -1,0 +1,158 @@
+//! The segments of paths: parsed from a path's text, and rendered back canonically.
+
+/// The segments of the path, each as its bytes, none for `/`.
+pub fn Path.segments(self, alloc: mem::Alloc) -> mem::List[mem::Bytes] {
+    let bytes = self.text.as_bytes()
+    var segments = mem::List[mem::Bytes].empty(alloc)
+    var at: usize = 1
+    while at < bytes.len() {
+        var segment = mem::Bytes.empty(alloc)
+        if bytes[at] == b'"' {
+            at = quoted_segment(bytes, from: at + 1, mut segment)
+        } else {
+            while at < bytes.len() and bytes[at] != b'/' {
+                mut segment.push(bytes[at])
+                at += 1
+            }
+        }
+        mut segments.push(take segment)
+        at += 1
+    }
+    return segments
+} Path.segments
+
+/// The path of `segments` in canonical rendering, `None` when a segment breaks the path rules.
+pub fn Path.of_segments(segments: Slice[mem::Bytes], alloc: mem::Alloc) -> Option[Path]
+    example Path.of_segments(mem::List[mem::Bytes].empty(testing::world().alloc).view(), alloc: testing::world().alloc).is_some()
+{
+    var rendered = mem::Bytes.empty(alloc)
+    if segments.len() == 0 {
+        mut rendered.push(b'/')
+    }
+    for segment in segments {
+        mut rendered.push(b'/')
+        render_segment(segment.view(), out: mut rendered)
+    }
+    let Ok(text) = attempt text::String.try_from_utf8(rendered.view(), alloc) else {
+        return None
+    }
+    if not is_path(text) {
+        return None
+    }
+    return Some(Path(text: take text))
+} Path.of_segments
+
+/// The path of the child `name` of this path, `None` when `name` breaks the path rules.
+pub fn Path.child(self, name: Slice[u8], alloc: mem::Alloc) -> Option[Path] {
+    var segments = self.segments(alloc)
+    mut segments.push(copy_of(name, alloc))
+    return Path.of_segments(segments.view(), alloc)
+} Path.child
+
+/// Reads a quoted segment from `from`, just past its opening quote, into `segment`, and gives the index of its closing quote's next byte.
+fn quoted_segment(bytes: Slice[u8], from: usize, mut segment: mem::Bytes) -> usize {
+    var at = from
+    while at < bytes.len() and bytes[at] != b'"' {
+        if bytes[at] != b'\\' or at + 1 >= bytes.len() {
+            mut segment.push(bytes[at])
+            at += 1
+            continue
+        }
+        let escape = bytes[at + 1]
+        if escape == b'x' and at + 3 < bytes.len() {
+            let value = hex_value(bytes[at + 2]).value_or(0) * 16 + hex_value(bytes[at + 3]).value_or(0)
+            mut segment.push(u8.truncate(value))
+            at += 4
+        } else if escape == b'u' {
+            at = unicode_escape(bytes, from: at + 3, mut segment)
+        } else {
+            mut segment.push(escape)
+            at += 2
+        }
+    }
+    return at + 1
+} quoted_segment
+
+/// Reads the hex digits of a `\u{...}` escape from `from`, appends the character's UTF-8 bytes to `segment`, and gives the index past the closing brace.
+fn unicode_escape(bytes: Slice[u8], from: usize, mut segment: mem::Bytes) -> usize {
+    var at = from
+    var point: u32 = 0
+    while at < bytes.len() and bytes[at] != b'}' {
+        point = point.saturating_mul(16).saturating_add(hex_value(bytes[at]).value_or(0))
+        at += 1
+    }
+    let c = char.checked_from_bits(point).value_or('?')
+    var encoded = Array[u8, 4].filled(0)
+    let length = text::utf8::write_char(c, out: mut encoded.view_mut())
+    for i in 0..<length {
+        mut segment.push(encoded[i])
+    }
+    return at + 1
+} unicode_escape
+
+/// Appends a segment's canonical rendering: plain when it is a plain segment, else a text literal escaping its quotes and backslashes.
+fn render_segment(segment: Slice[u8], mut out: mem::Bytes) {
+    var plain = segment.len() > 0 and segment != b"." and segment != b".."
+    for byte in segment {
+        plain = plain and is_plain(byte)
+    }
+    if plain {
+        mut out.append(segment)
+        return
+    }
+    mut out.push(b'"')
+    for byte in segment {
+        if byte == b'"' or byte == b'\\' {
+            mut out.push(b'\\')
+        }
+        mut out.push(byte)
+    }
+    mut out.push(b'"')
+} render_segment
+
+fn copy_of(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    return copy
+} copy_of
+
+fn path_of(text: Str, alloc: mem::Alloc) -> Path {
+    return Path(text: text::String.of(text, alloc))
+} path_of
+
+test segments_round_trip for Path.segments {
+    let alloc = testing::world().alloc
+    let path = path_of("/data/agent.ops/\"notes 2026.txt\"/\"a\\\"b\"/\"\\u{e9}t\\x41\"", alloc)
+    let segments = path.segments(alloc)
+    expect segments.len() == 5
+    expect segments[0].view() == b"data" and segments[1].view() == b"agent.ops"
+    expect segments[2].view() == b"notes 2026.txt" and segments[3].view() == b"a\"b"
+    expect segments[4].view() == b"\xc3\xa9tA"
+    let Some(rendered) = Path.of_segments(segments.view(), alloc) else {
+        expect false
+        return
+    }
+    expect rendered.text.as_str() == "/data/agent.ops/\"notes 2026.txt\"/\"a\\\"b\"/\"\u{e9}tA\""
+    let top = path_of("/", alloc)
+    let none = top.segments(alloc)
+    expect none.len() == 0
+} segments_round_trip
+
+test children_render_canonically for Path.child {
+    let alloc = testing::world().alloc
+    let config = path_of("/sys/config", alloc)
+    let Some(child) = config.child(b"store", alloc) else {
+        expect false
+        return
+    }
+    expect child.text.as_str() == "/sys/config/store"
+    let Some(spaced) = config.child(b"a b", alloc) else {
+        expect false
+        return
+    }
+    expect spaced.text.as_str() == "/sys/config/\"a b\""
+    let dotted = config.child(b"..", alloc)
+    expect dotted.is_none()
+    let slashed = config.child(b"a/b", alloc)
+    expect slashed.is_none()
+} children_render_canonically

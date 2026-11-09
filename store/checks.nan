@@ -1,0 +1,198 @@
+//! The checks of a transaction before its writes: its request key, its expectations and its reads at the branch's head; and the ids of the origin sets and types its nodes carry.
+
+/// The digest a request key keeps: the hash of `transaction`, a line feed and the wire bytes of the transaction's writes, expectations, plan and intent.
+pkg fn request_digest(transaction: Transaction, alloc: mem::Alloc) -> ident::HashValue {
+    var bytes = wire_of(transaction.writes, alloc)
+    mut bytes.append(wire_of(transaction.expects, alloc).view())
+    mut bytes.append(wire_of(transaction.plan, alloc).view())
+    mut bytes.append(wire_of(transaction.intent, alloc).view())
+    return ident::HashValue.of_object(ident::Kind.Transaction, bytes: bytes.view())
+} request_digest
+
+/// The commit made earlier under the transaction's request key for the same principal, when its digest is the same; `request.key-reused` when it differs.
+pkg fn Store.earlier_commit[D: disk::Device](
+    mut self,
+    device: D,
+    key: Option[text::String],
+    stamp: Stamp,
+    digest: ident::HashValue,
+    alloc: mem::Alloc,
+    ) -> Option[Committed] fails StoreError uses wait {
+    let Some(held) = key else {
+        return None
+    }
+    let Some(bytes) = try await mut self.catalog_get(device, key: request_key(stamp.principal, key: held.as_str(), alloc).view(), alloc) else {
+        return None
+    }
+    let entry = try decode_request_entry(bytes.view(), alloc)
+    if entry.digest != digest {
+        fail StoreError.KeyReused
+    }
+    let Some(commit) = try await mut self.catalog_get(device, key: number_key(KIND_COMMIT, number: entry.commit, width: 8, alloc).view(), alloc) else {
+        fail StoreError.KeyReused
+    }
+    let found = try decode_commit_entry(commit.view(), alloc)
+    return Some(Committed(number: found.meta.number, branch: take found.meta.branch, time: found.meta.time))
+} Store.earlier_commit
+
+/// Records the transaction's request key, when it has one, for its principal.
+pkg fn Store.request_entry[D: disk::Device](
+    mut self,
+    device: D,
+    key: Option[text::String],
+    stamp: Stamp,
+    number: u64,
+    digest: ident::HashValue,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let Some(held) = key else {
+        return
+    }
+    let entry = RequestEntry(session: stamp.session, commit: number, digest: digest)
+    try await mut self.stage_catalog(device, key: request_key(stamp.principal, key: held.as_str(), alloc).view(), value: wire_of(entry, alloc).view(), mut staged, alloc)
+} Store.request_entry
+
+/// Whether every expectation holds at the head of the branch at `head`.
+pkg fn Store.expectations_hold[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    expects: Slice[Expect],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> bool fails StoreError uses wait {
+    for condition in expects {
+        let holds = try await mut self.version_holds(device, head, path: condition.path, version: condition.version, scope: Scope.Node, now, alloc)
+        if not holds {
+            return false
+        }
+    }
+    return true
+} Store.expectations_hold
+
+/// Whether every read still holds at the head of the branch at `head`: a `Node` read the node's version, a `Subtree` read the dir's subtree version.
+pkg fn Store.reads_hold[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    reads: Slice[Read],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> bool fails StoreError uses wait {
+    for read in reads {
+        let holds = try await mut self.version_holds(device, head, path: read.path, version: read.version, scope: read.scope, now, alloc)
+        if not holds {
+            return false
+        }
+    }
+    return true
+} Store.reads_hold
+
+/// Whether the node at `path` has `version` at the head: the commit that last wrote it or, for `Subtree`, the dir's subtree version; its hash; or none for `Absent`.
+fn Store.version_holds[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    path: ident::Path,
+    version: Version,
+    scope: Scope,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> bool fails StoreError uses wait {
+    let segments = path.segments(alloc)
+    let resolution = match first attempt await mut self.resolve(device, head, segments: segments.view(), now, alloc) {
+        Ok(found) => found
+        Err(StoreError.NotFound) => return version == Version.Absent
+        Err(failure) => fail failure
+    }
+    let Some(found) = resolution.node() else {
+        return version == Version.Absent
+    }
+    return match version {
+        Version.Absent => false
+        Version.Commit(commit) => match scope {
+            Scope.Node => found.entry.version == commit.number
+            Scope.Subtree => found.entry.subtree == commit.number
+        }
+        Version.Hash(hash) => try await mut self.node_hash(device, found, alloc) == hash
+    }
+} Store.version_holds
+
+/// The id of the origin set `labels`, a new one when none holds it, 0 for none.
+pkg fn Store.origin_id[D: disk::Device](
+    mut self,
+    device: D,
+    labels: Slice[ident::OriginLabel],
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> u32 fails StoreError uses wait {
+    if labels.len() == 0 {
+        return 0
+    }
+    var sorted = mem::List[ident::OriginLabel].empty(alloc)
+    for label in labels {
+        mut sorted.push(ident::OriginLabel(text: label.text))
+    }
+    mut sorted.sort_by(fn(left: ident::OriginLabel, right: ident::OriginLabel) => left.cmp(right))
+    let lookup = origin_lookup_key(sorted.view(), alloc)
+    match try await mut self.catalog_get(device, key: lookup.view(), alloc) {
+        Some(bytes) => return bytes.view().u32_be(0)
+        None => {
+        }
+    }
+    let id = self.counters.origin
+    self.counters.origin += 1
+    let set = OriginSet(labels: take sorted, refcount: 0)
+    try await mut self.stage_catalog(device, key: number_key(KIND_ORIGIN_SET, number: u64.widen(id), width: 4, alloc).view(), value: wire_of(set, alloc).view(), mut staged, alloc)
+    try await mut self.stage_catalog(device, key: lookup.view(), value: id_bytes(id).view(), mut staged, alloc)
+    mut self.refs.count_id(kind: KIND_ORIGIN_SET, id, delta: 0)
+    return id
+} Store.origin_id
+
+/// The id of `type`, a new one when none holds it.
+pkg fn Store.type_id[D: disk::Device](
+    mut self,
+    device: D,
+    type: TypeRef,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> u32 fails StoreError uses wait {
+    let lookup = type_lookup_key(type, alloc)
+    match try await mut self.catalog_get(device, key: lookup.view(), alloc) {
+        Some(bytes) => return bytes.view().u32_be(0)
+        None => {
+        }
+    }
+    let id = self.counters.type
+    self.counters.type += 1
+    let entry = TypeEntry(type: type.copied(alloc), refcount: 0)
+    try await mut self.stage_catalog(device, key: number_key(KIND_TYPE, number: u64.widen(id), width: 4, alloc).view(), value: wire_of(entry, alloc).view(), mut staged, alloc)
+    try await mut self.stage_catalog(device, key: lookup.view(), value: id_bytes(id).view(), mut staged, alloc)
+    mut self.refs.count_id(kind: KIND_TYPE, id, delta: 0)
+    return id
+} Store.type_id
+
+/// The type of id `id`.
+pkg fn Store.type_of[D: disk::Device](mut self, device: D, id: u32, alloc: mem::Alloc) -> TypeRef fails StoreError uses wait {
+    let Some(bytes) = try await mut self.catalog_get(device, key: number_key(KIND_TYPE, number: u64.widen(id), width: 4, alloc).view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    let entry = try decode_type_entry(bytes.view(), alloc)
+    return entry.type
+} Store.type_of
+
+/// The catalog key of `key` as the request key of `principal`.
+fn request_key(principal: ident::Principal, key: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = catalog_key(KIND_REQUEST, key: principal.text.as_bytes(), alloc)
+    mut bytes.push(0)
+    mut bytes.append(key.as_bytes())
+    return bytes
+} request_key
+
+/// The 4 bytes of an id, big-endian.
+pkg fn id_bytes(id: u32) -> Array[u8, 4] {
+    var bytes = Array[u8, 4].filled(0)
+    mut bytes.view_mut().write_u32_be(0, value: id)
+    return bytes
+} id_bytes

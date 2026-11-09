@@ -1,0 +1,180 @@
+//! Replay at mount: each record of the log after the flush record's position registered and each commit record applied again, then, when replay applied any, an index flush with the log continuing in a new segment.
+
+/// Replays the log from the position of flush record `record`.
+pkg fn Store.replay[D: disk::Device](
+    mut self,
+    device: D,
+    record: disk::FlushRecord,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let started = match attempt await log::Replay.start(device, volume_id: self.superblock.volume_id, segment: record.segment, block: record.block, batch: record.batch, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    let Some(begun) = started else {
+        fail StoreError.Corrupt
+    }
+    var replay = begun
+    var applied: u64 = 0
+    loop {
+        let next = match attempt await mut replay.next_batch(device, alloc) {
+            Ok(found) => found
+            Err(failure) => fail StoreError.of_log(take failure)
+        }
+        let Some(batch) = next else {
+            break
+        }
+        mut self.log.set_state(batch.segment, state: log::SegmentState.Open)
+        let base = (disk::segment_start(batch.segment) + u64.widen(batch.block)) * u64.widen(disk::BLOCK_BYTES)
+        for placed in batch.records {
+            let address = base + u64.widen(placed.offset)
+            if try await mut self.replay_record(device, record: placed.record, address, alloc) {
+                applied += 1
+            }
+        }
+    }
+    mut self.events.push(Event.Mounted(format: self.superblock.format, replayed: applied))
+    if applied == 0 {
+        return
+    }
+    let ended = log::Position(segment: replay.segment, sequence: replay.sequence, next: replay.next, block: replay.block, batch: replay.batch)
+    match attempt mut self.log.continue_after(ended, time: now.utc_ns, alloc) {
+        Ok(_) => {
+        }
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    try await mut self.index_flush(device, now, alloc)
+} Store.replay
+
+/// Registers or applies one replayed record lying at `address`, and gives whether it is one a commit names.
+fn Store.replay_record[D: disk::Device](
+    mut self,
+    device: D,
+    record: disk::Record,
+    address: u64,
+    alloc: mem::Alloc,
+    ) -> bool fails StoreError uses wait {
+    let length = u32.truncate(record.payload.byte_len())
+    let pointer = disk::Pointer(target: address, length: length, kind: record.kind.code(), by_item: false, checksum: disk::placed_checksum(record.key, payload: record.payload.view(), alloc))
+    match record.kind {
+        disk::RecordKind.Commit => {
+            let decoded = try decode_commit_record(record.payload.view(), alloc)
+            try await mut self.reapply(device, record: take decoded, pointer, alloc)
+        }
+        disk::RecordKind.Value => mut self.index.place(record.key.view().u64_le(0), address, length, kind: record.kind.code())
+        disk::RecordKind.Piece => try await mut self.register_piece(device, key: record.key, pointer, alloc)
+        disk::RecordKind.Stream => try await mut self.register_run(device, record, pointer, alloc)
+        disk::RecordKind.Blob => try await mut self.register_blob(device, record, pointer, alloc)
+        disk::RecordKind.Index or disk::RecordKind.Pad => return false
+    }
+    return true
+} Store.replay_record
+
+/// Applies a replayed commit record again: its writes, its catalog entries, its catalog record and its branch's head.
+fn Store.reapply[D: disk::Device](
+    mut self,
+    device: D,
+    take record: CommitRecord,
+    pointer: disk::Pointer,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let CommitRecord(meta: meta, writes: writes, catalog: catalog) = record
+    let head = try self.head_named(meta.branch.as_str())
+    var staged = Staged.empty(alloc)
+    for write in writes {
+        mut self.count_ids(write)
+        let place = Place(head: head, tree: write.tree, dir: write.dir, name: copied_bytes(write.name.view(), alloc))
+        discard try await mut self.set_entry(device, place, entry: copied_entry(write.entry, alloc), mut staged, alloc)
+    }
+    for write in catalog {
+        mut self.count_catalog_ids(write.key.view())
+        match write.value {
+            Some(value) => try await mut self.catalog_put(device, key: write.key.view(), value: value.view(), alloc)
+            None => {
+                discard try await mut self.catalog_remove(device, key: write.key.view(), alloc)
+            }
+        }
+    }
+    let number = meta.number.number
+    let commit = meta.number
+    try await mut self.record_commit(device, take meta, record: pointer, writes: writes.view(), alloc)
+    self.counters.commit = number + 1
+    self.heads[head].branch.head = commit
+    mut self.heads[head].recent.push(Recent(number: number, writes: take writes))
+} Store.reapply
+
+/// Moves the dir and stream counters past the ids a replayed write creates.
+fn Store.count_ids(mut self, write: LogWrite) {
+    let Some(entry) = write.entry else {
+        return
+    }
+    match entry.content {
+        Content.Dir(id: id, declaration: _, digest: _, next: _) => {
+            if id >= self.counters.dir {
+                self.counters.dir = id + 1
+            }
+        }
+        Content.Stream(id: id, declaration: _, next: _, entries: _, bytes: _) => {
+            if id >= self.counters.stream {
+                self.counters.stream = id + 1
+            }
+        }
+        else => {
+        }
+    }
+} Store.count_ids
+
+/// Moves the type and origin set counters past the id a replayed catalog write creates.
+fn Store.count_catalog_ids(mut self, key: Slice[u8]) {
+    if key.len() != 5 {
+        return
+    }
+    let id = key.u32_be(1)
+    if key[0] == KIND_TYPE and id >= self.counters.type {
+        self.counters.type = id + 1
+    }
+    if key[0] == KIND_ORIGIN_SET and id >= self.counters.origin {
+        self.counters.origin = id + 1
+    }
+} Store.count_catalog_ids
+
+/// Registers a replayed piece record, unless its piece is held already.
+fn Store.register_piece[D: disk::Device](
+    mut self,
+    device: D,
+    key: Array[u8, 32],
+    pointer: disk::Pointer,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let catalog = catalog_key(KIND_PIECE, key: key.view(), alloc)
+    let held = try await mut self.catalog_get(device, key: catalog.view(), alloc)
+    if held.is_some() {
+        return
+    }
+    let entry = PieceEntry(record: pointer.to_list(alloc), refcount: 0)
+    try await mut self.catalog_put(device, key: catalog.view(), value: wire_of(entry, alloc).view(), alloc)
+} Store.register_piece
+
+/// Registers a replayed stream record as its stream's run.
+fn Store.register_run[D: disk::Device](
+    mut self,
+    device: D,
+    record: disk::Record,
+    pointer: disk::Pointer,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let entries = match attempt mem::wire::Codec[mem::List[StreamEntry]].decode(record.payload.view(), alloc) {
+        Ok(found) => found
+        Err(_) => fail StoreError.Corrupt
+    }
+    var bytes: u64 = 0
+    var newest: i64 = 0
+    for entry in entries {
+        bytes += u64.widen(entry.value.len())
+        newest = entry.time.utc_ns
+    }
+    let run = StreamRun(record: pointer.to_list(alloc), count: u32.fit(entries.len()), bytes: u32.saturate(bytes), time: newest)
+    let key = run_key(record.key.view().u64_le(0), earliest: record.key.view().u64_le(8), alloc)
+    try await mut self.catalog_put(device, key: key.view(), value: wire_of(run, alloc).view(), alloc)
+} Store.register_run

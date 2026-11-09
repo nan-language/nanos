@@ -1,0 +1,210 @@
+//! The steps of an index flush the engine takes: reference counts applied with everything left unnamed freed, branch heads made flush commits, and segment states recorded.
+
+/// Applies the reference changes collected since the last index flush: frees every item, blob, piece, origin set and type no entry names any more.
+pkg fn Store.settle_references[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    loop {
+        match attempt await mut self.index.free_unnamed(device, values: mut self.refs, alloc) {
+            Ok(_) => {
+            }
+            Err(failure) => fail StoreError.of_tree(take failure)
+        }
+        if self.refs.items.len() == 0 {
+            break
+        }
+        mut self.settle_items()
+    }
+    try await mut self.settle_blobs(device, alloc)
+    try await mut self.settle_counted(device, kind: KIND_ORIGIN_SET, alloc)
+    try await mut self.settle_counted(device, kind: KIND_TYPE, alloc)
+} Store.settle_references
+
+/// Makes each branch head that moved since its trees were last written a flush commit, its entry naming its versioned tree, and records the branch's trees.
+pkg fn Store.write_heads[D: disk::Device](
+    mut self,
+    device: D,
+    flush: u64,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    for at in 0..<self.heads.len() {
+        let number = self.heads[at].branch.head.number
+        if number == self.heads[at].written {
+            continue
+        }
+        let versioned = try mut self.write_tree(root: self.heads[at].versioned, flush, now, alloc)
+        let unversioned = try mut self.write_tree(root: self.heads[at].unversioned, flush, now, alloc)
+        self.heads[at].versioned = versioned
+        self.heads[at].unversioned = unversioned
+        self.heads[at].written = number
+        mut self.heads[at].recent.truncate(0)
+        let commit_key = number_key(KIND_COMMIT, number, width: 8, alloc)
+        let Some(held) = try await mut self.catalog_get(device, key: commit_key.view(), alloc) else {
+            fail StoreError.Corrupt
+        }
+        var entry = try decode_commit_entry(held.view(), alloc)
+        if entry.tree.is_none() {
+            entry.tree = Some(versioned.pointer.to_list(alloc))
+            mut self.index.retain(versioned.node)
+            try await mut self.catalog_put(device, key: commit_key.view(), value: wire_of(entry, alloc).view(), alloc)
+        }
+        try await mut self.write_branch_entry(device, at, alloc)
+    }
+} Store.write_heads
+
+/// Records in the catalog the states of the segments that changed since the last index flush.
+pkg fn Store.write_segments[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    for at in 0..<self.log.segments.len() {
+        let segment = self.log.segments[at]
+        if at < self.segments_written.len() and self.segments_written[at] == segment {
+            continue
+        }
+        let entry = SegmentEntry(state: state_code(segment.state), live: segment.live, written: segment.written)
+        let key = number_key(KIND_SEGMENT, number: u64.widen(at) + 1, width: 4, alloc)
+        try await mut self.catalog_put(device, key: key.view(), value: wire_of(entry, alloc).view(), alloc)
+    }
+    mut self.segments_written.truncate(0)
+    for segment in self.log.segments {
+        mut self.segments_written.push(segment)
+    }
+} Store.write_segments
+
+/// Writes the catalog entry of the branch at `at` of the heads.
+pkg fn Store.write_branch_entry[D: disk::Device](mut self, device: D, at: usize, alloc: mem::Alloc) fails StoreError uses wait {
+    let head = self.heads[at]
+    let entry = BranchEntry(branch: head.branch.copied(alloc), versioned: head.versioned.pointer.to_list(alloc), unversioned: head.unversioned.pointer.to_list(alloc))
+    let key = catalog_key(KIND_BRANCH, key: head.branch.name.as_bytes(), alloc)
+    try await mut self.catalog_put(device, key: key.view(), value: wire_of(entry, alloc).view(), alloc)
+} Store.write_branch_entry
+
+/// Applies the changes of blob references: frees each blob no node names, with the pieces it alone named.
+fn Store.settle_blobs[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    var changed = mem::List[BlobDelta].empty(alloc)
+    for entry in self.refs.blobs.cursor() {
+        mut changed.push(BlobDelta(id: entry.key(), delta: entry.value()))
+    }
+    mut self.refs.blobs.retain(fn(key: ident::HashValue, value: i64) => false)
+    for change in changed {
+        let key = catalog_key(KIND_BLOB, key: change.id.bytes.view(), alloc)
+        let Some(held) = try await mut self.catalog_get(device, key: key.view(), alloc) else {
+            continue
+        }
+        let stored = try decode_blob_entry(held.view(), alloc)
+        let count = i64.fit(stored.refcount) + change.delta
+        if count > 0 {
+            let updated = BlobEntry(size: stored.size, refcount: u64.fit(count))
+            try await mut self.catalog_put(device, key: key.view(), value: wire_of(updated, alloc).view(), alloc)
+        } else {
+            try await mut self.free_blob(device, id: change.id, alloc)
+        }
+    }
+} Store.settle_blobs
+
+/// Frees blob `id`: its entry and piece entries, and each piece it alone named.
+pkg fn Store.free_blob[D: disk::Device](mut self, device: D, id: ident::HashValue, alloc: mem::Alloc) fails StoreError uses wait {
+    discard try await mut self.catalog_remove(device, key: catalog_key(KIND_BLOB, key: id.bytes.view(), alloc).view(), alloc)
+    let held = try await mut self.catalog_scan(device, kind: KIND_BLOB_PIECE, from: id.bytes.view(), limit: 0xFFFF_FFFF, alloc)
+    for leaf in held {
+        if leaf.key.view().prefix(34) != catalog_key(KIND_BLOB_PIECE, key: id.bytes.view(), alloc).view().prefix(34) {
+            break
+        }
+        discard try await mut self.catalog_remove(device, key: leaf.key.view(), alloc)
+        try await mut self.release_piece(device, key: leaf.value.view(), alloc)
+    }
+} Store.free_blob
+
+/// One blob entry fewer names the piece of key `key`; at none, the piece is freed.
+pkg fn Store.release_piece[D: disk::Device](mut self, device: D, key: Slice[u8], alloc: mem::Alloc) fails StoreError uses wait {
+    let piece_key = catalog_key(KIND_PIECE, key, alloc)
+    let Some(held) = try await mut self.catalog_get(device, key: piece_key.view(), alloc) else {
+        return
+    }
+    let entry = try decode_piece_entry(held.view(), alloc)
+    if entry.refcount > 1 {
+        let updated = PieceEntry(record: take entry.record, refcount: entry.refcount - 1)
+        try await mut self.catalog_put(device, key: piece_key.view(), value: wire_of(updated, alloc).view(), alloc)
+        return
+    }
+    discard try await mut self.catalog_remove(device, key: piece_key.view(), alloc)
+    let Some(pointer) = disk::Pointer.of_bytes(entry.record.view()) else {
+        return
+    }
+    mut self.log.release(pointer.target, bytes: u64.widen(disk::record_span(pointer.length)))
+} Store.release_piece
+
+/// Applies the reference changes of origin sets or types, removing each entry left unnamed and its lookup.
+fn Store.settle_counted[D: disk::Device](mut self, device: D, kind: u8, alloc: mem::Alloc) fails StoreError uses wait {
+    var changed = mem::List[IdDelta].empty(alloc)
+    if kind == KIND_TYPE {
+        for entry in self.refs.types.cursor() {
+            mut changed.push(IdDelta(id: entry.key(), delta: entry.value()))
+        }
+        mut self.refs.types.retain(fn(key: u32, value: i64) => false)
+    } else {
+        for entry in self.refs.origins.cursor() {
+            mut changed.push(IdDelta(id: entry.key(), delta: entry.value()))
+        }
+        mut self.refs.origins.retain(fn(key: u32, value: i64) => false)
+    }
+    for change in changed {
+        let key = number_key(kind, number: u64.widen(change.id), width: 4, alloc)
+        let Some(held) = try await mut self.catalog_get(device, key: key.view(), alloc) else {
+            continue
+        }
+        try await mut self.recount(device, kind, key: key.view(), held: held.view(), delta: change.delta, alloc)
+    }
+} Store.settle_counted
+
+/// Applies `delta` to the count of the origin set or type entry `held` at `key`, removing it and its lookup at none.
+fn Store.recount[D: disk::Device](
+    mut self,
+    device: D,
+    kind: u8,
+    key: Slice[u8],
+    take held: Slice[u8],
+    delta: i64,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    if kind == KIND_TYPE {
+        let stored = try decode_type_entry(take held, alloc)
+        let count = i64.fit(stored.refcount) + delta
+        if count > 0 {
+            let updated = TypeEntry(type: take stored.type, refcount: u64.fit(count))
+            try await mut self.catalog_put(device, key, value: wire_of(updated, alloc).view(), alloc)
+            return
+        }
+        discard try await mut self.catalog_remove(device, key, alloc)
+        discard try await mut self.catalog_remove(device, key: type_lookup_key(stored.type, alloc).view(), alloc)
+        return
+    }
+    let stored = try decode_origin_set(take held, alloc)
+    let count = i64.fit(stored.refcount) + delta
+    if count > 0 {
+        let updated = OriginSet(labels: take stored.labels, refcount: u64.fit(count))
+        try await mut self.catalog_put(device, key, value: wire_of(updated, alloc).view(), alloc)
+        return
+    }
+    discard try await mut self.catalog_remove(device, key, alloc)
+    discard try await mut self.catalog_remove(device, key: origin_lookup_key(stored.labels.view(), alloc).view(), alloc)
+} Store.recount
+
+/// A change of a blob's references.
+struct BlobDelta derives Copy {
+    id: ident::HashValue
+    delta: i64
+} BlobDelta
+
+/// A change of the references to an origin set or type.
+struct IdDelta derives Copy {
+    id: u32
+    delta: i64
+} IdDelta
+
+/// The code a segment's state has in its catalog entry.
+pkg fn state_code(state: log::SegmentState) -> u8 {
+    return match state {
+        log::SegmentState.Free => 0
+        log::SegmentState.Open => 1
+        log::SegmentState.Full => 2
+        log::SegmentState.Freed => 3
+    }
+} state_code

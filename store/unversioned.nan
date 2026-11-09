@@ -1,0 +1,136 @@
+//! The writes of unversioned nodes: children added to numbered dirs, the children a numbered dir with `keep` keeps, holds and expiries.
+
+/// Adds a child named by the next number to the numbered dir at `segments`, deleting its lowest-numbered children beyond its `keep`.
+pkg fn Store.add_child[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    value: Value,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let resolution = try await mut self.resolve(device, head: writing.head, segments, now: writing.now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let declaration = try dir_declaration(found.entry, alloc)
+    if not declaration.numbered {
+        fail StoreError.Kind
+    }
+    let Content.Dir(id: id, declaration: bytes, digest: _, next: number) = found.entry.content else {
+        fail StoreError.Kind
+    }
+    let children = try child_dir(found.entry, tree: found.place.tree, alloc)
+    var counted = try found.entry.copied(alloc)
+    counted.content = Content.Dir(id: id, declaration: copied_bytes(bytes.view(), alloc), digest: None, next: number + 1)
+    discard try await mut self.set_entry(device, place: found.place.copied(alloc), entry: Some(take counted), mut staged, alloc)
+    var expires: i64 = 0
+    match declaration.keep {
+        Some(keep) => {
+            try await mut self.keep_children(device, head: writing.head, children, room: keep.count, writing, mut staged, alloc)
+            match keep.age_s {
+                Some(age) => {
+                    expires = writing.now.utc_ns.saturating_add(i64.saturate(age).saturating_mul(1_000_000_000))
+                }
+                None => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    var entry = try await mut self.value_entry(device, value, parent: Some(take declaration), existing: None, writing, mut staged, alloc)
+    entry.expires = expires
+    let place = Place(head: writing.head, tree: children.tree, dir: children.dir, name: decimal_name(number, alloc))
+    discard try await mut self.set_entry(device, place, entry: Some(take entry), mut staged, alloc)
+    mut staged.touch(resolution.found.view(), count: resolution.found.len(), children_changed: true, alloc)
+} Store.add_child
+
+/// Deletes the lowest-numbered children of the numbered dir `children`, held ones aside, until fewer than `room` remain.
+fn Store.keep_children[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    children: ChildDir,
+    room: u32,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let prefix = dir_prefix(children.dir, alloc)
+    let root = self.root_at(head, tree: children.tree)
+    let leaves = try await mut self.tree_scan(device, root, prefix: prefix.view(), from: prefix.view(), limit: 0xFFFF_FFFF, alloc)
+    var numbers = mem::List[u64].empty(alloc)
+    for leaf in leaves {
+        let Some(parts) = leaf.key.view().split_at(8) else {
+            continue
+        }
+        let entry = try NodeEntry.decode_from(leaf.value.view(), alloc)
+        let Some(number) = decimal_value(parts.tail) else {
+            continue
+        }
+        if not entry.held {
+            mut numbers.push(number)
+        }
+    }
+    mut numbers.sort_by(fn(left: u64, right: u64) => left.cmp(right))
+    var excess = numbers.len()
+    var at: usize = 0
+    while excess >= usize.widen(room) and at < numbers.len() {
+        let place = Place(head: head, tree: children.tree, dir: children.dir, name: decimal_name(numbers[at], alloc))
+        discard try await mut self.set_entry(device, place, entry: None, mut staged, alloc)
+        excess -= 1
+        at += 1
+    }
+} Store.keep_children
+
+/// Sets or clears the expiry of an unversioned node.
+pkg fn Store.expire_node[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    at: Option[ident::WallTime],
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let resolution = try await mut self.resolve(device, head: writing.head, segments, now: writing.now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    if found.place.tree == TREE_VERSIONED {
+        fail StoreError.Kind
+    }
+    var entry = try found.entry.copied(alloc)
+    entry.expires = match at {
+        Some(time) => time.utc_ns
+        None => 0
+    }
+    discard try await mut self.change_entry(device, place: found.place.copied(alloc), entry: Some(take entry), versioned: false, mut staged, alloc)
+} Store.expire_node
+
+/// Holds or releases a child of a numbered dir with `keep`.
+pkg fn Store.hold_node[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    on: bool,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let resolution = try await mut self.resolve(device, head: writing.head, segments, now: writing.now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let Some(parent) = try parent_declaration(resolution, alloc) else {
+        fail StoreError.Kind
+    }
+    if not parent.numbered or parent.keep.is_none() {
+        fail StoreError.Kind
+    }
+    var entry = try found.entry.copied(alloc)
+    entry.held = on
+    discard try await mut self.change_entry(device, place: found.place.copied(alloc), entry: Some(take entry), versioned: false, mut staged, alloc)
+} Store.hold_node

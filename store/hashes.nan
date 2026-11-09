@@ -1,0 +1,138 @@
+//! Identity: the hashes of nodes, the entry digests of dirs, their entry hashes cut into runs level by level, and the root hash of a commit.
+
+/// The hash of the node `found` names: the one its entry holds, else computed from its content and, for a dir, its children's.
+pkg fn Store.node_hash[D: disk::Device](mut self, device: D, found: Found, alloc: mem::Alloc) -> ident::HashValue fails StoreError uses wait {
+    return try await mut self.entry_hash(device, head: found.place.head, tree: found.place.tree, entry: found.entry, alloc)
+} Store.node_hash
+
+/// The hash of the node of `entry` in `tree` of the branch at `head`.
+pkg fn Store.entry_hash[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    tree: u8,
+    entry: NodeEntry,
+    alloc: mem::Alloc,
+    ) -> ident::HashValue fails StoreError uses wait {
+    match entry.hash {
+        Some(hash) => return hash
+        None => {
+        }
+    }
+    match entry.content {
+        Content.Blob(id: id, size: _) => return id
+        Content.Stream(id: _, declaration: declaration, next: _, entries: _, bytes: _) => return ident::HashValue.of_object(ident::Kind.Stream, bytes: declaration.view())
+        Content.Dir(id: id, declaration: declaration, digest: digest, next: _) => {
+            let children = try child_dir(entry, tree, alloc)
+            if children.tree != tree {
+                return ident::HashValue.of_object(ident::Kind.Ephemeral, bytes: declaration.view())
+            }
+            let held = match digest {
+                Some(found) => found
+                None => try await mut self.dir_digest(device, head, tree, dir: id, alloc)
+            }
+            var bytes = copied_bytes(declaration.view(), alloc)
+            mut bytes.append(held.bytes.view())
+            return ident::HashValue.of_object(ident::Kind.Dir, bytes: bytes.view())
+        }
+        else => {
+        }
+    }
+    let type = try await mut self.type_of(device, id: entry.type, alloc)
+    var bytes = copied_bytes(type.schema.bytes.view(), alloc)
+    let record = try await mut self.record_bytes(device, entry, alloc)
+    mut bytes.append(record.view())
+    return ident::HashValue.of_object(ident::Kind.Record, bytes: bytes.view())
+} Store.entry_hash
+
+/// The entry digest of dir `dir` in `tree`: its entry hashes in name order, cut into runs after each hash whose last byte is below 16 and after the last, level by level until one remains.
+pkg fn Store.dir_digest[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    tree: u8,
+    dir: u64,
+    alloc: mem::Alloc,
+    ) -> ident::HashValue fails StoreError uses wait {
+    let prefix = dir_prefix(dir, alloc)
+    let leaves = try await mut self.tree_scan(device, root: self.root_at(head, tree), prefix: prefix.view(), from: prefix.view(), limit: 0xFFFF_FFFF, alloc)
+    var level = mem::List[ident::HashValue].empty(alloc)
+    for leaf in leaves {
+        let Some(parts) = leaf.key.view().split_at(8) else {
+            continue
+        }
+        let entry = try NodeEntry.decode_from(leaf.value.view(), alloc)
+        let hash = try await mut self.entry_hash(device, head, tree, entry, alloc)
+        var bytes = wire_of(text_of(parts.tail, alloc), alloc)
+        mut bytes.push(entry.kind)
+        mut bytes.append(hash.bytes.view())
+        mut level.push(ident::HashValue.of_object(ident::Kind.Entry, bytes: bytes.view()))
+    }
+    if level.len() == 0 {
+        return ident::HashValue.of_object(ident::Kind.Run, bytes: b"")
+    }
+    loop {
+        level = runs_of_level(level.view(), alloc)
+        if level.len() == 1 {
+            return level[0]
+        }
+    }
+} Store.dir_digest
+
+/// The root hash of the head of the branch at `head`: the hash of a dir of empty declaration holding only its `data` and `sys`.
+pub fn Store.root_hash[D: disk::Device](mut self, device: D, branch: Str, alloc: mem::Alloc) -> ident::HashValue fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let digest = try await mut self.dir_digest(device, head, tree: TREE_VERSIONED, dir: TOP_DIR, alloc)
+    var bytes = wire_of(Declaration.Dir(DirDecl(element: None, ephemeral: false, secret: false, numbered: false, keep: None)), alloc)
+    mut bytes.append(digest.bytes.view())
+    return ident::HashValue.of_object(ident::Kind.Dir, bytes: bytes.view())
+} Store.root_hash
+
+/// The wire bytes of the record of `entry`, held inline or in a value record.
+pkg fn Store.record_bytes[D: disk::Device](mut self, device: D, entry: NodeEntry, alloc: mem::Alloc) -> mem::Bytes fails StoreError uses wait {
+    return match entry.content {
+        Content.Inline(bytes) => copied_bytes(bytes.view(), alloc)
+        Content.Value(bytes) => try await mut self.value_bytes(device, pointer: bytes.view(), alloc)
+        else => fail StoreError.Kind
+    }
+} Store.record_bytes
+
+/// The bytes of the value record a pointer names by its item.
+fn Store.value_bytes[D: disk::Device](mut self, device: D, pointer: Slice[u8], alloc: mem::Alloc) -> mem::Bytes fails StoreError uses wait {
+    let Some(named) = disk::Pointer.of_bytes(pointer) else {
+        fail StoreError.Corrupt
+    }
+    let entry = match attempt await mut self.index.item_entry(device, item: named.target, alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => fail StoreError.Corrupt
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+    let record = match attempt await log::read_record(device, address: entry.address, pointer: named, alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => fail StoreError.Corrupt
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    return accepted_bytes(record.payload.view(), alloc)
+} Store.value_bytes
+
+/// The hashes of one level of runs: each run of hashes, cut after each hash whose last byte is below 16 and after the last, hashed as `run`, a line feed and its hashes.
+fn runs_of_level(hashes: Slice[ident::HashValue], alloc: mem::Alloc) -> mem::List[ident::HashValue] {
+    var level = mem::List[ident::HashValue].empty(alloc)
+    var run = mem::Bytes.empty(alloc)
+    for at in 0..<hashes.len() {
+        mut run.append(hashes[at].bytes.view())
+        if hashes[at].bytes[32] < 16 or at + 1 == hashes.len() {
+            mut level.push(ident::HashValue.of_object(ident::Kind.Run, bytes: run.view()))
+            mut run.truncate(0)
+        }
+    }
+    return level
+} runs_of_level
+
+/// The text a name's bytes spell, empty when they are not UTF-8.
+fn text_of(name: Slice[u8], alloc: mem::Alloc) -> text::String {
+    return match attempt text::String.try_from_utf8(name, alloc) {
+        Ok(text) => text
+        Err(_) => text::String.empty(alloc)
+    }
+} text_of

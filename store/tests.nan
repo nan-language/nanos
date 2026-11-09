@@ -1,0 +1,122 @@
+//! Tests of the store on in-memory volumes.
+
+/// The blocks of the test volumes: the head area and 10 segments.
+const TEST_BLOCKS: u64 = 22_528
+
+/// A record type the tests write.
+struct Setting derives Eq, Encode {
+    level: u32
+    label: text::String
+} Setting
+
+fn test_volume(alloc: mem::Alloc) -> disk::MemoryVolume {
+    return disk::MemoryVolume.of_blocks(TEST_BLOCKS, alloc)
+} test_volume
+
+fn at_second(second: i64) -> ident::WallTime {
+    return ident::WallTime(utc_ns: second.saturating_mul(1_000_000_000), uncertainty_ns: 0)
+} at_second
+
+fn path_of(text: Str, alloc: mem::Alloc) -> ident::Path {
+    return ident::Path(text: text::String.of(text, alloc))
+} path_of
+
+fn system_stamp(alloc: mem::Alloc) -> Stamp {
+    return Stamp(principal: ident::Principal(text: text::Fixed[64].of("system")), session: None, instance: None, cause: ident::Cause.of(1, number: 1), origins: mem::List.empty(alloc), typed: true)
+} system_stamp
+
+fn setting_type(alloc: mem::Alloc) -> TypeRef {
+    return TypeRef.of("store::Setting", schema: mem::wire::Codec[Setting].schema_hash(), alloc)
+} setting_type
+
+fn setting(level: u32, label: Str, alloc: mem::Alloc) -> Value {
+    let value = Setting(level: level, label: text::String.of(label, alloc))
+    return Value.Record(type: setting_type(alloc), bytes: wire_of(value, alloc), secret: false)
+} setting
+
+fn plain_dir() -> Declaration = Declaration.Dir(DirDecl(element: None, ephemeral: false, secret: false, numbered: false, keep: None))
+
+fn make(text: Str, alloc: mem::Alloc) -> Write {
+    return Write.Make(path: path_of(text, alloc), declaration: plain_dir())
+} make
+
+fn put(text: Str, level: u32, alloc: mem::Alloc) -> Write {
+    return Write.Put(path: path_of(text, alloc), value: setting(level, label: text, alloc))
+} put
+
+fn blind(take writes: mem::List[Write], alloc: mem::Alloc) -> Transaction {
+    return Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+} blind
+
+/// A formatted store whose genesis made `/sys`, `/data` and `/state`.
+fn genesis_store(device: disk::MemoryVolume, alloc: mem::Alloc) -> Store fails StoreError uses wait {
+    var store = try await Store.format(device, volume_id: Array[u8, 16].filled(7), now: at_second(1), alloc)
+    var writes = mem::List[Write].empty(alloc)
+    mut writes.push(make("/sys", alloc))
+    mut writes.push(make("/data", alloc))
+    mut writes.push(make("/state", alloc))
+    discard try await mut store.genesis(device, take writes, stamp: system_stamp(alloc), now: at_second(2), alloc)
+    mut store.know("store::Setting", schema: mem::wire::Codec[Setting].schema(alloc), decoder: mem::wire::Codec[Setting].erased(), alloc)
+    return store
+} genesis_store
+
+/// The level of the setting at `text` on `main`.
+fn level_at(mut store: Store, device: disk::MemoryVolume, text: Str, alloc: mem::Alloc) -> u32 fails StoreError uses wait {
+    let node = try await mut store.get(device, branch: "main", path: path_of(text, alloc), now: at_second(100), alloc)
+    let Some(value) = node.value else {
+        return 0
+    }
+    return read_level(value.view(), alloc)
+} level_at
+
+validator fn read_level(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> u32 {
+    return match attempt mem::wire::Codec[Setting].decode(raw, alloc) {
+        Ok(found) => found.level
+        Err(_) => 0
+    }
+} read_level
+
+test genesis_makes_main_and_commits_read_back for Store.commit {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var writes = mem::List[Write].empty(alloc)
+    mut writes.push(put("/data/agent.ops/notes/first", level: 3, alloc))
+    mut writes.push(put("/data/agent.ops/notes/second", level: 4, alloc))
+    let committed = try await mut store.commit(device, branch: "main", transaction: blind(take writes, alloc), stamp: system_stamp(alloc), now: at_second(3), alloc)
+    expect committed.number.number == 2
+    let first_level = try await level_at(mut store, device, text: "/data/agent.ops/notes/first", alloc)
+    let second_level = try await level_at(mut store, device, text: "/data/agent.ops/notes/second", alloc)
+    expect first_level == 3 and second_level == 4
+    let listing = try await mut store.list(device, branch: "main", path: path_of("/data/agent.ops/notes", alloc), after: None, limit: 10, now: at_second(3), alloc)
+    expect listing.entries.len() == 2 and listing.entries[0].name.as_str() == "first"
+    let dir = try await mut store.get(device, branch: "main", path: path_of("/data/agent.ops", alloc), now: at_second(3), alloc)
+    expect dir.kind == NodeKind.Dir and dir.subtree == Some(ident::CommitId(number: 2)) and dir.size == 1
+} genesis_makes_main_and_commits_read_back
+
+test commits_survive_remounts for Store.mount {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var flushed = mem::List[Write].empty(alloc)
+    mut flushed.push(put("/data/kept", level: 5, alloc))
+    discard try await mut store.commit(device, branch: "main", transaction: blind(take flushed, alloc), stamp: system_stamp(alloc), now: at_second(3), alloc)
+    try await mut store.index_flush(device, now: at_second(4), alloc)
+    var logged = mem::List[Write].empty(alloc)
+    mut logged.push(put("/data/replayed", level: 6, alloc))
+    mut logged.push(Write.Delete(path: path_of("/data/kept", alloc)))
+    discard try await mut store.commit(device, branch: "main", transaction: blind(take logged, alloc), stamp: system_stamp(alloc), now: at_second(5), alloc)
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(6), alloc)
+    mut mounted.know("store::Setting", schema: mem::wire::Codec[Setting].schema(alloc), decoder: mem::wire::Codec[Setting].erased(), alloc)
+    let replayed = try await level_at(mut mounted, device, text: "/data/replayed", alloc)
+    expect replayed == 6
+    let gone = attempt await mut mounted.get(device, branch: "main", path: path_of("/data/kept", alloc), now: at_second(6), alloc)
+    expect gone.is_err()
+    var after = mem::List[Write].empty(alloc)
+    mut after.push(put("/data/after", level: 7, alloc))
+    let committed = try await mut mounted.commit(device, branch: "main", transaction: blind(take after, alloc), stamp: system_stamp(alloc), now: at_second(7), alloc)
+    expect committed.number.number == 4
+    var again = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(8), alloc)
+    let last = try await level_at(mut again, device, text: "/data/after", alloc)
+    expect last == 7
+} commits_survive_remounts

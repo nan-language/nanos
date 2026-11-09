@@ -1,0 +1,285 @@
+//! Reads at a branch's head: a node, a dir's children in order, their count and bytes from the index's subtree totals, and a range of children with their values.
+
+/// The node at `path` of the head of `branch`.
+pub fn Store.get[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Node fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head, segments: segments.view(), now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    return try await mut self.node_of(device, found, path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), alloc)
+} Store.get
+
+/// The children of the dir at `path` of the head of `branch`, after the child named `after`, at most `limit`, in byte order of their names or a numbered dir's numeric order.
+pub fn Store.list[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    after: Option[text::String],
+    limit: u32,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Listing fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head, segments: segments.view(), now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let declaration = try dir_declaration(found.entry, alloc)
+    let children = try child_dir(found.entry, tree: found.place.tree, alloc)
+    let leaves = try await mut self.children_of(device, head, children, numbered: declaration.numbered, after, now, alloc)
+    var listing = Listing(entries: mem::List.empty(alloc), next: None)
+    for leaf in leaves {
+        if listing.entries.len() >= usize.widen(limit) {
+            listing.next = Some(text_of_name(listing.entries[listing.entries.len() - 1].name.as_bytes(), alloc))
+            break
+        }
+        let entry = try NodeEntry.decode_from(leaf.value.view(), alloc)
+        let name = leaf.key.view().split_at(8)
+        let Some(parts) = name else {
+            continue
+        }
+        let size = try await mut self.size_of(device, head, tree: children.tree, entry, alloc)
+        let type = try await mut self.type_name(device, entry, alloc)
+        mut listing.entries.push(Entry(name: text_of_name(parts.tail, alloc), kind: NodeKind.of_code(entry.kind).value_or(NodeKind.Record), version: ident::CommitId(number: entry.version), size: size, type: take type))
+    }
+    return listing
+} Store.list
+
+/// The count and value bytes of the children of the dir at `path` of the head of `branch` whose names lie from `from` on and, unless `to` is empty, below `to`, by the index's subtree totals.
+pub fn Store.count[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    from: Str,
+    to: Str,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Count fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head, segments: segments.view(), now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let children = try child_dir(found.entry, tree: found.place.tree, alloc)
+    if children.dir == 0 {
+        fail StoreError.Kind
+    }
+    let low = entry_key(children.dir, name: from.as_bytes(), alloc)
+    let high = match to.byte_len() == 0 {
+        true => dir_prefix(children.dir + 1, alloc)
+        false => entry_key(children.dir, name: to.as_bytes(), alloc)
+    }
+    let totals = try await mut self.tree_count(device, root: self.root_at(head, tree: children.tree), from: low.view(), to: high.view(), alloc)
+    return Count(children: totals.count, bytes: totals.bytes)
+} Store.count
+
+/// The children of the dir at `path` of the head of `branch` whose names lie from `from` on and, unless `to` is empty, below `to`, at most `limit`, with their values.
+pub fn Store.scan[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    from: Str,
+    to: Str,
+    limit: u32,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> mem::List[Node] fails StoreError uses wait {
+    let listing = try await mut self.list(device, branch, path, after: None, limit: 0xFFFF_FFFF, now, alloc)
+    var nodes = mem::List[Node].empty(alloc)
+    for entry in listing.entries {
+        let name = entry.name.as_str()
+        if name < from or (to.byte_len() > 0 and name >= to) or nodes.len() >= usize.widen(limit) {
+            continue
+        }
+        let Some(child) = path.child(name.as_bytes(), alloc) else {
+            continue
+        }
+        mut nodes.push(try await mut self.get(device, branch, path: child, now, alloc))
+    }
+    return nodes
+} Store.scan
+
+/// The children of a dir as leaves of its tree, after `after`, in byte order or for a numbered dir numeric order, the expired left out.
+fn Store.children_of[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    children: ChildDir,
+    numbered: bool,
+    after: Option[text::String],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> mem::List[tree::Leaf] fails StoreError uses wait {
+    let prefix = dir_prefix(children.dir, alloc)
+    let leaves = try await mut self.tree_scan(device, root: self.root_at(head, tree: children.tree), prefix: prefix.view(), from: prefix.view(), limit: 0xFFFF_FFFF, alloc)
+    var kept = mem::List[tree::Leaf].empty(alloc)
+    for leaf in take leaves {
+        let entry = try NodeEntry.decode_from(leaf.value.view(), alloc)
+        let Some(parts) = leaf.key.view().split_at(8) else {
+            continue
+        }
+        let visible = entry.expires == 0 or entry.expires > now.utc_ns
+        let past = match after {
+            Some(name) => name_after(parts.tail, after: name.as_bytes(), numbered)
+            None => true
+        }
+        if visible and past {
+            mut kept.push(take leaf)
+        }
+    }
+    if numbered {
+        mut kept.sort_by(fn(left: tree::Leaf, right: tree::Leaf) => numeric_order(left.key.view(), right: right.key.view()))
+    }
+    return kept
+} Store.children_of
+
+/// The node `found` names, with its value when it is a record.
+pkg fn Store.node_of[D: disk::Device](
+    mut self,
+    device: D,
+    found: Found,
+    take path: ident::Path,
+    alloc: mem::Alloc,
+    ) -> Node fails StoreError uses wait {
+    let entry = found.entry
+    let kind = NodeKind.of_code(entry.kind).value_or(NodeKind.Record)
+    let size = try await mut self.size_of(device, head: found.place.head, tree: found.place.tree, entry, alloc)
+    var declared: Option[TypeRef] = None
+    if entry.type != 0 {
+        let id = match entry.declared {
+            0 => entry.type
+            else => entry.declared
+        }
+        declared = Some(try await mut self.type_of(device, id, alloc))
+    }
+    var value: Option[Untrusted[mem::Bytes]] = None
+    if kind == NodeKind.Record {
+        value = Some(Untrusted.of(try await mut self.record_bytes(device, entry, alloc)))
+    }
+    let subtree = match kind == NodeKind.Dir {
+        true => Some(ident::CommitId(number: entry.subtree))
+        false => None
+    }
+    var expires: Option[ident::WallTime] = None
+    if entry.expires != 0 {
+        expires = Some(ident::WallTime(utc_ns: entry.expires, uncertainty_ns: 0))
+    }
+    let origins = try await mut self.origin_labels(device, id: entry.origins, alloc)
+    let declaration = try declaration_of(entry, alloc)
+    return Node(path: take path, kind: kind, version: ident::CommitId(number: entry.version), subtree: subtree, declared: take declared, hash: entry.hash, size: size, origins: take origins, secret: false, expires: expires, declaration: take declaration, value: take value)
+} Store.node_of
+
+/// The size of the node of `entry`: a record's or blob's bytes, a dir's children or a stream's entries.
+fn Store.size_of[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    tree: u8,
+    entry: NodeEntry,
+    alloc: mem::Alloc,
+    ) -> u64 fails StoreError uses wait {
+    return match entry.content {
+        Content.Inline(bytes) => u64.widen(bytes.len())
+        Content.Value(bytes) => match disk::Pointer.of_bytes(bytes.view()) {
+            Some(pointer) => u64.widen(pointer.length)
+            None => 0
+        }
+        Content.Blob(id: _, size: size) => size
+        Content.Stream(id: _, declaration: _, next: _, entries: entries, bytes: _) => entries
+        Content.Dir(id: _, declaration: _, digest: _, next: _) => try await mut self.children_count(device, head, tree, entry, alloc)
+    }
+} Store.size_of
+
+fn Store.children_count[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    tree: u8,
+    entry: NodeEntry,
+    alloc: mem::Alloc,
+    ) -> u64 fails StoreError uses wait {
+    let children = try child_dir(entry, tree, alloc)
+    let low = dir_prefix(children.dir, alloc)
+    let high = dir_prefix(children.dir + 1, alloc)
+    let totals = try await mut self.tree_count(device, root: self.root_at(head, tree: children.tree), from: low.view(), to: high.view(), alloc)
+    return totals.count
+} Store.children_count
+
+/// The name of the declared type of a record or stream entry.
+fn Store.type_name[D: disk::Device](mut self, device: D, entry: NodeEntry, alloc: mem::Alloc) -> Option[text::String] fails StoreError uses wait {
+    if entry.type == 0 {
+        return None
+    }
+    let type = try await mut self.type_of(device, id: entry.type, alloc)
+    return Some(take type.name)
+} Store.type_name
+
+/// The labels of the origin set of id `id`, none for 0.
+fn Store.origin_labels[D: disk::Device](mut self, device: D, id: u32, alloc: mem::Alloc) -> mem::List[ident::OriginLabel] fails StoreError uses wait {
+    if id == 0 {
+        return mem::List.empty(alloc)
+    }
+    let Some(bytes) = try await mut self.catalog_get(device, key: number_key(KIND_ORIGIN_SET, number: u64.widen(id), width: 4, alloc).view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    let set = try decode_origin_set(bytes.view(), alloc)
+    return set.labels
+} Store.origin_labels
+
+/// The declaration of a dir or stream entry.
+fn declaration_of(entry: NodeEntry, alloc: mem::Alloc) -> Option[Declaration] fails StoreError {
+    return match entry.content {
+        Content.Dir(id: _, declaration: bytes, digest: _, next: _) => Some(try decode_declaration(bytes.view(), alloc))
+        Content.Stream(id: _, declaration: bytes, next: _, entries: _, bytes: _) => Some(try decode_declaration(bytes.view(), alloc))
+        else => None
+    }
+} declaration_of
+
+/// Whether the child name `name` comes after `after`, in numeric order in a numbered dir.
+fn name_after(name: Slice[u8], after: Slice[u8], numbered: bool) -> bool {
+    if not numbered {
+        return name > after
+    }
+    return match decimal_value(name) {
+        Some(value) => match decimal_value(after) {
+            Some(bound) => value > bound
+            None => true
+        }
+        None => name > after
+    }
+} name_after
+
+/// The order of two entry keys of a numbered dir by the numbers their names spell.
+fn numeric_order(left: Slice[u8], right: Slice[u8]) -> core::Ordering {
+    return number_of_key(left).cmp(number_of_key(right))
+} numeric_order
+
+/// The number the name of an entry key spells, 0 when it spells none.
+fn number_of_key(key: Slice[u8]) -> u64 {
+    let Some(parts) = key.split_at(8) else {
+        return 0
+    }
+    return decimal_value(parts.tail).value_or(0)
+} number_of_key
+
+/// The text of a child's name.
+fn text_of_name(name: Slice[u8], alloc: mem::Alloc) -> text::String {
+    return match attempt text::String.try_from_utf8(name, alloc) {
+        Ok(text) => text
+        Err(_) => text::String.empty(alloc)
+    }
+} text_of_name

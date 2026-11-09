@@ -1,0 +1,360 @@
+//! Transactions: the commit procedure's checks in order, writes applied to the branch's trees as they are checked and undone when a check fails, then the commit numbered, logged and durable once its log flush returns.
+
+/// The most writes, record and stream entry bytes, and reads and expectations a transaction holds.
+const MOST_WRITES: usize = 10_000
+
+const MOST_ENTRY_BYTES: u64 = 67_108_864
+
+const MOST_CONDITIONS: usize = 65_536
+
+/// The most bytes of a record's wire bytes, a stream entry and an intent.
+pkg const MOST_RECORD_BYTES: usize = 4_194_304
+
+pkg const MOST_STREAM_ENTRY_BYTES: usize = 65_536
+
+const MOST_INTENT_BYTES: usize = 1_024
+
+/// What applying a commit's writes needs: the branch, the commit's number and base, the origin set its nodes carry, whether its writes are typed, and the time.
+pkg struct Writing derives Copy {
+    pkg head: usize
+    pkg number: u64
+    pkg base: u64
+    pkg origins: u32
+    pkg typed: bool
+    pkg now: ident::WallTime
+} Writing
+
+/// Commits `transaction` to `branch` with what `stamp` gives, once its log flush returns.
+pub fn Store.commit[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    take transaction: Transaction,
+    take stamp: Stamp,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    return try await mut self.commit_as(device, branch, take transaction, take stamp, kind: CommitKind.Write, now, alloc)
+} Store.commit
+
+/// Commits `transaction` to `branch` as a commit of `kind`.
+pkg fn Store.commit_as[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    take transaction: Transaction,
+    take stamp: Stamp,
+    take kind: CommitKind,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    let Some(head) = self.head_of(branch) else {
+        fail StoreError.NotFound
+    }
+    let digest = request_digest(transaction, alloc)
+    match try await mut self.earlier_commit(device, key: transaction.key, stamp, digest, alloc) {
+        Some(earlier) => return earlier
+        None => {
+        }
+    }
+    try check_limits(transaction)
+    let head_number = self.heads[head].branch.head.number
+    let base = match transaction.base {
+        Some(commit) => commit.number
+        None => head_number
+    }
+    let expected = try await mut self.expectations_hold(device, head, expects: transaction.expects.view(), now, alloc)
+    let read = try await mut self.reads_hold(device, head, reads: transaction.reads.view(), now, alloc)
+    var staged = Staged.empty(alloc)
+    let origins = try await mut self.origin_id(device, labels: stamp.origins.view(), mut staged, alloc)
+    let writing = Writing(head: head, number: self.counters.commit, base: base, origins: origins, typed: stamp.typed, now: now)
+    let outcome = attempt await mut self.apply_writes(device, writes: transaction.writes.view(), writing, mut staged, alloc)
+    let serializable = transaction.plan.is_some() or touches_sys(transaction.writes.view(), alloc)
+    let refused = match outcome {
+        Ok(_) => refusal(staged.conflict, read: read or not serializable, expected)
+        Err(failure) => Some(take failure)
+    }
+    if refused.is_some() {
+        try await mut self.undo(device, mut staged, alloc)
+        let Some(failure) = refused else {
+            fail StoreError.Corrupt
+        }
+        fail failure
+    }
+    try await mut self.request_entry(device, key: transaction.key, stamp, number: writing.number, digest, mut staged, alloc)
+    var meta = commit_meta(transaction, stamp, writing, branch: self.heads[head].branch, recorded: staged.recorded, alloc)
+    meta.kind = kind
+    return try await mut self.finish(device, take meta, take staged, alloc)
+} Store.commit_as
+
+/// The first failure the checks after validity give, in the commit procedure's order: a write conflict, a read that no longer holds, an expectation that does not hold.
+fn refusal(conflict: bool, read: bool, expected: bool) -> Option[StoreError] {
+    if conflict {
+        return Some(StoreError.ConflictWrite)
+    }
+    if not read {
+        return Some(StoreError.ConflictRead)
+    }
+    if not expected {
+        return Some(StoreError.ConflictExpect)
+    }
+    return None
+} refusal
+
+/// Applies `writes` in order.
+fn Store.apply_writes[D: disk::Device](
+    mut self,
+    device: D,
+    writes: Slice[Write],
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    for write in writes {
+        try await mut self.apply_write(device, write, writing, mut staged, alloc)
+    }
+    try await mut self.update_ancestors(device, number: writing.number, mut staged, alloc)
+} Store.apply_writes
+
+/// Numbers and logs a checked commit, makes it durable, and records it in the catalog and its branch's head.
+pkg fn Store.finish[D: disk::Device](
+    mut self,
+    device: D,
+    take meta: CommitMeta,
+    take staged: Staged,
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    var held = staged
+    let head = try self.head_named(meta.branch.as_str())
+    let number = meta.number.number
+    let time = meta.time
+    let record = CommitRecord(meta: meta.copied(alloc), writes: take held.writes, catalog: take held.catalog)
+    let bytes = wire_of(record, alloc)
+    let CommitRecord(meta: _, writes: writes, catalog: catalog) = record
+    held.writes = writes
+    held.catalog = catalog
+    let logged = attempt mut self.log_commit(number, time: time.utc_ns, record: bytes.view(), staged: held, alloc)
+    let written = match logged {
+        Ok(found) => found
+        Err(failure) => {
+            try await mut self.undo(device, staged: mut held, alloc)
+            fail failure
+        }
+    }
+    match attempt await mut self.flush_log(device, alloc) {
+        Ok(_) => {
+        }
+        Err(failure) => {
+            discard attempt await mut self.undo(device, staged: mut held, alloc)
+            fail failure
+        }
+    }
+    let committed = Committed(number: meta.number, branch: text::String.of(meta.branch.as_str(), alloc), time: time)
+    for run in written.runs {
+        let Some(value) = run.value else {
+            continue
+        }
+        try await mut self.catalog_put(device, key: run.key.view(), value: value.view(), alloc)
+    }
+    try await mut self.record_commit(device, take meta, record: written.pointer, writes: held.writes.view(), alloc)
+    self.counters.commit = number + 1
+    self.heads[head].branch.head = ident::CommitId(number: number)
+    mut self.heads[head].recent.push(Recent(number: number, writes: take held.writes))
+    return committed
+} Store.finish
+
+/// What logging a commit gives: the pointer naming its commit record, and the catalog entries of its stream runs.
+struct Logged {
+    pointer: disk::Pointer
+    runs: mem::List[CatalogWrite]
+} Logged
+
+/// Appends a commit's value records, stream runs and commit record to the log.
+fn Store.log_commit(
+    mut self,
+    number: u64,
+    time: i64,
+    record: Slice[u8],
+    staged: Staged,
+    alloc: mem::Alloc,
+    ) -> Logged fails StoreError {
+    for value in staged.values {
+        var key = Array[u8, 32].filled(0)
+        mut key.view_mut().write_u64_le(0, value: value.item)
+        let placed = match attempt mut self.log.append(disk::RecordKind.Value, key, payload: value.bytes.view(), time, alloc) {
+            Ok(found) => found
+            Err(failure) => fail StoreError.of_log(take failure)
+        }
+        mut self.index.place(value.item, address: placed.address, length: placed.pointer.length, kind: disk::RecordKind.Value.code())
+    }
+    var runs = mem::List[CatalogWrite].empty(alloc)
+    for run in staged.runs {
+        mut runs.push(try mut self.log_run(run, time, alloc))
+    }
+    var key = Array[u8, 32].filled(0)
+    mut key.view_mut().write_u64_le(0, value: number)
+    let placed = match attempt mut self.log.append(disk::RecordKind.Commit, key, payload: record, time, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    return Logged(pointer: placed.pointer, runs: take runs)
+} Store.log_commit
+
+/// Records a durable commit in the catalog: its entry naming its record, and the path changes of a recorded commit.
+pkg fn Store.record_commit[D: disk::Device](
+    mut self,
+    device: D,
+    take meta: CommitMeta,
+    record: disk::Pointer,
+    writes: Slice[LogWrite],
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let number = meta.number.number
+    if meta.recorded {
+        for write in writes {
+            if write.tree == TREE_VERSIONED {
+                try await mut self.record_change(device, write, number, alloc)
+            }
+        }
+    }
+    let entry = CommitEntry(meta: take meta, record: Some(record.to_list(alloc)), tree: None)
+    try await mut self.catalog_put(device, key: number_key(KIND_COMMIT, number, width: 8, alloc).view(), value: wire_of(entry, alloc).view(), alloc)
+} Store.record_commit
+
+/// Records that commit `number` created, changed or deleted the versioned node `write` names.
+fn Store.record_change[D: disk::Device](
+    mut self,
+    device: D,
+    write: LogWrite,
+    number: u64,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let change: u8 = match write.entry {
+        Some(_) => 2
+        None => 3
+    }
+    var key = mem::Bytes.empty(alloc)
+    mut key.push(KIND_PATH_CHANGE)
+    mut key.push(write.tree)
+    var dir = Array[u8, 8].filled(0)
+    mut dir.view_mut().write_u64_be(0, value: write.dir)
+    mut key.append(dir.view())
+    mut key.append(write.name.view())
+    mut key.push(0)
+    var commit = Array[u8, 8].filled(0)
+    mut commit.view_mut().write_u64_be(0, value: number)
+    mut key.append(commit.view())
+    try await mut self.catalog_put(device, key: key.view(), value: wire_of(PathChange(change: change), alloc).view(), alloc)
+} Store.record_change
+
+/// The head of the branch named `name`, `store.not-found` when none is.
+pkg fn Store.head_named(self, name: Str) -> usize fails StoreError {
+    let Some(head) = self.head_of(name) else {
+        fail StoreError.NotFound
+    }
+    return head
+} Store.head_named
+
+/// `store.too-large` when the transaction exceeds a limit.
+fn check_limits(transaction: Transaction) fails StoreError {
+    if transaction.writes.len() > MOST_WRITES or transaction.reads.len() + transaction.expects.len() > MOST_CONDITIONS {
+        fail StoreError.TooLarge
+    }
+    match transaction.intent {
+        Some(intent) => {
+            if intent.byte_len() > MOST_INTENT_BYTES {
+                fail StoreError.TooLarge
+            }
+        }
+        None => {
+        }
+    }
+    var bytes: u64 = 0
+    for write in transaction.writes {
+        bytes = bytes.saturating_add(write_bytes(write))
+    }
+    if bytes > MOST_ENTRY_BYTES {
+        fail StoreError.TooLarge
+    }
+} check_limits
+
+/// The record and stream entry bytes a write carries.
+fn write_bytes(write: Write) -> u64 {
+    return match write {
+        Write.Put(path: _, value: Value.Record(type: _, bytes: bytes, secret: _)) => u64.widen(bytes.len())
+        Write.Add(path: _, value: Value.Record(type: _, bytes: bytes, secret: _)) => u64.widen(bytes.len())
+        Write.Append(path: _, entries: entries) => entries_bytes(entries.view())
+        else => 0
+    }
+} write_bytes
+
+fn entries_bytes(entries: Slice[mem::Bytes]) -> u64 {
+    var total: u64 = 0
+    for entry in entries {
+        total = total.saturating_add(u64.widen(entry.len()))
+    }
+    return total
+} entries_bytes
+
+/// Whether a write lies below `/sys`, which makes its transaction serializable.
+fn touches_sys(writes: Slice[Write], alloc: mem::Alloc) -> bool {
+    for write in writes {
+        let segments = write.path().segments(alloc)
+        if segments.len() > 0 and segments[0].view() == b"sys" {
+            return true
+        }
+    }
+    return false
+} touches_sys
+
+/// The path a write names.
+pkg proj fn Write.path(self) -> ident::Path {
+    return match self {
+        Write.Put(path: path, value: _) => path
+        Write.Make(path: path, declaration: _) => path
+        Write.Delete(path: path) => path
+        Write.Add(path: path, value: _) => path
+        Write.Append(path: path, entries: _) => path
+        Write.Expire(path: path, at: _) => path
+        Write.Hold(path: path, on: _) => path
+        Write.Trim(path: path, below: _) => path
+    }
+} Write.path
+
+/// The metadata of a commit of `transaction` on `branch`.
+fn commit_meta(
+    transaction: Transaction,
+    stamp: Stamp,
+    writing: Writing,
+    branch: Branch,
+    recorded: bool,
+    alloc: mem::Alloc,
+    ) -> CommitMeta {
+    var parents = mem::List[ident::CommitId].empty(alloc)
+    if branch.head.number > 0 {
+        mut parents.push(branch.head)
+    }
+    var origins = mem::List[ident::OriginLabel].empty(alloc)
+    for label in stamp.origins {
+        mut origins.push(ident::OriginLabel(text: label.text))
+    }
+    mut origins.sort_by(fn(left: ident::OriginLabel, right: ident::OriginLabel) => left.cmp(right))
+    return CommitMeta(number: ident::CommitId(number: writing.number), branch: text::String.of(branch.name.as_str(), alloc), parents: take parents, kind: CommitKind.Write, principal: ident::Principal(text: stamp.principal.text), session: stamp.session, instance: copied_moniker(stamp.instance), cause: stamp.cause, plan: transaction.plan, intent: copied_text(transaction.intent, alloc), origins: take origins, key: copied_text(transaction.key, alloc), time: writing.now, recorded: recorded, root: None)
+} commit_meta
+
+pkg fn copied_text(text: Option[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    return match text {
+        Some(held) => Some(text::String.of(held.as_str(), alloc))
+        None => None
+    }
+} copied_text
+
+fn copied_moniker(moniker: Option[ident::Moniker]) -> Option[ident::Moniker] {
+    return match moniker {
+        Some(held) => Some(ident::Moniker(text: held.text))
+        None => None
+    }
+} copied_moniker

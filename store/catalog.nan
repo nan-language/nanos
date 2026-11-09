@@ -1,0 +1,117 @@
+//! The catalog's entries read and written through the index, and the reference changes of value items, blobs, origin sets and types that collect until an index flush.
+
+/// The reference changes node entries make as leaves holding them are copied, freed, written or replaced.
+pkg struct Refs {
+    pkg items: mem::List[ItemRef]
+    pkg blobs: mem::Map[ident::HashValue, i64]
+    pkg origins: mem::Map[u32, i64]
+    pkg types: mem::Map[u32, i64]
+    alloc: mem::Alloc
+} Refs
+
+/// A change of the references to a value item, which the pointer naming it names.
+pkg struct ItemRef derives Copy {
+    pkg item: u64
+    pkg delta: i64
+    pkg pointer: disk::Pointer
+} ItemRef
+
+impl Refs: tree::Values
+
+pkg fn Refs.empty(alloc: mem::Alloc) -> Refs {
+    return Refs(items: mem::List.empty(alloc), blobs: mem::Map.empty(alloc), origins: mem::Map.empty(alloc), types: mem::Map.empty(alloc), alloc: alloc)
+} Refs.empty
+
+pkg fn Refs.retain(mut self, tree: u8, value: Slice[u8]) {
+    mut self.count_bytes(tree, value, delta: 1)
+} Refs.retain
+
+pkg fn Refs.release(mut self, tree: u8, value: Slice[u8]) {
+    mut self.count_bytes(tree, value, delta: -1)
+} Refs.release
+
+/// Counts the references of `entry` by `delta`.
+pkg fn Refs.count(mut self, entry: NodeEntry, delta: i64) {
+    match entry.content {
+        Content.Value(bytes) => {
+            let Some(pointer) = disk::Pointer.of_bytes(bytes.view()) else {
+                return
+            }
+            mut self.items.push(ItemRef(item: pointer.target, delta: delta, pointer: pointer))
+        }
+        Content.Blob(id: id, size: _) => add_delta(mut self.blobs, key: id, delta)
+        else => {
+        }
+    }
+    if entry.origins != 0 {
+        add_delta(mut self.origins, key: entry.origins, delta)
+    }
+    if entry.type != 0 {
+        add_delta(mut self.types, key: entry.type, delta)
+    }
+    if entry.declared != 0 {
+        add_delta(mut self.types, key: entry.declared, delta)
+    }
+} Refs.count
+
+/// Counts a change of `delta` to the references of blob `id`.
+pkg fn Refs.count_blob(mut self, id: ident::HashValue, delta: i64) {
+    add_delta(mut self.blobs, key: id, delta)
+} Refs.count_blob
+
+/// Counts a change of `delta` to the references of the origin set or type of id `id`.
+pkg fn Refs.count_id(mut self, kind: u8, id: u32, delta: i64) {
+    if kind == KIND_TYPE {
+        add_delta(mut self.types, key: id, delta)
+    } else {
+        add_delta(mut self.origins, key: id, delta)
+    }
+} Refs.count_id
+
+fn Refs.count_bytes(mut self, tree: u8, value: Slice[u8], delta: i64) {
+    if tree == TREE_CATALOG {
+        return
+    }
+    let raw = disk::copy_range(value, at: 0, count: value.len(), alloc: self.alloc)
+    let Ok(entry) = attempt mem::wire::Codec[NodeEntry].decode(Untrusted.of(raw.view()), alloc: self.alloc) else {
+        return
+    }
+    mut self.count(entry, delta)
+} Refs.count_bytes
+
+fn add_delta[K: Ord](mut deltas: mem::Map[K, i64], take key: K, delta: i64) {
+    let held = match deltas.get(key) {
+        Some(found) => found
+        None => 0
+    }
+    discard mut deltas.insert(take key, value: held + delta)
+} add_delta
+
+/// The store failure a tree failure is.
+pkg fn StoreError.of_tree(take failure: tree::TreeFailure) -> StoreError {
+    return match failure {
+        tree::TreeFailure.Corrupt => StoreError.Corrupt
+        tree::TreeFailure.Full => StoreError.Full
+        tree::TreeFailure.TooLarge => StoreError.TooLarge
+        tree::TreeFailure.Io => StoreError.Io
+        tree::TreeFailure.Cancelled(cancelled) => StoreError.Cancelled(take cancelled)
+    }
+} StoreError.of_tree
+
+/// The store failure a log failure is.
+pkg fn StoreError.of_log(take failure: log::LogFailure) -> StoreError {
+    return match failure {
+        log::LogFailure.Full => StoreError.Full
+        log::LogFailure.TooLarge => StoreError.TooLarge
+        log::LogFailure.Io => StoreError.Io
+        log::LogFailure.Cancelled(cancelled) => StoreError.Cancelled(take cancelled)
+    }
+} StoreError.of_log
+
+/// The node entry a tree's leaf holds, `store.corrupt` when it does not decode.
+pkg fn NodeEntry.decode_from(take bytes: Slice[u8], alloc: mem::Alloc) -> NodeEntry fails StoreError {
+    return match attempt mem::wire::Codec[NodeEntry].decode(Untrusted.of(take bytes), alloc) {
+        Ok(entry) => entry
+        Err(_) => fail StoreError.Corrupt
+    }
+} NodeEntry.decode_from

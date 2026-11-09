@@ -1,0 +1,218 @@
+//! Streams: entries appended as runs logged with the commit appending them, read back from a sequence number on, and trimmed below one.
+
+/// Appends entries to the stream at `segments`, numbering them from its next sequence number.
+pkg fn Store.append_entries[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    entries: Slice[mem::Bytes],
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let resolution = try await mut self.resolve(device, head: writing.head, segments, now: writing.now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let Content.Stream(id: id, declaration: declared, next: next, entries: count, bytes: size) = found.entry.content else {
+        fail StoreError.Kind
+    }
+    let Declaration.Stream(stream) = try decode_declaration(declared.view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    var run = mem::List[StreamEntry].empty(alloc)
+    var added: u64 = 0
+    for value in entries {
+        if value.len() > MOST_STREAM_ENTRY_BYTES {
+            fail StoreError.TooLarge
+        }
+        var bytes = copied_bytes(value.view(), alloc)
+        if not writing.typed {
+            let canonical = try self.schemas.decode(stream.type.schema, raw: Untrusted.of(bytes.view()), alloc)
+            bytes = accepted_bytes(canonical.view(), alloc)
+        }
+        added += u64.widen(bytes.len())
+        mut run.push(StreamEntry(seq: next + u64.widen(run.len()), time: writing.now, value: take bytes))
+    }
+    let appended = u64.widen(run.len())
+    mut staged.runs.push(PendingRun(stream: id, earliest: next, entries: take run))
+    var entry = try found.entry.copied(alloc)
+    entry.content = Content.Stream(id: id, declaration: copied_bytes(declared.view(), alloc), next: next + appended, entries: count + appended, bytes: size + added)
+    discard try await mut self.change_entry(device, place: found.place.copied(alloc), entry: Some(take entry), versioned: false, mut staged, alloc)
+} Store.append_entries
+
+/// Drops the entries of the stream at `segments` below sequence number `below`.
+pkg fn Store.trim_stream[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    below: u64,
+    writing: Writing,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let resolution = try await mut self.resolve(device, head: writing.head, segments, now: writing.now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let Content.Stream(id: id, declaration: declared, next: next, entries: count, bytes: size) = found.entry.content else {
+        fail StoreError.Kind
+    }
+    let earliest = next - count
+    if below <= earliest {
+        return
+    }
+    let cut = match below < next {
+        true => below
+        false => next
+    }
+    let dropped = try await mut self.entry_bytes_between(device, stream: id, from: earliest, to: cut, alloc)
+    var entry = try found.entry.copied(alloc)
+    entry.content = Content.Stream(id: id, declaration: copied_bytes(declared.view(), alloc), next: next, entries: count - (cut - earliest), bytes: size.saturating_sub(dropped))
+    discard try await mut self.change_entry(device, place: found.place.copied(alloc), entry: Some(take entry), versioned: false, mut staged, alloc)
+} Store.trim_stream
+
+/// The entries of the stream at `path` of `branch` from sequence number `from` on, at most `limit`, and the count of those requested already dropped.
+pub fn Store.read_stream[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    from: u64,
+    limit: u32,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> StreamRead fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head, segments: segments.view(), now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let Content.Stream(id: id, declaration: _, next: next, entries: count, bytes: _) = found.entry.content else {
+        fail StoreError.Kind
+    }
+    let earliest = next - count
+    let start = match from > earliest {
+        true => from
+        false => earliest
+    }
+    var read = StreamRead(entries: mem::List.empty(alloc), lost: earliest.saturating_sub(from))
+    let runs = try await mut self.runs_of(device, stream: id, alloc)
+    for run in runs {
+        if run.earliest + u64.widen(run.run.count) <= start {
+            continue
+        }
+        let held = try await mut self.run_entries(device, run: run.run, alloc)
+        for entry in take held {
+            if entry.seq >= start and entry.seq < next and read.entries.len() < usize.widen(limit) {
+                mut read.entries.push(take entry)
+            }
+        }
+        if read.entries.len() >= usize.widen(limit) {
+            break
+        }
+    }
+    return read
+} Store.read_stream
+
+/// What a stream read gives: entries in sequence order, and how many requested were already dropped.
+pub closed struct StreamRead {
+    pub entries: mem::List[StreamEntry]
+    pub lost: u64
+} StreamRead
+
+/// A run of a stream: its earliest sequence number and its catalog entry.
+pkg struct Run {
+    pkg earliest: u64
+    pkg run: StreamRun
+} Run
+
+/// Appends a run of entries to the log as a stream record, and gives its catalog entry's key and value.
+pkg fn Store.log_run(mut self, run: PendingRun, time: i64, alloc: mem::Alloc) -> CatalogWrite fails StoreError {
+    var key = Array[u8, 32].filled(0)
+    mut key.view_mut().write_u64_le(0, value: run.stream)
+    mut key.view_mut().write_u64_le(8, value: run.earliest)
+    let payload = wire_of(run.entries, alloc)
+    let placed = match attempt mut self.log.append(disk::RecordKind.Stream, key, payload: payload.view(), time, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    var bytes: u64 = 0
+    var newest: i64 = 0
+    for entry in run.entries {
+        bytes += u64.widen(entry.value.len())
+        newest = entry.time.utc_ns
+    }
+    let entry = StreamRun(record: placed.pointer.to_list(alloc), count: u32.fit(run.entries.len()), bytes: u32.saturate(bytes), time: newest)
+    return CatalogWrite(key: run_key(run.stream, earliest: run.earliest, alloc), value: Some(wire_of(entry, alloc)))
+} Store.log_run
+
+/// The runs of stream `stream` in sequence order.
+pkg fn Store.runs_of[D: disk::Device](mut self, device: D, stream: u64, alloc: mem::Alloc) -> mem::List[Run] fails StoreError uses wait {
+    let start = run_key(stream, earliest: 0, alloc)
+    var prefix = run_key(stream, earliest: 0, alloc)
+    mut prefix.truncate(9)
+    let leaves = try await mut self.tree_scan(device, root: self.catalog, prefix: prefix.view(), from: start.view(), limit: 0xFFFF_FFFF, alloc)
+    var runs = mem::List[Run].empty(alloc)
+    for leaf in leaves {
+        let run = try decode_stream_run(leaf.value.view(), alloc)
+        mut runs.push(Run(earliest: leaf.key.view().u64_be(9), run: take run))
+    }
+    return runs
+} Store.runs_of
+
+/// The entries a run's stream record holds.
+pkg fn Store.run_entries[D: disk::Device](mut self, device: D, run: StreamRun, alloc: mem::Alloc) -> mem::List[StreamEntry] fails StoreError uses wait {
+    let Some(pointer) = disk::Pointer.of_bytes(run.record.view()) else {
+        fail StoreError.Corrupt
+    }
+    let record = match attempt await log::read_record(device, address: pointer.target, pointer, alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => fail StoreError.Corrupt
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    return match attempt mem::wire::Codec[mem::List[StreamEntry]].decode(record.payload.view(), alloc) {
+        Ok(entries) => entries
+        Err(_) => fail StoreError.Corrupt
+    }
+} Store.run_entries
+
+/// The bytes of the entries of stream `stream` from sequence number `from` to `to` exclusive.
+fn Store.entry_bytes_between[D: disk::Device](
+    mut self,
+    device: D,
+    stream: u64,
+    from: u64,
+    to: u64,
+    alloc: mem::Alloc,
+    ) -> u64 fails StoreError uses wait {
+    var total: u64 = 0
+    let runs = try await mut self.runs_of(device, stream, alloc)
+    for run in runs {
+        let end = run.earliest + u64.widen(run.run.count)
+        if end <= from or run.earliest >= to {
+            continue
+        }
+        if run.earliest >= from and end <= to {
+            total += u64.widen(run.run.bytes)
+            continue
+        }
+        let entries = try await mut self.run_entries(device, run: run.run, alloc)
+        for entry in entries {
+            if entry.seq >= from and entry.seq < to {
+                total += u64.widen(entry.value.len())
+            }
+        }
+    }
+    return total
+} Store.entry_bytes_between
+
+/// The catalog key of the run of stream `stream` starting at sequence number `earliest`.
+pkg fn run_key(stream: u64, earliest: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var key = mem::Bytes.zeroed(17, alloc)
+    key[0] = KIND_STREAM_RUN
+    mut key.view_mut().write_u64_be(1, value: stream)
+    mut key.view_mut().write_u64_be(9, value: earliest)
+    return key
+} run_key

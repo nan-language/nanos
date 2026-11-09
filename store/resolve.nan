@@ -1,0 +1,143 @@
+//! Path resolution: a path's segments walked from the top dir through the entries of the versioned, unversioned and machine trees of a branch.
+
+/// Where a node's entry lies: the head whose trees hold it, the tree, the dir holding it and its name.
+pkg struct Place {
+    pkg head: usize
+    pkg tree: u8
+    pkg dir: u64
+    pkg name: mem::Bytes
+} Place
+
+/// A node found on a path: where its entry lies and the entry.
+pkg struct Found {
+    pkg place: Place
+    pkg entry: NodeEntry
+} Found
+
+/// A path of `wanted` segments resolved at a branch's head: the entries found along it, its ancestors then the node itself when it exists, and where the first segment without an entry, `missing`, would lie.
+pkg struct Resolution {
+    pkg wanted: usize
+    pkg found: mem::List[Found]
+    pkg missing: usize
+    pkg tree: u8
+    pkg dir: u64
+} Resolution
+
+/// Resolves `segments` at the head of the branch at `head`, nodes past their expiry counting as absent at `now`.
+pkg fn Store.resolve[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    segments: Slice[mem::Bytes],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Resolution fails StoreError uses wait {
+    var resolution = Resolution(wanted: segments.len(), found: mem::List.empty(alloc), missing: 0, tree: 0, dir: TOP_DIR)
+    if segments.len() == 0 {
+        return resolution
+    }
+    var tree = try tree_of_top(segments[0].view())
+    var dir = TOP_DIR
+    for at in 0..<segments.len() {
+        resolution.missing = at
+        resolution.tree = tree
+        resolution.dir = dir
+        let root = self.root_at(head, tree)
+        let key = entry_key(dir, name: segments[at].view(), alloc)
+        let Some(bytes) = try await mut self.tree_get(device, root, key: key.view(), alloc) else {
+            return resolution
+        }
+        let entry = try NodeEntry.decode_from(bytes.view(), alloc)
+        if entry.expires != 0 and entry.expires <= now.utc_ns {
+            return resolution
+        }
+        let next = try child_dir(entry, tree, alloc)
+        mut resolution.found.push(Found(place: Place(head: head, tree: tree, dir: dir, name: copied_bytes(segments[at].view(), alloc)), entry: take entry))
+        dir = next.dir
+        tree = next.tree
+    }
+    resolution.missing = segments.len()
+    return resolution
+} Store.resolve
+
+/// The node a resolution found, `None` when its path has no node.
+pkg proj fn Resolution.node(self) -> Option[Found] {
+    if not self.exists() {
+        return None
+    }
+    return self.found.get(self.found.len() - 1)
+} Resolution.node
+
+/// Whether the resolution found the whole path.
+pkg fn Resolution.exists(self) -> bool {
+    return self.wanted > 0 and self.found.len() == self.wanted
+} Resolution.exists
+
+/// The tree a node lies in by the top-level name its path starts with: `/sys` and `/data` versioned, `/state` unversioned, `/journal` the machine's; `store.not-found` for any other.
+pkg fn tree_of_top(name: Slice[u8]) -> u8 fails StoreError {
+    if name == b"sys" or name == b"data" {
+        return TREE_VERSIONED
+    }
+    if name == b"state" {
+        return TREE_UNVERSIONED
+    }
+    if name == b"journal" {
+        return TREE_MACHINE
+    }
+    fail StoreError.NotFound
+} tree_of_top
+
+/// Where the children of the node of `entry`, in `tree`, lie: in the unversioned tree below an ephemeral dir; none but a dir has any.
+pkg struct ChildDir derives Copy {
+    pkg tree: u8
+    pkg dir: u64
+} ChildDir
+
+pkg fn child_dir(entry: NodeEntry, tree: u8, alloc: mem::Alloc) -> ChildDir fails StoreError {
+    let Content.Dir(id: id, declaration: bytes, digest: _, next: _) = entry.content else {
+        return ChildDir(tree: tree, dir: 0)
+    }
+    let Declaration.Dir(declaration) = try decode_declaration(bytes.view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    if declaration.ephemeral and tree == TREE_VERSIONED {
+        return ChildDir(tree: TREE_UNVERSIONED, dir: id)
+    }
+    return ChildDir(tree: tree, dir: id)
+} child_dir
+
+/// The root of `tree` for the branch at `head`, the machine tree for every branch.
+pkg fn Store.root_at(self, head: usize, tree: u8) -> tree::Root {
+    if tree == TREE_MACHINE {
+        return self.machine
+    }
+    if tree == TREE_UNVERSIONED {
+        return self.heads[head].unversioned
+    }
+    return self.heads[head].versioned
+} Store.root_at
+
+/// Sets the root of `tree` for the branch at `head`.
+pkg fn Store.set_root(mut self, head: usize, tree: u8, root: tree::Root) {
+    if tree == TREE_MACHINE {
+        self.machine = root
+    } else if tree == TREE_UNVERSIONED {
+        self.heads[head].unversioned = root
+    } else {
+        self.heads[head].versioned = root
+    }
+} Store.set_root
+
+/// The index of the branch named `name` among the heads.
+pkg fn Store.head_of(self, name: Str) -> Option[usize] {
+    for at in 0..<self.heads.len() {
+        if self.heads[at].branch.name.as_str() == name {
+            return Some(at)
+        }
+    }
+    return None
+} Store.head_of
+
+pkg fn copied_bytes(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    return disk::copy_range(bytes, at: 0, count: bytes.len(), alloc)
+} copied_bytes

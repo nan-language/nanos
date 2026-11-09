@@ -1,0 +1,192 @@
+//! Mounting: the valid superblock with the higher sequence, the latest flush record whose catalog and item table verify or the one before it, the catalog's branches, segments and counters, and the log replayed from the flush record's position.
+
+/// Mounts the volume `device` holds, formatting it under `volume_id` when neither superblock holds the magic.
+pub fn Store.mount[D: disk::Device](device: D, volume_id: Array[u8, 16], now: ident::WallTime, alloc: mem::Alloc) -> Store fails StoreError uses wait {
+    let blocks = device.blocks() / disk::SEGMENT_BLOCKS * disk::SEGMENT_BLOCKS
+    if blocks < LEAST_VOLUME_BLOCKS {
+        fail StoreError.NoVolume
+    }
+    let copy_a = try await read_blocks(device, block: disk::SUPERBLOCK_A, count: 1, alloc)
+    let copy_b = try await read_blocks(device, block: disk::SUPERBLOCK_B, count: 1, alloc)
+    let found = chosen(disk::Superblock.read(copy_a.view()), other: disk::Superblock.read(copy_b.view()))
+    let superblock = match found {
+        disk::Found.Valid(held) => held
+        disk::Found.Damaged => fail StoreError.Corrupt
+        disk::Found.Blank => return try await Store.format(device, volume_id, now, alloc)
+    }
+    if superblock.format != disk::FORMAT {
+        fail StoreError.FormatUnsupported
+    }
+    if (superblock.flags & 0b101) != 0 {
+        fail StoreError.Locked
+    }
+    let ring = try await read_blocks(device, block: disk::FLUSH_RING, count: u32.truncate(disk::FLUSH_SLOTS), alloc)
+    let records = flush_records(ring.view(), alloc)
+    for at in 0..<records.len() {
+        if at > 1 {
+            break
+        }
+        var store = Store.over(superblock, alloc)
+        match first attempt await mut store.load_flushed(device, record: records[at], alloc) {
+            Ok(_) => {
+            }
+            Err(StoreError.Corrupt) => continue
+            Err(failure) => fail failure
+        }
+        try await mut store.replay(device, record: records[at], now, alloc)
+        return store
+    }
+    fail StoreError.Corrupt
+} Store.mount
+
+/// Commits `writes` as genesis, commit #1, on a new branch `main`, and flushes the index.
+pub fn Store.genesis[D: disk::Device](
+    mut self,
+    device: D,
+    take writes: mem::List[Write],
+    take stamp: Stamp,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    if self.heads.len() > 0 or self.counters.commit != 1 {
+        fail StoreError.BranchExists
+    }
+    let branch = Branch(name: text::String.of("main", alloc), head: ident::CommitId(number: 0), fork: ident::CommitId(number: 0), parent: None, created_by: ident::Principal(text: stamp.principal.text), expires: None)
+    let versioned = mut self.index.new_tree(TREE_VERSIONED, alloc)
+    mut self.index.retain(versioned.node)
+    let unversioned = mut self.index.new_tree(TREE_UNVERSIONED, alloc)
+    mut self.index.retain(unversioned.node)
+    mut self.heads.push(Head(branch: take branch, versioned: versioned, unversioned: unversioned, written: 0, recent: mem::List.empty(alloc)))
+    let transaction = Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+    let committed = try await mut self.commit_as(device, branch: "main", take transaction, take stamp, kind: CommitKind.Genesis, now, alloc)
+    try await mut self.index_flush(device, now, alloc)
+    return committed
+} Store.genesis
+
+/// The superblock copy to mount from: the valid one with the higher sequence, else damaged when either is, else blank.
+fn chosen(one: disk::Found, other: disk::Found) -> disk::Found {
+    return match one {
+        disk::Found.Valid(held) => match other {
+            disk::Found.Valid(second) => match second.sequence > held.sequence {
+                true => disk::Found.Valid(second)
+                false => disk::Found.Valid(held)
+            }
+            else => disk::Found.Valid(held)
+        }
+        disk::Found.Damaged => match other {
+            disk::Found.Valid(second) => disk::Found.Valid(second)
+            else => disk::Found.Damaged
+        }
+        disk::Found.Blank => other
+    }
+} chosen
+
+/// The valid flush records of the ring, highest flush number first.
+fn flush_records(ring: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::List[disk::FlushRecord] {
+    var records = mem::List[disk::FlushRecord].empty(alloc)
+    for slot in 0..<usize.widen(disk::FLUSH_SLOTS) {
+        let Some(parts) = ring.split_at(slot * disk::BLOCK_BYTES) else {
+            break
+        }
+        let Some(block) = parts.tail.prefix(disk::BLOCK_BYTES) else {
+            break
+        }
+        match disk::FlushRecord.read(block) {
+            Some(record) => mut records.push(record)
+            None => {
+            }
+        }
+    }
+    mut records.sort_by(fn(left: disk::FlushRecord, right: disk::FlushRecord) => right.flush.cmp(left.flush))
+    return records
+} flush_records
+
+/// Loads what flush record `record` names: the item table and catalog, verified, and the branches, segments, machine tree and counters the catalog holds.
+fn Store.load_flushed[D: disk::Device](mut self, device: D, record: disk::FlushRecord, alloc: mem::Alloc) fails StoreError uses wait {
+    let items = tree::Root(tree: 5, node: record.items.target, pointer: record.items)
+    self.index = tree::Index.of(items, next_item: record.next_item, alloc)
+    self.catalog = tree::Root(tree: TREE_CATALOG, node: record.catalog.target, pointer: record.catalog)
+    match attempt await mut self.index.load(device, tree: 5, id: items.node, pointer: items.pointer, alloc) {
+        Ok(_) => {
+        }
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+    match attempt await mut self.index.load(device, tree: TREE_CATALOG, id: self.catalog.node, pointer: self.catalog.pointer, alloc) {
+        Ok(_) => {
+        }
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+    self.flush = record.flush
+    self.counters = Counters(commit: record.commit + 1, dir: record.next_dir, stream: record.next_stream, secret: record.next_secret, origin: 1, type: 1)
+    try await mut self.load_branches(device, alloc)
+    try await mut self.load_segments(device, alloc)
+    let Some(machine) = try await mut self.catalog_get(device, key: catalog_key(KIND_MACHINE, key: b"", alloc).view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    let Some(pointer) = disk::Pointer.of_bytes(machine.view()) else {
+        fail StoreError.Corrupt
+    }
+    self.machine = tree::Root(tree: TREE_MACHINE, node: pointer.target, pointer: pointer)
+    self.counters.type = try await mut self.next_id(device, kind: KIND_TYPE, alloc)
+    self.counters.origin = try await mut self.next_id(device, kind: KIND_ORIGIN_SET, alloc)
+    let Some(header) = match attempt await log::read_header(device, segment: record.segment, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_log(take failure)
+    } else {
+        fail StoreError.Corrupt
+    }
+    self.log.position = log::Position(segment: record.segment, sequence: header.sequence, next: header.next, block: record.block, batch: record.batch)
+} Store.load_flushed
+
+/// Loads the heads of the branches the catalog holds.
+fn Store.load_branches[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    let leaves = try await mut self.catalog_scan(device, kind: KIND_BRANCH, from: b"", limit: 0xFFFF_FFFF, alloc)
+    for leaf in leaves {
+        let entry = try decode_branch_entry(leaf.value.view(), alloc)
+        let Some(versioned) = disk::Pointer.of_bytes(entry.versioned.view()) else {
+            fail StoreError.Corrupt
+        }
+        let Some(unversioned) = disk::Pointer.of_bytes(entry.unversioned.view()) else {
+            fail StoreError.Corrupt
+        }
+        let written = entry.branch.head.number
+        mut self.heads.push(Head(branch: take entry.branch, versioned: tree::Root(tree: TREE_VERSIONED, node: versioned.target, pointer: versioned), unversioned: tree::Root(tree: TREE_UNVERSIONED, node: unversioned.target, pointer: unversioned), written: written, recent: mem::List.empty(alloc)))
+    }
+} Store.load_branches
+
+/// Loads the states of the segments the catalog holds.
+fn Store.load_segments[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    let leaves = try await mut self.catalog_scan(device, kind: KIND_SEGMENT, from: b"", limit: 0xFFFF_FFFF, alloc)
+    for leaf in leaves {
+        let entry = try decode_segment_entry(leaf.value.view(), alloc)
+        let segment = leaf.key.view().u32_be(1)
+        if segment == 0 or usize.widen(segment) > self.log.segments.len() {
+            fail StoreError.Corrupt
+        }
+        let at = usize.widen(segment) - 1
+        self.log.segments[at] = log::Segment(state: state_of_code(entry.state), live: entry.live, written: entry.written, freed_at: 0)
+    }
+    mut self.segments_written.truncate(0)
+    for segment in self.log.segments {
+        mut self.segments_written.push(segment)
+    }
+} Store.load_segments
+
+/// The id after the highest the catalog holds among entries of `kind`.
+fn Store.next_id[D: disk::Device](mut self, device: D, kind: u8, alloc: mem::Alloc) -> u32 fails StoreError uses wait {
+    let leaves = try await mut self.catalog_scan(device, kind, from: b"", limit: 0xFFFF_FFFF, alloc)
+    if leaves.len() == 0 {
+        return 1
+    }
+    return leaves[leaves.len() - 1].key.view().u32_be(1) + 1
+} Store.next_id
+
+/// The state a segment entry's code names.
+fn state_of_code(code: u8) -> log::SegmentState {
+    return match code {
+        1 => log::SegmentState.Open
+        2 => log::SegmentState.Full
+        3 => log::SegmentState.Freed
+        else => log::SegmentState.Free
+    }
+} state_of_code

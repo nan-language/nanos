@@ -1,0 +1,213 @@
+//! The engine's access to its device and its trees: device failures as store codes, a failed write leaving the store read-only, and tree operations whose reference changes the engine settles.
+
+/// Writes whole blocks from `block`.
+pkg fn write_blocks[D: disk::Device](device: D, block: u64, take data: mem::Bytes, alloc: mem::Alloc) fails StoreError uses wait {
+    match attempt await device.write(block, take data, alloc) {
+        Ok(_) => {
+        }
+        Err(disk::DeviceFailure.Io) => fail StoreError.Io
+        Err(disk::DeviceFailure.Cancelled(cancelled)) => fail cancelled
+    }
+} write_blocks
+
+/// `count` blocks from `block`.
+pkg fn read_blocks[D: disk::Device](device: D, block: u64, count: u32, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails StoreError uses wait {
+    return match attempt await device.read(block, count, alloc) {
+        Ok(bytes) => bytes
+        Err(disk::DeviceFailure.Io) => fail StoreError.Io
+        Err(disk::DeviceFailure.Cancelled(cancelled)) => fail cancelled
+    }
+} read_blocks
+
+/// Discards the blocks of segment `segment`.
+pkg fn discard_segment[D: disk::Device](device: D, segment: u32, alloc: mem::Alloc) fails StoreError uses wait {
+    match attempt await device.discard_blocks(disk::segment_start(segment), count: u32.truncate(disk::SEGMENT_BLOCKS), alloc) {
+        Ok(_) => {
+        }
+        Err(disk::DeviceFailure.Io) => fail StoreError.Io
+        Err(disk::DeviceFailure.Cancelled(cancelled)) => fail cancelled
+    }
+} discard_segment
+
+/// Writes blocks, leaving the store read-only when the device fails.
+pkg fn Store.guarded_write[D: disk::Device](
+    mut self,
+    device: D,
+    block: u64,
+    take data: mem::Bytes,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    match first attempt await write_blocks(device, block, take data, alloc) {
+        Ok(_) => {
+        }
+        Err(StoreError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail mut self.device_failed()
+    }
+} Store.guarded_write
+
+/// Flushes the device cache, leaving the store read-only when the device fails.
+pkg fn Store.guarded_flush[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    match attempt await device.flush(alloc) {
+        Ok(_) => {
+        }
+        Err(disk::DeviceFailure.Cancelled(cancelled)) => fail cancelled
+        Err(disk::DeviceFailure.Io) => fail mut self.device_failed()
+    }
+} Store.guarded_flush
+
+/// Performs a log flush, leaving the store read-only when the device fails.
+pkg fn Store.flush_log[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    match first attempt await mut self.log.flush(device, alloc) {
+        Ok(_) => {
+        }
+        Err(log::LogFailure.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail mut self.device_failed()
+    }
+} Store.flush_log
+
+/// Leaves the store read-only after a device failure and gives `store.io`.
+pkg fn Store.device_failed(mut self) -> StoreError {
+    if not self.read_only {
+        self.read_only = true
+        mut self.events.push(Event.DeviceFailed)
+    }
+    return StoreError.Io
+} Store.device_failed
+
+pkg fn Store.tree_get[D: disk::Device](
+    mut self,
+    device: D,
+    root: tree::Root,
+    key: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> Option[mem::Bytes] fails StoreError uses wait {
+    return match attempt await mut self.index.get(device, root, key, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+} Store.tree_get
+
+pkg fn Store.tree_put[D: disk::Device](
+    mut self,
+    device: D,
+    mut root: tree::Root,
+    key: Slice[u8],
+    value: Slice[u8],
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    match attempt await mut self.index.put(device, mut root, key, value, values: mut self.refs, alloc) {
+        Ok(_) => {
+        }
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+    mut self.settle_items()
+} Store.tree_put
+
+pkg fn Store.tree_remove[D: disk::Device](
+    mut self,
+    device: D,
+    mut root: tree::Root,
+    key: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> Option[mem::Bytes] fails StoreError uses wait {
+    let removed = match attempt await mut self.index.remove(device, mut root, key, values: mut self.refs, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+    mut self.settle_items()
+    return removed
+} Store.tree_remove
+
+pkg fn Store.tree_scan[D: disk::Device](
+    mut self,
+    device: D,
+    root: tree::Root,
+    prefix: Slice[u8],
+    from: Slice[u8],
+    limit: usize,
+    alloc: mem::Alloc,
+    ) -> mem::List[tree::Leaf] fails StoreError uses wait {
+    return match attempt await mut self.index.scan(device, root, prefix, from, limit, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+} Store.tree_scan
+
+pkg fn Store.tree_count[D: disk::Device](
+    mut self,
+    device: D,
+    root: tree::Root,
+    from: Slice[u8],
+    to: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> tree::Totals fails StoreError uses wait {
+    return match attempt await mut self.index.count_range(device, root, from, to, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+} Store.tree_count
+
+pkg fn Store.catalog_get[D: disk::Device](mut self, device: D, key: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] fails StoreError uses wait {
+    return try await mut self.tree_get(device, root: self.catalog, key, alloc)
+} Store.catalog_get
+
+pkg fn Store.catalog_put[D: disk::Device](
+    mut self,
+    device: D,
+    key: Slice[u8],
+    value: Slice[u8],
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    var root = self.catalog
+    try await mut self.tree_put(device, mut root, key, value, alloc)
+    self.catalog = root
+} Store.catalog_put
+
+pkg fn Store.catalog_remove[D: disk::Device](mut self, device: D, key: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] fails StoreError uses wait {
+    var root = self.catalog
+    let removed = try await mut self.tree_remove(device, mut root, key, alloc)
+    self.catalog = root
+    return removed
+} Store.catalog_remove
+
+/// The catalog entries of `kind`, from `from` on, at most `limit`.
+pkg fn Store.catalog_scan[D: disk::Device](
+    mut self,
+    device: D,
+    kind: u8,
+    from: Slice[u8],
+    limit: usize,
+    alloc: mem::Alloc,
+    ) -> mem::List[tree::Leaf] fails StoreError uses wait {
+    let prefix = catalog_key(kind, key: b"", alloc)
+    let start = catalog_key(kind, key: from, alloc)
+    return try await mut self.tree_scan(device, root: self.catalog, prefix: prefix.view(), from: start.view(), limit, alloc)
+} Store.catalog_scan
+
+/// Writes the dirty nodes of the tree under `root` to the log.
+pkg fn Store.write_tree(
+    mut self,
+    root: tree::Root,
+    flush: u64,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> tree::Root fails StoreError {
+    return match attempt mut self.index.write_tree(mut self.log, root, flush, time: now.utc_ns, alloc) {
+        Ok(written) => written
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+} Store.write_tree
+
+/// Passes the value items node entries named or stopped naming to the index.
+pkg fn Store.settle_items(mut self) {
+    loop {
+        let Some(change) = mut self.refs.items.pop() else {
+            return
+        }
+        if change.delta > 0 {
+            mut self.index.retain(change.item)
+        } else {
+            mut self.index.release(change.item, tree: 0, pointer: change.pointer)
+        }
+    }
+} Store.settle_items

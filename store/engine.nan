@@ -1,0 +1,164 @@
+//! The engine's state: the log, the index and its trees, the heads of the branches, the counters, the drafts in the making, the events to tell and the reference changes the next index flush applies; and formatting a volume and index flushes.
+
+/// The fewest bytes a volume holds.
+const LEAST_VOLUME_BLOCKS: u64 = 16_384
+
+/// The head area's blocks a format zeroes at once.
+const ZEROING_BLOCKS: u64 = 256
+
+/// What the store has to tell its journal.
+pub closed enum Event {
+    Mounted(format: u32, replayed: u64)
+    Corruption(address: u64, kind: u8)
+    DeviceFailed
+    HistoryThinned(commits: u64, bytes: u64, oldest: ident::CommitId)
+    WritesRefused(free: u64, history: u64)
+} Event
+
+/// The next values of the store's counters.
+pkg struct Counters derives Copy, Eq {
+    pkg commit: u64
+    pkg dir: u64
+    pkg stream: u64
+    pkg secret: u64
+    pkg origin: u32
+    pkg type: u32
+} Counters
+
+/// A branch as the engine holds it: its record, its trees, the head its trees were last written at, and the commits since, with their writes, through which commits after its last flush commit are read.
+pkg struct Head {
+    pkg branch: Branch
+    pkg versioned: tree::Root
+    pkg unversioned: tree::Root
+    pkg written: u64
+    pkg recent: mem::List[Recent]
+} Head
+
+/// A commit since its branch's last flush commit, and the writes it made.
+pkg struct Recent {
+    pkg number: u64
+    pkg writes: mem::List[LogWrite]
+} Recent
+
+/// The store's engine.
+pub open struct Store {
+    pkg superblock: disk::Superblock
+    pkg log: log::Log
+    pkg index: tree::Index
+    pkg catalog: tree::Root
+    pkg machine: tree::Root
+    pkg heads: mem::List[Head]
+    pkg counters: Counters
+    pkg flush: u64
+    pkg read_only: bool
+    pkg schemas: Registry
+    pkg retention: Retention
+    pkg refs: Refs
+    pkg events: mem::List[Event]
+    pkg segments_written: mem::List[log::Segment]
+    pkg drafts: mem::Map[u64, Draft]
+    pkg next_draft: u64
+    pkg blob_records: mem::List[tree::Retired]
+} Store
+
+/// Formats the volume `device` holds: zeroes its head area, discards its segments, writes both superblocks and flushes an empty index.
+pub fn Store.format[D: disk::Device](device: D, volume_id: Array[u8, 16], now: ident::WallTime, alloc: mem::Alloc) -> Store fails StoreError uses wait {
+    let blocks = device.blocks() / disk::SEGMENT_BLOCKS * disk::SEGMENT_BLOCKS
+    if blocks < LEAST_VOLUME_BLOCKS {
+        fail StoreError.NoVolume
+    }
+    let segment_count = disk::segments_of(blocks)
+    var block: u64 = 0
+    while block < disk::HEAD_BLOCKS {
+        try await write_blocks(device, block, data: mem::Bytes.zeroed(usize.widen(ZEROING_BLOCKS) * disk::BLOCK_BYTES, alloc), alloc)
+        block += ZEROING_BLOCKS
+    }
+    if device.discards() {
+        for segment in 1..=segment_count {
+            try await discard_segment(device, segment, alloc)
+        }
+    }
+    let superblock = disk::Superblock(sequence: 1, format: disk::FORMAT, flags: 0, volume_id: volume_id, blocks: blocks, segments: segment_count, created: now.utc_ns)
+    try await write_blocks(device, block: disk::SUPERBLOCK_A, data: superblock.to_block(alloc), alloc)
+    try await write_blocks(device, block: disk::SUPERBLOCK_B, data: superblock.to_block(alloc), alloc)
+    var store = Store.over(superblock, alloc)
+    match attempt mut store.log.open_first(1, sequence: 1, alloc) {
+        Ok(_) => {
+        }
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    store.catalog = mut store.index.new_tree(TREE_CATALOG, alloc)
+    mut store.index.retain(store.catalog.node)
+    store.machine = mut store.index.new_tree(TREE_MACHINE, alloc)
+    mut store.index.retain(store.machine.node)
+    try await mut store.index_flush(device, now, alloc)
+    return store
+} Store.format
+
+/// Writes the index's changes, makes branch heads flush commits, and writes a flush record, after which a mount replays only what follows.
+pub fn Store.index_flush[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    let flush = self.flush + 1
+    try await mut self.settle_references(device, alloc)
+    try await mut self.write_heads(device, flush, now, alloc)
+    self.machine = try mut self.write_tree(root: self.machine, flush, now, alloc)
+    var pointer = self.machine.pointer
+    try await mut self.catalog_put(device, key: catalog_key(KIND_MACHINE, key: b"", alloc).view(), value: pointer.to_bytes().view(), alloc)
+    try await mut self.write_segments(device, alloc)
+    self.catalog = try mut self.write_tree(root: self.catalog, flush, now, alloc)
+    let items = match attempt await mut self.index.write_items(device, log: mut self.log, flush, time: now.utc_ns, alloc) {
+        Ok(root) => root
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+    try await mut self.flush_log(device, alloc)
+    let position = self.log.position
+    let record = disk::FlushRecord(flush: flush, batch: position.batch, segment: position.segment, block: position.block, commit: self.counters.commit - 1, next_item: self.index.next_item, next_dir: self.counters.dir, next_secret: self.counters.secret, next_stream: self.counters.stream, time: now.utc_ns, catalog: self.catalog.pointer, items: items.pointer)
+    try await mut self.guarded_write(device, block: disk::flush_slot(flush), data: record.to_block(alloc), alloc)
+    try await mut self.guarded_flush(device, alloc)
+    self.flush = flush
+    for stale in mut self.index.take_stale(alloc) {
+        mut self.log.release(stale.address, bytes: u64.widen(disk::record_span(stale.length)))
+    }
+    loop {
+        let Some(blob_record) = mut self.blob_records.pop() else {
+            break
+        }
+        mut self.log.release(blob_record.address, bytes: u64.widen(disk::record_span(blob_record.length)))
+    }
+} Store.index_flush
+
+/// The events since the last call, taken from the store.
+pub fn Store.take_events(mut self, alloc: mem::Alloc) -> mem::List[Event] {
+    var taken = mem::List[Event].empty(alloc)
+    loop {
+        if self.events.len() == 0 {
+            return taken
+        }
+        mut taken.push(mut self.events.remove(0))
+    }
+} Store.take_events
+
+/// Makes the type of canonical path `name` known by its schema tree and erased decoder, as `mem::wire::Codec` gives them.
+pub fn Store.know(
+    mut self,
+    name: Str,
+    take schema: mem::wire::Schema,
+    decoder: mem::wire::Erased,
+    alloc: mem::Alloc,
+    ) {
+    mut self.schemas.add(name, take schema, decoder, alloc)
+} Store.know
+
+/// A store in memory over a volume of `superblock`, its index and log empty.
+pkg fn Store.over(superblock: disk::Superblock, alloc: mem::Alloc) -> Store {
+    var states = mem::List[log::Segment].empty(alloc)
+    for _ in 0..<superblock.segments {
+        mut states.push(log::Segment(state: log::SegmentState.Free, live: 0, written: 0, freed_at: 0))
+    }
+    let log = log::Log.of(superblock.volume_id, segments: take states, position: log::Position(segment: 0, sequence: 0, next: 0, block: 0, batch: 1), alloc)
+    let empty = tree::Root(tree: 0, node: 0, pointer: disk::Pointer.none())
+    let counters = Counters(commit: 1, dir: TOP_DIR + 1, stream: 1, secret: 1, origin: 1, type: 1)
+    return Store(superblock: superblock, log: take log, index: tree::Index.empty(next_item: 1, alloc), catalog: empty, machine: empty, heads: mem::List.empty(alloc), counters: counters, flush: 0, read_only: false, schemas: Registry.empty(alloc), retention: Retention.default_of(alloc), refs: Refs.empty(alloc), events: mem::List.empty(alloc), segments_written: mem::List.empty(alloc), drafts: mem::Map.empty(alloc), next_draft: 1, blob_records: mem::List.empty(alloc))
+} Store.over

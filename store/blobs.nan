@@ -1,0 +1,366 @@
+//! Blobs: drafts filled piece by piece, each piece stored once by its key, closed into a blob whose id follows from its pieces, and read back piece by piece.
+
+/// The most bytes of a blob.
+const MOST_BLOB_BYTES: u64 = 1_099_511_627_776
+
+/// The nanoseconds a draft lives after its last append.
+const DRAFT_LIFE_NS: i64 = 3_600_000_000_000
+
+/// A blob in the making: the bytes of its piece being filled, the keys of its pieces written, its opening piece's bytes, its size, the time of its last append, and its blob once closed.
+pkg struct Draft {
+    pkg filling: mem::Bytes
+    pkg keys: mem::List[Array[u8, 32]]
+    pkg opening: mem::Bytes
+    pkg size: u64
+    pkg touched: i64
+    pkg closed: Option[ident::HashValue]
+} Draft
+
+/// A blob's id and size, as closing its draft gives them.
+pub closed struct Closed derives Copy, Eq {
+    pub id: ident::HashValue
+    pub size: u64
+} Closed
+
+/// A new draft.
+pub fn Store.draft(mut self, now: ident::WallTime, alloc: mem::Alloc) -> u64 {
+    let id = self.next_draft
+    self.next_draft += 1
+    let draft = Draft(filling: mem::Bytes.empty(alloc), keys: mem::List.empty(alloc), opening: mem::Bytes.empty(alloc), size: 0, touched: now.utc_ns, closed: None)
+    discard mut self.drafts.insert(id, value: take draft)
+    return id
+} Store.draft
+
+/// Appends `bytes` to draft `draft`, logging each piece as it fills.
+pub fn Store.draft_append[D: disk::Device](
+    mut self,
+    device: D,
+    draft: u64,
+    bytes: Slice[u8],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let Some(held) = mut self.drafts.remove(draft) else {
+        fail StoreError.NotFound
+    }
+    var filling = held
+    if filling.closed.is_some() {
+        discard mut self.drafts.insert(draft, value: take filling)
+        fail StoreError.NotFound
+    }
+    if filling.size + u64.widen(bytes.len()) > MOST_BLOB_BYTES {
+        discard mut self.drafts.insert(draft, value: take filling)
+        fail StoreError.TooLarge
+    }
+    mut filling.filling.append(bytes)
+    filling.size += u64.widen(bytes.len())
+    filling.touched = now.utc_ns
+    while filling.filling.len() >= ident::PIECE_BYTES {
+        let piece = disk::copy_range(filling.filling.view(), at: 0, count: ident::PIECE_BYTES, alloc)
+        let rest = disk::copy_range(filling.filling.view(), at: ident::PIECE_BYTES, count: filling.filling.len() - ident::PIECE_BYTES, alloc)
+        filling.filling = rest
+        try await mut self.store_piece(device, draft: mut filling, piece: piece.view(), now, alloc)
+    }
+    discard mut self.drafts.insert(draft, value: take filling)
+} Store.draft_append
+
+/// Closes draft `draft` into its blob, `store.hash-mismatch` when its id differs from `expected`; the draft holds the blob until a node references it or the draft is dropped.
+pub fn Store.draft_close[D: disk::Device](
+    mut self,
+    device: D,
+    draft: u64,
+    expected: Option[ident::HashValue],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Closed fails StoreError uses wait {
+    let Some(held) = mut self.drafts.remove(draft) else {
+        fail StoreError.NotFound
+    }
+    var closing = held
+    if closing.filling.len() > 0 or closing.keys.len() == 0 {
+        let piece = copied_bytes(closing.filling.view(), alloc)
+        closing.filling = mem::Bytes.empty(alloc)
+        if piece.len() > 0 {
+            try await mut self.store_piece(device, draft: mut closing, piece: piece.view(), now, alloc)
+        }
+    }
+    let id = blob_id(closing, alloc)
+    match expected {
+        Some(wanted) => {
+            if wanted != id {
+                fail StoreError.HashMismatch
+            }
+        }
+        None => {
+        }
+    }
+    try await mut self.store_blob(device, id, draft: closing, now, alloc)
+    closing.closed = Some(id)
+    let closed = Closed(id: id, size: closing.size)
+    discard mut self.drafts.insert(draft, value: take closing)
+    return closed
+} Store.draft_close
+
+/// Drops the drafts unreferenced for an hour after their last append, freeing the blobs and pieces only they held.
+pub fn Store.drop_drafts[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) fails StoreError uses wait {
+    var stale = mem::List[u64].empty(alloc)
+    for entry in self.drafts.cursor() {
+        if now.utc_ns.saturating_sub(entry.value().touched) >= DRAFT_LIFE_NS {
+            mut stale.push(entry.key())
+        }
+    }
+    for draft in stale {
+        let Some(gone) = mut self.drafts.remove(draft) else {
+            continue
+        }
+        try await mut self.release_draft(device, draft: gone, alloc)
+    }
+} Store.drop_drafts
+
+/// The bytes of the blob at `path` of the head of `branch` from `offset`, at most `length`, each piece read checked against its key when `verify`.
+pub fn Store.read[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    offset: u64,
+    length: u32,
+    verify: bool,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Untrusted[mem::Bytes] fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head, segments: segments.view(), now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let Content.Blob(id: id, size: size) = found.entry.content else {
+        fail StoreError.Kind
+    }
+    var out = Untrusted.of(mem::Bytes.empty(alloc))
+    if offset >= size {
+        return out
+    }
+    let end = match size - offset < u64.widen(length) {
+        true => size
+        false => offset + u64.widen(length)
+    }
+    let piece_bytes = u64.widen(ident::PIECE_BYTES)
+    var index = offset / piece_bytes
+    while index * piece_bytes < end {
+        let piece = try await mut self.read_piece(device, id, index, verify, alloc)
+        let start = index * piece_bytes
+        let from = match offset > start {
+            true => usize.widen(offset - start)
+            false => 0
+        }
+        var to = usize.widen(end - start)
+        if to > piece.byte_len() {
+            to = piece.byte_len()
+        }
+        let Some(parts) = piece.view().split_at(from) else {
+            break
+        }
+        let Some(taken) = parts.tail.prefix(to - from) else {
+            break
+        }
+        mut out.append(taken)
+        index += 1
+    }
+    return out
+} Store.read
+
+/// Registers a replayed blob record, unless its blob is held already.
+pkg fn Store.register_blob[D: disk::Device](
+    mut self,
+    device: D,
+    record: disk::Record,
+    pointer: disk::Pointer,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let map = match attempt mem::wire::Codec[BlobMap].decode(record.payload.view(), alloc) {
+        Ok(found) => found
+        Err(_) => fail StoreError.Corrupt
+    }
+    var digest = Array[u8, 33].filled(0x01)
+    for at in 0..<32usize {
+        digest[at + 1] = record.key[at]
+    }
+    mut self.blob_records.push(tree::Retired(address: pointer.target, length: pointer.length))
+    try await mut self.add_blob(device, id: ident::HashValue(bytes: digest), size: map.size, pieces: map.pieces.view(), alloc)
+} Store.register_blob
+
+/// Logs `piece`, the next piece of `draft`, unless a piece of its key is held already.
+fn Store.store_piece[D: disk::Device](
+    mut self,
+    device: D,
+    mut draft: Draft,
+    piece: Slice[u8],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let index = u64.widen(draft.keys.len())
+    let key = ident::piece_key(piece, index)
+    if index == 0 {
+        draft.opening = copied_bytes(piece, alloc)
+    }
+    mut draft.keys.push(key)
+    let catalog = catalog_key(KIND_PIECE, key: key.view(), alloc)
+    let held = try await mut self.catalog_get(device, key: catalog.view(), alloc)
+    if held.is_some() {
+        return
+    }
+    let placed = match attempt mut self.log.append(disk::RecordKind.Piece, key, payload: piece, time: now.utc_ns, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    let entry = PieceEntry(record: placed.pointer.to_list(alloc), refcount: 0)
+    try await mut self.catalog_put(device, key: catalog.view(), value: wire_of(entry, alloc).view(), alloc)
+} Store.store_piece
+
+/// Records blob `id` of a closed draft: its entry and piece entries and its blob record, unless the store holds it already.
+fn Store.store_blob[D: disk::Device](
+    mut self,
+    device: D,
+    id: ident::HashValue,
+    draft: Draft,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    var pieces = mem::Bytes.empty(alloc)
+    for key in draft.keys {
+        mut pieces.append(key.view())
+    }
+    let held = try await mut self.catalog_get(device, key: catalog_key(KIND_BLOB, key: id.bytes.view(), alloc).view(), alloc)
+    if held.is_some() {
+        return
+    }
+    var key = Array[u8, 32].filled(0)
+    for at in 0..<32usize {
+        key[at] = id.bytes[at + 1]
+    }
+    let map = BlobMap(size: draft.size, pieces: copied_bytes(pieces.view(), alloc))
+    let placed = match attempt mut self.log.append(disk::RecordKind.Blob, key, payload: wire_of(map, alloc).view(), time: now.utc_ns, alloc) {
+        Ok(found) => found
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    mut self.blob_records.push(tree::Retired(address: placed.address, length: placed.pointer.length))
+    try await mut self.add_blob(device, id, size: draft.size, pieces: pieces.view(), alloc)
+} Store.store_blob
+
+/// Adds the entry of blob `id` and its piece entries, each piece gaining its reference, unless the store holds the blob already.
+fn Store.add_blob[D: disk::Device](
+    mut self,
+    device: D,
+    id: ident::HashValue,
+    size: u64,
+    pieces: Slice[u8],
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let blob_key = catalog_key(KIND_BLOB, key: id.bytes.view(), alloc)
+    let held = try await mut self.catalog_get(device, key: blob_key.view(), alloc)
+    if held.is_some() {
+        return
+    }
+    try await mut self.catalog_put(device, key: blob_key.view(), value: wire_of(BlobEntry(size: size, refcount: 0), alloc).view(), alloc)
+    mut self.refs.count_blob(id, delta: 0)
+    let count = pieces.len() / 32
+    for index in 0..<count {
+        let key = disk::array32(pieces, at: index * 32)
+        var piece_index = catalog_key(KIND_BLOB_PIECE, key: id.bytes.view(), alloc)
+        var number = Array[u8, 8].filled(0)
+        mut number.view_mut().write_u64_be(0, value: u64.widen(index))
+        mut piece_index.append(number.view())
+        try await mut self.catalog_put(device, key: piece_index.view(), value: key.view(), alloc)
+        try await mut self.retain_piece(device, key: key.view(), alloc)
+    }
+} Store.add_blob
+
+/// One blob entry more names the piece of key `key`.
+fn Store.retain_piece[D: disk::Device](mut self, device: D, key: Slice[u8], alloc: mem::Alloc) fails StoreError uses wait {
+    let piece_key = catalog_key(KIND_PIECE, key, alloc)
+    let Some(held) = try await mut self.catalog_get(device, key: piece_key.view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    let entry = try decode_piece_entry(held.view(), alloc)
+    let updated = PieceEntry(record: take entry.record, refcount: entry.refcount + 1)
+    try await mut self.catalog_put(device, key: piece_key.view(), value: wire_of(updated, alloc).view(), alloc)
+} Store.retain_piece
+
+/// The bytes of piece `index` of blob `id`, checked against its key when `verify`.
+fn Store.read_piece[D: disk::Device](
+    mut self,
+    device: D,
+    id: ident::HashValue,
+    index: u64,
+    verify: bool,
+    alloc: mem::Alloc,
+    ) -> Untrusted[mem::Bytes] fails StoreError uses wait {
+    var piece_index = catalog_key(KIND_BLOB_PIECE, key: id.bytes.view(), alloc)
+    var number = Array[u8, 8].filled(0)
+    mut number.view_mut().write_u64_be(0, value: index)
+    mut piece_index.append(number.view())
+    let Some(key) = try await mut self.catalog_get(device, key: piece_index.view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    let Some(held) = try await mut self.catalog_get(device, key: catalog_key(KIND_PIECE, key: key.view(), alloc).view(), alloc) else {
+        fail StoreError.Corrupt
+    }
+    let entry = try decode_piece_entry(held.view(), alloc)
+    let Some(pointer) = disk::Pointer.of_bytes(entry.record.view()) else {
+        fail StoreError.Corrupt
+    }
+    let record = match attempt await log::read_record(device, address: pointer.target, pointer, alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => fail StoreError.Corrupt
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    if verify and not piece_holds(record.payload.view(), index, key: key.view()) {
+        fail StoreError.Corrupt
+    }
+    return record.payload
+} Store.read_piece
+
+/// Frees what a dropped draft alone held: its blob when no node names it, else its pieces no blob names.
+fn Store.release_draft[D: disk::Device](mut self, device: D, draft: Draft, alloc: mem::Alloc) fails StoreError uses wait {
+    match draft.closed {
+        Some(id) => {
+            mut self.refs.count_blob(id, delta: 0)
+            return
+        }
+        None => {
+        }
+    }
+    for key in draft.keys {
+        let catalog = catalog_key(KIND_PIECE, key: key.view(), alloc)
+        let Some(held) = try await mut self.catalog_get(device, key: catalog.view(), alloc) else {
+            continue
+        }
+        let entry = try decode_piece_entry(held.view(), alloc)
+        if entry.refcount == 0 {
+            discard try await mut self.catalog_remove(device, key: catalog.view(), alloc)
+            let Some(pointer) = disk::Pointer.of_bytes(entry.record.view()) else {
+                continue
+            }
+            mut self.log.release(pointer.target, bytes: u64.widen(disk::record_span(pointer.length)))
+        }
+    }
+} Store.release_draft
+
+/// The id of the blob a closed draft holds: from its piece keys, or for one piece or none from its bytes.
+fn blob_id(draft: Draft, alloc: mem::Alloc) -> ident::HashValue {
+    if draft.keys.len() >= 2 {
+        return ident::HashValue.of_pieces(draft.keys.view(), alloc)
+    }
+    return ident::HashValue.of_content(draft.opening.view())
+} blob_id
+
+/// Whether a piece's bytes have the key they are stored under.
+validator fn piece_holds(raw: Untrusted[Slice[u8]], index: u64, key: Slice[u8]) -> bool {
+    let bytes = raw.inspect()
+    if bytes.len() == 0 or bytes.len() > ident::PIECE_BYTES {
+        return false
+    }
+    return ident::piece_key(bytes, index).view() == key
+} piece_holds

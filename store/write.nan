@@ -1,0 +1,281 @@
+//! Writing node entries: each change recorded with the entry it replaced, for a failed commit to undo, and as a log write, for replay to redo; a dir deleted or replaced takes what it held with it, and the ancestors of what a commit changed take its number as their subtree version.
+
+/// What a commit has done so far: the entries and catalog entries it replaced, its log and catalog writes, the value records and stream runs to log, the ancestors of what it changed, and whether it changed a versioned node or hit a write conflict.
+pkg struct Staged {
+    pkg undo: mem::List[Undo]
+    pkg catalog_undo: mem::List[CatalogWrite]
+    pkg writes: mem::List[LogWrite]
+    pkg catalog: mem::List[CatalogWrite]
+    pkg values: mem::List[PendingValue]
+    pkg runs: mem::List[PendingRun]
+    pkg ancestors: mem::List[Ancestor]
+    pkg recorded: bool
+    pkg conflict: bool
+} Staged
+
+/// An entry a commit replaced, and where it lay.
+pkg struct Undo {
+    pkg place: Place
+    pkg entry: Option[NodeEntry]
+} Undo
+
+/// A value record a commit logs: its item id and its bytes.
+pkg struct PendingValue {
+    pkg item: u64
+    pkg bytes: mem::Bytes
+} PendingValue
+
+/// A run of entries a commit appends to a stream.
+pkg struct PendingRun {
+    pkg stream: u64
+    pkg earliest: u64
+    pkg entries: mem::List[StreamEntry]
+} PendingRun
+
+/// An ancestor of a node a commit changed, and whether a child of it was added or removed.
+pkg struct Ancestor {
+    pkg place: Place
+    pkg children_changed: bool
+} Ancestor
+
+pkg fn Staged.empty(alloc: mem::Alloc) -> Staged {
+    return Staged(undo: mem::List.empty(alloc), catalog_undo: mem::List.empty(alloc), writes: mem::List.empty(alloc), catalog: mem::List.empty(alloc), values: mem::List.empty(alloc), runs: mem::List.empty(alloc), ancestors: mem::List.empty(alloc), recorded: false, conflict: false)
+} Staged.empty
+
+/// Sets the entry at `place`, recording what it replaced and the log write, and gives the entry it replaced; a change to a versioned node makes the commit recorded.
+pkg fn Store.set_entry[D: disk::Device](
+    mut self,
+    device: D,
+    place: Place,
+    take entry: Option[NodeEntry],
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> Option[NodeEntry] fails StoreError uses wait {
+    return try await mut self.change_entry(device, place, take entry, versioned: true, mut staged, alloc)
+} Store.set_entry
+
+/// Sets the entry at `place` as [Store.set_entry] does, the change versioned only when `versioned`, as no change of a stream's entries or of an expiry is.
+pkg fn Store.change_entry[D: disk::Device](
+    mut self,
+    device: D,
+    place: Place,
+    take entry: Option[NodeEntry],
+    versioned: bool,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> Option[NodeEntry] fails StoreError uses wait {
+    let written = copied_entry(entry, alloc)
+    let old = try await mut self.put_entry(device, place, take entry, alloc)
+    mut staged.undo.push(Undo(place: place.copied(alloc), entry: copied_entry(old, alloc)))
+    if versioned and place.tree == TREE_VERSIONED {
+        staged.recorded = true
+    }
+    let held = held_dir(old, tree: place.tree, alloc)
+    let kept = held_dir(written, tree: place.tree, alloc)
+    mut staged.writes.push(LogWrite(tree: place.tree, dir: place.dir, name: copied_bytes(place.name.view(), alloc), entry: take written))
+    if held.dir != 0 and held.dir != kept.dir {
+        try await mut self.delete_held(device, head: place.head, tree: held.tree, dir: held.dir, mut staged, alloc)
+    }
+    return old
+} Store.change_entry
+
+/// Puts `entry` at `place`, or removes the entry there for `None`, counting the references of both, and gives the entry replaced.
+pkg fn Store.put_entry[D: disk::Device](
+    mut self,
+    device: D,
+    place: Place,
+    take entry: Option[NodeEntry],
+    alloc: mem::Alloc,
+    ) -> Option[NodeEntry] fails StoreError uses wait {
+    var root = self.root_at(place.head, tree: place.tree)
+    let key = entry_key(place.dir, name: place.name.view(), alloc)
+    let old_bytes = try await mut self.tree_get(device, root, key: key.view(), alloc)
+    match entry {
+        Some(new) => {
+            try await mut self.tree_put(device, mut root, key: key.view(), value: wire_of(new, alloc).view(), alloc)
+            mut self.refs.count(new, delta: 1)
+        }
+        None => {
+            discard try await mut self.tree_remove(device, mut root, key: key.view(), alloc)
+        }
+    }
+    mut self.set_root(place.head, tree: place.tree, root)
+    let Some(bytes) = old_bytes else {
+        mut self.settle_items()
+        return None
+    }
+    let old = try NodeEntry.decode_from(bytes.view(), alloc)
+    mut self.refs.count(old, delta: -1)
+    mut self.settle_items()
+    return Some(take old)
+} Store.put_entry
+
+/// Deletes every entry dir `dir` holds in `tree`, and what each dir among them holds.
+pkg fn Store.delete_held[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    tree: u8,
+    dir: u64,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let prefix = dir_prefix(dir, alloc)
+    loop {
+        let root = self.root_at(head, tree)
+        let leaves = try await mut self.tree_scan(device, root, prefix: prefix.view(), from: prefix.view(), limit: 256, alloc)
+        if leaves.len() == 0 {
+            return
+        }
+        for leaf in leaves {
+            let Some(name) = leaf.key.view().split_at(8) else {
+                continue
+            }
+            let place = Place(head: head, tree: tree, dir: dir, name: copied_bytes(name.tail, alloc))
+            let old = try await mut self.put_entry(device, place: place.copied(alloc), entry: None, alloc)
+            let held = held_dir(old, tree, alloc)
+            mut staged.undo.push(Undo(place: take place, entry: take old))
+            if held.dir != 0 {
+                try await mut self.delete_held(device, head, tree: held.tree, dir: held.dir, mut staged, alloc)
+            }
+        }
+    }
+} Store.delete_held
+
+/// Puts back every entry and catalog entry a failed commit replaced, in reverse order.
+pkg fn Store.undo[D: disk::Device](mut self, device: D, mut staged: Staged, alloc: mem::Alloc) fails StoreError uses wait {
+    loop {
+        let Some(Undo(place: place, entry: entry)) = mut staged.undo.pop() else {
+            break
+        }
+        discard try await mut self.put_entry(device, place, take entry, alloc)
+    }
+    loop {
+        let Some(CatalogWrite(key: key, value: value)) = mut staged.catalog_undo.pop() else {
+            return
+        }
+        match value {
+            Some(bytes) => try await mut self.catalog_put(device, key: key.view(), value: bytes.view(), alloc)
+            None => {
+                discard try await mut self.catalog_remove(device, key: key.view(), alloc)
+            }
+        }
+    }
+} Store.undo
+
+/// Writes a catalog entry as part of a commit, recording what it replaced and the catalog write replay redoes.
+pkg fn Store.stage_catalog[D: disk::Device](
+    mut self,
+    device: D,
+    key: Slice[u8],
+    value: Slice[u8],
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let old = try await mut self.catalog_get(device, key, alloc)
+    try await mut self.catalog_put(device, key, value, alloc)
+    mut staged.catalog_undo.push(CatalogWrite(key: copied_bytes(key, alloc), value: take old))
+    mut staged.catalog.push(CatalogWrite(key: copied_bytes(key, alloc), value: Some(copied_bytes(value, alloc))))
+} Store.stage_catalog
+
+/// Records the first `count` of `ancestors`, the entries above a node a commit changed in its tree, for their subtree versions to take the commit's number; `children_changed` for the node's parent when the node was added or removed.
+pkg fn Staged.touch(
+    mut self,
+    ancestors: Slice[Found],
+    count: usize,
+    children_changed: bool,
+    alloc: mem::Alloc,
+    )
+    requires count <= ancestors.len()
+{
+    for at in 0..<count {
+        let parent = at + 1 == count and children_changed
+        let place = ancestors[at].place
+        var known = false
+        for index in 0..<self.ancestors.len() {
+            if self.ancestors[index].place.same(place) {
+                known = true
+                self.ancestors[index].children_changed = self.ancestors[index].children_changed or parent
+            }
+        }
+        if not known {
+            mut self.ancestors.push(Ancestor(place: place.copied(alloc), children_changed: parent))
+        }
+    }
+} Staged.touch
+
+/// Gives each ancestor recorded by [Staged.touch] the subtree version `number`, and the version `number` when a child of it was added or removed, its hash and digest to compute anew.
+pkg fn Store.update_ancestors[D: disk::Device](
+    mut self,
+    device: D,
+    number: u64,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    var touched = mem::List[Ancestor].empty(alloc)
+    loop {
+        let Some(ancestor) = mut staged.ancestors.pop() else {
+            break
+        }
+        mut touched.push(take ancestor)
+    }
+    for ancestor in touched {
+        let root = self.root_at(ancestor.place.head, tree: ancestor.place.tree)
+        let key = entry_key(ancestor.place.dir, name: ancestor.place.name.view(), alloc)
+        let Some(bytes) = try await mut self.tree_get(device, root, key: key.view(), alloc) else {
+            continue
+        }
+        var entry = try NodeEntry.decode_from(bytes.view(), alloc)
+        entry.subtree = number
+        entry.hash = None
+        if ancestor.children_changed {
+            entry.version = number
+        }
+        entry.content = without_digest(take entry.content)
+        discard try await mut self.set_entry(device, place: ancestor.place, entry: Some(take entry), mut staged, alloc)
+    }
+} Store.update_ancestors
+
+/// Whether two places name the same entry.
+pkg fn Place.same(self, other: Place) -> bool {
+    return self.head == other.head and self.tree == other.tree and self.dir == other.dir and self.name == other.name
+} Place.same
+
+pkg fn Place.copied(self, alloc: mem::Alloc) -> Place {
+    return Place(head: self.head, tree: self.tree, dir: self.dir, name: copied_bytes(self.name.view(), alloc))
+} Place.copied
+
+/// A copy of a node entry, through its wire bytes.
+pkg fn NodeEntry.copied(self, alloc: mem::Alloc) -> NodeEntry fails StoreError {
+    return try NodeEntry.decode_from(wire_of(self, alloc).view(), alloc)
+} NodeEntry.copied
+
+/// A copy of a node entry, through its wire bytes.
+pkg fn copied_entry(entry: Option[NodeEntry], alloc: mem::Alloc) -> Option[NodeEntry] {
+    let Some(held) = entry else {
+        return None
+    }
+    return match attempt NodeEntry.decode_from(wire_of(held, alloc).view(), alloc) {
+        Ok(copy) => Some(take copy)
+        Err(_) => None
+    }
+} copied_entry
+
+/// The dir a node entry holds and the tree its children lie in, dir 0 for a node that is no dir.
+fn held_dir(entry: Option[NodeEntry], tree: u8, alloc: mem::Alloc) -> ChildDir {
+    let Some(held) = entry else {
+        return ChildDir(tree: tree, dir: 0)
+    }
+    return match attempt child_dir(held, tree, alloc) {
+        Ok(found) => found
+        Err(_) => ChildDir(tree: tree, dir: 0)
+    }
+} held_dir
+
+/// A dir's content without its entry digest, which an index flush computes anew.
+pkg fn without_digest(take content: Content) -> Content {
+    return match content {
+        Content.Dir(id: id, declaration: declaration, digest: _, next: next) => Content.Dir(id: id, declaration: take declaration, digest: None, next: next)
+        else => content
+    }
+} without_digest
