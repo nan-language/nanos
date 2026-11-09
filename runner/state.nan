@@ -1,0 +1,136 @@
+//! What the runner keeps for each instance in `/state/<moniker>`: its dead letters.
+
+/// The dead letters the runner keeps of each instance.
+const DEAD_LETTERS: u32 = 64
+
+/// The type of the records of `dead`.
+const DEAD_LETTER_TYPE: Str = "os::DeadLetter"
+
+/// The grant number the root entry of an instance's View of `/state` goes under, which no grant has.
+const STATE_GRANT: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The instance's View of `/state`, from its root entry, minted at the first use, acting for `principal` with the instance writing; `None` when `store` has no specification.
+fn Directory.state_view(
+    self,
+    mut minted: Minted,
+    take moniker: ident::Moniker,
+    take principal: ident::Principal,
+    alloc: mem::Alloc,
+    ) -> Option[store::service::View] {
+    let rights = store::service::Rights(read: true, write: true, admin: false, secret_read: false, own: true, reserved: 0)
+    for granted in minted.views {
+        if granted.grant == STATE_GRANT {
+            return Some(granted.view.mint(rights))
+        }
+    }
+    let Some(endpoint) = self.endpoints.get(ident::Moniker(text: text::Fixed[59].of(STORE_MONIKER))) else {
+        return None
+    }
+    let port = os::MintedPort.of(endpoint.intake, gate: endpoint.gate, protocols: endpoint.protocols, operations: None, credit: os::Credit(messages: 64, calls: 64), alloc)
+    let root = store::service::MintedView.of(store: port.handle(), prefix: ident::Path(text: text::String.of("/state", alloc)), branch: "main", take principal, instance: Some(take moniker), alloc)
+    let view = root.mint(rights)
+    mut minted.views.push(GrantedView(grant: STATE_GRANT, port: take port, view: take root))
+    return Some(view)
+} Directory.state_view
+
+/// Writes `letter` as the next dead letter of the instance `moniker`, numbered after those `/<moniker>/dead` of `view` keeps.
+fn write_dead(take letter: os::DeadLetter, view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(at) = ident::Path(text: text::String.of("/", alloc)).child(moniker.text.as_bytes(), alloc) else {
+        return
+    }
+    let Some(dead) = at.child(b"dead", alloc) else {
+        return
+    }
+    var held = letter
+    held.seq = try await last_number(view, dir: ident::Path(text: text::String.of(dead.text.as_str(), alloc)), alloc) + 1
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::DeadLetter].encode(held, out: mut bytes)
+    let type = store::TypeRef.of(DEAD_LETTER_TYPE, schema: mem::wire::Codec[os::DeadLetter].schema_hash(), alloc)
+    let declaration = store::Declaration.Dir(store::DirDecl(element: Some(store::Element(kind: store::NodeKind.Record, type: Some(store::TypeRef(name: text::String.of(DEAD_LETTER_TYPE, alloc), schema: type.schema)))), ephemeral: false, secret: false, numbered: true, keep: Some(store::Keep(count: DEAD_LETTERS, age_s: None))))
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Make(path: ident::Path(text: text::String.of(dead.text.as_str(), alloc)), declaration: take declaration))
+    mut writes.push(store::Write.Add(path: take dead, value: store::Value.Record(type: take type, bytes: take bytes, secret: false)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+    match attempt await view.commit(take transaction, typed: true, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} write_dead
+
+/// The highest number among the children of the numbered dir `dir`, 0 when it holds none or does not exist.
+fn last_number(view: store::service::View, take dir: ident::Path, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let listing = match first attempt await view.list(take dir, after: None, limit: DEAD_LETTERS + 1, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return 0
+    }
+    var highest: u64 = 0
+    for entry in listing.entries {
+        let number = decimal(entry.name.as_bytes())
+        if number > highest {
+            highest = number
+        }
+    }
+    return highest
+} last_number
+
+/// The value of the decimal digits of `name`, 0 for any other name.
+fn decimal(name: Slice[u8]) -> u64 {
+    var value: u64 = 0
+    for byte in name {
+        if byte < b'0' or byte > b'9' {
+            return 0
+        }
+        value = value.saturating_mul(10).saturating_add(u64.widen(byte - b'0'))
+    }
+    return value
+} decimal
+
+/// The name of the operation a call's encoding calls: the key of its wire variant, empty when it does not read or was not kept.
+fn operation_of(message: Option[mem::Bytes], alloc: mem::Alloc) -> text::String {
+    var name = text::String.empty(alloc)
+    let Some(kept) = message else {
+        return name
+    }
+    let encoded = kept.view()
+    var length: u64 = 0
+    var shift: u32 = 0
+    var at: usize = 0
+    loop {
+        if at >= encoded.len() or shift > 56 {
+            return name
+        }
+        let byte = encoded[at]
+        at += 1
+        length = length | (u64.widen(byte & 0x7F) << shift)
+        if (byte & 0x80) == 0 {
+            break
+        }
+        shift += 7
+    }
+    let Some(parts) = encoded.split_at(at) else {
+        return name
+    }
+    let Some(key) = parts.tail.prefix(usize.widen(length)) else {
+        return name
+    }
+    for byte in key {
+        mut name.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+    }
+    return name
+} operation_of
+
+/// A protocol whose calls the test encodes.
+protocol Probe {
+    pub fn ping(count: u32) limits traceless
+} Probe
+
+test dead_letters_name_the_operation_called for operation_of {
+    let alloc = testing::world().alloc
+    var call = sys::Encoded.empty(alloc)
+    sys::Wire[Probe].ping(mut call, count: 3)
+    let name = operation_of(Some(take call.bytes), alloc)
+    let none = operation_of(None, alloc)
+    expect name.as_str() == "ping" and none.as_str() == ""
+} dead_letters_name_the_operation_called
