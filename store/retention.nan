@@ -1,0 +1,177 @@
+//! Retention: at index flushes, the commits no tier, pin or head keeps thinned with their records, trees and path changes, a retained commit that would lose the records it is read through first given a tree of its own.
+
+/// The nanoseconds of a second.
+const SECOND_NS: i64 = 1_000_000_000
+
+/// A commit as thinning weighs it: its number, branch head, time, whether it is recorded, its record and tree, and whether it is kept.
+struct Weighed {
+    number: u64
+    branch: text::String
+    time: i64
+    recorded: bool
+    record: Option[disk::Pointer]
+    tree: Option[disk::Pointer]
+    kept: bool
+} Weighed
+
+/// What thinning freed: the commits thinned and the oldest of them.
+pub closed struct Thinned derives Copy, Eq {
+    pub commits: u64
+    pub oldest: u64
+} Thinned
+
+/// Sets the retention the store keeps history by.
+pub fn Store.retain_by(mut self, take retention: Retention) {
+    self.retention = retention
+} Store.retain_by
+
+/// Thins every commit no head, pin or retention tier keeps at `now`, giving each kept commit read through a thinned one a tree of its own first.
+pkg fn Store.thin[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) -> Thinned fails StoreError uses wait {
+    var weighed = try await mut self.weigh(device, now, alloc)
+    var thinned = Thinned(commits: 0, oldest: 0)
+    for at in 0..<weighed.len() {
+        if not weighed[at].kept or weighed[at].tree.is_some() {
+            continue
+        }
+        if reads_through_thinned(weighed.view(), at) {
+            let head = try self.head_named(weighed[at].branch.as_str())
+            let snapshot = try await mut self.snapshot(device, head, at: weighed[at].number, alloc)
+            try await mut self.give_tree(device, head, take snapshot, alloc)
+            weighed[at].tree = Some(disk::Pointer.none())
+        }
+    }
+    for commit in weighed {
+        if commit.kept {
+            continue
+        }
+        try await mut self.thin_commit(device, commit, alloc)
+        if thinned.commits == 0 {
+            thinned.oldest = commit.number
+        }
+        thinned.commits += 1
+    }
+    if thinned.commits > 0 {
+        mut self.events.push(Event.HistoryThinned(commits: thinned.commits, bytes: 0, oldest: ident::CommitId(number: thinned.oldest)))
+    }
+    return thinned
+} Store.thin
+
+/// Every commit the catalog holds, in number order, each marked kept when a head or pin holds it, or the retention tier of its age keeps it.
+fn Store.weigh[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) -> mem::List[Weighed] fails StoreError uses wait {
+    let leaves = try await mut self.catalog_scan(device, kind: KIND_COMMIT, from: b"", limit: 0xFFFF_FFFF, alloc)
+    var weighed = mem::List[Weighed].empty(alloc)
+    for leaf in leaves {
+        let entry = try decode_commit_entry(leaf.value.view(), alloc)
+        let record = match entry.record {
+            Some(bytes) => disk::Pointer.of_bytes(bytes.view())
+            None => None
+        }
+        let tree = match entry.tree {
+            Some(bytes) => disk::Pointer.of_bytes(bytes.view())
+            None => None
+        }
+        let number = entry.meta.number.number
+        let pinned = try await mut self.pins_of(device, commit: number, alloc)
+        let held = pinned.len() > 0 or self.is_head(number)
+        mut weighed.push(Weighed(number: number, branch: take entry.meta.branch, time: entry.meta.time.utc_ns, recorded: entry.meta.recorded, record: record, tree: tree, kept: held))
+    }
+    for at in 0..<weighed.len() {
+        if weighed[at].kept or not weighed[at].recorded {
+            continue
+        }
+        weighed[at].kept = self.tier_keeps(weighed.view(), at, now)
+    }
+    return weighed
+} Store.weigh
+
+/// Whether a branch's head is commit `number`.
+fn Store.is_head(self, number: u64) -> bool {
+    for head in self.heads {
+        if head.branch.head.number == number {
+            return true
+        }
+    }
+    return false
+} Store.is_head
+
+/// Whether the tier of the age of commit `weighed[at]` keeps it: one that keeps every commit, or one whose interval it is the latest flush commit of on its branch.
+fn Store.tier_keeps(self, weighed: Slice[Weighed], at: usize, now: ident::WallTime) -> bool {
+    let commit = weighed[at]
+    let age = now.utc_ns.saturating_sub(commit.time).div_trunc(SECOND_NS)
+    var youngest: Option[Tier] = None
+    for tier in self.retention.tiers {
+        let fits = match youngest {
+            Some(held) => tier.age_s < held.age_s
+            None => true
+        }
+        if i64.saturate(tier.age_s) > age and fits {
+            youngest = Some(tier)
+        }
+    }
+    let Some(tier) = youngest else {
+        return false
+    }
+    if tier.every_s == 0 {
+        return true
+    }
+    if commit.tree.is_none() {
+        return false
+    }
+    let span = i64.saturate(tier.every_s).saturating_mul(SECOND_NS)
+    let interval = commit.time.div_trunc(span)
+    for later in (at + 1)..<weighed.len() {
+        let other = weighed[later]
+        if other.branch == commit.branch and other.tree.is_some() and other.time.div_trunc(span) == interval {
+            return false
+        }
+    }
+    return true
+} Store.tier_keeps
+
+/// Whether the kept commit `weighed[at]`, read through the latest commit with a tree before it on its branch, would lose a record of a commit thinned between them.
+fn reads_through_thinned(weighed: Slice[Weighed], at: usize) -> bool {
+    var index = at
+    while index > 0 {
+        index -= 1
+        let earlier = weighed[index]
+        if earlier.branch != weighed[at].branch {
+            continue
+        }
+        if earlier.tree.is_some() {
+            return false
+        }
+        if not earlier.kept {
+            return true
+        }
+    }
+    return false
+} reads_through_thinned
+
+/// Thins a commit: removes its entry and its path changes, frees its record, and releases its tree.
+fn Store.thin_commit[D: disk::Device](mut self, device: D, commit: Weighed, alloc: mem::Alloc) fails StoreError uses wait {
+    match commit.record {
+        Some(pointer) => {
+            if commit.recorded {
+                let record = try await mut self.commit_record(device, pointer, alloc)
+                for write in record.writes {
+                    if write.tree == TREE_VERSIONED {
+                        discard try await mut self.catalog_remove(device, key: path_change_key(write, number: commit.number, alloc).view(), alloc)
+                    }
+                }
+            }
+            mut self.log.release(pointer.target, bytes: u64.widen(disk::record_span(pointer.length)))
+        }
+        None => {
+        }
+    }
+    match commit.tree {
+        Some(pointer) => {
+            if not pointer.is_none() {
+                mut self.index.release(pointer.target, tree: TREE_VERSIONED, pointer)
+            }
+        }
+        None => {
+        }
+    }
+    discard try await mut self.catalog_remove(device, key: number_key(KIND_COMMIT, number: commit.number, width: 8, alloc).view(), alloc)
+} Store.thin_commit

@@ -1,0 +1,196 @@
+//! The cleaner: a full segment holding little live data read batch by batch, each live record appended unchanged to the log with its entry pointed at the copy, and the segment freed.
+
+/// Cleans one segment when a full one holds less than a quarter of live data, and gives whether it cleaned one; a segment holding a live node of the item table stays as it is.
+pub fn Store.clean[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) -> bool fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    let Some(segment) = self.log.cleaning_candidate(now: now.utc_ns) else {
+        return false
+    }
+    let records = try await mut self.segment_records(device, segment, alloc)
+    for record in records {
+        if record.kind == disk::RecordKind.Index and record.key.view().u64_le(0) == 0 {
+            let live = try await mut self.table_node_live(device, address: record.address, alloc)
+            if live {
+                return false
+            }
+        }
+    }
+    for record in records {
+        try await mut self.move_if_live(device, record, now, alloc)
+    }
+    mut self.log.freed(segment, flush: self.flush)
+    return true
+} Store.clean
+
+/// A record of a segment: where it lies, its kind, key and length, and its payload.
+pkg struct Lying {
+    pkg address: u64
+    pkg kind: disk::RecordKind
+    pkg key: Array[u8, 32]
+    pkg length: u32
+    pkg payload: Untrusted[mem::Bytes]
+} Lying
+
+/// The records of the batches segment `segment` holds, up to the first batch that fails its checksum.
+fn Store.segment_records[D: disk::Device](mut self, device: D, segment: u32, alloc: mem::Alloc) -> mem::List[Lying] fails StoreError uses wait {
+    var records = mem::List[Lying].empty(alloc)
+    var block: u64 = 1
+    while block < disk::SEGMENT_BLOCKS {
+        let start = disk::segment_start(segment) + block
+        let opening = try await read_blocks(device, block: start, count: 1, alloc)
+        let Some(header) = disk::BatchHeader.read(opening.view()) else {
+            break
+        }
+        if header.blocks == 0 or u64.widen(header.blocks) > disk::SEGMENT_BLOCKS - block {
+            break
+        }
+        let whole = try await read_blocks(device, block: start, count: header.blocks, alloc)
+        if not disk::batch_verifies(whole.view(), alloc) {
+            mut self.events.push(Event.Corruption(address: start * u64.widen(disk::BLOCK_BYTES), kind: 0))
+            break
+        }
+        let Some(placed) = disk::batch_records(whole.view(), header, alloc) else {
+            break
+        }
+        for record in take placed {
+            let length = u32.truncate(record.record.payload.byte_len())
+            mut records.push(Lying(address: start * u64.widen(disk::BLOCK_BYTES) + u64.widen(record.offset), kind: record.record.kind, key: record.record.key, length: length, payload: take record.record.payload))
+        }
+        block += u64.widen(header.blocks)
+        if header.ends_segment {
+            break
+        }
+    }
+    return records
+} Store.segment_records
+
+/// Whether the item table holds a node at `address`.
+fn Store.table_node_live[D: disk::Device](mut self, device: D, address: u64, alloc: mem::Alloc) -> bool fails StoreError uses wait {
+    var pending = mem::List[tree::Root].empty(alloc)
+    mut pending.push(self.index.items)
+    loop {
+        let Some(root) = mut pending.pop() else {
+            return false
+        }
+        if root.pointer.target == address and not root.pointer.by_item {
+            return true
+        }
+        match attempt await mut self.index.load(device, tree: 5, id: root.node, pointer: root.pointer, alloc) {
+            Ok(_) => {
+            }
+            Err(failure) => fail StoreError.of_tree(take failure)
+        }
+        let Some(node) = self.index.node_at(5, id: root.node) else {
+            continue
+        }
+        for child in node.children {
+            mut pending.push(tree::Root(tree: 5, node: child.node, pointer: child.pointer))
+        }
+    }
+} Store.table_node_live
+
+/// Appends `record` unchanged to the log when an entry names it, and points that entry at the copy.
+fn Store.move_if_live[D: disk::Device](
+    mut self,
+    device: D,
+    record: Lying,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    match record.kind {
+        disk::RecordKind.Value or disk::RecordKind.Index => {
+            let item = record.key.view().u64_le(0)
+            if item == 0 {
+                return
+            }
+            let entry = match attempt await mut self.index.item_entry(device, item, alloc) {
+                Ok(found) => found
+                Err(failure) => fail StoreError.of_tree(take failure)
+            }
+            let Some(held) = entry else {
+                return
+            }
+            if held.address != record.address {
+                return
+            }
+            let copy = try mut self.copy_record(record, now, alloc)
+            mut self.index.place(item, address: copy.address, length: record.length, kind: record.kind.code())
+        }
+        disk::RecordKind.Piece => try await mut self.move_named(device, key: catalog_key(KIND_PIECE, key: record.key.view(), alloc), record, now, alloc)
+        disk::RecordKind.Stream => try await mut self.move_named(device, key: run_key(record.key.view().u64_le(0), earliest: record.key.view().u64_le(8), alloc), record, now, alloc)
+        disk::RecordKind.Commit => try await mut self.move_named(device, key: number_key(KIND_COMMIT, number: record.key.view().u64_le(0), width: 8, alloc), record, now, alloc)
+        disk::RecordKind.Blob or disk::RecordKind.Pad => {
+        }
+    }
+} Store.move_if_live
+
+/// Moves a record the catalog entry at `key` names by its pointer field, when it names this one.
+fn Store.move_named[D: disk::Device](
+    mut self,
+    device: D,
+    key: mem::Bytes,
+    record: Lying,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let Some(held) = try await mut self.catalog_get(device, key: key.view(), alloc) else {
+        return
+    }
+    var moved: Option[mem::Bytes] = None
+    if record.kind == disk::RecordKind.Piece {
+        let entry = try decode_piece_entry(held.view(), alloc)
+        let Some(pointer) = try mut self.moved_pointer(entry.record.view(), record, now, alloc) else {
+            return
+        }
+        moved = Some(wire_of(PieceEntry(record: pointer.to_list(alloc), refcount: entry.refcount), alloc))
+    } else if record.kind == disk::RecordKind.Stream {
+        let entry = try decode_stream_run(held.view(), alloc)
+        let Some(pointer) = try mut self.moved_pointer(entry.record.view(), record, now, alloc) else {
+            return
+        }
+        moved = Some(wire_of(StreamRun(record: pointer.to_list(alloc), count: entry.count, bytes: entry.bytes, time: entry.time), alloc))
+    } else {
+        var entry = try decode_commit_entry(held.view(), alloc)
+        let Some(bytes) = entry.record else {
+            return
+        }
+        let Some(pointer) = try mut self.moved_pointer(bytes.view(), record, now, alloc) else {
+            return
+        }
+        entry.record = Some(pointer.to_list(alloc))
+        moved = Some(wire_of(entry, alloc))
+    }
+    let Some(value) = moved else {
+        return
+    }
+    try await mut self.catalog_put(device, key: key.view(), value: value.view(), alloc)
+} Store.move_named
+
+/// The pointer to a copy of `record` when `pointer` names it.
+fn Store.moved_pointer(
+    mut self,
+    pointer: Slice[u8],
+    record: Lying,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Option[disk::Pointer] fails StoreError {
+    let Some(named) = disk::Pointer.of_bytes(pointer) else {
+        return None
+    }
+    if named.target != record.address {
+        return None
+    }
+    let copy = try mut self.copy_record(record, now, alloc)
+    return Some(copy.pointer)
+} Store.moved_pointer
+
+/// Appends a copy of `record` to the log.
+fn Store.copy_record(mut self, record: Lying, now: ident::WallTime, alloc: mem::Alloc) -> log::Appended fails StoreError {
+    let payload = accepted_bytes(record.payload.view(), alloc)
+    return match attempt mut self.log.append(record.kind, key: record.key, payload: payload.view(), time: now.utc_ns, alloc) {
+        Ok(placed) => placed
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+} Store.copy_record

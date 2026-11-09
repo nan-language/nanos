@@ -1,0 +1,124 @@
+//! What index flushes tend besides the index: streams' retention, nodes past their expiry, branches past theirs, and when a flush is due.
+
+/// The log bytes after the latest flush record past which an index flush is due, and the nanoseconds after the earliest batch since.
+const FLUSH_LOG_BYTES: u64 = 8_388_608
+
+const FLUSH_WAIT_NS: i64 = 30_000_000_000
+
+/// Whether an index flush is due at `now`: 8 MiB of log, or 30 s, after the latest flush record.
+pub fn Store.flush_due(self, now: ident::WallTime) -> bool {
+    if self.first_logged == 0 {
+        return false
+    }
+    return self.log_bytes >= FLUSH_LOG_BYTES or now.utc_ns.saturating_sub(self.first_logged) >= FLUSH_WAIT_NS
+} Store.flush_due
+
+/// Notes `bytes` of log written at `now`.
+pkg fn Store.logged(mut self, bytes: u64, now: ident::WallTime) {
+    self.log_bytes += bytes
+    if self.first_logged == 0 {
+        self.first_logged = now.utc_ns
+    }
+} Store.logged
+
+/// Applies stream retention to the streams appended to or trimmed since the last flush, removes the nodes past their expiry and deletes the branches past theirs.
+pkg fn Store.tend[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) fails StoreError uses wait {
+    var tended = mem::List[Tended].empty(alloc)
+    loop {
+        let Some(held) = mut self.tended.pop() else {
+            break
+        }
+        mut tended.push(take held)
+    }
+    for node in tended {
+        if node.place.head >= self.heads.len() {
+            continue
+        }
+        let key = entry_key(node.place.dir, name: node.place.name.view(), alloc)
+        let Some(bytes) = try await mut self.tree_get(device, root: self.root_at(node.place.head, tree: node.place.tree), key: key.view(), alloc) else {
+            continue
+        }
+        let entry = try NodeEntry.decode_from(bytes.view(), alloc)
+        if entry.expires != 0 and entry.expires <= now.utc_ns {
+            var staged = Staged.empty(alloc)
+            discard try await mut self.set_entry(device, place: node.place.copied(alloc), entry: None, mut staged, alloc)
+            continue
+        }
+        if node.expires != 0 {
+            mut self.tended.push(Tended(place: node.place.copied(alloc), expires: node.expires))
+            continue
+        }
+        try await mut self.keep_stream(device, place: node.place, entry, now, alloc)
+    }
+    try await mut self.expire_branches(device, now, alloc)
+} Store.tend
+
+/// Drops the runs of a stream below its earliest entry, older than its `max_age_s` or beyond its `max_bytes`, from the oldest.
+fn Store.keep_stream[D: disk::Device](
+    mut self,
+    device: D,
+    place: Place,
+    entry: NodeEntry,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let Content.Stream(id: id, declaration: declared, next: next, entries: count, bytes: size) = entry.content else {
+        return
+    }
+    let Declaration.Stream(stream) = try decode_declaration(declared.view(), alloc) else {
+        return
+    }
+    var entries = count
+    var bytes = size
+    let runs = try await mut self.runs_of(device, stream: id, alloc)
+    for run in runs {
+        let end = run.earliest + u64.widen(run.run.count)
+        let below = end <= next - entries
+        let aged = match stream.max_age_s {
+            Some(age) => now.utc_ns.saturating_sub(run.run.time) > i64.saturate(age).saturating_mul(SECOND_NS)
+            None => false
+        }
+        let beyond = match stream.max_bytes {
+            Some(most) => bytes > most
+            None => false
+        }
+        if not below and not aged and not beyond {
+            break
+        }
+        if not below {
+            let dropped = end - (next - entries)
+            entries -= dropped
+            bytes = bytes.saturating_sub(u64.widen(run.run.bytes))
+        }
+        discard try await mut self.catalog_remove(device, key: run_key(id, earliest: run.earliest, alloc).view(), alloc)
+        let Some(pointer) = disk::Pointer.of_bytes(run.run.record.view()) else {
+            continue
+        }
+        mut self.log.release(pointer.target, bytes: u64.widen(disk::record_span(pointer.length)))
+    }
+    if entries == count {
+        return
+    }
+    var kept = try entry.copied(alloc)
+    kept.content = Content.Stream(id: id, declaration: copied_bytes(declared.view(), alloc), next: next, entries: entries, bytes: bytes)
+    discard try await mut self.put_entry(device, place, entry: Some(take kept), alloc)
+} Store.keep_stream
+
+/// Deletes each branch but `main` whose expiry has passed.
+fn Store.expire_branches[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) fails StoreError uses wait {
+    var at: usize = 0
+    while at < self.heads.len() {
+        let expired = match self.heads[at].branch.expires {
+            Some(time) => time.utc_ns <= now.utc_ns and self.heads[at].branch.name.as_str() != "main"
+            None => false
+        }
+        if not expired {
+            at += 1
+            continue
+        }
+        let gone = mut self.heads.remove(at)
+        mut self.index.release(gone.versioned.node, tree: TREE_VERSIONED, pointer: gone.versioned.pointer)
+        mut self.index.release(gone.unversioned.node, tree: TREE_UNVERSIONED, pointer: gone.unversioned.pointer)
+        discard try await mut self.catalog_remove(device, key: catalog_key(KIND_BRANCH, key: gone.branch.name.as_bytes(), alloc).view(), alloc)
+    }
+} Store.expire_branches

@@ -1,0 +1,219 @@
+//! Scrub: every live record read through its pointer and checked, each piece's key and each blob's id computed again, and both superblocks checked, a damaged copy rewritten from the valid one.
+
+pub closed struct ScrubError derives Eq, Encode {
+    pub address: u64
+    pub kind: u8
+    pub paths: mem::List[ident::Path]
+} ScrubError
+
+pub closed struct ScrubReport derives Eq, Encode {
+    pub records: u64
+    pub pieces: u64
+    pub blobs: u64
+    pub bytes: u64
+    pub errors: mem::List[ScrubError]
+    pub duration_ms: u64
+} ScrubReport
+
+/// Verifies the volume: the nodes of every tree, value records, pieces, blobs, stream runs and commit records, and the superblocks.
+pub fn Store.scrub[D: disk::Device](mut self, device: D, alloc: mem::Alloc) -> ScrubReport fails StoreError uses wait {
+    var report = ScrubReport(records: 0, pieces: 0, blobs: 0, bytes: 0, errors: mem::List.empty(alloc), duration_ms: 0)
+    var roots = mem::List[tree::Root].empty(alloc)
+    mut roots.push(self.catalog)
+    mut roots.push(self.machine)
+    for head in self.heads {
+        mut roots.push(head.versioned)
+        mut roots.push(head.unversioned)
+    }
+    for root in roots {
+        try await mut self.scrub_tree(device, root, mut report, alloc)
+    }
+    try await mut self.scrub_blobs(device, mut report, alloc)
+    try await mut self.scrub_named(device, kind: KIND_STREAM_RUN, mut report, alloc)
+    try await mut self.scrub_named(device, kind: KIND_COMMIT, mut report, alloc)
+    try await mut self.scrub_superblocks(device, alloc)
+    for error in report.errors {
+        mut self.events.push(Event.Corruption(address: error.address, kind: error.kind))
+    }
+    return report
+} Store.scrub
+
+/// Reads every written node of the tree under `root` through its pointer, and every value record its leaves name.
+fn Store.scrub_tree[D: disk::Device](
+    mut self,
+    device: D,
+    root: tree::Root,
+    mut report: ScrubReport,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    var pending = mem::List[tree::Root].empty(alloc)
+    mut pending.push(root)
+    loop {
+        let Some(next) = mut pending.pop() else {
+            return
+        }
+        if not next.pointer.is_none() {
+            let address = try await mut self.address_of(device, pointer: next.pointer, alloc)
+            try await mut self.scrub_record(device, address, pointer: next.pointer, mut report, alloc)
+        }
+        match attempt await mut self.index.load(device, tree: next.tree, id: next.node, pointer: next.pointer, alloc) {
+            Ok(_) => {
+            }
+            Err(_) => continue
+        }
+        let Some(node) = self.index.node_at(next.tree, id: next.node) else {
+            continue
+        }
+        let values = try value_pointers(node, alloc)
+        for child in node.children {
+            mut pending.push(tree::Root(tree: next.tree, node: child.node, pointer: child.pointer))
+        }
+        for pointer in values {
+            let address = try await mut self.address_of(device, pointer, alloc)
+            try await mut self.scrub_record(device, address, pointer, mut report, alloc)
+        }
+    }
+} Store.scrub_tree
+
+/// The pointers to the value records the leaves of a node of trees 1 to 3 name.
+fn value_pointers(node: tree::Node, alloc: mem::Alloc) -> mem::List[disk::Pointer] fails StoreError {
+    var values = mem::List[disk::Pointer].empty(alloc)
+    if node.tree == TREE_CATALOG {
+        return values
+    }
+    for leaf in node.leaves {
+        let entry = try NodeEntry.decode_from(leaf.value.view(), alloc)
+        let Content.Value(bytes) = entry.content else {
+            continue
+        }
+        match disk::Pointer.of_bytes(bytes.view()) {
+            Some(pointer) => mut values.push(pointer)
+            None => {
+            }
+        }
+    }
+    return values
+} value_pointers
+
+/// Checks every piece of every blob against its key, and every blob of two pieces or more against its id.
+fn Store.scrub_blobs[D: disk::Device](mut self, device: D, mut report: ScrubReport, alloc: mem::Alloc) fails StoreError uses wait {
+    let blobs = try await mut self.catalog_scan(device, kind: KIND_BLOB, from: b"", limit: 0xFFFF_FFFF, alloc)
+    for blob in blobs {
+        let Some(parts) = blob.key.view().split_at(1) else {
+            continue
+        }
+        var digest = Array[u8, 33].filled(0x01)
+        for at in 1..<33usize {
+            digest[at] = parts.tail[at]
+        }
+        let id = ident::HashValue(bytes: digest)
+        let entry = try decode_blob_entry(blob.value.view(), alloc)
+        let count = (entry.size + u64.widen(ident::PIECE_BYTES) - 1) / u64.widen(ident::PIECE_BYTES)
+        var keys = mem::List[Array[u8, 32]].empty(alloc)
+        for index in 0..<count {
+            let piece = attempt await mut self.read_piece(device, id, index, verify: true, alloc)
+            match first piece {
+                Ok(bytes) => {
+                    report.pieces += 1
+                    report.bytes += u64.widen(bytes.byte_len())
+                    mut keys.push(piece_key_of(bytes.view(), index))
+                }
+                Err(StoreError.Cancelled(cancelled)) => fail cancelled
+                Err(_) => mut report.errors.push(ScrubError(address: 0, kind: disk::RecordKind.Piece.code(), paths: mem::List.empty(alloc)))
+            }
+        }
+        if keys.len() >= 2 and ident::HashValue.of_pieces(keys.view(), alloc) != id {
+            mut report.errors.push(ScrubError(address: 0, kind: disk::RecordKind.Blob.code(), paths: mem::List.empty(alloc)))
+        }
+        report.blobs += 1
+    }
+} Store.scrub_blobs
+
+/// Reads every record the catalog entries of `kind` name by their pointer field.
+fn Store.scrub_named[D: disk::Device](
+    mut self,
+    device: D,
+    kind: u8,
+    mut report: ScrubReport,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let leaves = try await mut self.catalog_scan(device, kind, from: b"", limit: 0xFFFF_FFFF, alloc)
+    for leaf in leaves {
+        var pointer_bytes: Option[mem::Bytes] = None
+        if kind == KIND_STREAM_RUN {
+            let run = try decode_stream_run(leaf.value.view(), alloc)
+            pointer_bytes = Some(take run.record)
+        } else {
+            let entry = try decode_commit_entry(leaf.value.view(), alloc)
+            pointer_bytes = entry.record
+        }
+        let Some(bytes) = pointer_bytes else {
+            continue
+        }
+        let Some(pointer) = disk::Pointer.of_bytes(bytes.view()) else {
+            continue
+        }
+        try await mut self.scrub_record(device, address: pointer.target, pointer, mut report, alloc)
+    }
+} Store.scrub_named
+
+/// Reads the record at `address` through `pointer`, recording an error when it fails its checksum.
+fn Store.scrub_record[D: disk::Device](
+    mut self,
+    device: D,
+    address: u64,
+    pointer: disk::Pointer,
+    mut report: ScrubReport,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    let read = match first attempt await log::read_record(device, address, pointer, alloc) {
+        Ok(found) => found
+        Err(log::LogFailure.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail StoreError.Io
+    }
+    report.records += 1
+    report.bytes += u64.widen(pointer.length)
+    if read.is_none() {
+        mut report.errors.push(ScrubError(address: address, kind: pointer.kind, paths: mem::List.empty(alloc)))
+    }
+} Store.scrub_record
+
+/// The address of the record `pointer` names, by item or by address.
+fn Store.address_of[D: disk::Device](mut self, device: D, pointer: disk::Pointer, alloc: mem::Alloc) -> u64 fails StoreError uses wait {
+    if not pointer.by_item {
+        return pointer.target
+    }
+    return match attempt await mut self.index.item_entry(device, item: pointer.target, alloc) {
+        Ok(Some(entry)) => entry.address
+        Ok(None) => 0
+        Err(failure) => fail StoreError.of_tree(take failure)
+    }
+} Store.address_of
+
+/// Checks both superblocks and rewrites a damaged copy from the valid one.
+fn Store.scrub_superblocks[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    let copy_a = try await read_blocks(device, block: disk::SUPERBLOCK_A, count: 1, alloc)
+    let copy_b = try await read_blocks(device, block: disk::SUPERBLOCK_B, count: 1, alloc)
+    let found_a = disk::Superblock.read(copy_a.view())
+    let found_b = disk::Superblock.read(copy_b.view())
+    match found_a {
+        disk::Found.Valid(_) => {
+        }
+        else => try await mut self.guarded_write(device, block: disk::SUPERBLOCK_A, data: self.superblock.to_block(alloc), alloc)
+    }
+    match found_b {
+        disk::Found.Valid(_) => {
+        }
+        else => try await mut self.guarded_write(device, block: disk::SUPERBLOCK_B, data: self.superblock.to_block(alloc), alloc)
+    }
+    try await mut self.guarded_flush(device, alloc)
+} Store.scrub_superblocks
+
+/// The key of piece `index` whose bytes are `raw`.
+validator fn piece_key_of(raw: Untrusted[Slice[u8]], index: u64) -> Array[u8, 32] {
+    let bytes = raw.inspect()
+    if bytes.len() == 0 or bytes.len() > ident::PIECE_BYTES {
+        return Array[u8, 32].filled(0)
+    }
+    return ident::piece_key(bytes, index)
+} piece_key_of

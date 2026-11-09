@@ -1,0 +1,138 @@
+//! Tests of retention, pins, stream retention, expiries, the cleaner and scrub.
+
+fn short_retention(alloc: mem::Alloc) -> Retention {
+    var tiers = mem::List[Tier].empty(alloc)
+    mut tiers.push(Tier(every_s: 0, age_s: 100))
+    return Retention(tiers: take tiers, max_pct: 25, agent_pct: 25)
+} short_retention
+
+fn commit_at(
+    mut store: Store,
+    device: disk::MemoryVolume,
+    take writes: mem::List[Write],
+    second: i64,
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    return try await mut store.commit(device, branch: "main", transaction: blind(take writes, alloc), stamp: system_stamp(alloc), now: at_second(second), alloc)
+} commit_at
+
+fn large_setting(level: u32, size: usize, alloc: mem::Alloc) -> Value {
+    var label = text::String.empty(alloc)
+    for _ in 0..<size {
+        mut label.push('x')
+    }
+    return Value.Record(type: setting_type(alloc), bytes: wire_of(Setting(level: level, label: take label), alloc), secret: false)
+} large_setting
+
+test commits_older_than_every_tier_are_thinned for Store.thin {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    mut store.retain_by(short_retention(alloc))
+    let kept = try await commit_at(mut store, device, writes: single(put("/data/x", level: 1, alloc), alloc), second: 3, alloc)
+    let pinned = try await commit_at(mut store, device, writes: single(put("/data/x", level: 2, alloc), alloc), second: 4, alloc)
+    discard try await commit_at(mut store, device, writes: single(put("/data/x", level: 3, alloc), alloc), second: 5, alloc)
+    try await mut store.pin(device, branch: "main", commit: pinned.number, by: ident::Principal(text: text::Fixed[64].of("owner")), note: None, now: at_second(6), alloc)
+    try await mut store.index_flush(device, now: at_second(10), alloc)
+    let young = try await level_then(mut store, device, text: "/data/x", at: kept.number.number, alloc)
+    expect young == 1
+    discard try await commit_at(mut store, device, writes: single(put("/data/y", level: 9, alloc), alloc), second: 300, alloc)
+    try await mut store.index_flush(device, now: at_second(301), alloc)
+    let thinned = attempt await mut store.get_at(device, branch: "main", path: path_of("/data/x", alloc), at: kept.number, now: at_second(301), alloc)
+    let refused = match thinned {
+        Err(StoreError.Thinned(retained: _)) => true
+        else => false
+    }
+    expect refused
+    let held = try await level_then(mut store, device, text: "/data/x", at: pinned.number.number, alloc)
+    expect held == 2
+    let now_level = try await level_on(mut store, device, branch: "main", text: "/data/x", alloc)
+    expect now_level == 3
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(302), alloc)
+    let after = try await level_on(mut mounted, device, branch: "main", text: "/data/x", alloc)
+    expect after == 3
+} commits_older_than_every_tier_are_thinned
+
+test streams_drop_entries_beyond_their_bytes for Store.tend {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    let limited = Declaration.Stream(StreamDecl(type: setting_type(alloc), max_age_s: None, max_bytes: Some(200)))
+    discard try await commit_at(mut store, device, writes: single(Write.Make(path: path_of("/data/events", alloc), declaration: take limited), alloc), second: 3, alloc)
+    for round in 0..<6u32 {
+        var entries = mem::List[mem::Bytes].empty(alloc)
+        mut entries.push(entry_of(round, alloc))
+        mut entries.push(entry_of(round + 100, alloc))
+        mut entries.push(entry_of(round + 200, alloc))
+        discard try await commit_at(mut store, device, writes: single(Write.Append(path: path_of("/data/events", alloc), entries: take entries), alloc), second: 4, alloc)
+    }
+    try await mut store.index_flush(device, now: at_second(5), alloc)
+    let read = try await mut store.read_stream(device, branch: "main", path: path_of("/data/events", alloc), from: 1, limit: 100, now: at_second(5), alloc)
+    expect read.lost > 0 and read.entries.len() < 18 and read.entries[read.entries.len() - 1].seq == 18
+} streams_drop_entries_beyond_their_bytes
+
+test expired_nodes_vanish for Store.expire_node {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var writes = mem::List[Write].empty(alloc)
+    mut writes.push(put("/state/app/lease", level: 1, alloc))
+    mut writes.push(Write.Expire(path: path_of("/state/app/lease", alloc), at: Some(at_second(50))))
+    discard try await commit_at(mut store, device, take writes, second: 3, alloc)
+    let before = attempt await mut store.get(device, branch: "main", path: path_of("/state/app/lease", alloc), now: at_second(40), alloc)
+    let after = attempt await mut store.get(device, branch: "main", path: path_of("/state/app/lease", alloc), now: at_second(60), alloc)
+    expect before.is_ok() and after.is_err()
+    let versioned = attempt await mut store.commit(device, branch: "main", transaction: blind(single(Write.Expire(path: path_of("/data", alloc), at: None), alloc), alloc), stamp: system_stamp(alloc), now: at_second(4), alloc)
+    expect is_failure(versioned, code: StoreError.Kind)
+} expired_nodes_vanish
+
+test the_cleaner_frees_segments_of_little_live_data for Store.clean {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    mut store.retain_by(short_retention(alloc))
+    for index in 0..<90u32 {
+        let name = decimal_name(u64.widen(index), alloc)
+        let path = text_of_name(name.view(), alloc)
+        var full = text::String.of("/data/big/", alloc)
+        mut full.append(path.as_str())
+        discard try await commit_at(mut store, device, writes: single(Write.Put(path: path_of(full.as_str(), alloc), value: large_setting(index, size: 100_000, alloc)), alloc), second: 3, alloc)
+    }
+    try await mut store.index_flush(device, now: at_second(4), alloc)
+    for index in 0..<90u32 {
+        let name = decimal_name(u64.widen(index), alloc)
+        let path = text_of_name(name.view(), alloc)
+        var full = text::String.of("/data/big/", alloc)
+        mut full.append(path.as_str())
+        discard try await commit_at(mut store, device, writes: single(Write.Put(path: path_of(full.as_str(), alloc), value: setting(index, label: "small", alloc)), alloc), second: 500, alloc)
+    }
+    try await mut store.index_flush(device, now: at_second(501), alloc)
+    let cleaned = try await mut store.clean(device, now: at_second(9_000), alloc)
+    expect cleaned
+    try await mut store.index_flush(device, now: at_second(9_001), alloc)
+    try await mut store.index_flush(device, now: at_second(9_002), alloc)
+    let level = try await level_on(mut store, device, branch: "main", text: "/data/big/7", alloc)
+    expect level == 7
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(9_003), alloc)
+    let remounted = try await level_on(mut mounted, device, branch: "main", text: "/data/big/42", alloc)
+    expect remounted == 42
+    let discarded = try await device.discarded()
+    expect discarded > 0
+} the_cleaner_frees_segments_of_little_live_data
+
+test scrub_finds_damage_and_repairs_superblocks for Store.scrub {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_at(mut store, device, writes: single(Write.Put(path: path_of("/data/large", alloc), value: large_setting(5, size: 3_000, alloc)), alloc), second: 3, alloc)
+    try await mut store.index_flush(device, now: at_second(4), alloc)
+    let clean = try await mut store.scrub(device, alloc)
+    expect clean.errors.len() == 0 and clean.records > 0
+    let node = try await mut store.get(device, branch: "main", path: path_of("/data/large", alloc), now: at_second(5), alloc)
+    expect node.size > 1_024
+    try await device.damage(offset: 0 + 100, alloc)
+    discard try await mut store.scrub(device, alloc)
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(6), alloc)
+    let level = try await level_on(mut mounted, device, branch: "main", text: "/data/large", alloc)
+    expect level == 5
+} scrub_finds_damage_and_repairs_superblocks
