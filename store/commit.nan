@@ -24,6 +24,9 @@ pkg struct Writing derives Copy {
     pkg now: ident::WallTime
 } Writing
 
+/// Whether version `version` comes from a commit after the base other than the one being written.
+pkg fn Writing.changed_after_base(self, version: u64) -> bool = version > self.base and version != self.number
+
 /// Commits `transaction` to `branch` with what `stamp` gives, once its log flush returns.
 pub fn Store.commit[D: disk::Device](
     mut self,
@@ -262,7 +265,7 @@ fn Store.settle[D: disk::Device](mut self, device: D, take sealed: Sealed, alloc
     }
     mut self.logged(now: meta.time)
     let committed = Committed(number: meta.number, branch: text::String.of(meta.branch.as_str(), alloc), time: meta.time)
-    try await mut self.record_commit(device, take meta, record: logged.pointer, writes: staged.writes.view(), alloc)
+    try await mut self.record_commit(device, take meta, record: logged.pointer, writes: staged.writes.view(), changes: staged.changes.view(), alloc)
     return committed
 } Store.settle
 
@@ -378,14 +381,15 @@ pkg fn Store.record_commit[D: disk::Device](
     take meta: CommitMeta,
     record: disk::Pointer,
     writes: Slice[LogWrite],
+    changes: Slice[u8],
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
     let number = meta.number.number
-    for write in writes {
-        if meta.recorded and write.tree == TREE_VERSIONED {
-            try await mut self.record_change(device, write, number, alloc)
+    for at in 0..<writes.len() {
+        if meta.recorded and writes[at].tree == TREE_VERSIONED and at < changes.len() {
+            try await mut self.record_change(device, write: writes[at], change: changes[at], number, alloc)
         }
-        let Some(written) = write.entry else {
+        let Some(written) = writes[at].entry else {
             continue
         }
         mut self.refs.count(written, delta: 1)
@@ -395,21 +399,45 @@ pkg fn Store.record_commit[D: disk::Device](
     try await mut self.catalog_put(device, key: number_key(KIND_COMMIT, number, width: 8, alloc).view(), value: wire_of(entry, alloc).view(), alloc)
 } Store.record_commit
 
-/// Records that commit `number` created, changed or deleted the versioned node `write` names.
+/// Records that commit `number` made `change` to the versioned node `write` names, merged with what its earlier writes to that node made: a node it created and changed stays created, one it created and deleted keeps no change, and one it deleted and created again is changed.
 fn Store.record_change[D: disk::Device](
     mut self,
     device: D,
     write: LogWrite,
+    change: u8,
     number: u64,
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
-    let change: u8 = match write.entry {
-        Some(_) => 2
-        None => 3
-    }
     let key = path_change_key(write, number, alloc)
-    try await mut self.catalog_put(device, key: key.view(), value: wire_of(PathChange(change: change), alloc).view(), alloc)
+    let earlier = match try await mut self.catalog_get(device, key: key.view(), alloc) {
+        Some(bytes) => change_of(Untrusted.of(bytes.view()), alloc)
+        None => 0
+    }
+    let merged: u8 = match earlier {
+        CHANGE_CREATED => match change {
+            CHANGE_DELETED => 0
+            else => CHANGE_CREATED
+        }
+        CHANGE_DELETED => match change {
+            CHANGE_CREATED => CHANGE_CHANGED
+            else => change
+        }
+        else => change
+    }
+    if merged == 0 {
+        discard try await mut self.catalog_remove(device, key: key.view(), alloc)
+        return
+    }
+    try await mut self.catalog_put(device, key: key.view(), value: wire_of(PathChange(change: merged), alloc).view(), alloc)
 } Store.record_change
+
+/// The change a path change entry records, 0 for one that does not decode.
+validator fn change_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> u8 {
+    return match attempt mem::wire::Codec[PathChange].decode(raw, alloc) {
+        Ok(found) => found.change
+        Err(_) => 0
+    }
+} change_of
 
 /// The catalog key of the path change commit `number` made to the node `write` names.
 pkg fn path_change_key(write: LogWrite, number: u64, alloc: mem::Alloc) -> mem::Bytes {
