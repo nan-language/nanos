@@ -176,7 +176,7 @@ Entries fill the node from its end downwards. A leaf entry is a key length (2 by
 | 2 commit | number (8) | `CommitEntry { meta: CommitMeta, record: Option[pointer], tree: Option[pointer] }` |
 | 3 pin | commit (8) ‖ pin number (8) | `Pin` |
 | 4 request key | principal ‖ `0x00` ‖ the key's bytes | `RequestEntry { session: Option[SessionId], commit: u64, digest: HashValue, branch: text::String, time: WallTime }`, the branch and time of its commit |
-| 5 stream run | stream id (8) ‖ earliest sequence number (8) | `StreamRun { record: pointer, count: u32, bytes: u32, time: i64, agent: bool }`, `time` being its newest entry's wall time |
+| 5 stream run | stream id (8) ‖ earliest sequence number (8) | `StreamRun { record: pointer, count: u32, bytes: u32, time: i64, agent: bool }`, `time` being its newest entry's wall time; under sequence number 0, `StreamHead { heads: u64 }`, the references from what branch heads reach to the stream |
 | 6 blob | blob id (33) | `BlobEntry { size: u64, refcount: u64, heads: u64, agent: bool }` |
 | 7 blob piece | blob id (33) ‖ piece index (8) | the piece key, 32 bytes |
 | 8 piece | piece key (32) | `PieceEntry { record: pointer, refcount: u64 }` |
@@ -254,6 +254,8 @@ Every item, blob entry, piece entry, origin set and type entry carries a referen
 - When the store changes a node that more than one tree references, it writes a copy: each item, blob, origin set and type the copy names gains a reference, and the shared node loses the reference of the tree that changed. A blob entry holds one reference to each of its pieces.
 - Thinning a commit removes the references of its commit record's node entries and of its tree's top node; deleting a branch, those of its trees' top nodes.
 - An entry whose count reaches zero is freed, and everything it names loses one reference.
+
+A stream's entries live under its id while a head reaches it; when they reach it no more, its runs are freed. A commit changing a stream that another head's tree holds at the same path, as branches share one from a fork, gives its branch's stream a new id, the runs copied under it.
 
 Count changes collect in memory and apply at index flushes. Space freed at flush k is reused only after flush k + 1 is durable, so a mount from the latest durable flush record or the one before it stays possible. Commit records and stream runs have one naming catalog entry and are freed with it; blob records are freed at the index flush after them.
 
