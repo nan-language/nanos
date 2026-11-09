@@ -227,7 +227,8 @@ A device failure at any step fails the index flush with `store.io` and leaves th
 | time | 72 | 8 | wall time, UTC nanoseconds |
 | catalog | 80 | 32 | pointer to the catalog's top node |
 | items | 112 | 32 | pointer to the item table's top node |
-| reserved | 144 | 3,936 | |
+| next_preview | 144 | 8 | the number of the next preview branch |
+| reserved | 152 | 3,928 | |
 | checksum | 4,080 | 16 | of bytes 0 to 4,079 |
 
 ## Mounting and recovery
