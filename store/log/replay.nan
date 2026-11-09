@@ -1,0 +1,125 @@
+//! Replay: the log's batches from a flush record's position, in sequence through segments, up to the first the device did not keep.
+
+/// The most bytes of log replay reads.
+pkg const REPLAY_BYTES: u64 = 33_554_432
+
+/// A batch replay read: its header, where it lies, and its records with their offsets.
+pkg struct Replayed {
+    pkg header: disk::BatchHeader
+    pkg segment: u32
+    pkg block: u32
+    pkg records: mem::List[disk::Placed]
+} Replayed
+
+/// Where replay continues: the segment, its header's sequence and successor, the next block and batch, the bytes read so far and the volume.
+pkg struct Replay {
+    pkg segment: u32
+    pkg sequence: u64
+    pkg next: u32
+    pkg block: u32
+    pkg batch: u64
+    pkg bytes: u64
+    pkg volume_id: Array[u8, 16]
+} Replay
+
+/// Replay from block `block` of segment `segment` and batch `batch`, `None` when that segment's header is not valid for the volume.
+pkg fn Replay.start[D: disk::Device](
+    device: D,
+    volume_id: Array[u8, 16],
+    segment: u32,
+    block: u32,
+    batch: u64,
+    alloc: mem::Alloc,
+    ) -> Option[Replay] fails LogFailure uses wait {
+    let Some(header) = try await read_header(device, segment, alloc) else {
+        return None
+    }
+    if header.volume_id != volume_id or header.segment != segment {
+        return None
+    }
+    return Some(Replay(segment: segment, sequence: header.sequence, next: header.next, block: block, batch: batch, bytes: 0, volume_id: volume_id))
+} Replay.start
+
+/// The next batch of the log, `None` past the last one the device kept.
+pkg fn Replay.next_batch[D: disk::Device](mut self, device: D, alloc: mem::Alloc) -> Option[Replayed] fails LogFailure uses wait {
+    if u64.widen(self.block) >= disk::SEGMENT_BLOCKS and not try await mut self.enter_next(device, alloc) {
+        return None
+    }
+    let start = disk::segment_start(self.segment) + u64.widen(self.block)
+    let opening = try await read_blocks(device, block: start, count: 1, alloc)
+    let Some(header) = disk::BatchHeader.read(opening.view()) else {
+        return None
+    }
+    let room = disk::SEGMENT_BLOCKS - u64.widen(self.block)
+    if header.batch != self.batch or header.blocks == 0 or u64.widen(header.blocks) > room {
+        return None
+    }
+    let length = u64.widen(header.blocks) * u64.widen(disk::BLOCK_BYTES)
+    if self.bytes + length > REPLAY_BYTES {
+        return None
+    }
+    let whole = try await read_blocks(device, block: start, count: header.blocks, alloc)
+    if not disk::batch_verifies(whole.view(), alloc) {
+        return None
+    }
+    let Some(records) = disk::batch_records(whole.view(), header, alloc) else {
+        return None
+    }
+    let replayed = Replayed(header: header, segment: self.segment, block: self.block, records: take records)
+    self.bytes += length
+    self.batch += 1
+    self.block += header.blocks
+    if header.ends_segment {
+        self.block = u32.truncate(disk::SEGMENT_BLOCKS)
+    }
+    return Some(take replayed)
+} Replay.next_batch
+
+/// Moves replay to the open segment's successor, when its header follows the open one's.
+fn Replay.enter_next[D: disk::Device](mut self, device: D, alloc: mem::Alloc) -> bool fails LogFailure uses wait {
+    let Some(header) = try await read_header(device, segment: self.next, alloc) else {
+        return false
+    }
+    if header.volume_id != self.volume_id or header.segment != self.next or header.sequence != self.sequence + 1 {
+        return false
+    }
+    self.segment = header.segment
+    self.sequence = header.sequence
+    self.next = header.next
+    self.block = 1
+    return true
+} Replay.enter_next
+
+/// The header of segment `segment`, `None` when its block 0 holds none.
+pkg fn read_header[D: disk::Device](device: D, segment: u32, alloc: mem::Alloc) -> Option[disk::SegmentHeader] fails LogFailure uses wait {
+    if segment == 0 or u64.widen(segment) >= device.blocks() / disk::SEGMENT_BLOCKS {
+        return None
+    }
+    let block = try await read_blocks(device, block: disk::segment_start(segment), count: 1, alloc)
+    return disk::SegmentHeader.read(block.view())
+} read_header
+
+/// `count` blocks from `block`.
+pkg fn read_blocks[D: disk::Device](device: D, block: u64, count: u32, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails LogFailure uses wait {
+    return match attempt await device.read(block, count, alloc) {
+        Ok(bytes) => bytes
+        Err(disk::DeviceFailure.Cancelled(cancelled)) => fail cancelled
+        Err(disk::DeviceFailure.Io) => fail LogFailure.Io
+    }
+} read_blocks
+
+/// The record a pointer names by its address, `None` when it fails its checksum or lies outside the volume.
+pkg fn read_record[D: disk::Device](device: D, address: u64, pointer: disk::Pointer, alloc: mem::Alloc) -> Option[disk::Record] fails LogFailure uses wait {
+    let block_bytes = u64.widen(disk::BLOCK_BYTES)
+    let lead = address / block_bytes
+    let end = address + u64.widen(disk::record_bytes(pointer.length))
+    let last = (end + block_bytes - 1) / block_bytes
+    if last > device.blocks() or last - lead > 0xFFFF_FFFF {
+        return None
+    }
+    let blocks = try await read_blocks(device, block: lead, count: u32.truncate(last - lead), alloc)
+    let Some(parts) = blocks.view().split_at(usize.widen(address - lead * block_bytes)) else {
+        return None
+    }
+    return disk::read_named(parts.tail, pointer, alloc)
+} read_record

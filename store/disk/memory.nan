@@ -1,0 +1,184 @@
+//! A volume in memory, on which tests run the store: the blocks its device keeps, the writes its cache holds until a flush, and the failures and crashes a test injects.
+
+/// A volume in memory of `blocks` blocks.
+pkg struct MemoryVolume {
+    platters: task::Cown[Platters]
+    size: u64
+} MemoryVolume
+
+impl MemoryVolume: Device
+
+/// What the device holds: the blocks it keeps, the writes its cache holds in order, the writes it has taken, the write from which it fails every write, and the blocks it discarded.
+struct Platters {
+    kept: mem::Map[u64, mem::Bytes]
+    cached: mem::List[Cached]
+    writes: u64
+    failing_from: Option[u64]
+    discarded: u64
+} Platters
+
+/// A block in the device's cache.
+struct Cached {
+    block: u64
+    bytes: mem::Bytes
+} Cached
+
+pkg fn MemoryVolume.of_blocks(blocks: u64, alloc: mem::Alloc) -> MemoryVolume {
+    let platters = Platters(kept: mem::Map.empty(alloc), cached: mem::List.empty(alloc), writes: 0, failing_from: None, discarded: 0)
+    return MemoryVolume(platters: task::Cown.of(take platters, alloc), size: blocks)
+} MemoryVolume.of_blocks
+
+/// The same volume, through another handle.
+pkg fn MemoryVolume.share(self) -> MemoryVolume {
+    return MemoryVolume(platters: self.platters.share(), size: self.size)
+} MemoryVolume.share
+
+pkg fn MemoryVolume.blocks(self) -> u64 = self.size
+
+pkg fn MemoryVolume.discards(self) -> bool = true
+
+pkg fn MemoryVolume.read(self, block: u64, count: u32, alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails DeviceFailure uses wait {
+    if block > self.size or self.size - block < u64.widen(count) {
+        fail DeviceFailure.Io
+    }
+    let held = self.platters.share()
+    let bytes = await when held => held.read_blocks(block, count, alloc)
+    return Untrusted.of(take bytes)
+} MemoryVolume.read
+
+pkg fn MemoryVolume.write(self, block: u64, take data: mem::Bytes, alloc: mem::Alloc) fails DeviceFailure uses wait {
+    let count = u64.widen(data.len() / BLOCK_BYTES)
+    if data.len() % BLOCK_BYTES != 0 or block > self.size or self.size - block < count {
+        fail DeviceFailure.Io
+    }
+    let held = self.platters.share()
+    var failed = false
+    await when mut held {
+        held.writes += 1
+        failed = match held.failing_from {
+            Some(from) => held.writes >= from
+            None => false
+        }
+        if not failed {
+            mut held.cache(block, data: data.view(), alloc)
+        }
+    }
+    if failed {
+        fail DeviceFailure.Io
+    }
+} MemoryVolume.write
+
+pkg fn MemoryVolume.flush(self, alloc: mem::Alloc) fails DeviceFailure uses wait {
+    let held = self.platters.share()
+    var failing = false
+    await when mut held {
+        failing = held.failing_from.is_some()
+        if not failing {
+            mut held.keep_cached()
+        }
+    }
+    if failing {
+        fail DeviceFailure.Io
+    }
+} MemoryVolume.flush
+
+pkg fn MemoryVolume.discard_blocks(self, block: u64, count: u32, alloc: mem::Alloc) fails DeviceFailure uses wait {
+    let held = self.platters.share()
+    await when mut held {
+        for at in block..<(block + u64.widen(count)) {
+            discard mut held.kept.remove(at)
+        }
+        held.discarded += u64.widen(count)
+    }
+} MemoryVolume.discard_blocks
+
+/// Loses every write the cache holds but the first `kept` blocks, as a power cut does.
+pkg fn MemoryVolume.cut_power(self, kept: usize) fails task::Cancelled uses wait {
+    let held = self.platters.share()
+    await when mut held {
+        mut held.cached.truncate(kept)
+        mut held.keep_cached()
+        held.failing_from = None
+    }
+} MemoryVolume.cut_power
+
+/// Fails every write from the `count`th from now on, and every flush, until the next power cut.
+pkg fn MemoryVolume.fail_writes_after(self, count: u64) fails task::Cancelled uses wait {
+    let held = self.platters.share()
+    await when mut held {
+        held.failing_from = Some(held.writes + count)
+    }
+} MemoryVolume.fail_writes_after
+
+/// The blocks discarded so far.
+pkg fn MemoryVolume.discarded(self) -> u64 fails task::Cancelled uses wait {
+    let held = self.platters.share()
+    return await when held => held.discarded
+} MemoryVolume.discarded
+
+/// Overwrites the byte at `offset` of the volume, kept at once, as a damaged medium does.
+pkg fn MemoryVolume.damage(self, offset: u64, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let held = self.platters.share()
+    await when mut held {
+        let block = offset / u64.widen(BLOCK_BYTES)
+        var bytes = held.read_blocks(block, count: 1, alloc)
+        let at = usize.widen(offset % u64.widen(BLOCK_BYTES))
+        bytes[at] = bytes[at] ^ 0xFF
+        discard mut held.kept.insert(block, value: take bytes)
+    }
+} MemoryVolume.damage
+
+fn Platters.read_blocks(self, block: u64, count: u32, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    for at in block..<(block + u64.widen(count)) {
+        mut bytes.append(self.block_at(at, alloc).view())
+    }
+    return bytes
+} Platters.read_blocks
+
+fn Platters.block_at(self, block: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var index = self.cached.len()
+    while index > 0 {
+        index -= 1
+        let cached = self.cached.at(index)
+        if cached.block == block {
+            var copy = mem::Bytes.empty(alloc)
+            mut copy.append(cached.bytes.view())
+            return copy
+        }
+    }
+    let Some(kept) = self.kept.get(block) else {
+        return zero_block(alloc)
+    }
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(kept.view())
+    return copy
+} Platters.block_at
+
+fn Platters.cache(mut self, block: u64, data: Slice[u8], alloc: mem::Alloc) {
+    var at: usize = 0
+    var target = block
+    while at < data.len() {
+        let Some(parts) = data.split_at(at) else {
+            return
+        }
+        let Some(one) = parts.tail.prefix(BLOCK_BYTES) else {
+            return
+        }
+        var bytes = mem::Bytes.empty(alloc)
+        mut bytes.append(one)
+        mut self.cached.push(Cached(block: target, bytes: take bytes))
+        at += BLOCK_BYTES
+        target += 1
+    }
+} Platters.cache
+
+fn Platters.keep_cached(mut self) {
+    loop {
+        if self.cached.len() == 0 {
+            return
+        }
+        let Cached(block: block, bytes: bytes) = mut self.cached.remove(0)
+        discard mut self.kept.insert(block, value: take bytes)
+    }
+} Platters.keep_cached

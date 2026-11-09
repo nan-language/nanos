@@ -1,0 +1,252 @@
+//! The structures of the log: batch headers, log records and the pointers naming them.
+
+const BATCH_MAGIC: Slice[u8] = b"NANOSLB1"
+
+/// The bytes of a batch header, after which its records start.
+pub const BATCH_HEADER_BYTES: usize = 56
+
+/// The bytes of a log record before its payload: kind, flags, length and key.
+pub const RECORD_HEADER_BYTES: usize = 40
+
+/// The bytes of a pointer, inside a wire record and elsewhere.
+pub const POINTER_BYTES: usize = 32
+
+/// A log record's kind.
+pub closed enum RecordKind derives Copy, Eq {
+    Commit
+    Value
+    Piece
+    Index
+    Stream
+    Blob
+    Pad
+} RecordKind
+
+/// A batch header's fields: its number, its length, whether its segment ends after it, its count of records and its wall time.
+pub closed struct BatchHeader derives Copy, Eq {
+    pub batch: u64
+    pub blocks: u32
+    pub ends_segment: bool
+    pub records: u32
+    pub time: i64
+} BatchHeader
+
+/// A pointer: the record it names, by item id or by its byte offset in the volume, its payload length and kind, and the checksum of its key and payload.
+pub closed struct Pointer derives Copy, Eq {
+    pub target: u64
+    pub length: u32
+    pub kind: u8
+    pub by_item: bool
+    pub checksum: Array[u8, 16]
+} Pointer
+
+/// A log record as a batch holds it: its kind, its key and its payload.
+pub closed struct Record derives Eq {
+    pub kind: RecordKind
+    pub key: Array[u8, 32]
+    pub payload: mem::Bytes
+} Record
+
+pub fn RecordKind.code(self) -> u8 {
+    return match self {
+        RecordKind.Commit => 1
+        RecordKind.Value => 2
+        RecordKind.Piece => 3
+        RecordKind.Index => 4
+        RecordKind.Stream => 5
+        RecordKind.Blob => 6
+        RecordKind.Pad => 7
+    }
+} RecordKind.code
+
+pub fn RecordKind.of_code(code: u8) -> Option[RecordKind] {
+    return match code {
+        1 => Some(RecordKind.Commit)
+        2 => Some(RecordKind.Value)
+        3 => Some(RecordKind.Piece)
+        4 => Some(RecordKind.Index)
+        5 => Some(RecordKind.Stream)
+        6 => Some(RecordKind.Blob)
+        7 => Some(RecordKind.Pad)
+        else => None
+    }
+} RecordKind.of_code
+
+/// Whether a record of this kind has its payload begin at a block boundary.
+pub fn RecordKind.is_aligned(self) -> bool {
+    return self == RecordKind.Piece or self == RecordKind.Index
+} RecordKind.is_aligned
+
+pub fn Pointer.none() -> Pointer = Pointer(target: 0, length: 0, kind: 0, by_item: false, checksum: Array[u8, 16].filled(0))
+
+pub fn Pointer.is_none(self) -> bool = self.target == 0 and self.kind == 0
+
+pub fn Pointer.to_bytes(self) -> Array[u8, 32] {
+    var bytes = Array[u8, 32].filled(0)
+    mut bytes.view_mut().write_u64_le(0, value: self.target)
+    mut bytes.view_mut().write_u32_le(8, value: self.length)
+    bytes[12] = self.kind
+    if self.by_item {
+        bytes[13] = 1
+    }
+    for i in 0..<16usize {
+        bytes[16 + i] = self.checksum[i]
+    }
+    return bytes
+} Pointer.to_bytes
+
+pub fn Pointer.of_array(bytes: Array[u8, 32]) -> Pointer {
+    return Pointer(target: bytes.view().u64_le(0), length: bytes.view().u32_le(8), kind: bytes[12], by_item: (bytes[13] & 1) == 1, checksum: array16(bytes.view(), at: 16))
+} Pointer.of_array
+
+/// The pointer of 32 bytes `bytes` names, `None` when they are not 32.
+pub fn Pointer.of_bytes(bytes: Slice[u8]) -> Option[Pointer] {
+    if bytes.len() != POINTER_BYTES {
+        return None
+    }
+    return Some(Pointer.of_array(array32(bytes, at: 0)))
+} Pointer.of_bytes
+
+/// The pointer's 32 bytes as a wire record holds them.
+pub fn Pointer.to_list(self, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(self.to_bytes().view())
+    return bytes
+} Pointer.to_list
+
+/// The bytes of a log record of `payload` bytes, header included.
+pub fn record_bytes(payload: u32) -> usize = RECORD_HEADER_BYTES + usize.widen(payload)
+
+/// The bytes a record occupies in a batch: its own, rounded up to a multiple of 8.
+pub fn record_span(payload: u32) -> usize = (record_bytes(payload) + 7) / 8 * 8
+
+/// The checksum of a record's key and payload, which pointers to it hold.
+pub fn record_checksum(key: Array[u8, 32], payload: Slice[u8], alloc: mem::Alloc) -> Array[u8, 16] {
+    var stored = mem::Bytes.empty(alloc)
+    mut stored.append(key.view())
+    mut stored.append(payload)
+    return checksum(stored.view())
+} record_checksum
+
+/// Writes the header of a record of `kind`, `key` and `length` payload bytes at `at` of `batch`.
+pub fn put_record_header(
+    mut batch: mem::Bytes,
+    at: usize,
+    kind: RecordKind,
+    key: Array[u8, 32],
+    length: u32,
+    ) {
+    batch[at] = kind.code()
+    batch[at + 1] = 0
+    mut batch.view_mut().write_u32_le(at + 4, value: length)
+    put_bytes(mut batch, at: at + 8, data: key.view())
+} put_record_header
+
+/// Writes the batch header, `header.records` records following it, and the batch's checksum into `batch`.
+pub fn seal_batch(mut batch: mem::Bytes, header: BatchHeader) {
+    put_bytes(mut batch, at: 0, data: BATCH_MAGIC)
+    mut batch.view_mut().write_u64_le(8, value: header.batch)
+    mut batch.view_mut().write_u32_le(16, value: header.blocks)
+    var flags: u32 = 0
+    if header.ends_segment {
+        flags = 1
+    }
+    mut batch.view_mut().write_u32_le(20, value: flags)
+    mut batch.view_mut().write_u32_le(24, value: header.records)
+    mut batch.view_mut().write_u64_le(32, value: header.time.to_bits())
+    for i in 40..<56usize {
+        batch[i] = 0
+    }
+    let sum = checksum(batch.view())
+    put_bytes(mut batch, at: 40, data: sum.view())
+} seal_batch
+
+/// The header a batch's first block holds, `None` when it fails its magic; its checksum covers blocks a later read brings.
+pub validator fn BatchHeader.read(raw: Untrusted[Slice[u8]]) -> Option[BatchHeader] {
+    let bytes = raw.inspect()
+    if bytes.len() < BATCH_HEADER_BYTES or not has_magic(bytes, magic: BATCH_MAGIC) {
+        return None
+    }
+    return Some(BatchHeader(batch: bytes.u64_le(8), blocks: bytes.u32_le(16), ends_segment: (bytes.u32_le(20) & 1) == 1, records: bytes.u32_le(24), time: i64.from_bits(bytes.u64_le(32))))
+} BatchHeader.read
+
+/// Whether a whole batch's bytes hold the checksum its header stores.
+pub validator fn batch_verifies(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> bool {
+    let bytes = raw.inspect()
+    if bytes.len() < BATCH_HEADER_BYTES {
+        return false
+    }
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    for i in 40..<56usize {
+        copy[i] = 0
+    }
+    return checksum(copy.view()) == array16(bytes, at: 40)
+} batch_verifies
+
+/// The records a verified batch holds, in order, `None` when one does not lie within it or has no known kind.
+pub validator fn batch_records(raw: Untrusted[Slice[u8]], header: BatchHeader, alloc: mem::Alloc) -> Option[mem::List[Placed]] {
+    let bytes = raw.inspect()
+    var placed = mem::List[Placed].empty(alloc)
+    var at = BATCH_HEADER_BYTES
+    for _ in 0..<header.records {
+        if bytes.len() < at or bytes.len() - at < RECORD_HEADER_BYTES {
+            return None
+        }
+        let Some(kind) = RecordKind.of_code(bytes[at]) else {
+            return None
+        }
+        let stated = bytes.u32_le(at + 4)
+        let length = usize.widen(stated)
+        if bytes.len() - at - RECORD_HEADER_BYTES < length {
+            return None
+        }
+        var payload = mem::Bytes.empty(alloc)
+        let Some(parts) = bytes.split_at(at + RECORD_HEADER_BYTES) else {
+            return None
+        }
+        let Some(held) = parts.tail.prefix(length) else {
+            return None
+        }
+        mut payload.append(held)
+        mut placed.push(Placed(offset: at, record: Record(kind: kind, key: array32(bytes, at: at + 8), payload: take payload)))
+        at += record_span(stated)
+    }
+    return Some(take placed)
+} batch_records
+
+/// A record and its offset in its batch.
+pub closed struct Placed derives Eq {
+    pub offset: usize
+    pub record: Record
+} Placed
+
+/// The payload of the record whose bytes from its header on are `raw`, `None` unless its kind and length match `pointer`'s and its key and payload hold `pointer`'s checksum.
+pub validator fn read_named(raw: Untrusted[Slice[u8]], pointer: Pointer, alloc: mem::Alloc) -> Option[Record] {
+    let bytes = raw.inspect()
+    let length = usize.widen(pointer.length)
+    if bytes.len() < RECORD_HEADER_BYTES or bytes.len() - RECORD_HEADER_BYTES < length {
+        return None
+    }
+    if bytes[0] != pointer.kind or usize.widen(bytes.u32_le(4)) != length {
+        return None
+    }
+    let Some(parts) = bytes.split_at(8) else {
+        return None
+    }
+    let Some(stored) = parts.tail.prefix(32 + length) else {
+        return None
+    }
+    if checksum(stored) != pointer.checksum {
+        return None
+    }
+    let Some(kind) = RecordKind.of_code(bytes[0]) else {
+        return None
+    }
+    let Some(tail) = stored.split_at(32) else {
+        return None
+    }
+    var payload = mem::Bytes.empty(alloc)
+    mut payload.append(tail.tail)
+    return Some(Record(kind: kind, key: array32(bytes, at: 8), payload: take payload))
+} read_named

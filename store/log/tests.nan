@@ -1,0 +1,114 @@
+//! Tests of the log on in-memory volumes.
+
+/// The segments of the test volumes.
+const TEST_SEGMENTS: u32 = 6
+
+fn test_volume_id() -> Array[u8, 16] = Array[u8, 16].filled(0x5A)
+
+fn fresh_log(alloc: mem::Alloc) -> Log fails LogFailure {
+    var segments = mem::List[Segment].empty(alloc)
+    for _ in 0..<TEST_SEGMENTS {
+        mut segments.push(Segment(state: SegmentState.Free, live: 0, written: 0, freed_at: 0))
+    }
+    var log = Log.of(test_volume_id(), take segments, position: Position(segment: 0, sequence: 0, next: 0, block: 0, batch: 1), alloc)
+    try mut log.open_first(1, sequence: 1, alloc)
+    return log
+} fresh_log
+
+fn test_volume(alloc: mem::Alloc) -> disk::MemoryVolume {
+    return disk::MemoryVolume.of_blocks(disk::SEGMENT_BLOCKS * u64.widen(TEST_SEGMENTS + 1), alloc)
+} test_volume
+
+fn filled(length: usize, seed: u8, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    for at in 0..<length {
+        mut bytes.push(u8.truncate(at).wrapping_mul(13).wrapping_add(seed))
+    }
+    return bytes
+} filled
+
+fn key_of(byte: u8) -> Array[u8, 32] = Array[u8, 32].filled(byte)
+
+/// The records of every batch replay reads from the log's start, pads left out, each batch numbered after the one before and lying after it.
+fn replayed_records(device: disk::MemoryVolume, alloc: mem::Alloc) -> mem::List[disk::Record] fails LogFailure uses wait {
+    var records = mem::List[disk::Record].empty(alloc)
+    let Some(started) = try await Replay.start(device, volume_id: test_volume_id(), segment: 1, block: 1, batch: 1, alloc) else {
+        return records
+    }
+    var replay = started
+    var expected: u64 = 1
+    var after = disk::segment_start(1)
+    loop {
+        let Some(batch) = try await mut replay.next_batch(device, alloc) else {
+            return records
+        }
+        let at = disk::segment_start(batch.segment) + u64.widen(batch.block)
+        expect batch.header.batch == expected and at > after
+        expected += 1
+        after = at
+        for placed in take batch.records {
+            if placed.record.kind != disk::RecordKind.Pad {
+                mut records.push(take placed.record)
+            }
+        }
+    }
+} replayed_records
+
+test records_replay_in_order for Replay.next_batch {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var log = try fresh_log(alloc)
+    let commit = filled(100, seed: 1, alloc)
+    let piece = filled(65_536, seed: 2, alloc)
+    let value = filled(7, seed: 3, alloc)
+    discard try mut log.append(disk::RecordKind.Commit, key: key_of(1), payload: commit.view(), time: 10, alloc)
+    let placed = try mut log.append(disk::RecordKind.Piece, key: key_of(2), payload: piece.view(), time: 10, alloc)
+    discard try mut log.append(disk::RecordKind.Value, key: key_of(3), payload: value.view(), time: 10, alloc)
+    try await mut log.flush(device, alloc)
+    expect (placed.address + u64.widen(disk::RECORD_HEADER_BYTES)) % u64.widen(disk::BLOCK_BYTES) == 0
+    let records = try await replayed_records(device, alloc)
+    expect records.len() == 3
+    expect records[0].kind == disk::RecordKind.Commit and records[0].payload == commit
+    expect records[1].kind == disk::RecordKind.Piece and records[1].payload == piece and records[1].key == key_of(2)
+    expect records[2].payload == value
+    let Some(read) = try await read_record(device, address: placed.address, pointer: placed.pointer, alloc) else {
+        expect false
+        return
+    }
+    expect read.payload == piece
+} records_replay_in_order
+
+test replay_stops_at_a_torn_batch for Replay.next_batch {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var log = try fresh_log(alloc)
+    let small = filled(50, seed: 4, alloc)
+    let large = filled(20_000, seed: 5, alloc)
+    discard try mut log.append(disk::RecordKind.Commit, key: key_of(1), payload: small.view(), time: 1, alloc)
+    try await mut log.flush(device, alloc)
+    discard try mut log.append(disk::RecordKind.Commit, key: key_of(2), payload: large.view(), time: 2, alloc)
+    mut log.seal(alloc)
+    try await device.fail_writes_after(100)
+    discard attempt await mut log.flush(device, alloc)
+    try await device.cut_power(kept: 2)
+    let records = try await replayed_records(device, alloc)
+    expect records.len() == 1
+    expect records[0].payload == small
+} replay_stops_at_a_torn_batch
+
+test the_log_continues_in_the_next_segment for Log.append {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var log = try fresh_log(alloc)
+    let piece = filled(65_536, seed: 6, alloc)
+    for index in 0..<130u8 {
+        discard try mut log.append(disk::RecordKind.Piece, key: key_of(index), payload: piece.view(), time: 3, alloc)
+    }
+    try await mut log.flush(device, alloc)
+    expect log.segment(1).state == SegmentState.Full
+    expect log.segment(2).state == SegmentState.Open
+    expect log.position.segment == 2 and log.position.next == 3
+    let records = try await replayed_records(device, alloc)
+    expect records.len() == 130
+    expect records[129].key == key_of(129) and records[129].payload == piece
+} the_log_continues_in_the_next_segment
