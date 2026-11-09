@@ -1,0 +1,325 @@
+//! Index nodes: 16 KiB of entries in key order, leaf entries holding values and internal ones a child with the count and value bytes of the leaf entries below it.
+
+const NODE_MAGIC: Slice[u8] = b"NIX1"
+
+/// The bytes of an index node.
+pkg const NODE_BYTES: usize = 16_384
+
+/// The bytes of a node's header, after which its slots follow.
+const NODE_HEADER_BYTES: usize = 32
+
+/// The most bytes of a leaf entry: its key and value with their lengths.
+pkg const LEAF_ENTRY_BYTES: usize = 4_096
+
+/// The bytes of an internal entry beside its key: the key's length, the child's pointer, and the count and value bytes below it.
+const CHILD_EXTRA_BYTES: usize = 50
+
+/// The item table, whose nodes are reached by address and are no items.
+pkg const ITEM_TABLE: u8 = 5
+
+/// A node of an index tree as the store holds it: its tree and level, its item id, its entries, and whether it changed since it was written.
+pkg struct Node {
+    pkg tree: u8
+    pkg level: u8
+    pkg item: u64
+    pkg leaves: mem::List[Leaf]
+    pkg children: mem::List[Child]
+    pkg dirty: bool
+} Node
+
+/// A leaf entry.
+pkg struct Leaf {
+    pkg key: mem::Bytes
+    pkg value: mem::Bytes
+} Leaf
+
+/// An internal entry: the least key of its child's keys, the child by its in-memory id and its pointer as last written, and the count and value bytes of the leaf entries below it.
+pkg struct Child {
+    pkg key: mem::Bytes
+    pkg node: u64
+    pkg pointer: disk::Pointer
+    pkg count: u64
+    pkg bytes: u64
+} Child
+
+/// Why reading a node failed.
+pkg enum NodeFault derives Copy, Eq {
+    Corrupt
+} NodeFault
+
+pkg fn Node.leaf(tree: u8, item: u64, alloc: mem::Alloc) -> Node {
+    return Node(tree: tree, level: 0, item: item, leaves: mem::List.empty(alloc), children: mem::List.empty(alloc), dirty: true)
+} Node.leaf
+
+pkg fn Node.is_leaf(self) -> bool = self.level == 0
+
+/// The number of entries.
+pkg fn Node.count(self) -> usize {
+    if self.is_leaf() {
+        return self.leaves.len()
+    }
+    return self.children.len()
+} Node.count
+
+/// The bytes the node takes once encoded.
+pkg fn Node.encoded_bytes(self) -> usize {
+    var total = NODE_HEADER_BYTES
+    for leaf in self.leaves {
+        total += 2 + leaf_bytes(leaf.key.len(), value: leaf.value.len())
+    }
+    for child in self.children {
+        total += 2 + child.key.len() + CHILD_EXTRA_BYTES
+    }
+    return total
+} Node.encoded_bytes
+
+/// The totals of the node's entries.
+pkg fn Node.totals[V: Values](self, values: V) -> Totals {
+    var totals = Totals(count: 0, bytes: 0)
+    for leaf in self.leaves {
+        totals.count += 1
+        totals.bytes += values.size_of(self.tree, value: leaf.value.view())
+    }
+    for child in self.children {
+        totals.count += child.count
+        totals.bytes += child.bytes
+    }
+    return totals
+} Node.totals
+
+/// A copy of the node under item id `item`, each value of its leaves retained.
+pkg fn Node.duplicate[V: Values](self, item: u64, mut values: V, alloc: mem::Alloc) -> Node {
+    var copy = Node(tree: self.tree, level: self.level, item: item, leaves: mem::List.empty(alloc), children: mem::List.empty(alloc), dirty: true)
+    for leaf in self.leaves {
+        mut values.retain(self.tree, value: leaf.value.view())
+        mut copy.leaves.push(Leaf(key: copied(leaf.key.view(), alloc), value: copied(leaf.value.view(), alloc)))
+    }
+    for child in self.children {
+        mut copy.children.push(Child(key: copied(child.key.view(), alloc), node: child.node, pointer: child.pointer, count: child.count, bytes: child.bytes))
+    }
+    return copy
+} Node.duplicate
+
+/// Sets `key` to `value` in the leaf.
+pkg fn Node.set_leaf(mut self, key: Slice[u8], value: Slice[u8], alloc: mem::Alloc) {
+    let at = self.search(key)
+    if at < self.leaves.len() and self.leaves[at].key.view() == key {
+        self.leaves[at].value = copied(value, alloc)
+        return
+    }
+    mut self.leaves.insert(at, value: Leaf(key: copied(key, alloc), value: copied(value, alloc)))
+} Node.set_leaf
+
+/// Splits off the entries past the node's middle byte into a new node of item id `item`, leaving at least one on each side.
+pkg fn Node.split_off(mut self, item: u64, alloc: mem::Alloc) -> Node {
+    let half = self.encoded_bytes() / 2
+    var used = NODE_HEADER_BYTES
+    var keep: usize = 0
+    while keep + 1 < self.count() and used < half {
+        used += self.entry_bytes(keep) + 2
+        keep += 1
+    }
+    var right = Node(tree: self.tree, level: self.level, item: item, leaves: mem::List.empty(alloc), children: mem::List.empty(alloc), dirty: true)
+    var moved_leaves = mem::List[Leaf].empty(alloc)
+    while self.leaves.len() > keep {
+        let Some(leaf) = mut self.leaves.pop() else {
+            break
+        }
+        mut moved_leaves.push(take leaf)
+    }
+    while moved_leaves.len() > 0 {
+        let Some(leaf) = mut moved_leaves.pop() else {
+            break
+        }
+        mut right.leaves.push(take leaf)
+    }
+    var moved_children = mem::List[Child].empty(alloc)
+    while self.children.len() > keep {
+        let Some(child) = mut self.children.pop() else {
+            break
+        }
+        mut moved_children.push(take child)
+    }
+    while moved_children.len() > 0 {
+        let Some(child) = mut moved_children.pop() else {
+            break
+        }
+        mut right.children.push(take child)
+    }
+    return right
+} Node.split_off
+
+/// The node's least key.
+pkg fn Node.first_key(self, alloc: mem::Alloc) -> mem::Bytes {
+    if self.is_leaf() and self.leaves.len() > 0 {
+        return copied(self.leaves[0].key.view(), alloc)
+    }
+    if self.children.len() > 0 {
+        return copied(self.children[0].key.view(), alloc)
+    }
+    return mem::Bytes.empty(alloc)
+} Node.first_key
+
+/// The bytes entry `index` takes, its slot not counted.
+fn Node.entry_bytes(self, index: usize) -> usize {
+    if self.is_leaf() {
+        return leaf_bytes(self.leaves[index].key.len(), value: self.leaves[index].value.len())
+    }
+    return self.children[index].key.len() + CHILD_EXTRA_BYTES
+} Node.entry_bytes
+
+fn copied(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    return disk::copy_range(bytes, at: 0, count: bytes.len(), alloc)
+} copied
+
+/// The bytes a leaf entry takes, its slot not counted.
+pkg fn leaf_bytes(key: usize, value: usize) -> usize {
+    return key.saturating_add(value).saturating_add(4)
+} leaf_bytes
+
+/// The index of the entry holding `key`, or of where it would be inserted: the first entry whose key is not less.
+pkg fn Node.search(self, key: Slice[u8]) -> usize {
+    var low: usize = 0
+    var high = self.count()
+    while low < high {
+        let middle = low + (high - low) / 2
+        let held = match self.is_leaf() {
+            true => self.leaves[middle].key.view() < key
+            false => self.children[middle].key.view() < key
+        }
+        if held {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    return low
+} Node.search
+
+/// The index of the child whose keys `key` falls among: the last whose least key is not above it, the first for any key below all.
+pkg fn Node.route(self, key: Slice[u8]) -> usize {
+    let at = self.search(key)
+    if at < self.children.len() and self.children[at].key.view() == key {
+        return at
+    }
+    if at == 0 {
+        return 0
+    }
+    return at - 1
+} Node.route
+
+/// Encodes the node into its 16 KiB, written by index flush `flush`.
+pkg fn Node.encode(self, flush: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.zeroed(NODE_BYTES, alloc)
+    disk::put_bytes(mut bytes, at: 0, data: NODE_MAGIC)
+    bytes[4] = self.tree
+    bytes[5] = self.level
+    let count = self.count()
+    mut bytes.view_mut().write_u16_le(6, value: u16.truncate(count))
+    mut bytes.view_mut().write_u64_le(8, value: self.item)
+    mut bytes.view_mut().write_u64_le(16, value: flush)
+    var heap = NODE_BYTES
+    for index in 0..<count {
+        let size = match self.is_leaf() {
+            true => leaf_bytes(self.leaves[index].key.len(), value: self.leaves[index].value.len())
+            false => 2 + self.children[index].key.len() + CHILD_EXTRA_BYTES - 2
+        }
+        heap -= size
+        mut bytes.view_mut().write_u16_le(NODE_HEADER_BYTES + 2 * index, value: u16.truncate(heap))
+        match self.is_leaf() {
+            true => put_leaf(mut bytes, at: heap, leaf: self.leaves[index])
+            false => put_child(mut bytes, at: heap, child: self.children[index])
+        }
+    }
+    mut bytes.view_mut().write_u16_le(24, value: u16.truncate(heap))
+    return bytes
+} Node.encode
+
+fn put_leaf(mut bytes: mem::Bytes, at: usize, leaf: Leaf) {
+    mut bytes.view_mut().write_u16_le(at, value: u16.truncate(leaf.key.len()))
+    disk::put_bytes(mut bytes, at: at + 2, data: leaf.key.view())
+    let after = at + 2 + leaf.key.len()
+    mut bytes.view_mut().write_u16_le(after, value: u16.truncate(leaf.value.len()))
+    disk::put_bytes(mut bytes, at: after + 2, data: leaf.value.view())
+} put_leaf
+
+fn put_child(mut bytes: mem::Bytes, at: usize, child: Child) {
+    mut bytes.view_mut().write_u16_le(at, value: u16.truncate(child.key.len()))
+    disk::put_bytes(mut bytes, at: at + 2, data: child.key.view())
+    let after = at + 2 + child.key.len()
+    disk::put_bytes(mut bytes, at: after, data: child.pointer.to_bytes().view())
+    mut bytes.view_mut().write_u64_le(after + 32, value: child.count)
+    mut bytes.view_mut().write_u64_le(after + 40, value: child.bytes)
+} put_child
+
+/// The node a record's payload holds, for a node of `tree` whose item id is `item`, `None` when it fails validation: its magic, tree, item, slots and entries within its bytes, and its keys in strictly ascending order.
+pkg validator fn Node.read(raw: Untrusted[Slice[u8]], tree: u8, item: u64, alloc: mem::Alloc) -> Option[Node] {
+    let bytes = raw.inspect()
+    if bytes.len() != NODE_BYTES or not disk::has_magic(bytes, magic: NODE_MAGIC) or bytes[4] != tree or bytes.u64_le(8) != item {
+        return None
+    }
+    let level = bytes[5]
+    let count = usize.widen(bytes.u16_le(6))
+    if NODE_HEADER_BYTES + 2 * count > NODE_BYTES or (level > 0 and count == 0) {
+        return None
+    }
+    var node = Node(tree: tree, level: level, item: item, leaves: mem::List.empty(alloc), children: mem::List.empty(alloc), dirty: false)
+    for index in 0..<count {
+        let at = usize.widen(bytes.u16_le(NODE_HEADER_BYTES + 2 * index))
+        if at < NODE_HEADER_BYTES + 2 * count {
+            return None
+        }
+        let held = match level == 0 {
+            true => read_leaf(bytes, at, mut node, alloc)
+            false => read_child(bytes, at, mut node, alloc)
+        }
+        if not held {
+            return None
+        }
+    }
+    return Some(take node)
+} Node.read
+
+/// Reads the leaf entry at `at` into `node`, when it lies within `bytes` and its key follows the last one.
+fn read_leaf(bytes: Slice[u8], at: usize, mut node: Node, alloc: mem::Alloc) -> bool {
+    if at + 2 > bytes.len() {
+        return false
+    }
+    let key_length = usize.widen(bytes.u16_le(at))
+    let after = at + 2 + key_length
+    if after + 2 > bytes.len() {
+        return false
+    }
+    let value_length = usize.widen(bytes.u16_le(after))
+    if after + 2 + value_length > bytes.len() or leaf_bytes(key_length, value: value_length) > LEAF_ENTRY_BYTES {
+        return false
+    }
+    let key = disk::copy_range(bytes, at: at + 2, count: key_length, alloc)
+    let value = disk::copy_range(bytes, at: after + 2, count: value_length, alloc)
+    let count = node.leaves.len()
+    if count > 0 and node.leaves[count - 1].key >= key {
+        return false
+    }
+    mut node.leaves.push(Leaf(key: take key, value: take value))
+    return true
+} read_leaf
+
+/// Reads the internal entry at `at` into `node`, when it lies within `bytes` and its key follows the last one.
+fn read_child(bytes: Slice[u8], at: usize, mut node: Node, alloc: mem::Alloc) -> bool {
+    if at + 2 > bytes.len() {
+        return false
+    }
+    let key_length = usize.widen(bytes.u16_le(at))
+    let after = at + 2 + key_length
+    if after + 48 > bytes.len() {
+        return false
+    }
+    let key = disk::copy_range(bytes, at: at + 2, count: key_length, alloc)
+    let count = node.children.len()
+    if count > 0 and node.children[count - 1].key >= key {
+        return false
+    }
+    let pointer = disk::Pointer.of_array(disk::array32(bytes, at: after))
+    mut node.children.push(Child(key: take key, node: pointer.target, pointer: pointer, count: bytes.u64_le(after + 32), bytes: bytes.u64_le(after + 40)))
+    return true
+} read_child

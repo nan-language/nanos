@@ -1,0 +1,175 @@
+//! Tests of the index on in-memory volumes.
+
+/// Values counted by their length, whose copies and frees the tests count.
+struct Counted {
+    retained: u64
+    released: u64
+} Counted
+
+impl Counted: Values
+
+fn Counted.size_of(self, tree: u8, value: Slice[u8]) -> u64 = u64.widen(value.len())
+
+fn Counted.retain(mut self, tree: u8, value: Slice[u8]) {
+    self.retained += 1
+} Counted.retain
+
+fn Counted.release(mut self, tree: u8, value: Slice[u8]) {
+    self.released += 1
+} Counted.release
+
+/// Whether `found` holds the bytes of `wanted`.
+fn holds(found: Option[mem::Bytes], wanted: mem::Bytes) -> bool {
+    return match found {
+        Some(bytes) => bytes.view() == wanted.view()
+        None => false
+    }
+} holds
+
+fn key_of(number: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var key = mem::Bytes.zeroed(8, alloc)
+    mut key.view_mut().write_u64_be(0, value: number)
+    for _ in 0..<(number % 7) {
+        mut key.push(b'k')
+    }
+    return key
+} key_of
+
+fn value_of(number: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var value = mem::Bytes.empty(alloc)
+    let length = 20 + number % 300 * 10
+    for at in 0..<length {
+        mut value.push(u8.truncate(at + number))
+    }
+    return value
+} value_of
+
+fn test_volume(alloc: mem::Alloc) -> disk::MemoryVolume {
+    return disk::MemoryVolume.of_blocks(disk::SEGMENT_BLOCKS * 9, alloc)
+} test_volume
+
+fn test_log(alloc: mem::Alloc) -> log::Log fails TreeFailure {
+    var segments = mem::List[log::Segment].empty(alloc)
+    for _ in 0..<8u32 {
+        mut segments.push(log::Segment(state: log::SegmentState.Free, live: 0, written: 0, freed_at: 0))
+    }
+    var opened = log::Log.of(Array[u8, 16].filled(1), take segments, position: log::Position(segment: 0, sequence: 0, next: 0, block: 0, batch: 1), alloc)
+    match attempt mut opened.open_first(1, sequence: 1, alloc) {
+        Ok(_) => {
+        }
+        Err(_) => fail TreeFailure.Full
+    }
+    return opened
+} test_log
+
+/// A tree of keys 0 to `count` exclusive, each holding its value.
+fn filled_tree(mut index: Index, count: u64, mut values: Counted, alloc: mem::Alloc) -> Root fails TreeFailure uses wait {
+    let device = test_volume(alloc)
+    var root = mut index.new_tree(1, alloc)
+    mut index.retain(root.node)
+    for number in 0..<count {
+        let key = key_of(number * 7_919 % count, alloc)
+        let value = value_of(number * 7_919 % count, alloc)
+        try await mut index.put(device, mut root, key: key.view(), value: value.view(), mut values, alloc)
+    }
+    return root
+} filled_tree
+
+test trees_hold_many_keys for Index.put {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var index = Index.empty(next_item: 1, alloc)
+    var values = Counted(retained: 0, released: 0)
+    var root = try await filled_tree(mut index, count: 3_000, mut values, alloc)
+    let level = match index.node_at(1, id: root.node) {
+        Some(node) => node.level
+        None => 0
+    }
+    expect level >= 2
+    for number in 0..<3_000u64 {
+        let found = try await mut index.get(device, root, key: key_of(number, alloc).view(), alloc)
+        let wanted = value_of(number, alloc)
+        expect holds(found, wanted)
+    }
+    let missing = try await mut index.get(device, root, key: key_of(3_000, alloc).view(), alloc)
+    expect missing.is_none()
+    let totals = try await mut index.totals(device, root, values, alloc)
+    expect totals.count == 3_000
+    let scanned = try await mut index.scan(device, root, prefix: b"", from: key_of(100, alloc).view(), limit: 50, alloc)
+    let first_key = key_of(100, alloc)
+    let last_key = key_of(149, alloc)
+    expect scanned.len() == 50 and scanned[0].key == first_key and scanned[49].key == last_key
+    let range = try await mut index.count_range(device, root, from: key_of(1_000, alloc).view(), to: key_of(2_000, alloc).view(), values, alloc)
+    expect range.count == 1_000
+    for number in 0..<1_500u64 {
+        let removed = try await mut index.remove(device, mut root, key: key_of(number * 2, alloc).view(), mut values, alloc)
+        let wanted = value_of(number * 2, alloc)
+        expect holds(removed, wanted)
+    }
+    let left = try await mut index.totals(device, root, values, alloc)
+    expect left.count == 1_500
+    let odd = try await mut index.get(device, root, key: key_of(1_001, alloc).view(), alloc)
+    let even = try await mut index.get(device, root, key: key_of(1_000, alloc).view(), alloc)
+    expect odd.is_some() and even.is_none()
+} trees_hold_many_keys
+
+test flushed_trees_read_back for Index.write_tree {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var log = try test_log(alloc)
+    var index = Index.empty(next_item: 1, alloc)
+    var values = Counted(retained: 0, released: 0)
+    let filled = try await filled_tree(mut index, count: 2_000, mut values, alloc)
+    let root = try mut index.write_tree(mut log, root: filled, flush: 1, time: 5, alloc)
+    let items = try await mut index.write_items(device, mut log, flush: 1, time: 5, alloc)
+    match attempt await mut log.flush(device, alloc) {
+        Ok(_) => {
+        }
+        Err(_) => fail TreeFailure.Io
+    }
+    expect root.pointer.by_item and not items.pointer.by_item
+    var reread = Index.of(items, next_item: index.next_item, alloc)
+    for number in 0..<2_000u64 {
+        let found = try await mut reread.get(device, root, key: key_of(number, alloc).view(), alloc)
+        let wanted = value_of(number, alloc)
+        expect holds(found, wanted)
+    }
+    let count = try await mut reread.refcount(device, item: root.node, alloc)
+    expect count == 1
+} flushed_trees_read_back
+
+test shared_trees_copy_what_they_change for Index.writable {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var index = Index.empty(next_item: 1, alloc)
+    var values = Counted(retained: 0, released: 0)
+    let original = try await filled_tree(mut index, count: 1_000, mut values, alloc)
+    mut index.retain(original.node)
+    var changed = original
+    try await mut index.put(device, root: mut changed, key: key_of(5, alloc).view(), value: b"changed", mut values, alloc)
+    expect changed.node != original.node
+    expect values.retained > 0
+    let old = try await mut index.get(device, root: original, key: key_of(5, alloc).view(), alloc)
+    let new = try await mut index.get(device, root: changed, key: key_of(5, alloc).view(), alloc)
+    let old_value = value_of(5, alloc)
+    expect holds(old, wanted: old_value)
+    let changed_value = disk::copy_range(b"changed", at: 0, count: 7, alloc)
+    expect holds(new, wanted: changed_value)
+    let other = try await mut index.get(device, root: changed, key: key_of(900, alloc).view(), alloc)
+    let other_value = value_of(900, alloc)
+    expect holds(other, wanted: other_value)
+    let original_count = try await mut index.refcount(device, item: original.node, alloc)
+    expect original_count == 1
+} shared_trees_copy_what_they_change
+
+test released_trees_are_freed for Index.free_unnamed {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var index = Index.empty(next_item: 1, alloc)
+    var values = Counted(retained: 0, released: 0)
+    let root = try await filled_tree(mut index, count: 1_000, mut values, alloc)
+    mut index.release(root.node, tree: 1, pointer: root.pointer)
+    try await mut index.free_unnamed(device, mut values, alloc)
+    expect values.released == 1_000
+    expect index.node_at(1, id: root.node).is_none()
+} released_trees_are_freed

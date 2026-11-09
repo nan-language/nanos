@@ -1,0 +1,170 @@
+//! Scans and counts: a tree's entries in key order from a key, and the totals of those in a range of keys, from the subtree totals of internal entries.
+
+/// A child to visit: its in-memory id, its pointer, and the keys it covers, from its least key up to the next child's.
+struct Visit {
+    node: u64
+    pointer: disk::Pointer
+    low: mem::Bytes
+    high: Option[mem::Bytes]
+    count: u64
+    bytes: u64
+} Visit
+
+/// The entries of the tree under `root` whose keys begin with `prefix` and are not below `from`, in key order, at most `limit` of them.
+pkg fn Index.scan[D: disk::Device](
+    mut self,
+    device: D,
+    root: Root,
+    prefix: Slice[u8],
+    from: Slice[u8],
+    limit: usize,
+    alloc: mem::Alloc,
+    ) -> mem::List[Leaf] fails TreeFailure uses wait {
+    var out = mem::List[Leaf].empty(alloc)
+    discard try await mut self.scan_node(device, tree: root.tree, id: root.node, pointer: root.pointer, prefix, from, limit, mut out, alloc)
+    return out
+} Index.scan
+
+/// The totals of the entries of the tree under `root` whose keys are not below `from` and, unless `to` is empty, below `to`.
+pkg fn Index.count_range[D: disk::Device, V: Values](
+    mut self,
+    device: D,
+    root: Root,
+    from: Slice[u8],
+    to: Slice[u8],
+    values: V,
+    alloc: mem::Alloc,
+    ) -> Totals fails TreeFailure uses wait {
+    return try await mut self.count_node(device, tree: root.tree, id: root.node, pointer: root.pointer, from, to, values, alloc)
+} Index.count_range
+
+/// Scans below the node `id`, and gives whether the scan is done: `limit` entries found or a key past `prefix` reached.
+fn Index.scan_node[D: disk::Device](
+    mut self,
+    device: D,
+    tree: u8,
+    id: u64,
+    pointer: disk::Pointer,
+    prefix: Slice[u8],
+    from: Slice[u8],
+    limit: usize,
+    mut out: mem::List[Leaf],
+    alloc: mem::Alloc,
+    ) -> bool fails TreeFailure uses wait {
+    try await mut self.load(device, tree, id, pointer, alloc)
+    let Some(node) = self.node_at(tree, id) else {
+        fail TreeFailure.Corrupt
+    }
+    if node.is_leaf() {
+        return node.scan_leaf(prefix, from, limit, mut out, alloc)
+    }
+    let visits = node.visits(from, alloc)
+    for visit in visits {
+        if past_prefix(visit.low.view(), prefix) {
+            return true
+        }
+        if try await mut self.scan_node(device, tree, id: visit.node, pointer: visit.pointer, prefix, from, limit, mut out, alloc) {
+            return true
+        }
+    }
+    return false
+} Index.scan_node
+
+fn Index.count_node[D: disk::Device, V: Values](
+    mut self,
+    device: D,
+    tree: u8,
+    id: u64,
+    pointer: disk::Pointer,
+    from: Slice[u8],
+    to: Slice[u8],
+    values: V,
+    alloc: mem::Alloc,
+    ) -> Totals fails TreeFailure uses wait {
+    try await mut self.load(device, tree, id, pointer, alloc)
+    let Some(node) = self.node_at(tree, id) else {
+        fail TreeFailure.Corrupt
+    }
+    var totals = Totals(count: 0, bytes: 0)
+    if node.is_leaf() {
+        for leaf in node.leaves {
+            if leaf.key.view() >= from and (to.len() == 0 or leaf.key.view() < to) {
+                totals.count += 1
+                totals.bytes += values.size_of(tree, value: leaf.value.view())
+            }
+        }
+        return totals
+    }
+    let visits = node.visits(from, alloc)
+    for visit in visits {
+        if to.len() > 0 and visit.low.view() >= to {
+            break
+        }
+        let whole = visit.low.view() >= from and (to.len() == 0 or ends_before(visit.high, to))
+        if whole {
+            totals.count += visit.count
+            totals.bytes += visit.bytes
+        } else {
+            let part = try await mut self.count_node(device, tree, id: visit.node, pointer: visit.pointer, from, to, values, alloc)
+            totals.count += part.count
+            totals.bytes += part.bytes
+        }
+    }
+    return totals
+} Index.count_node
+
+/// Copies the entries of the leaf whose keys begin with `prefix` and are not below `from`, and gives whether the scan is done.
+fn Node.scan_leaf(
+    self,
+    prefix: Slice[u8],
+    from: Slice[u8],
+    limit: usize,
+    mut out: mem::List[Leaf],
+    alloc: mem::Alloc,
+    ) -> bool {
+    for at in self.search(from)..<self.leaves.len() {
+        let leaf = self.leaves[at]
+        if past_prefix(leaf.key.view(), prefix) {
+            return true
+        }
+        if leaf.key.view().prefix(prefix.len()) == Some(prefix) {
+            if out.len() >= limit {
+                return true
+            }
+            mut out.push(Leaf(key: copied(leaf.key.view(), alloc), value: copied(leaf.value.view(), alloc)))
+        }
+    }
+    return false
+} Node.scan_leaf
+
+/// The children of an internal node that may hold keys not below `from`, in order, each with the keys it covers.
+fn Node.visits(self, from: Slice[u8], alloc: mem::Alloc) -> mem::List[Visit] {
+    var visits = mem::List[Visit].empty(alloc)
+    let count = self.children.len()
+    for at in self.route(from)..<count {
+        let child = self.children[at]
+        var high: Option[mem::Bytes] = None
+        if at + 1 < count {
+            high = Some(copied(self.children[at + 1].key.view(), alloc))
+        }
+        var low = copied(child.key.view(), alloc)
+        if at == 0 {
+            low = mem::Bytes.empty(alloc)
+        }
+        mut visits.push(Visit(node: child.node, pointer: child.pointer, low: take low, high: take high, count: child.count, bytes: child.bytes))
+    }
+    return visits
+} Node.visits
+
+/// Whether `key` comes after every key beginning with `prefix`.
+fn past_prefix(key: Slice[u8], prefix: Slice[u8]) -> bool {
+    return key > prefix and key.prefix(prefix.len()) != Some(prefix)
+} past_prefix
+
+/// Whether a child's keys, up to `high` or without bound, all lie below `to`.
+fn ends_before(high: Option[mem::Bytes], to: Slice[u8]) -> bool {
+    return match high {
+        Some(bound) => bound.view() <= to
+        None => false
+    }
+} ends_before

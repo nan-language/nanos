@@ -1,0 +1,197 @@
+//! Index flushes: dirty nodes written to the log children first, items no entry names freed with what they name, and every item's place and count written to the item table.
+
+/// The values of the item table's leaves, which name nothing.
+pkg struct NoValues derives Copy {
+} NoValues
+
+impl NoValues: Values
+
+pkg fn NoValues.size_of(self, tree: u8, value: Slice[u8]) -> u64 = 0
+
+pkg fn NoValues.retain(mut self, tree: u8, value: Slice[u8]) {
+} NoValues.retain
+
+pkg fn NoValues.release(mut self, tree: u8, value: Slice[u8]) {
+} NoValues.release
+
+/// A node as an index flush wrote it: its in-memory id and the pointer naming it.
+struct Written derives Copy {
+    id: u64
+    pointer: disk::Pointer
+} Written
+
+/// Writes the dirty nodes of the tree under `root` to the log, children first, and gives the tree with its top node's pointer.
+pkg fn Index.write_tree(
+    mut self,
+    mut log: log::Log,
+    root: Root,
+    flush: u64,
+    time: i64,
+    alloc: mem::Alloc,
+    ) -> Root fails TreeFailure {
+    let written = try mut self.write_node(mut log, tree: root.tree, id: root.node, pointer: root.pointer, flush, time, alloc)
+    return Root(tree: root.tree, node: written.id, pointer: written.pointer)
+} Index.write_tree
+
+/// Frees every item no entry names any more, each freeing what it names in turn: a node its children and the values of its leaves, by `values`.
+pkg fn Index.free_unnamed[D: disk::Device, V: Values](mut self, device: D, mut values: V, alloc: mem::Alloc) fails TreeFailure uses wait {
+    loop {
+        let Some(item) = try await mut self.unnamed(device, alloc) else {
+            return
+        }
+        try await mut self.free_item(device, item, mut values, alloc)
+    }
+} Index.free_unnamed
+
+/// Writes each item's new place and count into the item table, then the item table's dirty nodes, and gives its top node.
+pkg fn Index.write_items[D: disk::Device](
+    mut self,
+    device: D,
+    mut log: log::Log,
+    flush: u64,
+    time: i64,
+    alloc: mem::Alloc,
+    ) -> Root fails TreeFailure uses wait {
+    var items = mem::List[u64].empty(alloc)
+    for entry in self.changes.cursor() {
+        mut items.push(entry.key())
+    }
+    var none = NoValues()
+    for item in items {
+        let Some(updated) = try await mut self.item_entry(device, item, alloc) else {
+            continue
+        }
+        let Some(change) = mut self.changes.remove(item) else {
+            continue
+        }
+        let stored = try await mut self.stored_entry(device, item, alloc)
+        if change.placed {
+            match stored {
+                Some(old) => mut self.stale.push(Retired(address: old.address, length: old.length))
+                None => {
+                }
+            }
+        }
+        var bytes = mem::Bytes.empty(alloc)
+        mem::wire::Codec[ItemEntry].encode(updated, out: mut bytes)
+        var table = self.items
+        try await mut self.put(device, root: mut table, key: item_key(item).view(), value: bytes.view(), values: mut none, alloc)
+        self.items = table
+    }
+    self.items = try mut self.write_tree(mut log, root: self.items, flush, time, alloc)
+    return self.items
+} Index.write_items
+
+/// The records gone stale since the last index flush, taken from the index.
+pkg fn Index.take_stale(mut self, alloc: mem::Alloc) -> mem::List[Retired] {
+    var gone = mem::List[Retired].empty(alloc)
+    loop {
+        let Some(record) = mut self.stale.pop() else {
+            return gone
+        }
+        mut gone.push(record)
+    }
+} Index.take_stale
+
+/// An item whose count of naming entries has fallen to zero, if any.
+fn Index.unnamed[D: disk::Device](mut self, device: D, alloc: mem::Alloc) -> Option[u64] fails TreeFailure uses wait {
+    var candidates = mem::List[u64].empty(alloc)
+    for entry in self.changes.cursor() {
+        mut candidates.push(entry.key())
+    }
+    for item in candidates {
+        let count = try await mut self.refcount(device, item, alloc)
+        if count <= 0 {
+            return Some(item)
+        }
+    }
+    return None
+} Index.unnamed
+
+/// Frees `item`: removes its entry and retires its record, and for a node releases its children and the values of its leaves.
+fn Index.free_item[D: disk::Device, V: Values](
+    mut self,
+    device: D,
+    item: u64,
+    mut values: V,
+    alloc: mem::Alloc,
+    ) fails TreeFailure uses wait {
+    let change = self.change_of(item)
+    let stored = try await mut self.stored_entry(device, item, alloc)
+    discard mut self.changes.remove(item)
+    var none = NoValues()
+    match stored {
+        Some(entry) => {
+            mut self.stale.push(Retired(address: entry.address, length: entry.length))
+            var table = self.items
+            discard try await mut self.remove(device, root: mut table, key: item_key(item).view(), values: mut none, alloc)
+            self.items = table
+        }
+        None => {
+        }
+    }
+    if change.tree == 0 {
+        return
+    }
+    try await mut self.load(device, tree: change.tree, id: item, pointer: change.pointer, alloc)
+    let Some(node) = mut self.withdraw(change.tree, id: item) else {
+        return
+    }
+    for leaf in node.leaves {
+        mut values.release(change.tree, value: leaf.value.view())
+    }
+    for child in node.children {
+        mut self.release(child.node, tree: change.tree, pointer: child.pointer)
+    }
+} Index.free_item
+
+fn Index.write_node(
+    mut self,
+    mut log: log::Log,
+    tree: u8,
+    id: u64,
+    pointer: disk::Pointer,
+    flush: u64,
+    time: i64,
+    alloc: mem::Alloc,
+    ) -> Written fails TreeFailure {
+    let Some(held) = mut self.withdraw(tree, id) else {
+        return Written(id: id, pointer: pointer)
+    }
+    var node = held
+    if not node.dirty {
+        discard mut self.keep(tree, id, take node)
+        return Written(id: id, pointer: pointer)
+    }
+    for at in 0..<node.children.len() {
+        let child = node.children[at]
+        let written = try mut self.write_node(mut log, tree, id: child.node, pointer: child.pointer, flush, time, alloc)
+        node.children[at].node = written.id
+        node.children[at].pointer = written.pointer
+    }
+    let bytes = node.encode(flush, alloc)
+    var key = Array[u8, 32].filled(0)
+    mut key.view_mut().write_u64_le(0, value: node.item)
+    let appended = match attempt mut log.append(disk::RecordKind.Index, key, payload: bytes.view(), time, alloc) {
+        Ok(placed) => placed
+        Err(log::LogFailure.Full) => fail TreeFailure.Full
+        Err(log::LogFailure.TooLarge) => fail TreeFailure.TooLarge
+        Err(log::LogFailure.Io) => fail TreeFailure.Io
+        Err(log::LogFailure.Cancelled(cancelled)) => fail cancelled
+    }
+    node.dirty = false
+    if tree == ITEM_TABLE {
+        discard mut self.keep(tree, id: appended.address, take node)
+        return Written(id: appended.address, pointer: appended.pointer)
+    }
+    mut self.place(id, address: appended.address, length: appended.pointer.length, kind: disk::RecordKind.Index.code())
+    discard mut self.keep(tree, id, take node)
+    return Written(id: id, pointer: disk::Pointer(target: id, length: appended.pointer.length, kind: appended.pointer.kind, by_item: true, checksum: appended.pointer.checksum))
+} Index.write_node
+
+/// The key of `item` in the item table.
+fn item_key(item: u64) -> Array[u8, 8] {
+    var key = Array[u8, 8].filled(0)
+    mut key.view_mut().write_u64_be(0, value: item)
+    return key
+} item_key
