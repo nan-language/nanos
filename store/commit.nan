@@ -1,4 +1,4 @@
-//! Transactions: the commit procedure's checks in order, writes applied to the branch's trees as they are checked and undone when a check fails, then the commit numbered, logged and durable once its log flush returns.
+//! Transactions: the commit procedure's checks in order, writes applied to the branch's trees as they are checked and undone when a check fails, then the commit numbered, logged and sealed until the log flush carrying it, and every commit sealed before that flush, returns.
 
 /// The most writes, record and stream entry bytes, and reads and expectations a transaction holds.
 const MOST_WRITES: usize = 10_000
@@ -48,6 +48,23 @@ pkg fn Store.commit_as[D: disk::Device](
     now: ident::WallTime,
     alloc: mem::Alloc,
     ) -> Committed fails StoreError uses wait {
+    return match try await mut self.stage(device, branch, take transaction, take stamp, take kind, now, alloc) {
+        Some(earlier) => earlier
+        None => try await mut self.flush_one(device, alloc)
+    }
+} Store.commit_as
+
+/// Checks and applies `transaction` to `branch`'s trees as a commit of `kind`, undoing it when a check fails, then seals it; gives the commit its request key made earlier instead when there is one.
+fn Store.stage[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    take transaction: Transaction,
+    take stamp: Stamp,
+    take kind: CommitKind,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Option[Committed] fails StoreError uses wait {
     if self.read_only {
         fail StoreError.ReadOnly
     }
@@ -56,7 +73,7 @@ pkg fn Store.commit_as[D: disk::Device](
     }
     let digest = request_digest(transaction, alloc)
     match try await mut self.earlier_commit(device, key: transaction.key, stamp, digest, alloc) {
-        Some(earlier) => return earlier
+        Some(earlier) => return Some(take earlier)
         None => {
         }
     }
@@ -87,8 +104,9 @@ pkg fn Store.commit_as[D: disk::Device](
     try await mut self.request_entry(device, key: transaction.key, stamp, number: writing.number, digest, mut staged, alloc)
     var meta = commit_meta(transaction, stamp, writing, branch: self.heads[head].branch, recorded: staged.recorded, alloc)
     meta.kind = kind
-    return try await mut self.finish(device, take meta, take staged, alloc)
-} Store.commit_as
+    try await mut self.seal(device, take meta, take staged, alloc)
+    return None
+} Store.stage
 
 /// The first failure the checks after validity give, in the commit procedure's order: a write conflict, a read that no longer holds, an expectation that does not hold.
 fn refusal(conflict: bool, read: bool, expected: bool) -> Option[StoreError] {
@@ -127,49 +145,158 @@ pkg fn Store.finish[D: disk::Device](
     take staged: Staged,
     alloc: mem::Alloc,
     ) -> Committed fails StoreError uses wait {
-    var held = staged
+    try await mut self.seal(device, take meta, take staged, alloc)
+    return try await mut self.flush_one(device, alloc)
+} Store.finish
+
+/// A commit numbered and logged that its log flush has yet to make durable: its metadata, its staging, what logging it gave, its branch and that branch's head before it.
+pkg struct Sealed {
+    pkg meta: CommitMeta
+    pkg staged: Staged
+    pkg logged: Logged
+    pkg head: usize
+    pkg previous: ident::CommitId
+} Sealed
+
+/// Appends a checked commit's records to the log, moves its branch's head and the commit counter, and queues it for the next log flush; undoes it when its records do not fit.
+fn Store.seal[D: disk::Device](
+    mut self,
+    device: D,
+    take meta: CommitMeta,
+    take staged: Staged,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
     let head = try self.head_named(meta.branch.as_str())
     let number = meta.number.number
-    let time = meta.time
+    var held = staged
     let record = CommitRecord(meta: meta.copied(alloc), writes: take held.writes, catalog: take held.catalog)
     let bytes = wire_of(record, alloc)
     let CommitRecord(meta: _, writes: writes, catalog: catalog) = record
     held.writes = writes
     held.catalog = catalog
-    let logged = attempt mut self.log_commit(number, time: time.utc_ns, record: bytes.view(), staged: held, alloc)
-    let written = match logged {
+    let logged = match attempt mut self.log_commit(number, time: meta.time.utc_ns, record: bytes.view(), staged: held, alloc) {
         Ok(found) => found
         Err(failure) => {
             try await mut self.undo(device, staged: mut held, alloc)
             fail failure
         }
     }
-    match attempt await mut self.flush_log(device, alloc) {
+    mut self.sealed.push(Sealed(meta: take meta, staged: take held, logged: take logged, head: head, previous: self.heads[head].branch.head))
+    self.heads[head].branch.head = ident::CommitId(number: number)
+    self.counters.commit = number + 1
+} Store.seal
+
+/// Performs the log flush that makes the sealed commits durable and records each in the catalog, in order; when the flush fails, undoes them newest first, and each gives the failure.
+fn Store.flush_sealed[D: disk::Device](mut self, device: D, alloc: mem::Alloc) -> mem::List[Result[Committed, StoreError]] fails task::Cancelled uses wait {
+    var outcomes = mem::List[Result[Committed, StoreError]].empty(alloc)
+    match first attempt await mut self.flush_log(device, alloc) {
         Ok(_) => {
         }
-        Err(failure) => {
-            discard attempt await mut self.undo(device, staged: mut held, alloc)
-            fail failure
+        Err(StoreError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => {
+            loop {
+                let Some(sealed) = mut self.sealed.pop() else {
+                    return outcomes
+                }
+                discard attempt await mut self.withdraw(device, take sealed, alloc)
+                mut outcomes.push(Err(StoreError.Io))
+            }
         }
     }
-    mut self.logged(bytes: u64.widen(bytes.len()), now: time)
-    let committed = Committed(number: meta.number, branch: text::String.of(meta.branch.as_str(), alloc), time: time)
-    for run in written.runs {
+    while self.sealed.len() > 0 {
+        let sealed = mut self.sealed.remove(0)
+        mut outcomes.push(attempt await mut self.settle(device, take sealed, alloc))
+    }
+    return outcomes
+} Store.flush_sealed
+
+/// Undoes a sealed commit that will not be durable: its writes, its catalog entries, its branch's head and the commit counter.
+fn Store.withdraw[D: disk::Device](mut self, device: D, take sealed: Sealed, alloc: mem::Alloc) fails StoreError uses wait {
+    var staged = sealed.staged
+    self.heads[sealed.head].branch.head = sealed.previous
+    self.counters.commit = sealed.meta.number.number
+    try await mut self.undo(device, mut staged, alloc)
+} Store.withdraw
+
+/// Makes the one sealed commit durable and gives it.
+fn Store.flush_one[D: disk::Device](mut self, device: D, alloc: mem::Alloc) -> Committed fails StoreError uses wait {
+    var outcomes = try await mut self.flush_sealed(device, alloc)
+    return match mut outcomes.pop() {
+        Some(Ok(committed)) => committed
+        Some(Err(failure)) => fail failure
+        None => fail StoreError.Corrupt
+    }
+} Store.flush_one
+
+/// Records a durable commit in the catalog with its stream runs.
+fn Store.settle[D: disk::Device](mut self, device: D, take sealed: Sealed, alloc: mem::Alloc) -> Committed fails StoreError uses wait {
+    let Sealed(meta: meta, staged: staged, logged: logged, head: _, previous: _) = sealed
+    for run in logged.runs {
         let Some(value) = run.value else {
             continue
         }
         try await mut self.catalog_put(device, key: run.key.view(), value: value.view(), alloc)
     }
-    try await mut self.record_commit(device, take meta, record: written.pointer, writes: held.writes.view(), alloc)
-    self.counters.commit = number + 1
-    self.heads[head].branch.head = ident::CommitId(number: number)
+    mut self.logged(bytes: u64.widen(logged.pointer.length), now: meta.time)
+    let committed = Committed(number: meta.number, branch: text::String.of(meta.branch.as_str(), alloc), time: meta.time)
+    try await mut self.record_commit(device, take meta, record: logged.pointer, writes: staged.writes.view(), alloc)
     return committed
-} Store.finish
+} Store.settle
+
+/// A transaction to commit to a branch with what its View and message stamp on it.
+pub closed struct Request {
+    pub branch: text::String
+    pub transaction: Transaction
+    pub stamp: Stamp
+} Request
+
+/// Commits `requests` in order through one log flush, each checked as [Store.commit] checks it against the heads the ones before it left and giving its own outcome; a device failure fails every commit it carries with `store.io`, and the requests whose keys name them.
+pub fn Store.commit_all[D: disk::Device](
+    mut self,
+    device: D,
+    take requests: mem::List[Request],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> mem::List[Result[Committed, StoreError]] fails task::Cancelled uses wait {
+    let numbered = self.counters.commit
+    var outcomes = mem::List[Result[Committed, StoreError]].empty(alloc)
+    var sealed = mem::List[usize].empty(alloc)
+    for request in take requests {
+        let Request(branch: branch, transaction: transaction, stamp: stamp) = request
+        match first attempt await mut self.stage(device, branch: branch.as_str(), take transaction, take stamp, kind: CommitKind.Write, now, alloc) {
+            Ok(Some(earlier)) => mut outcomes.push(Ok(take earlier))
+            Ok(None) => {
+                mut sealed.push(outcomes.len())
+                mut outcomes.push(Err(StoreError.Io))
+            }
+            Err(StoreError.Cancelled(cancelled)) => fail cancelled
+            Err(failure) => mut outcomes.push(Err(take failure))
+        }
+    }
+    let flushed = try await mut self.flush_sealed(device, alloc)
+    var at: usize = 0
+    for outcome in take flushed {
+        outcomes[sealed[at]] = outcome
+        at += 1
+    }
+    if self.read_only {
+        for each in 0..<outcomes.len() {
+            let carried = match outcomes[each] {
+                Ok(committed) => committed.number.number >= numbered
+                Err(_) => false
+            }
+            if carried {
+                outcomes[each] = Err(StoreError.Io)
+            }
+        }
+    }
+    return outcomes
+} Store.commit_all
 
 /// What logging a commit gives: the pointer naming its commit record, and the catalog entries of its stream runs.
-struct Logged {
-    pointer: disk::Pointer
-    runs: mem::List[CatalogWrite]
+pkg struct Logged {
+    pkg pointer: disk::Pointer
+    pkg runs: mem::List[CatalogWrite]
 } Logged
 
 /// Appends a commit's value records, stream runs and commit record to the log.

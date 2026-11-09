@@ -1,4 +1,4 @@
-//! Tests of transactions: write conflicts, expectations, serializable reads, failed commits undone, declared types and request keys.
+//! Tests of transactions: write conflicts, expectations, serializable reads, failed commits undone, declared types, request keys and group commits.
 
 fn commit_writes(
     mut store: Store,
@@ -61,6 +61,10 @@ fn same_code(left: StoreError, right: StoreError) -> bool {
         }
         StoreError.NotFound => match right {
             StoreError.NotFound => true
+            else => false
+        }
+        StoreError.Io => match right {
+            StoreError.Io => true
             else => false
         }
         else => false
@@ -199,3 +203,52 @@ test large_records_live_in_value_records for Store.commit {
     let after_flush = try await level_at(mut flushed, device, text: "/data/large", alloc)
     expect after_flush == 8
 } large_records_live_in_value_records
+
+fn main_request(take transaction: Transaction, alloc: mem::Alloc) -> Request {
+    return Request(branch: text::String.of("main", alloc), transaction: take transaction, stamp: system_stamp(alloc))
+} main_request
+
+fn number_of(outcome: Result[Committed, StoreError]) -> u64 {
+    return match outcome {
+        Ok(committed) => committed.number.number
+        Err(_) => 0
+    }
+} number_of
+
+test group_commits_check_in_order_and_fail_together for Store.commit_all {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var requests = mem::List[Request].empty(alloc)
+    mut requests.push(main_request(blind(single(put("/data/a", level: 1, alloc), alloc), alloc), alloc))
+    var expecting = blind(single(put("/data/b", level: 2, alloc), alloc), alloc)
+    mut expecting.expects.push(Expect(path: path_of("/data/a", alloc), version: Version.Absent))
+    mut requests.push(main_request(take expecting, alloc))
+    var keyed = blind(single(put("/data/a", level: 3, alloc), alloc), alloc)
+    keyed.key = Some(text::String.of("req-1", alloc))
+    mut requests.push(main_request(take keyed, alloc))
+    var again = blind(single(put("/data/a", level: 3, alloc), alloc), alloc)
+    again.key = Some(text::String.of("req-1", alloc))
+    mut requests.push(main_request(take again, alloc))
+    let outcomes = try await mut store.commit_all(device, take requests, now: at_second(10), alloc)
+    expect is_failure(outcomes[1], code: StoreError.ConflictExpect)
+    expect number_of(outcomes[0]) > 0 and number_of(outcomes[2]) == number_of(outcomes[0]) + 1 and number_of(outcomes[3]) == number_of(outcomes[2])
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(11), alloc)
+    let level = try await level_at(mut mounted, device, text: "/data/a", alloc)
+    expect level == 3
+    let absent = attempt await mut mounted.get(device, branch: "main", path: path_of("/data/b", alloc), now: at_second(12), alloc)
+    expect absent.is_err()
+    try await device.fail_writes_after(0)
+    var failing = mem::List[Request].empty(alloc)
+    mut failing.push(main_request(blind(single(put("/data/a", level: 4, alloc), alloc), alloc), alloc))
+    var retried = blind(single(put("/data/c", level: 5, alloc), alloc), alloc)
+    retried.key = Some(text::String.of("req-2", alloc))
+    mut failing.push(main_request(take retried, alloc))
+    var repeated = blind(single(put("/data/c", level: 5, alloc), alloc), alloc)
+    repeated.key = Some(text::String.of("req-2", alloc))
+    mut failing.push(main_request(take repeated, alloc))
+    let failed = try await mut mounted.commit_all(device, requests: take failing, now: at_second(13), alloc)
+    expect is_failure(failed[0], code: StoreError.Io) and is_failure(failed[1], code: StoreError.Io) and is_failure(failed[2], code: StoreError.Io)
+    let kept = try await level_at(mut mounted, device, text: "/data/a", alloc)
+    expect kept == 3
+} group_commits_check_in_order_and_fail_together
