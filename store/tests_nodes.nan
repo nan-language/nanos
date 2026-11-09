@@ -1,0 +1,136 @@
+//! Tests of node kinds: numbered dirs with `keep`, streams, blobs and node hashes.
+
+fn numbered_keep(count: u32) -> Declaration {
+    return Declaration.Dir(DirDecl(element: None, ephemeral: false, secret: false, numbered: true, keep: Some(Keep(count: count, age_s: None))))
+} numbered_keep
+
+fn setting_stream(alloc: mem::Alloc) -> Declaration {
+    return Declaration.Stream(StreamDecl(type: setting_type(alloc), max_age_s: None, max_bytes: None))
+} setting_stream
+
+fn entry_of(level: u32, alloc: mem::Alloc) -> mem::Bytes {
+    return wire_of(Setting(level: level, label: text::String.of("entry", alloc)), alloc)
+} entry_of
+
+fn names_of(listing: Listing, alloc: mem::Alloc) -> text::String {
+    var names = text::String.empty(alloc)
+    for entry in listing.entries {
+        mut names.append(entry.name.as_str())
+        mut names.append(",")
+    }
+    return names
+} names_of
+
+test numbered_dirs_keep_their_newest_children for Store.add_child {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_writes(mut store, device, writes: single(Write.Make(path: path_of("/state/app/checkpoint", alloc), declaration: numbered_keep(3)), alloc), base: None, alloc)
+    for level in 1..=4u32 {
+        discard try await commit_writes(mut store, device, writes: single(Write.Add(path: path_of("/state/app/checkpoint", alloc), value: setting(level, label: "checkpoint", alloc)), alloc), base: None, alloc)
+    }
+    discard try await commit_writes(mut store, device, writes: single(Write.Hold(path: path_of("/state/app/checkpoint/2", alloc), on: true), alloc), base: None, alloc)
+    for level in 5..=12u32 {
+        discard try await commit_writes(mut store, device, writes: single(Write.Add(path: path_of("/state/app/checkpoint", alloc), value: setting(level, label: "checkpoint", alloc)), alloc), base: None, alloc)
+    }
+    let listing = try await mut store.list(device, branch: "main", path: path_of("/state/app/checkpoint", alloc), after: None, limit: 10, now: at_second(20), alloc)
+    let names = names_of(listing, alloc)
+    expect names.as_str() == "2,10,11,12,"
+    let held = try await level_at(mut store, device, text: "/state/app/checkpoint/2", alloc)
+    expect held == 2
+    let unnumbered = try await commit_writes(mut store, device, writes: single(Write.Add(path: path_of("/state/app", alloc), value: setting(1, label: "x", alloc)), alloc), base: None, alloc)
+    expect is_failure(unnumbered, code: StoreError.Kind)
+} numbered_dirs_keep_their_newest_children
+
+test streams_append_read_and_trim for Store.read_stream {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_writes(mut store, device, writes: single(Write.Make(path: path_of("/data/log", alloc), declaration: setting_stream(alloc)), alloc), base: None, alloc)
+    var first_entries = mem::List[mem::Bytes].empty(alloc)
+    for level in 1..=3u32 {
+        mut first_entries.push(entry_of(level, alloc))
+    }
+    discard try await commit_writes(mut store, device, writes: single(Write.Append(path: path_of("/data/log", alloc), entries: take first_entries), alloc), base: None, alloc)
+    var second_entries = mem::List[mem::Bytes].empty(alloc)
+    for level in 4..=5u32 {
+        mut second_entries.push(entry_of(level, alloc))
+    }
+    discard try await commit_writes(mut store, device, writes: single(Write.Append(path: path_of("/data/log", alloc), entries: take second_entries), alloc), base: None, alloc)
+    let all = try await mut store.read_stream(device, branch: "main", path: path_of("/data/log", alloc), from: 1, limit: 10, now: at_second(20), alloc)
+    expect all.entries.len() == 5 and all.lost == 0 and all.entries[0].seq == 1 and all.entries[4].seq == 5
+    let level = read_level(Untrusted.of(all.entries[3].value.view()), alloc)
+    expect level == 4
+    discard try await commit_writes(mut store, device, writes: single(Write.Trim(path: path_of("/data/log", alloc), below: 3), alloc), base: None, alloc)
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(21), alloc)
+    let trimmed = try await mut mounted.read_stream(device, branch: "main", path: path_of("/data/log", alloc), from: 1, limit: 2, now: at_second(22), alloc)
+    expect trimmed.lost == 2 and trimmed.entries.len() == 2 and trimmed.entries[0].seq == 3 and trimmed.entries[1].seq == 4
+    let node = try await mut mounted.get(device, branch: "main", path: path_of("/data/log", alloc), now: at_second(22), alloc)
+    expect node.kind == NodeKind.Stream and node.size == 3 and node.version.number == 2
+} streams_append_read_and_trim
+
+test blobs_of_several_pieces_read_back for Store.read {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    let draft = mut store.draft(now: at_second(10), alloc)
+    var content = mem::Bytes.empty(alloc)
+    for at in 0..<150_000usize {
+        mut content.push(u8.truncate(at * 31 % 251))
+    }
+    var offset: usize = 0
+    while offset < content.len() {
+        let size = match content.len() - offset < 40_000 {
+            true => content.len() - offset
+            false => 40_000
+        }
+        let chunk = disk::copy_range(content.view(), at: offset, count: size, alloc)
+        try await mut store.draft_append(device, draft, bytes: chunk.view(), now: at_second(10), alloc)
+        offset += size
+    }
+    let expected = ident::HashValue.of_content(content.view())
+    let closed = try await mut store.draft_close(device, draft, expected: Some(expected), now: at_second(10), alloc)
+    expect closed.size == 150_000
+    discard try await commit_writes(mut store, device, writes: single(Write.Put(path: path_of("/data/file", alloc), value: Value.Blob(closed.id)), alloc), base: None, alloc)
+    let whole = try await mut store.read(device, branch: "main", path: path_of("/data/file", alloc), offset: 0, length: 200_000, verify: true, now: at_second(11), alloc)
+    expect testing::same(whole.view(), expected: Untrusted.of(content.view()))
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(12), alloc)
+    let part = try await mut mounted.read(device, branch: "main", path: path_of("/data/file", alloc), offset: 65_000, length: 1_000, verify: true, now: at_second(13), alloc)
+    let wanted = disk::copy_range(content.view(), at: 65_000, count: 1_000, alloc)
+    expect testing::same(part.view(), expected: Untrusted.of(wanted.view()))
+    let missing = mut mounted.draft(now: at_second(13), alloc)
+    let mismatched = attempt await mut mounted.draft_close(device, draft: missing, expected: Some(expected), now: at_second(13), alloc)
+    expect mismatched.is_err()
+} blobs_of_several_pieces_read_back
+
+test hashes_follow_content for Store.root_hash {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var writes = mem::List[Write].empty(alloc)
+    mut writes.push(put("/data/one/x", level: 1, alloc))
+    mut writes.push(Write.Put(path: path_of("/data/two/x", alloc), value: setting(1, label: "/data/one/x", alloc)))
+    discard try await commit_writes(mut store, device, take writes, base: None, alloc)
+    let before = try await mut store.root_hash(device, branch: "main", alloc)
+    let one_hash = try await mut store.hash_at(device, path: path_of("/data/one", alloc), alloc)
+    let two_hash = try await mut store.hash_at(device, path: path_of("/data/two", alloc), alloc)
+    expect one_hash == two_hash
+    discard try await commit_writes(mut store, device, writes: single(put("/data/one/x", level: 2, alloc), alloc), base: None, alloc)
+    let changed = try await mut store.hash_at(device, path: path_of("/data/one", alloc), alloc)
+    let after = try await mut store.root_hash(device, branch: "main", alloc)
+    expect changed != two_hash and after != before
+    var expecting = blind(single(put("/data/three", level: 1, alloc), alloc), alloc)
+    mut expecting.expects.push(Expect(path: path_of("/data/two", alloc), version: Version.Hash(two_hash)))
+    let held = attempt await mut store.commit(device, branch: "main", transaction: take expecting, stamp: system_stamp(alloc), now: at_second(10), alloc)
+    expect held.is_ok()
+} hashes_follow_content
+
+/// The hash of the node at `path` on `main`.
+fn Store.hash_at(mut self, device: disk::MemoryVolume, path: ident::Path, alloc: mem::Alloc) -> ident::HashValue fails StoreError uses wait {
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head: 0, segments: segments.view(), now: at_second(10), alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    return try await mut self.node_hash(device, found, alloc)
+} Store.hash_at

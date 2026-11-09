@@ -1,0 +1,201 @@
+//! Tests of transactions: write conflicts, expectations, serializable reads, failed commits undone, declared types and request keys.
+
+fn commit_writes(
+    mut store: Store,
+    device: disk::MemoryVolume,
+    take writes: mem::List[Write],
+    base: Option[ident::CommitId],
+    alloc: mem::Alloc,
+    ) -> Result[Committed, StoreError] fails task::Cancelled uses wait {
+    var transaction = blind(take writes, alloc)
+    transaction.base = base
+    return attempt await mut store.commit(device, branch: "main", take transaction, stamp: system_stamp(alloc), now: at_second(10), alloc)
+} commit_writes
+
+fn single(take write: Write, alloc: mem::Alloc) -> mem::List[Write] {
+    var writes = mem::List[Write].empty(alloc)
+    mut writes.push(take write)
+    return writes
+} single
+
+fn is_failure(outcome: Result[Committed, StoreError], code: StoreError) -> bool {
+    return match outcome {
+        Err(failure) => same_code(failure, right: code)
+        Ok(_) => false
+    }
+} is_failure
+
+fn same_code(left: StoreError, right: StoreError) -> bool {
+    return match left {
+        StoreError.ConflictWrite => match right {
+            StoreError.ConflictWrite => true
+            else => false
+        }
+        StoreError.ConflictRead => match right {
+            StoreError.ConflictRead => true
+            else => false
+        }
+        StoreError.ConflictExpect => match right {
+            StoreError.ConflictExpect => true
+            else => false
+        }
+        StoreError.Kind => match right {
+            StoreError.Kind => true
+            else => false
+        }
+        StoreError.SchemaMismatch => match right {
+            StoreError.SchemaMismatch => true
+            else => false
+        }
+        StoreError.SchemaUnknown => match right {
+            StoreError.SchemaUnknown => true
+            else => false
+        }
+        StoreError.SchemaInvalid(_) => match right {
+            StoreError.SchemaInvalid(_) => true
+            else => false
+        }
+        StoreError.KeyReused => match right {
+            StoreError.KeyReused => true
+            else => false
+        }
+        StoreError.NotFound => match right {
+            StoreError.NotFound => true
+            else => false
+        }
+        else => false
+    }
+} same_code
+
+test writes_conflict_with_changes_after_their_base for Store.commit {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    let made = try await commit_writes(mut store, device, writes: single(put("/data/a/x", level: 1, alloc), alloc), base: None, alloc)
+    expect made.is_ok()
+    let stale = try await commit_writes(mut store, device, writes: single(put("/data/a/x", level: 2, alloc), alloc), base: Some(ident::CommitId(number: 1)), alloc)
+    expect is_failure(stale, code: StoreError.ConflictWrite)
+    let sibling = try await commit_writes(mut store, device, writes: single(put("/data/a/y", level: 2, alloc), alloc), base: Some(ident::CommitId(number: 1)), alloc)
+    expect sibling.is_ok()
+    let deleted = try await commit_writes(mut store, device, writes: single(Write.Delete(path: path_of("/data/a", alloc)), alloc), base: Some(ident::CommitId(number: 2)), alloc)
+    expect is_failure(deleted, code: StoreError.ConflictWrite)
+    let current = try await commit_writes(mut store, device, writes: single(put("/data/a/x", level: 3, alloc), alloc), base: Some(ident::CommitId(number: 3)), alloc)
+    expect current.is_ok()
+    let level = try await level_at(mut store, device, text: "/data/a/x", alloc)
+    expect level == 3
+} writes_conflict_with_changes_after_their_base
+
+test expectations_and_reads_decide_commits for Store.commit {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_writes(mut store, device, writes: single(put("/sys/config/a", level: 1, alloc), alloc), base: None, alloc)
+    var expecting = blind(single(put("/data/b", level: 1, alloc), alloc), alloc)
+    mut expecting.expects.push(Expect(path: path_of("/sys/config/a", alloc), version: Version.Commit(ident::CommitId(number: 2))))
+    mut expecting.expects.push(Expect(path: path_of("/data/b", alloc), version: Version.Absent))
+    let held = attempt await mut store.commit(device, branch: "main", transaction: take expecting, stamp: system_stamp(alloc), now: at_second(10), alloc)
+    expect held.is_ok()
+    var failing = blind(single(put("/data/c", level: 1, alloc), alloc), alloc)
+    mut failing.expects.push(Expect(path: path_of("/data/b", alloc), version: Version.Absent))
+    let refused = attempt await mut store.commit(device, branch: "main", transaction: take failing, stamp: system_stamp(alloc), now: at_second(10), alloc)
+    expect is_failure(refused, code: StoreError.ConflictExpect)
+    var reading = blind(single(put("/sys/config/b", level: 1, alloc), alloc), alloc)
+    mut reading.reads.push(Read(path: path_of("/sys/config/a", alloc), version: Version.Commit(ident::CommitId(number: 1)), scope: Scope.Node))
+    let stale = attempt await mut store.commit(device, branch: "main", transaction: take reading, stamp: system_stamp(alloc), now: at_second(10), alloc)
+    expect is_failure(stale, code: StoreError.ConflictRead)
+    var unchecked = blind(single(put("/data/d", level: 1, alloc), alloc), alloc)
+    mut unchecked.reads.push(Read(path: path_of("/sys/config/a", alloc), version: Version.Commit(ident::CommitId(number: 1)), scope: Scope.Node))
+    let snapshot = attempt await mut store.commit(device, branch: "main", transaction: take unchecked, stamp: system_stamp(alloc), now: at_second(10), alloc)
+    expect snapshot.is_ok()
+} expectations_and_reads_decide_commits
+
+test failed_commits_leave_nothing for Store.undo {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_writes(mut store, device, writes: single(put("/data/record", level: 1, alloc), alloc), base: None, alloc)
+    var writes = mem::List[Write].empty(alloc)
+    mut writes.push(put("/data/fresh/one", level: 5, alloc))
+    mut writes.push(put("/data/record", level: 9, alloc))
+    mut writes.push(put("/data/record/child", level: 2, alloc))
+    let failed = try await commit_writes(mut store, device, take writes, base: None, alloc)
+    expect is_failure(failed, code: StoreError.Kind)
+    let fresh = attempt await mut store.get(device, branch: "main", path: path_of("/data/fresh", alloc), now: at_second(11), alloc)
+    expect fresh.is_err()
+    let level = try await level_at(mut store, device, text: "/data/record", alloc)
+    expect level == 1
+    let next = try await commit_writes(mut store, device, writes: single(put("/data/later", level: 1, alloc), alloc), base: None, alloc)
+    let Ok(committed) = next else {
+        expect false
+        return
+    }
+    expect committed.number.number == 3
+} failed_commits_leave_nothing
+
+test declared_types_check_record_writes for Store.commit {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    let typed = Declaration.Dir(DirDecl(element: Some(Element(kind: NodeKind.Record, type: Some(setting_type(alloc)))), ephemeral: false, secret: false, numbered: false, keep: None))
+    discard try await commit_writes(mut store, device, writes: single(Write.Make(path: path_of("/data/settings", alloc), declaration: take typed), alloc), base: None, alloc)
+    let good = try await commit_writes(mut store, device, writes: single(put("/data/settings/a", level: 1, alloc), alloc), base: None, alloc)
+    expect good.is_ok()
+    let other = Value.Record(type: TypeRef.of("store::Other", schema: mem::wire::Codec[u32].schema_hash(), alloc), bytes: wire_of(7u32, alloc), secret: false)
+    let renamed = try await commit_writes(mut store, device, writes: single(Write.Put(path: path_of("/data/settings/b", alloc), value: take other), alloc), base: None, alloc)
+    expect is_failure(renamed, code: StoreError.SchemaMismatch)
+    let blob_dir = try await commit_writes(mut store, device, writes: single(make("/data/settings/c", alloc), alloc), base: None, alloc)
+    expect is_failure(blob_dir, code: StoreError.SchemaMismatch)
+    var encoded = blind(single(Write.Put(path: path_of("/data/loose", alloc), value: Value.Record(type: setting_type(alloc), bytes: wire_of(3u8, alloc), secret: false)), alloc), alloc)
+    var stamp = system_stamp(alloc)
+    stamp.typed = false
+    let invalid = attempt await mut store.commit(device, branch: "main", transaction: take encoded, take stamp, now: at_second(10), alloc)
+    expect is_failure(invalid, code: StoreError.SchemaInvalid(core::DecodeError.Malformed))
+    var unknown_stamp = system_stamp(alloc)
+    unknown_stamp.typed = false
+    let unknown_value = Value.Record(type: TypeRef.of("store::Unknown", schema: mem::wire::Codec[u64].schema_hash(), alloc), bytes: wire_of(3u64, alloc), secret: false)
+    let unknown = attempt await mut store.commit(device, branch: "main", transaction: blind(single(Write.Put(path: path_of("/data/unknown", alloc), value: take unknown_value), alloc), alloc), stamp: take unknown_stamp, now: at_second(10), alloc)
+    expect is_failure(unknown, code: StoreError.SchemaUnknown)
+} declared_types_check_record_writes
+
+test request_keys_return_the_earlier_commit for Store.commit {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var keyed = blind(single(put("/data/keyed", level: 1, alloc), alloc), alloc)
+    keyed.key = Some(text::String.of("req-1", alloc))
+    let first_commit = try await mut store.commit(device, branch: "main", transaction: take keyed, stamp: system_stamp(alloc), now: at_second(10), alloc)
+    var again = blind(single(put("/data/keyed", level: 1, alloc), alloc), alloc)
+    again.key = Some(text::String.of("req-1", alloc))
+    let repeated = try await mut store.commit(device, branch: "main", transaction: take again, stamp: system_stamp(alloc), now: at_second(11), alloc)
+    expect repeated.number == first_commit.number
+    var changed = blind(single(put("/data/keyed", level: 2, alloc), alloc), alloc)
+    changed.key = Some(text::String.of("req-1", alloc))
+    let reused = attempt await mut store.commit(device, branch: "main", transaction: take changed, stamp: system_stamp(alloc), now: at_second(12), alloc)
+    expect is_failure(reused, code: StoreError.KeyReused)
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(13), alloc)
+    var after = blind(single(put("/data/keyed", level: 1, alloc), alloc), alloc)
+    after.key = Some(text::String.of("req-1", alloc))
+    let replayed = try await mut mounted.commit(device, branch: "main", transaction: take after, stamp: system_stamp(alloc), now: at_second(14), alloc)
+    expect replayed.number == first_commit.number
+} request_keys_return_the_earlier_commit
+
+test large_records_live_in_value_records for Store.commit {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var label = text::String.empty(alloc)
+    for _ in 0..<5_000usize {
+        mut label.push('v')
+    }
+    let value = Value.Record(type: setting_type(alloc), bytes: wire_of(Setting(level: 8, label: take label), alloc), secret: false)
+    discard try await commit_writes(mut store, device, writes: single(Write.Put(path: path_of("/data/large", alloc), value: take value), alloc), base: None, alloc)
+    let level = try await level_at(mut store, device, text: "/data/large", alloc)
+    expect level == 8
+    var replayed = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(13), alloc)
+    let after_replay = try await level_at(mut replayed, device, text: "/data/large", alloc)
+    expect after_replay == 8
+    try await mut replayed.index_flush(device, now: at_second(14), alloc)
+    var flushed = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(15), alloc)
+    let after_flush = try await level_at(mut flushed, device, text: "/data/large", alloc)
+    expect after_flush == 8
+} large_records_live_in_value_records
