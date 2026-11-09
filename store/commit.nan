@@ -78,6 +78,7 @@ fn Store.stage[D: disk::Device](
         }
     }
     try check_limits(transaction)
+    try await mut self.bound_log(device, adding: transaction_bytes(transaction), now, alloc)
     let head_number = self.heads[head].branch.head.number
     let base = match transaction.base {
         Some(commit) => commit.number
@@ -237,7 +238,7 @@ fn Store.settle[D: disk::Device](mut self, device: D, take sealed: Sealed, alloc
         }
         try await mut self.catalog_put(device, key: run.key.view(), value: value.view(), alloc)
     }
-    mut self.logged(bytes: u64.widen(logged.pointer.length), now: meta.time)
+    mut self.logged(now: meta.time)
     let committed = Committed(number: meta.number, branch: text::String.of(meta.branch.as_str(), alloc), time: meta.time)
     try await mut self.record_commit(device, take meta, record: logged.pointer, writes: staged.writes.view(), alloc)
     return committed
@@ -250,7 +251,7 @@ pub closed struct Request {
     pub stamp: Stamp
 } Request
 
-/// Commits `requests` in order through one log flush, each checked as [Store.commit] checks it against the heads the ones before it left and giving its own outcome; a device failure fails every commit it carries with `store.io`, and the requests whose keys name them.
+/// Commits `requests` in order through one log flush, or several when the log bound needs an index flush between them, each checked as [Store.commit] checks it against the heads the ones before it left and giving its own outcome; a device failure fails every commit its log flush carries with `store.io`, and the requests whose keys name them.
 pub fn Store.commit_all[D: disk::Device](
     mut self,
     device: D,
@@ -258,10 +259,14 @@ pub fn Store.commit_all[D: disk::Device](
     now: ident::WallTime,
     alloc: mem::Alloc,
     ) -> mem::List[Result[Committed, StoreError]] fails task::Cancelled uses wait {
-    let numbered = self.counters.commit
     var outcomes = mem::List[Result[Committed, StoreError]].empty(alloc)
     var sealed = mem::List[usize].empty(alloc)
+    var numbered = self.counters.commit
     for request in take requests {
+        if self.bound_reached(adding: transaction_bytes(request.transaction)) {
+            try await mut self.place_flushed(device, mut outcomes, mut sealed, numbered, alloc)
+            numbered = self.counters.commit
+        }
         let Request(branch: branch, transaction: transaction, stamp: stamp) = request
         match first attempt await mut self.stage(device, branch: branch.as_str(), take transaction, take stamp, kind: CommitKind.Write, now, alloc) {
             Ok(Some(earlier)) => mut outcomes.push(Ok(take earlier))
@@ -273,25 +278,39 @@ pub fn Store.commit_all[D: disk::Device](
             Err(failure) => mut outcomes.push(Err(take failure))
         }
     }
+    try await mut self.place_flushed(device, mut outcomes, mut sealed, numbered, alloc)
+    return outcomes
+} Store.commit_all
+
+/// Makes the sealed commits durable and puts their outcomes at the positions `sealed` holds; when the device failed, fails too each outcome naming a commit numbered from `numbered` on.
+fn Store.place_flushed[D: disk::Device](
+    mut self,
+    device: D,
+    mut outcomes: mem::List[Result[Committed, StoreError]],
+    mut sealed: mem::List[usize],
+    numbered: u64,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
     let flushed = try await mut self.flush_sealed(device, alloc)
     var at: usize = 0
     for outcome in take flushed {
         outcomes[sealed[at]] = outcome
         at += 1
     }
-    if self.read_only {
-        for each in 0..<outcomes.len() {
-            let carried = match outcomes[each] {
-                Ok(committed) => committed.number.number >= numbered
-                Err(_) => false
-            }
-            if carried {
-                outcomes[each] = Err(StoreError.Io)
-            }
+    mut sealed.truncate(0)
+    if not self.read_only {
+        return
+    }
+    for each in 0..<outcomes.len() {
+        let carried = match outcomes[each] {
+            Ok(committed) => committed.number.number >= numbered
+            Err(_) => false
+        }
+        if carried {
+            outcomes[each] = Err(StoreError.Io)
         }
     }
-    return outcomes
-} Store.commit_all
+} Store.place_flushed
 
 /// What logging a commit gives: the pointer naming its commit record, and the catalog entries of its stream runs.
 pkg struct Logged {
@@ -402,14 +421,19 @@ fn check_limits(transaction: Transaction) fails StoreError {
         None => {
         }
     }
+    if transaction_bytes(transaction) > MOST_ENTRY_BYTES {
+        fail StoreError.TooLarge
+    }
+} check_limits
+
+/// The record and stream entry bytes a transaction carries.
+pkg fn transaction_bytes(transaction: Transaction) -> u64 {
     var bytes: u64 = 0
     for write in transaction.writes {
         bytes = bytes.saturating_add(write_bytes(write))
     }
-    if bytes > MOST_ENTRY_BYTES {
-        fail StoreError.TooLarge
-    }
-} check_limits
+    return bytes
+} transaction_bytes
 
 /// The record and stream entry bytes a write carries.
 fn write_bytes(write: Write) -> u64 {
