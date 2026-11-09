@@ -1,0 +1,68 @@
+//! Space: the free segments the store keeps for itself, and history thinned from the oldest commit when a write of a principal other than an agent or a child principal lacks room.
+
+/// The bytes of a segment.
+const SEGMENT_BYTES: u64 = 8_388_608
+
+/// The bytes the log takes before the store's reserve of free segments, 2 plus 0.5% of all segments: the open segment's room and the free segments beyond the reserve.
+pkg fn Store.free_bytes(self) -> u64 {
+    let reserve = 2 + self.superblock.segments / 200
+    let free = self.log.free_segments()
+    if free <= reserve {
+        return self.log.room()
+    }
+    return u64.widen(free - reserve).saturating_mul(SEGMENT_BYTES).saturating_add(self.log.room())
+} Store.free_bytes
+
+/// Makes room for `adding` bytes of a write on `principal`'s authority: thins unpinned commits other than heads from the oldest, in rounds of doubling size each followed by cleaning and index flushes, until the room suffices; `store.full` for an agent or a child principal, and with `store.writes-refused` once only pins and heads remain.
+pkg fn Store.make_space[D: disk::Device](
+    mut self,
+    device: D,
+    adding: u64,
+    principal: ident::Principal,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    if adds_agent_bytes(principal) {
+        fail StoreError.Full
+    }
+    var most: u64 = 1
+    loop {
+        let thinned = try await mut self.thin(device, now, tiers: false, most, alloc)
+        try await mut self.reclaim(device, now, alloc)
+        if self.free_bytes() >= adding {
+            return
+        }
+        if thinned.commits == 0 {
+            mut self.events.push(Event.WritesRefused(free: self.free_bytes(), history: 0))
+            fail StoreError.Full
+        }
+        most = most.saturating_mul(2)
+    }
+} Store.make_space
+
+/// Frees what thinning released: an index flush applies its reference changes, the cleaner empties the segments left with little live data, and two more index flushes free them.
+fn Store.reclaim[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) fails StoreError uses wait {
+    try await mut self.index_flush(device, now, alloc)
+    while try await mut self.clean(device, now, alloc) {
+    }
+    try await mut self.index_flush(device, now, alloc)
+    try await mut self.index_flush(device, now, alloc)
+} Store.reclaim
+
+/// Whether writes on `principal`'s authority add agent bytes: an agent's, or a child principal's.
+fn adds_agent_bytes(principal: ident::Principal) -> bool {
+    let name = principal.text.as_str()
+    if name.starts_with("agent.") {
+        return true
+    }
+    if not name.starts_with("human.") {
+        return false
+    }
+    let bytes = name.as_bytes()
+    for at in 6..<bytes.len() {
+        if bytes[at] == b'.' {
+            return true
+        }
+    }
+    return false
+} adds_agent_bytes

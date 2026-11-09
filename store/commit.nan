@@ -79,6 +79,33 @@ fn Store.stage[D: disk::Device](
     }
     try check_limits(transaction)
     try await mut self.bound_log(device, adding: transaction_bytes(transaction), now, alloc)
+    var staged = Staged.empty(alloc)
+    var writing = try await mut self.validate(device, head, transaction, stamp, now, mut staged, alloc)
+    let adding = transaction_bytes(transaction)
+    if self.free_bytes() < adding {
+        try await mut self.undo(device, mut staged, alloc)
+        try await mut self.make_space(device, adding, principal: stamp.principal, now, alloc)
+        staged = Staged.empty(alloc)
+        writing = try await mut self.validate(device, head, transaction, stamp, now, mut staged, alloc)
+    }
+    try await mut self.request_entry(device, key: transaction.key, stamp, number: writing.number, digest, mut staged, alloc)
+    var meta = commit_meta(transaction, stamp, writing, branch: self.heads[head].branch, recorded: staged.recorded, alloc)
+    meta.kind = kind
+    try await mut self.seal(device, take meta, take staged, alloc)
+    return None
+} Store.stage
+
+/// Checks `transaction`'s writes and applies them to the trees of branch `head` in the commit procedure's order, undoing them when a check fails, and gives what applying them needed.
+fn Store.validate[D: disk::Device](
+    mut self,
+    device: D,
+    head: usize,
+    transaction: Transaction,
+    stamp: Stamp,
+    now: ident::WallTime,
+    mut staged: Staged,
+    alloc: mem::Alloc,
+    ) -> Writing fails StoreError uses wait {
     let head_number = self.heads[head].branch.head.number
     let base = match transaction.base {
         Some(commit) => commit.number
@@ -86,7 +113,6 @@ fn Store.stage[D: disk::Device](
     }
     let expected = try await mut self.expectations_hold(device, head, expects: transaction.expects.view(), now, alloc)
     let read = try await mut self.reads_hold(device, head, reads: transaction.reads.view(), now, alloc)
-    var staged = Staged.empty(alloc)
     let origins = try await mut self.origin_id(device, labels: stamp.origins.view(), mut staged, alloc)
     let writing = Writing(head: head, number: self.counters.commit, base: base, origins: origins, typed: stamp.typed, now: now)
     let outcome = attempt await mut self.apply_writes(device, writes: transaction.writes.view(), writing, mut staged, alloc)
@@ -102,12 +128,8 @@ fn Store.stage[D: disk::Device](
         }
         fail failure
     }
-    try await mut self.request_entry(device, key: transaction.key, stamp, number: writing.number, digest, mut staged, alloc)
-    var meta = commit_meta(transaction, stamp, writing, branch: self.heads[head].branch, recorded: staged.recorded, alloc)
-    meta.kind = kind
-    try await mut self.seal(device, take meta, take staged, alloc)
-    return None
-} Store.stage
+    return writing
+} Store.validate
 
 /// The first failure the checks after validity give, in the commit procedure's order: a write conflict, a read that no longer holds, an expectation that does not hold.
 fn refusal(conflict: bool, read: bool, expected: bool) -> Option[StoreError] {
@@ -263,7 +285,7 @@ pub fn Store.commit_all[D: disk::Device](
     var sealed = mem::List[usize].empty(alloc)
     var numbered = self.counters.commit
     for request in take requests {
-        if self.bound_reached(adding: transaction_bytes(request.transaction)) {
+        if self.must_flush_before(adding: transaction_bytes(request.transaction)) {
             try await mut self.place_flushed(device, mut outcomes, mut sealed, numbered, alloc)
             numbered = self.counters.commit
         }
@@ -349,7 +371,7 @@ fn Store.log_commit(
     return Logged(pointer: placed.pointer, runs: take runs)
 } Store.log_commit
 
-/// Records a durable commit in the catalog: its entry naming its record, and the path changes of a recorded commit.
+/// Records a durable commit in the catalog: its entry naming its record, and the path changes of a recorded commit; the record's node entries hold references to what they name while the commit is retained.
 pkg fn Store.record_commit[D: disk::Device](
     mut self,
     device: D,
@@ -359,13 +381,16 @@ pkg fn Store.record_commit[D: disk::Device](
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
     let number = meta.number.number
-    if meta.recorded {
-        for write in writes {
-            if write.tree == TREE_VERSIONED {
-                try await mut self.record_change(device, write, number, alloc)
-            }
+    for write in writes {
+        if meta.recorded and write.tree == TREE_VERSIONED {
+            try await mut self.record_change(device, write, number, alloc)
         }
+        let Some(written) = write.entry else {
+            continue
+        }
+        mut self.refs.count(written, delta: 1)
     }
+    mut self.settle_items()
     let entry = CommitEntry(meta: take meta, record: Some(record.to_list(alloc)), tree: None)
     try await mut self.catalog_put(device, key: number_key(KIND_COMMIT, number, width: 8, alloc).view(), value: wire_of(entry, alloc).view(), alloc)
 } Store.record_commit
