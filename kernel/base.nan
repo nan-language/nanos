@@ -57,6 +57,9 @@ const POWER_CONFIG_TYPE: Str = "power::PowerConfig"
 /// The memory limit of `store`, whose engine keeps index nodes of 16 KiB in memory.
 const STORE_LIMIT: u64 = 67_108_864
 
+/// How long after the core's start `store`, `keys`, `journal` and `policy` may take to run.
+const BASE_DEADLINE_NS: u64 = 30_000_000_000
+
 /// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, and the switch of the machine's power.
 struct Base derives Copy {
     root: devices::Root
@@ -841,6 +844,7 @@ fn run_base(
         discard s.spawn(fn[take genesis, take reserver, take gauges]() fails task::Cancelled uses wait limits stack 65_536 {
             discard try await runner::run(take genesis, components: base, journal: rings, reservations: take reserver, config, postings: posted, gauges, body: fn(core: runner::Core) fails task::Cancelled uses wait {
                 discard attempt await core.control.start(moniker("supervisor"), alloc: config.alloc)
+                try await watch_base(core.control, clock: config.clock, alloc: config.alloc)
                 let parked = hw::Signal[Unit].empty()
                 loop {
                     try await parked.wait()
@@ -850,6 +854,33 @@ fn run_base(
         try await serve_reservations(mut frames, requests: mut requested)
     })
 } run_base
+
+/// Halts the kernel with `fault.base-not-running` and the first of `store`, `keys`, `journal` and `policy` that is not running 30 s after the core's start.
+fn watch_base(control: os::Control, clock: sys::Clock, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let now = match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+    if now < BASE_DEADLINE_NS {
+        try await clock.sleep_ns(BASE_DEADLINE_NS - now)
+    }
+    try await require_running(control, name: "store", alloc)
+    try await require_running(control, name: "keys", alloc)
+    try await require_running(control, name: "journal", alloc)
+    try await require_running(control, name: "policy", alloc)
+} watch_base
+
+/// Halts the kernel with `fault.base-not-running` and `name` unless the instance `name` is running.
+fn require_running(control: os::Control, name: Str, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let running = match first attempt await control.lifecycle(moniker(name), alloc) {
+        Ok(os::Lifecycle.Running) => true
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        else => false
+    }
+    if not running {
+        halt(code: "fault.base-not-running", subject: name)
+    }
+} require_running
 
 /// Writes each event the store reports to the core rings, and halts the kernel with the code of a failed mount.
 fn record_store_events(take reports: task::Receiver[store::service::Report], rings: rings::Rings) fails task::Cancelled uses wait {
