@@ -1,0 +1,304 @@
+//! `/history`: the store's commit metadata, branch records and pins, read as the nodes of a read-only dir.
+
+/// The type of the records of `/history/commits`.
+const COMMIT_META_TYPE: Str = "store::CommitMeta"
+
+/// The type of the records of `/history/branches`.
+const BRANCH_TYPE: Str = "store::Branch"
+
+/// The type of the records of `/history/pins`.
+const PINS_TYPE: Str = "mem::List[store::Pin]"
+
+/// The node at `path`, whose segments below `/history` are `segments`: the dirs `commits`, `branches` and `pins`, the `CommitMeta` of each retained commit, the `Branch` record of each branch, its name taking as many segments as it has, and the pins of each pinned commit.
+pub fn Store.history_node[D: disk::Device](
+    mut self,
+    device: D,
+    path: ident::Path,
+    segments: Slice[mem::Bytes],
+    alloc: mem::Alloc,
+    ) -> Node fails StoreError uses wait {
+    let Some(parts) = segments.split_at(1) else {
+        return metadata_dir(path, children: 3, alloc)
+    }
+    let tail = parts.tail
+    let part = segments[0].view()
+    if part == b"commits" {
+        if tail.len() == 0 {
+            let totals = try await mut self.tree_count(device, root: self.catalog, from: catalog_key(KIND_COMMIT, key: b"", alloc).view(), to: catalog_key(KIND_COMMIT + 1, key: b"", alloc).view(), alloc)
+            return metadata_dir(path, children: totals.count, alloc)
+        }
+        let Some(meta) = try await mut self.commit_meta(device, name: tail, alloc) else {
+            fail StoreError.NotFound
+        }
+        return metadata_record(path, version: meta.number.number, type: TypeRef.of(COMMIT_META_TYPE, schema: mem::wire::Codec[CommitMeta].schema_hash(), alloc), bytes: wire_of(meta, alloc), alloc)
+    }
+    if part == b"branches" {
+        let name = branch_path(tail, alloc)
+        var below: u64 = 0
+        for held in self.heads {
+            if held.branch.name.as_str() == name.as_str() {
+                return metadata_record(path, version: held.branch.head.number, type: TypeRef.of(BRANCH_TYPE, schema: mem::wire::Codec[Branch].schema_hash(), alloc), bytes: wire_of(held.branch, alloc), alloc)
+            }
+            if next_segment(held.branch.name.as_bytes(), below: name.as_bytes(), alloc).is_some() {
+                below += 1
+            }
+        }
+        if below == 0 {
+            fail StoreError.NotFound
+        }
+        return metadata_dir(path, children: below, alloc)
+    }
+    if part == b"pins" {
+        if tail.len() == 0 {
+            let pinned = try await mut self.pinned(device, after: 0, limit: 0xFFFF_FFFF, alloc)
+            return metadata_dir(path, children: u64.widen(pinned.len()), alloc)
+        }
+        if tail.len() > 1 {
+            fail StoreError.NotFound
+        }
+        let Some(number) = decimal_value(tail[0].view()) else {
+            fail StoreError.NotFound
+        }
+        let held = try await mut self.pins_of(device, commit: number, alloc)
+        if held.len() == 0 {
+            fail StoreError.NotFound
+        }
+        var pins = mem::List[Pin].empty(alloc)
+        for each in take held {
+            mut pins.push(take each.pin)
+        }
+        return metadata_record(path, version: number, type: TypeRef.of(PINS_TYPE, schema: mem::wire::Codec[mem::List[Pin]].schema_hash(), alloc), bytes: wire_of(pins, alloc), alloc)
+    }
+    fail StoreError.NotFound
+} Store.history_node
+
+/// The children of the dir of `/history` whose segments below it are `segments`, named after `after` when given, at most `limit`: commits and pinned commits in numeric order, branch names by segment in byte order.
+pub fn Store.history_listing[D: disk::Device](
+    mut self,
+    device: D,
+    segments: Slice[mem::Bytes],
+    after: Option[text::String],
+    limit: u32,
+    alloc: mem::Alloc,
+    ) -> Listing fails StoreError uses wait {
+    var entries = mem::List[Entry].empty(alloc)
+    let Some(parts) = segments.split_at(1) else {
+        push_dir(mut entries, name: "branches", after, alloc)
+        push_dir(mut entries, name: "commits", after, alloc)
+        push_dir(mut entries, name: "pins", after, alloc)
+        return paged(take entries, limit, alloc)
+    }
+    let tail = parts.tail
+    let part = segments[0].view()
+    let from = match after {
+        Some(name) => decimal_value(name.as_bytes()).value_or(0) + 1
+        None => 0
+    }
+    if part == b"commits" and tail.len() == 0 {
+        var start = Array[u8, 8].filled(0)
+        mut start.view_mut().write_u64_be(0, value: from)
+        let leaves = try await mut self.catalog_scan(device, kind: KIND_COMMIT, from: start.view(), limit: usize.widen(limit) + 1, alloc)
+        for leaf in leaves {
+            let entry = try decode_commit_entry(leaf.value.view(), alloc)
+            let size = u64.widen(wire_of(entry.meta, alloc).len())
+            mut entries.push(Entry(name: text_of_name(decimal_name(entry.meta.number.number, alloc).view(), alloc), kind: NodeKind.Record, version: entry.meta.number, size: size, type: Some(text::String.of(COMMIT_META_TYPE, alloc))))
+        }
+        return paged(take entries, limit, alloc)
+    }
+    if part == b"pins" and tail.len() == 0 {
+        let pinned = try await mut self.pinned(device, after: from, limit: usize.widen(limit) + 1, alloc)
+        for number in pinned {
+            mut entries.push(Entry(name: text_of_name(decimal_name(number, alloc).view(), alloc), kind: NodeKind.Record, version: ident::CommitId(number: number), size: 0, type: Some(text::String.of(PINS_TYPE, alloc))))
+        }
+        return paged(take entries, limit, alloc)
+    }
+    if part == b"branches" {
+        let prefix = branch_path(tail, alloc)
+        var names = mem::List[text::String].empty(alloc)
+        for held in self.heads {
+            let whole = held.branch.name.as_bytes()
+            if whole == prefix.as_bytes() {
+                fail StoreError.Kind
+            }
+            let Some(name) = next_segment(whole, below: prefix.as_bytes(), alloc) else {
+                continue
+            }
+            if not after_name(name.as_bytes(), after) or holds_name(names, name: name.as_bytes()) {
+                continue
+            }
+            let at = insertion(names, name: name.as_bytes())
+            mut names.insert(at, value: take name)
+        }
+        if names.len() == 0 and prefix.byte_len() > 0 {
+            fail StoreError.NotFound
+        }
+        for name in take names {
+            var kind = NodeKind.Dir
+            var version = ident::CommitId(number: 0)
+            var full = text::String.of(prefix.as_str(), alloc)
+            if full.byte_len() > 0 {
+                mut full.push('/')
+            }
+            mut full.append(name.as_str())
+            for held in self.heads {
+                if held.branch.name.as_str() == full.as_str() {
+                    kind = NodeKind.Record
+                    version = held.branch.head
+                }
+            }
+            let type = match kind == NodeKind.Record {
+                true => Some(text::String.of(BRANCH_TYPE, alloc))
+                false => None
+            }
+            mut entries.push(Entry(name: take name, kind: kind, version: version, size: 0, type: take type))
+        }
+        return paged(take entries, limit, alloc)
+    }
+    if part == b"commits" or part == b"pins" {
+        discard try await mut self.history_node(device, path: ident::Path(text: text::String.of("/history", alloc)), segments, alloc)
+        fail StoreError.Kind
+    }
+    fail StoreError.NotFound
+} Store.history_listing
+
+/// The `CommitMeta` of the retained commit `name` names, `None` when none does.
+fn Store.commit_meta[D: disk::Device](mut self, device: D, name: Slice[mem::Bytes], alloc: mem::Alloc) -> Option[CommitMeta] fails StoreError uses wait {
+    if name.len() != 1 {
+        return None
+    }
+    let Some(number) = decimal_value(name[0].view()) else {
+        return None
+    }
+    let Some(bytes) = try await mut self.catalog_get(device, key: number_key(KIND_COMMIT, number, width: 8, alloc).view(), alloc) else {
+        return None
+    }
+    let entry = try decode_commit_entry(bytes.view(), alloc)
+    return Some(take entry.meta)
+} Store.commit_meta
+
+/// The numbers of the pinned commits from `after` on, in order, at most `limit`.
+fn Store.pinned[D: disk::Device](
+    mut self,
+    device: D,
+    after: u64,
+    limit: usize,
+    alloc: mem::Alloc,
+    ) -> mem::List[u64] fails StoreError uses wait {
+    var start = Array[u8, 8].filled(0)
+    mut start.view_mut().write_u64_be(0, value: after)
+    var numbers = mem::List[u64].empty(alloc)
+    var from = catalog_key(KIND_PIN, key: start.view(), alloc)
+    let prefix = catalog_key(KIND_PIN, key: b"", alloc)
+    while numbers.len() < limit {
+        let leaves = try await mut self.tree_scan(device, root: self.catalog, prefix: prefix.view(), from: from.view(), limit: 1, alloc)
+        if leaves.len() == 0 {
+            break
+        }
+        let number = leaves[0].key.view().u64_be(1)
+        mut numbers.push(number)
+        if number == 0xFFFF_FFFF_FFFF_FFFF {
+            break
+        }
+        from = number_key(KIND_PIN, number: number + 1, width: 8, alloc)
+    }
+    return numbers
+} Store.pinned
+
+/// A dir of `/history` holding `children` children.
+fn metadata_dir(path: ident::Path, children: u64, alloc: mem::Alloc) -> Node {
+    return Node(path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), kind: NodeKind.Dir, version: ident::CommitId(number: 0), subtree: None, declared: None, hash: None, size: children, origins: mem::List.empty(alloc), secret: false, expires: None, declaration: None, value: None)
+} metadata_dir
+
+/// A record of `/history` holding `bytes` of `type`.
+fn metadata_record(
+    path: ident::Path,
+    version: u64,
+    take type: TypeRef,
+    take bytes: mem::Bytes,
+    alloc: mem::Alloc,
+    ) -> Node {
+    let size = u64.widen(bytes.len())
+    return Node(path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), kind: NodeKind.Record, version: ident::CommitId(number: version), subtree: None, declared: Some(take type), hash: None, size: size, origins: mem::List.empty(alloc), secret: false, expires: None, declaration: None, value: Some(Untrusted.of(take bytes)))
+} metadata_record
+
+/// `entries` as a listing of at most `limit`, naming the last it holds when more follow.
+fn paged(take entries: mem::List[Entry], limit: u32, alloc: mem::Alloc) -> Listing {
+    var held = entries
+    if held.len() <= usize.widen(limit) {
+        return Listing(entries: take held, next: None)
+    }
+    mut held.truncate(usize.widen(limit))
+    var next: Option[text::String] = None
+    if held.len() > 0 {
+        next = Some(text::String.of(held[held.len() - 1].name.as_str(), alloc))
+    }
+    return Listing(entries: take held, next: take next)
+} paged
+
+/// The branch name `segments` spell, joined by `/`.
+fn branch_path(segments: Slice[mem::Bytes], alloc: mem::Alloc) -> text::String {
+    var bytes = mem::Bytes.empty(alloc)
+    for segment in segments {
+        if bytes.len() > 0 {
+            mut bytes.push(b'/')
+        }
+        mut bytes.append(segment.view())
+    }
+    return text_of_name(bytes.view(), alloc)
+} branch_path
+
+/// The segment of the branch name `whole` that follows the segments `below` spell, `None` when `whole` does not continue them.
+fn next_segment(whole: Slice[u8], below: Slice[u8], alloc: mem::Alloc) -> Option[text::String] {
+    var at: usize = 0
+    if below.len() > 0 {
+        if whole.len() <= below.len() + 1 or whole[below.len()] != b'/' {
+            return None
+        }
+        while at < below.len() {
+            if whole[at] != below[at] {
+                return None
+            }
+            at += 1
+        }
+        at += 1
+    }
+    var segment = mem::Bytes.empty(alloc)
+    while at < whole.len() and whole[at] != b'/' {
+        mut segment.push(whole[at])
+        at += 1
+    }
+    return Some(text_of_name(segment.view(), alloc))
+} next_segment
+
+/// Whether `name` comes after `after` in byte order, or `after` is `None`.
+fn after_name(name: Slice[u8], after: Option[text::String]) -> bool {
+    let Some(bound) = after else {
+        return true
+    }
+    return name > bound.as_bytes()
+} after_name
+
+/// Adds the dir `name` to `entries` when it comes after `after`.
+fn push_dir(mut entries: mem::List[Entry], name: Str, after: Option[text::String], alloc: mem::Alloc) {
+    if after_name(name.as_bytes(), after) {
+        mut entries.push(Entry(name: text::String.of(name, alloc), kind: NodeKind.Dir, version: ident::CommitId(number: 0), size: 0, type: None))
+    }
+} push_dir
+
+fn holds_name(names: mem::List[text::String], name: Slice[u8]) -> bool {
+    for held in names {
+        if held.as_bytes() == name {
+            return true
+        }
+    }
+    return false
+} holds_name
+
+/// Where `name` goes among `names`, kept in byte order.
+fn insertion(names: mem::List[text::String], name: Slice[u8]) -> usize {
+    var at: usize = 0
+    while at < names.len() and names[at].as_bytes() < name {
+        at += 1
+    }
+    return at
+} insertion

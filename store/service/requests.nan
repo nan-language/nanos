@@ -2,8 +2,23 @@
 
 /// The top-level nodes whose owning operations alone write them.
 fn is_owned(name: Slice[u8]) -> bool {
-    return name == b"sys" or name == b"state" or name == b"journal" or name == b"history" or name == b"live"
+    return name == b"sys" or name == b"state" or name == b"journal"
 } is_owned
+
+/// The top-level nodes the store's providers render, which no write reaches.
+fn is_rendered(name: Slice[u8]) -> bool {
+    return name == b"history" or name == b"live"
+} is_rendered
+
+/// The segments of `path` below `/<top>`, `None` when it lies elsewhere.
+fn segments_below(path: ident::Path, top: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[mem::Bytes]] {
+    var segments = path.segments(alloc)
+    if segments.len() == 0 or segments[0].view() != top {
+        return None
+    }
+    discard mut segments.remove(0)
+    return Some(take segments)
+} segments_below
 
 /// What the store stamps on a commit made through the View: its principal and instance, the typedness of its writes, no session, cause or origins yet.
 fn Scoped.stamp(self, typed: bool, alloc: mem::Alloc) -> store::Stamp {
@@ -27,7 +42,7 @@ fn Scoped.check(self, need: Need) fails Failure {
     }
 } Scoped.check
 
-/// The path `path` names within the View's subtree, after checking the View holds what `need` asks: `store.denied` for a write reaching a node its owning operations alone write, unless the View owns them.
+/// The path `path` names within the View's subtree, after checking the View holds what `need` asks: `store.denied` for a write below `/history` or `/live`, or reaching a node its owning operations alone write unless the View owns them, and `store.not-found` for one below another top-level name than the tree's.
 fn Scoped.resolve(self, path: ident::Path, need: Need, alloc: mem::Alloc) -> ident::Path fails Failure {
     try self.check(need)
     var segments = self.prefix.segments(alloc)
@@ -37,8 +52,14 @@ fn Scoped.resolve(self, path: ident::Path, need: Need, alloc: mem::Alloc) -> ide
     let Some(joined) = ident::Path.of_segments(segments.view(), alloc) else {
         fail Failure.Denied
     }
-    if need != Need.Read and not Rights.from_bits(self.rights).own and segments.len() > 0 and is_owned(segments[0].view()) {
-        fail Failure.Denied
+    if need != Need.Read and segments.len() > 0 {
+        let top = segments[0].view()
+        if is_rendered(top) or (is_owned(top) and not Rights.from_bits(self.rights).own) {
+            fail Failure.Denied
+        }
+        if top != b"data" and not is_owned(top) {
+            fail Failure.NotFound
+        }
     }
     return joined
 } Scoped.resolve
@@ -137,10 +158,16 @@ fn Sequencer.get(
         Ok(found) => found
         Err(failure) => return Err(take failure)
     }
-    return match at {
-        Some(commit) => try settled(attempt await mut self.engine.get_at(self.volume, branch: scope.branch.as_str(), path: resolved, at: commit, now: world.now(), alloc: world.alloc))
-        None => try settled(attempt await mut self.engine.get(self.volume, branch: scope.branch.as_str(), path: resolved, now: world.now(), alloc: world.alloc))
+    let Some(rendered) = segments_below(resolved, top: b"history", alloc: world.alloc) else {
+        return match at {
+            Some(commit) => try settled(attempt await mut self.engine.get_at(self.volume, branch: scope.branch.as_str(), path: resolved, at: commit, now: world.now(), alloc: world.alloc))
+            None => try settled(attempt await mut self.engine.get(self.volume, branch: scope.branch.as_str(), path: resolved, now: world.now(), alloc: world.alloc))
+        }
     }
+    if at.is_some() {
+        return Err(Failure.Unversioned)
+    }
+    return try settled(attempt await mut self.engine.history_node(self.volume, path: resolved, segments: rendered.view(), alloc: world.alloc))
 } Sequencer.get
 
 fn Sequencer.list(
@@ -155,6 +182,16 @@ fn Sequencer.list(
     let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
         Ok(found) => found
         Err(failure) => return Err(take failure)
+    }
+    match segments_below(resolved, top: b"history", alloc: world.alloc) {
+        Some(rendered) => {
+            if at.is_some() {
+                return Err(Failure.Unversioned)
+            }
+            return try settled(attempt await mut self.engine.history_listing(self.volume, segments: rendered.view(), after, limit, alloc: world.alloc))
+        }
+        None => {
+        }
     }
     let Some(commit) = at else {
         return try settled(attempt await mut self.engine.list(self.volume, branch: scope.branch.as_str(), path: resolved, after, limit, now: world.now(), alloc: world.alloc))
