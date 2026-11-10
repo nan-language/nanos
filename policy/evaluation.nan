@@ -1,0 +1,300 @@
+//! Evaluation: the subjects the policy decides, the rules matching each with the fixed rules, and the decision of a plan's subjects with what its asking rules require.
+
+/// The fixed rules that ask the owner outside an owner session.
+const OWNER_ASKS: Str = "op.keys.rotate op.keys.revoke op.clock.set"
+
+const NS_PER_MIN: i64 = 60_000_000_000
+
+const NS_PER_DAY: i64 = 86_400_000_000_000
+
+/// What the policy decides: a step or a `call`, or a `delegate` or `extract` request, of a session of `principal`: its operation names and objects, its provenance, whether its session is tainted, the destinations `<host>:<port>` of the outbox entries it adds, whether its plan meets the rule of two, the agent budgets it exceeds, and whether it uses a grant with the `ask` caveat.
+pub closed struct Subject derives Encode {
+    pub principal: ident::Principal
+    pub operations: mem::List[text::String]
+    pub objects: mem::List[text::String]
+    pub provenance: Option[os::Provenance]
+    pub tainted: bool
+    pub destinations: mem::List[text::String]
+    pub rule_of_two: bool
+    pub exceeds: mem::List[BudgetKind]
+    pub ask_caveat: bool
+} Subject
+
+/// What an asking rule requires of an approval.
+pub closed struct Requirement derives Encode {
+    pub rule: text::String
+    pub approvers: mem::List[text::String]
+    pub quorum: u8
+    pub expiry_min: u16
+    pub channel: Channel
+} Requirement
+
+/// A decision: what it is, the rules giving it, `no rule` when none matched, and what each asking rule requires.
+pub closed struct Verdict derives Encode {
+    pub decision: Decision
+    pub rules: mem::List[text::String]
+    pub requirements: mem::List[Requirement]
+} Verdict
+
+/// The decision of the subjects of a plan under this policy at the wall time `now`: the strongest of theirs, `Deny` for a subject no rule matches.
+pub fn Policy.decide(self, subjects: mem::List[Subject], now: ident::WallTime, alloc: mem::Alloc) -> Verdict {
+    var verdict = Verdict(decision: Decision.Allow, rules: mem::List.empty(alloc), requirements: mem::List.empty(alloc))
+    for subject in subjects {
+        let given = self.decide_one(subject, now, alloc)
+        if given.decision > verdict.decision {
+            verdict.decision = given.decision
+            verdict.rules = mem::List.empty(alloc)
+        }
+        if given.decision == verdict.decision {
+            for name in given.rules {
+                mut verdict.rules.push(text::String.of(name.as_str(), alloc))
+            }
+        }
+        for requirement in take given.requirements {
+            mut verdict.requirements.push(take requirement)
+        }
+    }
+    return verdict
+} Policy.decide
+
+/// The decision of `subject`: the strongest of the rules matching it and the fixed rules', `Deny` without one.
+pub fn Policy.decide_one(self, subject: Subject, now: ident::WallTime, alloc: mem::Alloc) -> Verdict {
+    var verdict = Verdict(decision: Decision.Deny, rules: mem::List.empty(alloc), requirements: mem::List.empty(alloc))
+    var matched = false
+    for rule in self.rules {
+        if not rule.matches(subject, policy: self, now, alloc) {
+            continue
+        }
+        mut verdict.add(rule.decision, name: rule.name.as_str(), fresh: matched == false, alloc)
+        matched = true
+        if rule.decision == Decision.Ask {
+            mut verdict.requirements.push(Requirement(rule: text::String.of(rule.name.as_str(), alloc), approvers: copies(rule.approvers, alloc), quorum: rule.quorum, expiry_min: rule.expiry_min, channel: rule.channel))
+        }
+    }
+    if subject.ask_caveat {
+        mut verdict.add(Decision.Ask, name: "ask-caveat", fresh: matched == false, alloc)
+        matched = true
+        mut verdict.requirements.push(Requirement(rule: text::String.of("ask-caveat", alloc), approvers: owner_and_humans(alloc), quorum: 1, expiry_min: 15, channel: Channel.Any))
+    }
+    if subject.principal.text.as_str() != "owner" and asks_owner(subject, alloc) {
+        mut verdict.add(Decision.Ask, name: "owner-operations", fresh: matched == false, alloc)
+        matched = true
+        var owner = mem::List[text::String].empty(alloc)
+        mut owner.push(text::String.of("owner", alloc))
+        mut verdict.requirements.push(Requirement(rule: text::String.of("owner-operations", alloc), approvers: take owner, quorum: 1, expiry_min: 15, channel: Channel.Any))
+    }
+    if not matched {
+        mut verdict.rules.push(text::String.of("no rule", alloc))
+    }
+    return verdict
+} Policy.decide_one
+
+/// The names of the rules matching `subject`.
+pub fn Policy.explain(self, subject: Subject, now: ident::WallTime, alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    for rule in self.rules {
+        if rule.matches(subject, policy: self, now, alloc) {
+            mut found.push(text::String.of(rule.name.as_str(), alloc))
+        }
+    }
+    return found
+} Policy.explain
+
+/// Takes the decision `decision` of the rule `name` into the verdict: a stronger one replaces the rules held, and a `fresh` one, the first taken, any.
+fn Verdict.add(
+    mut self,
+    decision: Decision,
+    name: Str,
+    fresh: bool,
+    alloc: mem::Alloc,
+    ) {
+    if fresh or decision > self.decision {
+        self.decision = decision
+        self.rules = mem::List.empty(alloc)
+    }
+    if decision == self.decision {
+        mut self.rules.push(text::String.of(name, alloc))
+    }
+} Verdict.add
+
+/// Whether the rule matches `subject` under `policy` at `now`: its globs match the subject's principal, one of its operation names and one of its objects, and each of its conditions holds.
+pub fn Rule.matches(
+    self,
+    subject: Subject,
+    policy: Policy,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> bool {
+    if not any_dotted(self.principals, named: single(subject.principal.text.as_str(), alloc), alloc) {
+        return false
+    }
+    if not any_dotted(self.operations, named: subject.operations, alloc) or not any_object(self.objects, targets: subject.objects, alloc) {
+        return false
+    }
+    let taint_holds = match self.taint {
+        TaintTest.Any => true
+        TaintTest.Empty => not subject.tainted
+        TaintTest.Tainted => subject.tainted
+    }
+    if not taint_holds or not self.destinations_hold(subject, policy, alloc) {
+        return false
+    }
+    if self.rule_of_two and not subject.rule_of_two {
+        return false
+    }
+    if self.budget_above.len() > 0 and not exceeds_listed(self.budget_above, exceeded: subject.exceeds) {
+        return false
+    }
+    if self.provenance.len() > 0 {
+        let Some(class) = subject.provenance else {
+            return false
+        }
+        if not holds_class(self.provenance, class) {
+            return false
+        }
+    }
+    return match self.window {
+        Some(window) => window.holds(now, decision: self.decision)
+        None => true
+    }
+} Rule.matches
+
+/// Whether the rule's destination test holds for `subject`: `Allowlisted` when it adds outbox entries, each to a destination `policy`'s allowlist matches, `Other` when one is not.
+fn Rule.destinations_hold(self, subject: Subject, policy: Policy, alloc: mem::Alloc) -> bool {
+    if self.destinations == DestinationTest.Any {
+        return true
+    }
+    var allowlisted = subject.destinations.len() > 0
+    var other = false
+    for destination in subject.destinations {
+        if not any_object(policy.allowlist, targets: single(destination.as_str(), alloc), alloc) {
+            allowlisted = false
+            other = true
+        }
+    }
+    return match self.destinations {
+        DestinationTest.Allowlisted => allowlisted
+        DestinationTest.Other => other
+        DestinationTest.Any => true
+    }
+} Rule.destinations_hold
+
+/// Whether the wall time `now` lies in the window; while the clock's uncertainty exceeds 1 min, it holds for `Ask` and `Deny` rules alone.
+fn Window.holds(self, now: ident::WallTime, decision: Decision) -> bool {
+    if now.uncertainty_ns > 60_000_000_000 {
+        return decision == Decision.Ask or decision == Decision.Deny
+    }
+    let days = now.utc_ns.div_floor(NS_PER_DAY)
+    let weekday = (days + 3).mod_floor(7)
+    if ((self.days >> u32.truncate(weekday)) & 1) == 0 {
+        return false
+    }
+    let minute = now.utc_ns.mod_floor(NS_PER_DAY).div_floor(NS_PER_MIN)
+    return minute >= i64.widen(self.from_min) and minute < i64.widen(self.to_min)
+} Window.holds
+
+/// Whether one of the globs `wanted` matches one of `named`, dotted, `*` alone matching every name.
+fn any_dotted(wanted: mem::List[text::String], named: mem::List[text::String], alloc: mem::Alloc) -> bool {
+    for glob in wanted {
+        if glob.as_str() == "*" {
+            return true
+        }
+        for name in named {
+            if dotted_matches(glob.as_str(), name: name.as_str(), alloc) {
+                return true
+            }
+        }
+    }
+    return false
+} any_dotted
+
+/// Whether one of the object patterns `patterns` matches one of `targets`.
+fn any_object(patterns: mem::List[text::String], targets: mem::List[text::String], alloc: mem::Alloc) -> bool {
+    for pattern in patterns {
+        for target in targets {
+            if object_matches(pattern.as_str(), target: target.as_str(), alloc) {
+                return true
+            }
+        }
+    }
+    return false
+} any_object
+
+/// Whether `subject` names an operation that asks the owner outside an owner session.
+fn asks_owner(subject: Subject, alloc: mem::Alloc) -> bool {
+    for operation in subject.operations {
+        if one_of(operation.as_bytes(), choices: OWNER_ASKS, alloc) {
+            return true
+        }
+    }
+    return false
+} asks_owner
+
+fn exceeds_listed(listed: mem::List[BudgetKind], exceeded: mem::List[BudgetKind]) -> bool {
+    for kind in exceeded {
+        for wanted in listed {
+            if kind == wanted {
+                return true
+            }
+        }
+    }
+    return false
+} exceeds_listed
+
+fn holds_class(classes: mem::List[os::Provenance], class: os::Provenance) -> bool {
+    for held in classes {
+        if held == class {
+            return true
+        }
+    }
+    return false
+} holds_class
+
+fn single(text: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var held = mem::List[text::String].empty(alloc)
+    mut held.push(text::String.of(text, alloc))
+    return held
+} single
+
+fn copies(texts: mem::List[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var held = mem::List[text::String].empty(alloc)
+    for each in texts {
+        mut held.push(text::String.of(each.as_str(), alloc))
+    }
+    return held
+} copies
+
+fn owner_and_humans(alloc: mem::Alloc) -> mem::List[text::String] {
+    var held = single("owner", alloc)
+    mut held.push(text::String.of("human.**", alloc))
+    return held
+} owner_and_humans
+
+/// A subject of `principal` with the operation names `operations` and the objects `objects` separate by spaces.
+fn subject_of(principal: Str, operations: Str, objects: Str, alloc: mem::Alloc) -> Subject {
+    return Subject(principal: ident::Principal(text: text::Fixed[64].of(principal)), operations: names(operations, alloc), objects: names(objects, alloc), provenance: None, tainted: false, destinations: mem::List.empty(alloc), rule_of_two: false, exceeds: mem::List.empty(alloc), ask_caveat: false)
+} subject_of
+
+test supervised_agents_apply_restorable_steps_and_ask_for_the_rest for Policy.decide {
+    let alloc = testing::world().alloc
+    let policy = Preset.Supervised.policy(version: 1, machine: Array[u8, 16].filled(0), alloc)
+    let now = ident::WallTime(utc_ns: 0, uncertainty_ns: 0)
+    var restorable = mem::List[Subject].empty(alloc)
+    mut restorable.push(subject_of("agent.ops", operations: "step.write reversibility.restorable", objects: "/data/agent.ops/notes", alloc))
+    let allowed = policy.decide(restorable, now, alloc)
+    var irreversible = mem::List[Subject].empty(alloc)
+    mut irreversible.push(subject_of("agent.ops", operations: "step.call irreversible irreversible.emit", objects: "mail.send", alloc))
+    let asked = policy.decide(irreversible, now, alloc)
+    var stopping = mem::List[Subject].empty(alloc)
+    mut stopping.push(subject_of("agent.ops", operations: "step.stop reversibility.restorable", objects: "journal", alloc))
+    let base_asked = policy.decide(stopping, now, alloc)
+    var owned = mem::List[Subject].empty(alloc)
+    mut owned.push(subject_of("owner", operations: "step.call op.keys.rotate reversibility.recorded", objects: "keys", alloc))
+    let owner_allowed = policy.decide(owned, now, alloc)
+    var stranger = mem::List[Subject].empty(alloc)
+    mut stranger.push(subject_of("builder.ci", operations: "step.write reversibility.recorded", objects: "/data/x", alloc))
+    let denied = policy.decide(stranger, now, alloc)
+    expect allowed.decision == Decision.Allow and asked.decision == Decision.Ask and base_asked.decision == Decision.Ask
+    expect owner_allowed.decision == Decision.Allow and denied.decision == Decision.Deny and denied.rules[0].as_str() == "no rule"
+    expect asked.requirements.len() == 1 and asked.requirements[0].channel == Channel.Independent
+} supervised_agents_apply_restorable_steps_and_ask_for_the_rest

@@ -29,6 +29,8 @@ const JOURNAL: Str = "journal::Recorder"
 
 const KEYS: Str = "keys::Keyring"
 
+const POLICY: Str = "policy::Overseer"
+
 /// The canonical paths of the record types genesis writes besides specifications.
 const GRANT_TYPE: Str = "os::Grant"
 
@@ -40,10 +42,12 @@ const PRINCIPAL_RECORD_TYPE: Str = "os::PrincipalRecord"
 
 const JOURNAL_CONFIG_TYPE: Str = "journal::JournalConfig"
 
+const SIGNED_POLICY_TYPE: Str = "policy::SignedPolicy"
+
 /// The memory limit of `store`, whose engine keeps index nodes of 16 KiB in memory.
 const STORE_LIMIT: u64 = 67_108_864
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings and where `keys` publishes its part of `/live/security`.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security`, and the machine's measured facts.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
@@ -57,6 +61,7 @@ struct Base derives Copy {
     handoff: bootfmt::Handoff
     feed: journal::Feed
     keys_live: os::Live
+    machine: os::Machine
 } Base
 
 impl Base: runner::Components
@@ -104,11 +109,14 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == KEYS {
         return Some(os::Protocols(own: sys::Wire[keys::Keys].hash(), serves: None))
     }
+    if component == POLICY {
+        return Some(os::Protocols(own: sys::Wire[policy::Oversight].hash(), serves: Some(sys::Wire[store::service::Watcher].hash())))
+    }
     return None
 } Base.protocols
 
-/// Whether the component's Env takes a configuration record: `journal`'s alone.
-fn Base.configured(self, component: Str) -> bool = component == JOURNAL
+/// Whether the component's Env takes a configuration record: `journal`'s and `policy`'s.
+fn Base.configured(self, component: Str) -> bool = component == JOURNAL or component == POLICY
 
 fn Base.serve(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     if component == DEVICES {
@@ -170,6 +178,9 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     }
     if component == KEYS {
         return try await self.serve_keys(take world, take serving)
+    }
+    if component == POLICY {
+        return try await self.serve_policy(take world, take serving)
     }
     let exec = world.exec
     let alloc = world.alloc
@@ -386,6 +397,42 @@ fn Base.serve_keys(self, take world: nanos::World, take serving: runner::Serving
     })
 } Base.serve_keys
 
+/// Serves `policy` on its Views of `/sys/policy` and of its configuration record, its ports to `keys` and to itself, its source of events, the kernel's entropy and the clocks, with its configuration record.
+fn Base.serve_policy(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Ok(read) = attempt nanos::Cap[store::service::View].get(world.caps, key: "policy") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(configuring) = attempt nanos::Cap[store::service::View].get(world.caps, key: "configuring") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(keying) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "keys") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Some(keyring) = os::Port[keys::Keys].of(keying) else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(own) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "own") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let config: Option[policy::PolicyConfig] = match mut serving.take_config() {
+        Some(record) => match attempt mem::wire::Codec[policy::PolicyConfig].decode(record.view(), alloc) {
+            Ok(configured) => Some(configured)
+            Err(_) => return runner::Ended.EnvIncomplete
+        }
+        None => None
+    }
+    let dev = self.handoff.mode == bootfmt::Mode.Dev.to_bits()
+    let env = policy::Env.of(config, policy: read, configuring, keys: keyring, own, events, random: world.random, clock: world.clock, wall: self.wall, iommu: self.machine.conditions.iommu, dev, alloc)
+    var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+    mut peers.push(sys::Wire[store::service::Watcher].schema(alloc))
+    return try await runner::Driven[policy::Overseer, policy::Env, policy::Oversight].run(take env, exec: world.exec, alloc, take serving, take peers, release: fn(take ended: policy::Env) limits stack 512 {
+    })
+} Base.serve_policy
+
 /// The schemas a block driver or view serves the calls of: `Block`'s.
 fn schema_of_block(alloc: mem::Alloc) -> mem::List[sys::ProtocolSchema] {
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
@@ -476,6 +523,15 @@ fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem
     mut building.grant(mut keeping, holder: "keys", field: "random", object: os::Object.Random, granted: mem::Set.empty(alloc), alloc)
     discard mut building.specs.insert(moniker("journal"), value: take journaling)
     discard mut building.specs.insert(moniker("keys"), value: take keeping)
+    var overseeing = os::InstanceSpec.of(principal: principal("system"), bundle, component: POLICY, alloc)
+    overseeing.durability = os::Durability(class: os::DurabilityClass.Checkpointed, epoch_s: None, max_bytes: 1_048_576)
+    mut building.grant(mut overseeing, holder: "policy", field: "policy", object: tree_of("/sys/policy", alloc), granted: read_rights(alloc), alloc)
+    mut building.grant(mut overseeing, holder: "policy", field: "configuring", object: tree_of("/sys/config/policy", alloc), granted: tree_rights(alloc), alloc)
+    mut building.grant(mut overseeing, holder: "policy", field: "random", object: os::Object.Random, granted: mem::Set.empty(alloc), alloc)
+    mut building.grant(mut overseeing, holder: "policy", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
+    discard mut overseeing.wiring.insert(text::String.of("keys", alloc), value: os::Wire.to(moniker("keys")))
+    discard mut overseeing.wiring.insert(text::String.of("own", alloc), value: os::Wire(target: os::Target.Instance(moniker("policy")), operations: None, credit: os::Credit(messages: 16, calls: 1)))
+    discard mut building.specs.insert(moniker("policy"), value: take overseeing)
     if owner_of(handoff, alloc).is_some() {
         let number = u64.widen(building.grants.len())
         discard mut building.grants.insert(number, value: os::Grant(holder: principal("owner"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
@@ -546,7 +602,10 @@ fn genesis_record(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: me
         None => {
         }
     }
-    return store::service::Genesis(format: 1, generation: handoff.generation, nodes: take nodes, instances: take specs, config: take config, principals: take principals, grants: take granted)
+    var policed = mem::Bytes.empty(alloc)
+    mem::wire::Codec[policy::SignedPolicy].encode(policy::SignedPolicy(policy: policy::Preset.Supervised.policy(version: 1, machine: Array[u8, 16].filled(0), alloc), signature: None), out: mut policed)
+    let signed = store::service::TypedValue(type: store::TypeRef.of(SIGNED_POLICY_TYPE, schema: mem::wire::Codec[policy::SignedPolicy].schema_hash(), alloc), bytes: take policed)
+    return store::service::Genesis(format: 1, generation: handoff.generation, nodes: take nodes, instances: take specs, config: take config, principals: take principals, grants: take granted, policy: take signed)
 } genesis_record
 
 /// The owner's principal record: holding the owner key the handoff record names on a claimed machine, no key in `dev` mode on an unclaimed one, `None` otherwise.
@@ -631,7 +690,7 @@ fn run_base(
     defer take feeding.close()
     let securing = os::MintedLive.of(posted, own: "/live/security/keys", alloc: config.alloc)
     defer take securing.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: storing.mint(), devices_live: managing.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: securing.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: storing.mint(), devices_live: managing.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: securing.mint(), machine: machine)
     var requested = incoming
     var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings))
     defer abandon_given(take given)
@@ -787,6 +846,13 @@ fn tree_path(text: Str, alloc: mem::Alloc) -> ident::Path {
     return ident::Path(text: text::String.of(text, alloc))
 } tree_path
 
+/// The rights of a `Tree` grant reading its subtree.
+fn read_rights(alloc: mem::Alloc) -> mem::Set[os::Right] {
+    var set = mem::Set[os::Right].empty(alloc)
+    discard mut set.insert(os::Right.Read)
+    return set
+} read_rights
+
 /// The rights of a `Tree` grant reading and writing its subtree.
 fn tree_rights(alloc: mem::Alloc) -> mem::Set[os::Right] {
     var set = mem::Set[os::Right].empty(alloc)
@@ -818,7 +884,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     defer take living.close()
     let feeding = journal::MintedFeed.of(journal::Backlog.empty(alloc), alloc)
     defer take feeding.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains))
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, gauges: runner::Gauges.empty(alloc), body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)

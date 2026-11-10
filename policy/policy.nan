@@ -1,0 +1,417 @@
+//! The `policy` instance: the owner-signed policy and its presets, the patterns its rules match, and the decisions it gives subjects by the record of `/sys/policy` it last accepted, or by `locked` when it accepts none.
+
+/// The key of the keyed task drawing the machine id, reading the policy and subscribing to its changes.
+const STARTING: u64 = 1
+
+/// The key of the keyed task checking a policy written since.
+const CHECKING: u64 = 2
+
+/// The type of `policy`'s configuration record.
+const POLICY_CONFIG_TYPE: Str = "policy::PolicyConfig"
+
+/// What `policy` serves: decisions and explanations, the store's notices of `/sys/policy`, and what its tasks report.
+pub protocol Oversight {
+    /// The decision of the subjects of a plan, at its preview or, when `at_apply`, at its apply.
+    pub fn decide(subjects: mem::List[Subject], at_apply: bool) -> Verdict limits traceless
+    /// The rules matching `subject` and its decision.
+    pub fn explain(subject: Subject) -> Explanation limits traceless
+    pub fn changed(subscription: u64, commit: ident::CommitId, paths: mem::List[ident::Path], more: u64) limits traceless
+    pub fn appended(subscription: u64, path: ident::Path, seq: u64) limits traceless
+    pub fn lost(subscription: u64, commits: u64) limits traceless
+    /// The record of `/sys/policy` was checked: `policy` when it is valid, else the code of the check it failed.
+    fn checked(outcome: Checked) limits traceless
+} Oversight
+
+/// What `explain` gives: the rules matching the subject, and its decision.
+pub closed struct Explanation derives Encode {
+    pub rules: mem::List[text::String]
+    pub decision: Decision
+} Explanation
+
+/// The outcome of checking the record of `/sys/policy`: its policy, or the code of the validity check it failed.
+pub closed enum Checked derives Encode {
+    Valid(policy: Policy)
+    Invalid(code: text::String)
+} Checked
+
+/// The payload of `policy.changed`: the version accepted.
+pub closed struct PolicyChanged derives Encode {
+    pub version: u64
+} PolicyChanged
+
+/// The payload of `policy.invalid`: the code of the check the record failed.
+pub closed struct PolicyInvalid derives Encode {
+    pub code: text::String
+} PolicyInvalid
+
+/// The Env of `policy`: its configuration, its Views of `/sys/policy` and of its configuration record, the port to `keys`, a port to itself for the store's notices, its source of events, the kernel's entropy, the clocks, whether the machine has `iommu`, whether it boots in `dev` mode, and its cell.
+pub open struct Env derives Send {
+    config: Option[PolicyConfig]
+    policy: store::service::View
+    configuring: store::service::View
+    keys: os::Port[keys::Keys]
+    own: os::PortHandle
+    events: journal::Source
+    random: sys::Random
+    clock: sys::Clock
+    wall: ident::Wall
+    iommu: bool
+    dev: bool
+    alloc: mem::Alloc
+} Env
+
+/// The state of `policy`: the policy it decides by, and whether it accepted it or decides by `locked` for want of one.
+pub closed struct Overseer derives Encode {
+    pub policy: Policy
+    pub accepted: bool
+} Overseer
+
+impl Overseer: sys::Component[Env, Oversight]
+
+impl Overseer: sys::Resume[Env, Oversight]
+
+pub fn Env.of(
+    config: Option[PolicyConfig],
+    policy: store::service::View,
+    configuring: store::service::View,
+    keys: os::Port[keys::Keys],
+    own: os::PortHandle,
+    events: journal::Source,
+    random: sys::Random,
+    clock: sys::Clock,
+    wall: ident::Wall,
+    iommu: bool,
+    dev: bool,
+    alloc: mem::Alloc,
+    ) -> Env {
+    return Env(config: config, policy: policy, configuring: configuring, keys: keys, own: own, events: events, random: random, clock: clock, wall: wall, iommu: iommu, dev: dev, alloc: alloc)
+} Env.of
+
+pub fn Overseer.start(mut env: Env) -> Overseer {
+    return Overseer(policy: Preset.Locked.policy(version: 0, machine: Array[u8, 16].filled(0), alloc: env.alloc), accepted: false)
+} Overseer.start
+
+/// Draws the machine id when its configuration holds none, then checks the record of `/sys/policy` and subscribes to its changes, from a keyed task.
+pub fn Overseer.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Oversight]) {
+    let reader = Checking.of(env, accepted: self.accepted_version())
+    let configuring = env.configuring
+    let policy = env.policy
+    let own = env.own
+    let random = env.random
+    let config = env.config
+    let alloc = env.alloc
+    mut cx.spawn(key: STARTING, run: fn(out: sys::Outbox[Oversight]) fails task::Cancelled uses wait limits stack 65_536 {
+        let machine = match first config {
+            Some(held) if held.machine != Array[u8, 16].filled(0) => held.machine
+            else => try await draw_machine(configuring, random, alloc)
+        }
+        try await reader.check(machine, out)
+        match attempt await policy.subscribe(ident::Path(text: text::String.of("/", alloc)), since: ident::CommitId(number: 0), port: own, alloc) {
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    })
+} Overseer.resume
+
+pub fn Overseer.decide(
+    mut self,
+    take subjects: mem::List[Subject],
+    take at_apply: bool,
+    mut env: Env,
+    mut cx: sys::Cx[Oversight],
+    ) -> Verdict {
+    return self.policy.decide(subjects, now: env.wall.now(env.clock), alloc: env.alloc)
+} Overseer.decide
+
+pub fn Overseer.explain(mut self, take subject: Subject, mut env: Env, mut cx: sys::Cx[Oversight]) -> Explanation {
+    let now = env.wall.now(env.clock)
+    let verdict = self.policy.decide_one(subject, now, alloc: env.alloc)
+    return Explanation(rules: self.policy.explain(subject, now, alloc: env.alloc), decision: verdict.decision)
+} Overseer.explain
+
+/// Checks the record of `/sys/policy` again after a commit wrote it.
+pub fn Overseer.changed(
+    mut self,
+    take subscription: u64,
+    take commit: ident::CommitId,
+    take paths: mem::List[ident::Path],
+    take more: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Oversight],
+    ) {
+    mut self.recheck(mut env, mut cx)
+} Overseer.changed
+
+pub fn Overseer.appended(
+    mut self,
+    take subscription: u64,
+    take path: ident::Path,
+    take seq: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Oversight],
+    ) {
+} Overseer.appended
+
+/// Checks the record of `/sys/policy` again after the store could not tell of some commits.
+pub fn Overseer.lost(
+    mut self,
+    take subscription: u64,
+    take commits: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Oversight],
+    ) {
+    mut self.recheck(mut env, mut cx)
+} Overseer.lost
+
+/// Decides by the policy checked when it is valid, emitting `policy.changed`, else by `locked`, emitting `policy.invalid`.
+fn Overseer.checked(mut self, take outcome: Checked, mut env: Env, mut cx: sys::Cx[Oversight]) {
+    let events = env.events
+    let alloc = env.alloc
+    match outcome {
+        Checked.Valid(policy: policy) => {
+            let changed = PolicyChanged(version: policy.version)
+            self.policy = policy
+            self.accepted = true
+            mut cx.spawn(key: CHECKING + 1, run: fn[take changed](out: sys::Outbox[Oversight]) fails task::Cancelled uses wait limits stack 16_384 {
+                try await events.emit("policy.changed", severity: journal::Severity.Notice, payload: changed, alloc)
+            })
+        }
+        Checked.Invalid(code: code) => {
+            if not self.accepted {
+                self.policy = Preset.Locked.policy(version: 0, machine: Array[u8, 16].filled(0), alloc)
+            }
+            let invalid = PolicyInvalid(code: take code)
+            mut cx.spawn(key: CHECKING + 1, run: fn[take invalid](out: sys::Outbox[Oversight]) fails task::Cancelled uses wait limits stack 16_384 {
+                try await events.emit("policy.invalid", severity: journal::Severity.Error, payload: invalid, alloc)
+            })
+        }
+    }
+} Overseer.checked
+
+/// The version of the policy accepted, `None` while it decides by `locked`.
+fn Overseer.accepted_version(self) -> Option[u64] {
+    if not self.accepted {
+        return None
+    }
+    return Some(self.policy.version)
+} Overseer.accepted_version
+
+/// Checks the record of `/sys/policy` from a keyed task, against the machine id of the configuration.
+fn Overseer.recheck(mut self, mut env: Env, mut cx: sys::Cx[Oversight]) {
+    let Some(config) = env.config else {
+        return
+    }
+    let reader = Checking.of(env, accepted: self.accepted_version())
+    mut cx.spawn(key: CHECKING, run: fn(out: sys::Outbox[Oversight]) fails task::Cancelled uses wait limits stack 65_536 {
+        try await reader.check(machine: config.machine, out)
+    })
+} Overseer.recheck
+
+/// What a check of the record of `/sys/policy` reads: the View of it, the port to `keys`, the version accepted, whether the machine has `iommu`, whether it boots in `dev` mode, and the cell.
+struct Checking derives Copy {
+    policy: store::service::View
+    keys: os::Port[keys::Keys]
+    accepted: Option[u64]
+    iommu: bool
+    dev: bool
+    alloc: mem::Alloc
+} Checking
+
+fn Checking.of(env: Env, accepted: Option[u64]) -> Checking {
+    return Checking(policy: env.policy, keys: env.keys, accepted: accepted, iommu: env.iommu, dev: env.dev, alloc: env.alloc)
+} Checking.of
+
+/// Reads the record of `/sys/policy`, checks its validity for the machine `machine`, and tells `out` the outcome.
+fn Checking.check(self, machine: Array[u8, 16], out: sys::Outbox[Oversight]) fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let node = match first attempt await self.policy.get(ident::Path(text: text::String.of("/", alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => {
+            discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("store.not-found", alloc)))
+            return
+        }
+    }
+    let Some(value) = node.value else {
+        discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("store.not-found", alloc)))
+        return
+    }
+    let Some(signed) = signed_of(value.view(), alloc) else {
+        discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("schema.invalid", alloc)))
+        return
+    }
+    let outcome = match try await self.validity(signed, machine) {
+        Some(code) => Checked.Invalid(code: text::String.of(code.as_str(), alloc))
+        None => Checked.Valid(policy: take signed.policy)
+    }
+    discard attempt await out.checked(take outcome)
+} Checking.check
+
+/// The code of the first validity check `signed` fails for the machine `machine`, `None` when it passes them all: its signature by the owner key, unless it is the genesis record's policy or the boot is in `dev` mode; a version above the one accepted and the machine id, the genesis policy excepted; patterns that parse; no approver, reviewer or sealer glob that can match an agent or an instance; and on a machine without `iommu`, no `autonomous` preset and no agent code in the shared space.
+fn Checking.validity(self, signed: SignedPolicy, machine: Array[u8, 16]) -> Option[text::Fixed[32]] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let policy = signed.policy
+    let genesis = is_genesis(signed, alloc)
+    match signed.signature {
+        Some(signature) => {
+            var bytes = mem::Bytes.empty(alloc)
+            mem::wire::Codec[Policy].encode(policy, out: mut bytes)
+            let subject = ident::HashValue.of_object(ident::Kind.Policy, bytes: bytes.view())
+            var call = sys::Encoded.empty(alloc)
+            let reply = sys::Wire[keys::Keys].verify(mut call, principal: ident::Principal(text: text::Fixed[64].of("owner")), kind: text::String.of("policy", alloc), subject, signature, former: false)
+            match first attempt await self.keys.call(take call, reply, alloc) {
+                Ok(_) => {
+                }
+                Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+                Err(_) => return Some(text::Fixed[32].of("auth.bad-signature"))
+            }
+        }
+        None => {
+            if not genesis and not self.dev {
+                return Some(text::Fixed[32].of("auth.bad-signature"))
+            }
+        }
+    }
+    match first self.accepted {
+        Some(version) if not genesis and policy.version <= version => return Some(text::Fixed[32].of("policy.version"))
+        else => {
+        }
+    }
+    if not genesis and policy.machine != machine {
+        return Some(text::Fixed[32].of("policy.machine"))
+    }
+    if not patterns_parse(policy, alloc) {
+        return Some(text::Fixed[32].of("policy.pattern"))
+    }
+    if reaches_agents(policy, alloc) {
+        return Some(text::Fixed[32].of("policy.agent-approver"))
+    }
+    if not self.iommu and (policy.preset.as_str() == "autonomous" or policy.agent_shared_space) {
+        return Some(text::Fixed[32].of("policy.preset-unavailable"))
+    }
+    return None
+} Checking.validity
+
+/// Whether `signed` is the genesis record's policy: `supervised`, version 1, for no machine yet, unsigned.
+pub fn is_genesis(signed: SignedPolicy, alloc: mem::Alloc) -> bool {
+    if signed.signature.is_some() {
+        return false
+    }
+    var held = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Policy].encode(signed.policy, out: mut held)
+    var genesis = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Policy].encode(Preset.Supervised.policy(version: 1, machine: Array[u8, 16].filled(0), alloc), out: mut genesis)
+    return held.view() == genesis.view()
+} is_genesis
+
+/// Whether every pattern of `policy` parses.
+fn patterns_parse(policy: Policy, alloc: mem::Alloc) -> bool {
+    for rule in policy.rules {
+        for pattern in rule.principals {
+            if not principal_parses(pattern.as_str(), alloc) {
+                return false
+            }
+        }
+        for pattern in rule.operations {
+            if not operation_parses(pattern.as_str(), alloc) {
+                return false
+            }
+        }
+        for pattern in rule.objects {
+            if not object_parses(pattern.as_str(), alloc) {
+                return false
+            }
+        }
+        for pattern in rule.approvers {
+            if not principal_parses(pattern.as_str(), alloc) {
+                return false
+            }
+        }
+    }
+    for pattern in policy.allowlist {
+        if not object_parses(pattern.as_str(), alloc) {
+            return false
+        }
+    }
+    for pattern in policy.sensitive {
+        if not object_parses(pattern.as_str(), alloc) {
+            return false
+        }
+    }
+    return every_principal(policy.reviewers, alloc) and every_principal(policy.sealers, alloc) and every_principal(policy.builders, alloc)
+} patterns_parse
+
+fn every_principal(patterns: mem::List[text::String], alloc: mem::Alloc) -> bool {
+    for pattern in patterns {
+        if not principal_parses(pattern.as_str(), alloc) {
+            return false
+        }
+    }
+    return true
+} every_principal
+
+/// Whether a glob of an approver, a reviewer or a sealer of `policy` can match a principal starting with `agent.` or `inst.`.
+fn reaches_agents(policy: Policy, alloc: mem::Alloc) -> bool {
+    for rule in policy.rules {
+        if any_reaches(rule.approvers) {
+            return true
+        }
+    }
+    return any_reaches(policy.reviewers) or any_reaches(policy.sealers)
+} reaches_agents
+
+/// Whether one of the globs `patterns` can match a principal starting with `agent.` or `inst.`: its first segment is a wildcard, `agent` or `inst`.
+fn any_reaches(patterns: mem::List[text::String]) -> bool {
+    for glob in patterns {
+        let bytes = glob.as_bytes()
+        var end: usize = 0
+        while end < bytes.len() and bytes[end] != b'.' {
+            end += 1
+        }
+        let Some(head) = bytes.prefix(end) else {
+            continue
+        }
+        if head == b"*" or head == b"**" or head == b"agent" or head == b"inst" {
+            return true
+        }
+    }
+    return false
+} any_reaches
+
+/// Draws the machine id from `random` and writes it as `policy`'s configuration record through `configuring`.
+fn draw_machine(configuring: store::service::View, random: sys::Random, alloc: mem::Alloc) -> Array[u8, 16] fails task::Cancelled uses wait {
+    var machine = Array[u8, 16].filled(0)
+    discard attempt random.fill(mut machine.view_mut())
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[PolicyConfig].encode(PolicyConfig(machine: machine), out: mut bytes)
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: ident::Path(text: text::String.of("/", alloc)), value: store::Value.Record(type: store::TypeRef.of(POLICY_CONFIG_TYPE, schema: mem::wire::Codec[PolicyConfig].schema_hash(), alloc), bytes: take bytes, secret: false)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+    match attempt await configuring.commit(take transaction, typed: true, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+    return machine
+} draw_machine
+
+validator fn signed_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[SignedPolicy] {
+    return match attempt mem::wire::Codec[SignedPolicy].decode(raw, alloc) {
+        Ok(found) => Some(take found)
+        Err(_) => None
+    }
+} signed_of
+
+test the_genesis_policy_is_supervised_and_unsigned for is_genesis {
+    let alloc = testing::world().alloc
+    let genesis = SignedPolicy(policy: Preset.Supervised.policy(version: 1, machine: Array[u8, 16].filled(0), alloc), signature: None)
+    let later = SignedPolicy(policy: Preset.Supervised.policy(version: 2, machine: Array[u8, 16].filled(0), alloc), signature: None)
+    let original = is_genesis(genesis, alloc)
+    let newer = is_genesis(later, alloc)
+    expect original and not newer
+    let policy = Preset.Autonomous.policy(version: 1, machine: Array[u8, 16].filled(0), alloc)
+    let parsed = patterns_parse(policy, alloc)
+    let reached = reaches_agents(policy, alloc)
+    expect parsed and not reached
+} the_genesis_policy_is_supervised_and_unsigned

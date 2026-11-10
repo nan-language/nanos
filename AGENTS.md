@@ -26,6 +26,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `store/` | The `store` package: the store's engine, its log, index trees, item table and blob cache, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol, Views and mappings |
 | `journal/` | The `journal` package: events and the kernel image's kind table, the streams of `/journal`, sources, and the `journal` instance |
 | `keys/` | The `keys` package: the `keys` instance, the machine's keys and the principals' |
+| `policy/` | The `policy` package: the policy's records, presets, patterns and evaluation, and the `policy` instance |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install` and `sandbox` scripts |
