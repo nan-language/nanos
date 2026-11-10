@@ -30,6 +30,7 @@ enum Report {
     Woken
     Ending
     CheckpointFailed(code: text::Fixed[32], bytes: u64)
+    Published(summary: mem::Bytes)
 } Report
 
 /// When the handlers of an instance run, which its watchdog bounds: their start, then how long they took.
@@ -82,7 +83,7 @@ pub fn Driven.run(
     ) -> Ended fails task::Cancelled uses wait {
     let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore) = serving
     let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
-    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Replied, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
+    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
     let signal = pending.signal.share()
     let replier = sys::Minter[Replier, Pending, u8].of(take pending, alloc)
@@ -125,7 +126,7 @@ pub fn Driven.run(
         let queued = replies.share()
         let ringing = signal.share()
         discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
-            try await hand_replies(queued, signal: ringing, reports: answering, incarnation)
+            try await hand_over(queued, signal: ringing, reports: answering, incarnation)
         })
         try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), clock, reports, marks, steps, finished, incarnation, alloc)
     })
@@ -439,18 +440,18 @@ impl Replier: sys::RunnerService
 
 /// The replies of an incarnation's postponed requests waiting for its driver, the signal its replies post, whether its checkpoints are kept and one is asked for, and where the replies' copies are drawn from.
 struct Pending {
-    replies: mem::Shared[hw::SpinLock[mem::Bounded[Replied, QUEUED_REPLIES]]]
+    replies: mem::Shared[hw::SpinLock[mem::Bounded[Handed, QUEUED_REPLIES]]]
     signal: mem::Shared[hw::Signal[Unit]]
     keeps: bool
     syncing: mem::Shared[core::atomic::AtomicBool]
     alloc: mem::Alloc
 } Pending
 
-/// The reply to the request an incarnation's driver numbered `request`.
-struct Replied {
-    request: u64
-    reply: sys::Encoded
-} Replied
+/// What the component hands its driver: the reply to the request the driver numbered `request`, or the summary it published.
+enum Handed {
+    Reply(request: u64, reply: sys::Encoded)
+    Summary(bytes: mem::Bytes)
+} Handed
 
 /// Queues the reply to the request `request` for the driver: its bytes, as replies carry no handles; unknown when it carries some or the queue is full.
 pub fn Replier.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
@@ -460,28 +461,33 @@ pub fn Replier.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::H
     let queued = sys::reach(self, body: fn(state: Pending, record: u8) -> bool {
         var reply = sys::Encoded.empty(state.alloc)
         mut reply.bytes.append(bytes)
-        var held = Some(Replied(request: request, reply: take reply))
-        return hw::without_irqs(fn[mut held](t: hw::IrqsDisabled) -> bool limits notrap {
-            let fitted = state.replies.contents().with(t, body: fn[mut held](mut queue: mem::Bounded[Replied, QUEUED_REPLIES]) -> bool limits notrap, terminates, noalloc {
-                let Some(replied) = mut held.extract() else {
-                    return false
-                }
-                if queue.is_full() {
-                    return false
-                }
-                mut queue.push(take replied)
-                return true
-            })
-            if fitted {
-                state.signal.contents().post(t, value: Unit)
-            }
-            return fitted
-        })
+        return state.hand(handed: Handed.Reply(request: request, reply: take reply))
     })
     if queued != Some(true) {
         fail sys::RunnerError.Unknown
     }
 } Replier.reply
+
+/// Queues `handed` for the driver and posts the signal; whether the queue had room.
+fn Pending.hand(self, take handed: Handed) -> bool {
+    var held = Some(take handed)
+    return hw::without_irqs(fn[mut held](t: hw::IrqsDisabled) -> bool limits notrap {
+        let fitted = self.replies.contents().with(t, body: fn[mut held](mut queue: mem::Bounded[Handed, QUEUED_REPLIES]) -> bool limits notrap, terminates, noalloc {
+            let Some(next) = mut held.extract() else {
+                return false
+            }
+            if queue.is_full() {
+                return false
+            }
+            mut queue.push(take next)
+            return true
+        })
+        if fitted {
+            self.signal.contents().post(t, value: Unit)
+        }
+        return fitted
+    })
+} Pending.hand
 
 pub fn Replier.send_to(
     self,
@@ -504,8 +510,16 @@ pub fn Replier.call(
     fail sys::RunnerError.Unknown
 } Replier.call
 
+/// Queues the component's summary for the driver, which publishes it with the instance's record; unknown when the queue is full.
 pub fn Replier.publish(self, summary: Slice[u8]) fails sys::RunnerError limits stack 4_096 {
-    fail sys::RunnerError.Unknown
+    let queued = sys::reach(self, body: fn(state: Pending, record: u8) -> bool {
+        var bytes = mem::Bytes.empty(state.alloc)
+        mut bytes.append(summary)
+        return state.hand(handed: Handed.Summary(bytes: take bytes))
+    })
+    if queued != Some(true) {
+        fail sys::RunnerError.Unknown
+    }
 } Replier.publish
 
 /// Asks for a checkpoint of the component once it is idle; unknown when the instance keeps none.
@@ -541,20 +555,24 @@ pub fn Replier.put_resource(self, id: u64, take resource: sys::Held) fails sys::
     fail sys::RunnerError.Unknown
 } Replier.put_resource
 
-/// Hands the driver each reply `replies` queues, as `signal` tells it they come, until cancelled.
-fn hand_replies(replies: mem::Shared[hw::SpinLock[mem::Bounded[Replied, QUEUED_REPLIES]]], signal: mem::Shared[hw::Signal[Unit]], reports: task::Sender[Input], incarnation: u64) fails task::Cancelled uses wait {
+/// Hands the driver each reply and summary `replies` queues, as `signal` tells it they come, until cancelled.
+fn hand_over(replies: mem::Shared[hw::SpinLock[mem::Bounded[Handed, QUEUED_REPLIES]]], signal: mem::Shared[hw::Signal[Unit]], reports: task::Sender[Input], incarnation: u64) fails task::Cancelled uses wait {
     loop {
         try await signal.contents().wait()
         loop {
-            let next = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Replied] limits notrap {
-                return replies.contents().with(t, body: fn(mut queue: mem::Bounded[Replied, QUEUED_REPLIES]) -> Option[Replied] limits notrap, terminates, noalloc {
+            let next = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Handed] limits notrap {
+                return replies.contents().with(t, body: fn(mut queue: mem::Bounded[Handed, QUEUED_REPLIES]) -> Option[Handed] limits notrap, terminates, noalloc {
                     return mut queue.pop()
                 })
             })
-            let Some(Replied(request: request, reply: reply)) = next else {
+            let Some(handed) = next else {
                 break
             }
-            try await tell(reports, incarnation, report: Report.Answered(id: request, answer: os::Answer.Replied(take reply)))
+            let report = match handed {
+                Handed.Reply(request: request, reply: reply) => Report.Answered(id: request, answer: os::Answer.Replied(take reply))
+                Handed.Summary(bytes: bytes) => Report.Published(summary: take bytes)
+            }
+            try await tell(reports, incarnation, take report)
         }
     }
-} hand_replies
+} hand_over

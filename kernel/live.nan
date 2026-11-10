@@ -1,0 +1,273 @@
+//! The board: the core's task holding the latest record each provider published below `/live`, which computes `/live/status` from them and the clocks when it is read.
+
+/// The path of the record the board computes.
+const LIVE_STATUS: Str = "/live/status"
+
+/// The dir of the records of instances.
+const LIVE_INSTANCES: Str = "/live/instances/"
+
+/// The path of the store's record.
+const LIVE_STORE: Str = "/live/store"
+
+/// What `/live/status` reads besides the records: the generation booted and its mode, and the clocks.
+struct Origin derives Copy {
+    generation: u64
+    mode: os::BootMode
+    clock: sys::Clock
+    wall: ident::Wall
+} Origin
+
+/// The origin the handoff record `handoff` tells.
+fn Origin.of(handoff: bootfmt::Handoff, clock: sys::Clock, wall: ident::Wall) -> Origin {
+    let mode = match bootfmt::Mode.checked_from_bits(handoff.mode) {
+        Some(bootfmt::Mode.Trial) => os::BootMode.Trial
+        Some(bootfmt::Mode.Recovery) => os::BootMode.Recovery
+        Some(bootfmt::Mode.Dev) => os::BootMode.Dev
+        else => os::BootMode.Normal
+    }
+    return Origin(generation: handoff.generation, mode: mode, clock: clock, wall: wall)
+} Origin.of
+
+/// Holds `machine` and the records published through `postings`, and answers their reads, until every sender is gone.
+fn serve_board(take postings: task::Receiver[os::Posting], origin: Origin, machine: os::Machine, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var records = mem::Map[text::String, os::Published].empty(alloc)
+    var measured = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::Machine].encode(machine, out: mut measured)
+    discard mut records.insert(text::String.of("/live/machine", alloc), value: os::Published(type: text::String.of("os::Machine", alloc), schema: mem::wire::Codec[os::Machine].schema_hash(), bytes: take measured))
+    var receiver = postings
+    loop {
+        let Some(posting) = try await mut receiver.receive() else {
+            return
+        }
+        match posting {
+            os::Posting.Publish(path: path, record: record) => {
+                discard mut records.insert(take path, value: take record)
+            }
+            os::Posting.Withdraw(path: path) => {
+                discard mut records.remove(path)
+            }
+            os::Posting.Get(path: path, reply: reply) => {
+                let found = match path.as_str() == LIVE_STATUS {
+                    true => Some(status_of(records, origin, alloc))
+                    false => match records.get(path) {
+                        Some(record) => Some(os::Published(type: text::String.of(record.type.as_str(), alloc), schema: record.schema, bytes: copy_of(record.bytes.view(), alloc)))
+                        None => None
+                    }
+                }
+                try await answer(reply, value: take found)
+            }
+            os::Posting.List(path: path, after: after, limit: limit, reply: reply) => try await answer(reply, value: children(records, path: path.as_str(), after, limit, alloc))
+        }
+    }
+} serve_board
+
+/// Sends `value` to a reader, which may have stopped waiting.
+fn answer[T: Send](reply: task::Sender[T], take value: T) fails task::Cancelled uses wait {
+    match attempt await reply.send(take value) {
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} answer
+
+/// The children of `path` the records give, and `status` below `/live`, in name order, named after `after`, at most `limit`.
+fn children(
+    records: mem::Map[text::String, os::Published],
+    path: Str,
+    after: Option[text::String],
+    limit: u32,
+    alloc: mem::Alloc,
+    ) -> mem::List[os::LiveEntry] {
+    var prefix = text::String.of(path, alloc)
+    if not prefix.ends_with("/") {
+        mut prefix.push('/')
+    }
+    var entries = mem::List[os::LiveEntry].empty(alloc)
+    if path == "/live" {
+        add_child(mut entries, name: b"status", type: Some(text::String.of("os::LiveStatus", alloc)), parent: false, after, alloc)
+    }
+    for entry in records {
+        let key = entry.key().as_bytes()
+        let Some(parts) = key.split_at(prefix.byte_len()) else {
+            continue
+        }
+        if parts.head != prefix.as_bytes() or parts.tail.len() == 0 {
+            continue
+        }
+        var end: usize = 0
+        while end < parts.tail.len() and parts.tail[end] != b'/' {
+            end += 1
+        }
+        let Some(name) = parts.tail.prefix(end) else {
+            continue
+        }
+        let type = match end == parts.tail.len() {
+            true => Some(text::String.of(entry.value().type.as_str(), alloc))
+            false => None
+        }
+        add_child(mut entries, name, take type, parent: end < parts.tail.len(), after, alloc)
+    }
+    mut entries.truncate(usize.widen(limit))
+    return entries
+} children
+
+/// Adds the child `name` to `entries`, kept in name order, or what it adds to the child already there, unless `name` does not come after `after`.
+fn add_child(
+    mut entries: mem::List[os::LiveEntry],
+    name: Slice[u8],
+    take type: Option[text::String],
+    parent: bool,
+    after: Option[text::String],
+    alloc: mem::Alloc,
+    ) {
+    match after {
+        Some(bound) => {
+            if name <= bound.as_bytes() {
+                return
+            }
+        }
+        None => {
+        }
+    }
+    var at: usize = 0
+    while at < entries.len() and entries[at].name.as_bytes() < name {
+        at += 1
+    }
+    if at < entries.len() and entries[at].name.as_bytes() == name {
+        let os::LiveEntry(name: kept, type: typed, parent: nested) = mut entries.remove(at)
+        let merged = match type {
+            Some(given) => Some(take given)
+            None => typed
+        }
+        mut entries.insert(at, value: os::LiveEntry(name: take kept, type: take merged, parent: nested or parent))
+        return
+    }
+    let named = match attempt text::String.try_from_utf8(name, alloc) {
+        Ok(spelt) => spelt
+        Err(_) => return
+    }
+    mut entries.insert(at, value: os::LiveEntry(name: take named, type: take type, parent: parent))
+} add_child
+
+/// The record of `/live/status` as of now: the instances the records of `/live/instances` count running, converging and failed, and the share of the store's capacity in use its record tells.
+fn status_of(records: mem::Map[text::String, os::Published], origin: Origin, alloc: mem::Alloc) -> os::Published {
+    var counts = os::InstanceCounts(running: 0, converging: 0, failed: 0)
+    var used_pct: u8 = 0
+    for entry in records {
+        if entry.key().starts_with(LIVE_INSTANCES) {
+            let Some(instance) = instance_of(Untrusted.of(entry.value().bytes.view()), alloc) else {
+                continue
+            }
+            if instance.state == os::Lifecycle.Running {
+                counts.running += 1
+            }
+            match instance.status.state {
+                os::ReconcileState.Converging => {
+                    counts.converging += 1
+                }
+                os::ReconcileState.Failed(code: _, detail: _) => {
+                    counts.failed += 1
+                }
+                os::ReconcileState.Converged => {
+                }
+            }
+        } else if entry.key().as_str() == LIVE_STORE {
+            used_pct = used_share(Untrusted.of(entry.value().bytes.view()), alloc)
+        }
+    }
+    let now = journal::elapsed(origin.clock)
+    let status = os::LiveStatus(generation: origin.generation, mode: origin.mode, claimed: false, uptime: now, time: origin.wall.now(origin.clock), instances: counts, approvals: 0, store_used_pct: used_pct, exposures: mem::List.empty(alloc), cursor: ident::Cursor(seq: 0), as_of: now)
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::LiveStatus].encode(status, out: mut bytes)
+    return os::Published(type: text::String.of("os::LiveStatus", alloc), schema: mem::wire::Codec[os::LiveStatus].schema_hash(), bytes: take bytes)
+} status_of
+
+validator fn instance_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[os::LiveInstance] {
+    return match attempt mem::wire::Codec[os::LiveInstance].decode(raw, alloc) {
+        Ok(found) => Some(take found)
+        Err(_) => None
+    }
+} instance_of
+
+/// The share of the store's capacity in use, in percent, that its record `raw` tells.
+validator fn used_share(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> u8 {
+    let Ok(stored) = attempt mem::wire::Codec[store::service::LiveStore].decode(raw, alloc) else {
+        return 0
+    }
+    if stored.capacity == 0 {
+        return 0
+    }
+    return u8.saturate(stored.used.saturating_mul(100) / stored.capacity)
+} used_share
+
+/// The record of `/live/machine` the measured facts `facts` give, the store's device not yet measured, on mains power.
+fn machine_of(facts: Facts) -> os::Machine {
+    let level = match facts.features.level {
+        cpu::Level.X86v1 => os::Level.X86v1
+        cpu::Level.X86v2 => os::Level.X86v2
+        cpu::Level.X86v3 => os::Level.X86v3
+        cpu::Level.X86v4 => os::Level.X86v4
+    }
+    let features = facts.features
+    let conditions = os::Conditions(iommu: false, tpm: facts.conditions.tpm, secure_boot: facts.conditions.secure_boot, user_mode: false, invariant_tsc: features.invariant_tsc, tsc_deadline: features.tsc_deadline, pcid: features.pcid, pages_1g: features.pages_1g, mwait: features.mwait, watchdog: false, nic: false, meltdown_immune: features.meltdown_immune)
+    return os::Machine(arch: os::Arch.Amd64, conditions: conditions, ram_bytes: facts.ram_bytes, cpus: facts.cpus, level: level, smt: features.smt, numa_nodes: facts.nodes, storage: os::Storage.File, power: os::PowerSource.Mains)
+} machine_of
+
+fn copy_of(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copied = mem::Bytes.empty(alloc)
+    mut copied.append(bytes)
+    return copied
+} copy_of
+
+/// An instance's record in `state`, reconciled as `reconciled`.
+fn instance_record(state: os::Lifecycle, take reconciled: os::ReconcileState, alloc: mem::Alloc) -> os::LiveInstance {
+    let durability = os::Durability(class: os::DurabilityClass.Volatile, epoch_s: None, max_bytes: 1_048_576)
+    return os::LiveInstance(state: state, status: os::ReconcileStatus(state: take reconciled, desired: 0, since: ident::WallTime.unknown()), bundle: ident::HashValue(bytes: Array[u8, 33].filled(1)), space: text::String.of("shared", alloc), durability: durability, restarts: 0, fault: None, intake: 0, memory: os::Usage(charged: 0, limit: 65_536, peak: 0), cpu_ns: 0, probation: None, summary: None, as_of: 0)
+} instance_record
+
+validator fn running_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Array[u32, 2] {
+    var counts = Array[u32, 2].filled(0)
+    match attempt mem::wire::Codec[os::LiveStatus].decode(raw, alloc) {
+        Ok(status) => {
+            counts[0] = status.instances.running
+            counts[1] = status.instances.failed
+        }
+        Err(_) => {
+        }
+    }
+    return counts
+} running_of
+
+test boards_list_what_providers_publish_and_count_instances_in_the_status for serve_board {
+    let world = testing::world()
+    let alloc = world.alloc
+    let task::Channel(sender: posted, receiver: postings) = task::Channel[os::Posting].bounded(4, alloc)
+    let origin = Origin(generation: 3, mode: os::BootMode.Dev, clock: world.clock, wall: ident::Wall(at: ident::WallTime.unknown(), since_ns: 0))
+    let conditions = os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false)
+    let machine = os::Machine(arch: os::Arch.Amd64, conditions: conditions, ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains)
+    let living = os::MintedLive.of(posted, own: "/live/store", alloc)
+    defer take living.close()
+    let live = living.mint()
+    var given = Some(take postings)
+    try await task::scope(world.exec, body: fn[mut given](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(board) = mut given.extract() else {
+            return
+        }
+        discard s.spawn(fn[take board]() fails task::Cancelled uses wait limits stack 32_768 {
+            try await serve_board(take board, origin, machine, alloc)
+        })
+        try await os::publish(posted, path: "/live/instances/a", type: "os::LiveInstance", value: instance_record(os::Lifecycle.Running, reconciled: os::ReconcileState.Converged, alloc), alloc)
+        try await os::publish(posted, path: "/live/instances/b", type: "os::LiveInstance", value: instance_record(os::Lifecycle.Failed, reconciled: os::ReconcileState.Failed(code: text::String.of("trap.unreachable", alloc), detail: text::String.empty(alloc)), alloc), alloc)
+        let top = try await live.list("/live", after: None, limit: 8, alloc)
+        let instances = try await live.list("/live/instances", after: Some(text::String.of("a", alloc)), limit: 8, alloc)
+        let Some(status) = try await live.get(LIVE_STATUS, alloc) else {
+            expect false
+            return
+        }
+        let counts = running_of(Untrusted.of(status.bytes.view()), alloc)
+        expect top.len() == 3 and top[0].name.as_str() == "instances" and top[0].parent and top[1].name.as_str() == "machine" and top[2].name.as_str() == "status"
+        expect instances.len() == 1 and instances[0].name.as_str() == "b"
+        expect counts[0] == 1 and counts[1] == 1
+        s.cancel()
+    })
+} boards_list_what_providers_publish_and_count_instances_in_the_status

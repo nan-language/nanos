@@ -1,0 +1,249 @@
+//! `/live`: the records its providers publish there, what the core's board holding them takes, and the `Live` capability through which `store` reads them and a provider publishes below its own path.
+
+/// A record published below `/live`: its type's canonical name and schema hash, and its encoding.
+pub closed struct Published {
+    pub type: text::String
+    pub schema: mem::wire::SchemaHash
+    pub bytes: mem::Bytes
+} Published
+
+/// A child of a node of `/live`: its name, the type of the record it holds, and whether nodes lie below it.
+pub closed struct LiveEntry {
+    pub name: text::String
+    pub type: Option[text::String]
+    pub parent: bool
+} LiveEntry
+
+/// What the board takes: a record published at a path, the withdrawal of the one at a path, the record at a path, or the children of a path after a name, at most `limit`.
+pub closed enum Posting {
+    Publish(path: text::String, record: Published)
+    Withdraw(path: text::String)
+    Get(path: text::String, reply: task::Sender[Option[Published]])
+    List(path: text::String, after: Option[text::String], limit: u32, reply: task::Sender[mem::List[LiveEntry]])
+} Posting
+
+/// A capability on the board: reading every node of `/live`, and publishing the records below its own path.
+pub open struct Live {
+} Live
+
+impl Live: sys::Kind[Board, u8]
+
+/// Where a `Live` capability's postings go, and the path below which it publishes.
+struct Board {
+    postings: task::Sender[Posting]
+    own: text::String
+} Board
+
+/// The root entry the `Live` capabilities of one provider derive from, revoked when it closes.
+pub open linear struct MintedLive derives Send {
+    minter: sys::Minter[Live, Board, u8]
+} MintedLive
+
+/// A root entry of capabilities posting to `postings` and publishing below `own`.
+pub fn MintedLive.of(postings: task::Sender[Posting], own: Str, alloc: mem::Alloc) -> MintedLive {
+    return MintedLive(minter: sys::Minter[Live, Board, u8].of(Board(postings: postings.split(), own: text::String.of(own, alloc)), alloc))
+} MintedLive.of
+
+pub fn MintedLive.mint(self) -> Live {
+    return self.minter.mint(0)
+} MintedLive.mint
+
+/// Revokes every capability of this root entry.
+pub fn MintedLive.close(take self) {
+    let MintedLive(minter: minter) = self
+    take minter.close()
+} MintedLive.close
+
+/// The record at `path`, `None` when none is published there or the capability is stale.
+pub fn Live.get(self, path: Str, alloc: mem::Alloc) -> Option[Published] fails task::Cancelled uses wait {
+    let Some(postings) = sys::reach(self, body: fn(state: Board, record: u8) => state.postings.split()) else {
+        return None
+    }
+    let task::Channel(sender: reply, receiver: replies) = task::Channel[Option[Published]].bounded(1, alloc)
+    try await post(postings, posting: Posting.Get(path: text::String.of(path, alloc), reply: take reply))
+    var receiver = replies
+    let Some(found) = try await mut receiver.receive() else {
+        return None
+    }
+    return found
+} Live.get
+
+/// The children of `path` named after `after`, at most `limit`; none when the capability is stale.
+pub fn Live.list(
+    self,
+    path: Str,
+    take after: Option[text::String],
+    limit: u32,
+    alloc: mem::Alloc,
+    ) -> mem::List[LiveEntry] fails task::Cancelled uses wait {
+    let Some(postings) = sys::reach(self, body: fn(state: Board, record: u8) => state.postings.split()) else {
+        return mem::List.empty(alloc)
+    }
+    let task::Channel(sender: reply, receiver: replies) = task::Channel[mem::List[LiveEntry]].bounded(1, alloc)
+    try await post(postings, posting: Posting.List(path: text::String.of(path, alloc), after: take after, limit: limit, reply: take reply))
+    var receiver = replies
+    let Some(found) = try await mut receiver.receive() else {
+        return mem::List.empty(alloc)
+    }
+    return found
+} Live.list
+
+/// Publishes `value` of the type named `type` as the record at the capability's own path; nothing once it is stale.
+pub fn Live.publish[T: Encode](self, type: Str, value: T, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(postings) = sys::reach(self, body: fn(state: Board, record: u8) => state.postings.split()) else {
+        return
+    }
+    let Some(own) = sys::reach(self, body: fn(state: Board, record: u8) => text::String.of(state.own.as_str(), alloc)) else {
+        return
+    }
+    try await publish(postings, path: own.as_str(), type, value, alloc)
+} Live.publish
+
+/// Posts `value` of the type named `type` as the record at `path`.
+pub fn publish[T: Encode](
+    postings: task::Sender[Posting],
+    path: Str,
+    type: Str,
+    value: T,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[T].encode(value, out: mut bytes)
+    let record = Published(type: text::String.of(type, alloc), schema: mem::wire::Codec[T].schema_hash(), bytes: take bytes)
+    try await post(postings, posting: Posting.Publish(path: text::String.of(path, alloc), record: take record))
+} publish
+
+/// Posts `posting` to the board; nothing once it no longer listens.
+pub fn post(postings: task::Sender[Posting], take posting: Posting) fails task::Cancelled uses wait {
+    match attempt await postings.send(take posting) {
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} post
+
+/// The state of an instance's reconciliation, `failed` with the code and the detail of its failure.
+pub closed enum ReconcileState derives Eq, Encode {
+    Converged
+    Converging
+    Failed(code: text::String, detail: text::String)
+} ReconcileState
+
+/// How far a reconciled node is from its desired value: its state, the commit of the desired value it acts on, and the time of its last change.
+pub closed struct ReconcileStatus derives Eq, Encode {
+    pub state: ReconcileState
+    pub desired: u64
+    pub since: ident::WallTime
+} ReconcileStatus
+
+/// A cell's charge, limit and peak in bytes.
+pub closed struct Usage derives Copy, Eq, Encode {
+    pub charged: u64
+    pub limit: u64
+    pub peak: u64
+} Usage
+
+/// The record of `/live/instances/<moniker>`.
+pub closed struct LiveInstance derives Eq, Encode {
+    pub state: Lifecycle
+    pub status: ReconcileStatus
+    pub bundle: ident::HashValue
+    pub space: text::String
+    pub durability: Durability
+    pub restarts: u32
+    pub fault: Option[text::String]
+    pub intake: u32
+    pub memory: Usage
+    pub cpu_ns: u64
+    pub probation: Option[ident::WallTime]
+    pub summary: Option[mem::Bytes]
+    pub as_of: u64
+} LiveInstance
+
+/// The instances that run, converge and failed.
+pub closed struct InstanceCounts derives Copy, Eq, Encode {
+    pub running: u32
+    pub converging: u32
+    pub failed: u32
+} InstanceCounts
+
+/// The boot mode of the running generation.
+pub closed enum BootMode derives Copy, Eq, Encode {
+    Normal
+    Trial
+    Recovery
+    Dev
+} BootMode
+
+/// The record of `/live/status`.
+pub closed struct LiveStatus derives Eq, Encode {
+    pub generation: u64
+    pub mode: BootMode
+    pub claimed: bool
+    pub uptime: u64
+    pub time: ident::WallTime
+    pub instances: InstanceCounts
+    pub approvals: u32
+    pub store_used_pct: u8
+    pub exposures: mem::List[text::String]
+    pub cursor: ident::Cursor
+    pub as_of: u64
+} LiveStatus
+
+pub closed enum Arch derives Copy, Eq, Encode {
+    Amd64
+    Aarch64
+} Arch
+
+/// The machine conditions, one field per condition, its hyphens written `_`.
+pub closed struct Conditions derives Copy, Eq, Encode {
+    pub iommu: bool
+    pub tpm: bool
+    pub secure_boot: bool
+    pub user_mode: bool
+    pub invariant_tsc: bool
+    pub tsc_deadline: bool
+    pub pcid: bool
+    pub pages_1g: bool
+    pub mwait: bool
+    pub watchdog: bool
+    pub nic: bool
+    pub meltdown_immune: bool
+} Conditions
+
+pub closed enum Storage derives Copy, Eq, Encode {
+    Nvme
+    Ssd
+    Rotational
+    Flash
+    Virtual
+    File
+} Storage
+
+pub closed enum PowerSource derives Copy, Eq, Encode {
+    Mains
+    Battery
+} PowerSource
+
+/// A machine's instruction-set level: the x86-64 levels 1 to 4 of the System V psABI, Armv8.0-A and Armv8.2-A with the dot product instructions.
+pub closed enum Level derives Copy, Eq, Ord, Encode {
+    X86v1
+    X86v2
+    X86v3
+    X86v4
+    Armv80
+    Armv82
+} Level
+
+/// The record of `/live/machine`: the facts the kernel measures at start.
+pub closed struct Machine derives Copy, Eq, Encode {
+    pub arch: Arch
+    pub conditions: Conditions
+    pub ram_bytes: u64
+    pub cpus: u32
+    pub level: Level
+    pub smt: bool
+    pub numa_nodes: u32
+    pub storage: Storage
+    pub power: PowerSource
+} Machine

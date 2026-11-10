@@ -43,6 +43,7 @@ struct Base derives Copy {
     boot: devices::BootVolume
     isa: Array[acpi::IsaRoute, 16]
     reporter: store::service::Reporter
+    live: os::Live
     wall: ident::Wall
     handoff: bootfmt::Handoff
 } Base
@@ -308,7 +309,7 @@ fn Base.serve_store(self, take world: nanos::World, take serving: runner::Servin
         return runner::Ended.EnvIncomplete
     }
     let genesis = genesis_record(self.bundle, generation: self.handoff.generation, alloc)
-    let env = store::service::Env.of(volume, take genesis, boot: boot_record(self.handoff, alloc), clock: world.clock, wall: self.wall, random: world.random, reporter: self.reporter, alloc)
+    let env = store::service::Env.of(volume, take genesis, boot: boot_record(self.handoff, alloc), clock: world.clock, wall: self.wall, random: world.random, reporter: self.reporter, live: self.live, alloc)
     return try await runner::Driven[store::service::Service, store::service::Env, store::service::Store].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: store::service::Env) limits stack 8_192 {
     })
 } Base.serve_store
@@ -452,7 +453,7 @@ fn boot_record(handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::
     return store::service::TypedValue(type: store::TypeRef.of(BOOT_STATE_TYPE, schema: mem::wire::Codec[bootfmt::BootState].schema_hash(), alloc), bytes: take bytes)
 } boot_record
 
-/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames` and prints each event `rings` record; it never ends unless cancelled.
+/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames`, prints each event `rings` record and holds the board of `/live`, `machine` its first record; it never ends unless cancelled.
 fn run_base(
     take known: runner::Known,
     take keeper: keeper::Keeper,
@@ -460,6 +461,7 @@ fn run_base(
     boot: devices::BootVolume,
     isa: Array[acpi::IsaRoute, 16],
     handoff: bootfmt::Handoff,
+    machine: os::Machine,
     config: runner::Config,
     rings: journal::Rings,
     mut frames: frames::Frames,
@@ -471,14 +473,21 @@ fn run_base(
     let task::Channel(sender: reported, receiver: reports) = task::Channel[store::service::Report].bounded(16, alloc: config.alloc)
     let reporting = store::service::MintedReporter.of(reported, alloc: config.alloc)
     defer take reporting.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), wall: config.wall, handoff: handoff)
+    let task::Channel(sender: posted, receiver: postings) = task::Channel[os::Posting].bounded(16, alloc: config.alloc)
+    let living = os::MintedLive.of(posted, own: "/live/store", alloc: config.alloc)
+    defer take living.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), live: living.mint(), wall: config.wall, handoff: handoff)
     var requested = incoming
-    var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports))
+    var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings))
     defer abandon_given(take given)
     try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Given(known: genesis, reservations: reserver, keeper: held, orders: root_orders, store_events: store_events)) = mut given.extract() else {
+        let Some(Given(known: genesis, reservations: reserver, keeper: held, orders: root_orders, store_events: store_events, postings: board)) = mut given.extract() else {
             return
         }
+        let origin = Origin.of(handoff, clock: config.clock, wall: config.wall)
+        discard s.spawn(fn[take board]() fails task::Cancelled uses wait limits stack 32_768 {
+            try await serve_board(take board, origin, machine, alloc: config.alloc)
+        })
         discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
             try await print_events(rings, exec: config.exec, alloc: config.alloc)
         })
@@ -500,7 +509,7 @@ fn run_base(
             try await keeper::relay_slots(signal, take inputs)
         })
         discard s.spawn(fn[take genesis, take reserver]() fails task::Cancelled uses wait limits stack 65_536 {
-            discard try await runner::run(take genesis, components: base, journal: rings, reservations: take reserver, config, body: fn(core: runner::Core) fails task::Cancelled uses wait {
+            discard try await runner::run(take genesis, components: base, journal: rings, reservations: take reserver, config, postings: posted, body: fn(core: runner::Core) fails task::Cancelled uses wait {
                 discard attempt await core.control.start(moniker("supervisor"), alloc: config.alloc)
                 let parked = hw::Signal[Unit].empty()
                 loop {
@@ -530,7 +539,7 @@ fn record_store_events(take reports: task::Receiver[store::service::Report], rin
 fn abandon_given(take given: Option[Given]) {
     match given {
         Some(left) => {
-            let Given(known: _, reservations: _, keeper: kept, orders: _, store_events: _) = left
+            let Given(known: _, reservations: _, keeper: kept, orders: _, store_events: _, postings: _) = left
             take kept.release()
         }
         None => {
@@ -538,13 +547,14 @@ fn abandon_given(take given: Option[Given]) {
     }
 } abandon_given
 
-/// What the tasks of `run_base` take: the genesis record and the reservations the runner makes, the keeper with the device root's orders, and the events the store reports.
+/// What the tasks of `run_base` take: the genesis record and the reservations the runner makes, the keeper with the device root's orders, the events the store reports, and the postings to the board.
 linear struct Given {
     known: runner::Known
     reservations: Reserver
     keeper: keeper::Keeper
     orders: task::Receiver[devices::RootOrder]
     store_events: task::Receiver[store::service::Report]
+    postings: task::Receiver[os::Posting]
 } Given
 
 /// A reserved instance's request for a region of `bytes`, and where the store over it goes, `None` when no free range holds one.
@@ -645,8 +655,12 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unreported
     let reporting = store::service::MintedReporter.of(reported, alloc)
     defer take reporting.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty())
-    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
+    let task::Channel(sender: posted, receiver: unposted) = task::Channel[os::Posting].bounded(1, alloc)
+    discard unposted
+    let living = os::MintedLive.of(posted, own: "/live/store", alloc)
+    defer take living.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty())
+    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)
         return started

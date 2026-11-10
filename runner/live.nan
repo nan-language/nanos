@@ -1,0 +1,103 @@
+//! What the runner publishes of each instance at `/live/instances/<moniker>`, whenever what it shows changes.
+
+/// What a driver publishes of its instance besides its lifecycle and specification: the code of its last fault, the summary its component last published, the counts of each, when what it shows last changed, and what it last showed.
+struct Showing {
+    fault: Option[text::String]
+    faults: u64
+    summary: Option[mem::Bytes]
+    summaries: u64
+    since: ident::WallTime
+    shown: Option[Shown]
+} Showing
+
+/// What a published record of an instance follows: its lifecycle, whether its specification has it stopped, its restarts in the period, and the counts of its faults and summaries.
+struct Shown derives Copy, Eq {
+    lifecycle: Option[os::Lifecycle]
+    stopped: bool
+    restarts: usize
+    faults: u64
+    summaries: u64
+} Shown
+
+/// What a driver shows of an instance before its first start.
+fn Showing.none() -> Showing {
+    return Showing(fault: None, faults: 0, summary: None, summaries: 0, since: ident::WallTime.unknown(), shown: None)
+} Showing.none
+
+/// Notes the fault of code `code`.
+fn Showing.faulted(mut self, take code: text::String) {
+    self.fault = Some(take code)
+    self.faults += 1
+} Showing.faulted
+
+/// Notes the summary the component published.
+fn Showing.summarize(mut self, take bytes: mem::Bytes) {
+    self.summary = Some(take bytes)
+    self.summaries += 1
+} Showing.summarize
+
+/// Publishes the record of the instance when what it shows changed since the driver last published it.
+fn Shared.show(self, mut driver: Driver) fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    let seen = Shown(lifecycle: driver.lifecycle, stopped: driver.spec.stopped, restarts: driver.restarts.times.len(), faults: driver.showing.faults, summaries: driver.showing.summaries)
+    if driver.showing.shown == Some(seen) {
+        return
+    }
+    if lifecycle_changed(driver.showing.shown, seen) {
+        driver.showing.since = self.config.wall.now(self.config.clock)
+    }
+    driver.showing.shown = Some(seen)
+    let state = driver.lifecycle.value_or(os::Lifecycle.Stopped)
+    let fault = match driver.showing.fault {
+        Some(code) => Some(text::String.of(code.as_str(), alloc))
+        None => None
+    }
+    let summary = match driver.showing.summary {
+        Some(bytes) => Some(copied(bytes.view(), alloc))
+        None => None
+    }
+    let record = os::LiveInstance(state: state, status: os::ReconcileStatus(state: reconciled(state, stopped: driver.spec.stopped, fault: driver.showing.fault, alloc), desired: 0, since: driver.showing.since), bundle: driver.spec.bundle, space: text::String.of("shared", alloc), durability: driver.spec.durability, restarts: u32.fit(driver.restarts.times.len()), fault: take fault, intake: u32.saturate(driver.queue.len()), memory: os::Usage(charged: 0, limit: driver.spec.budget.limit, peak: 0), cpu_ns: 0, probation: None, summary: take summary, as_of: now(self.config.clock))
+    try await os::publish(self.postings, path: instance_path(driver.moniker, alloc).as_str(), type: "os::LiveInstance", value: record, alloc)
+} Shared.show
+
+/// Withdraws the record of the deleted instance `moniker`.
+fn Shared.unshow(self, moniker: ident::Moniker) fails task::Cancelled uses wait {
+    try await os::post(self.postings, posting: os::Posting.Withdraw(path: instance_path(moniker, alloc: self.config.alloc)))
+} Shared.unshow
+
+/// Whether `seen` shows another lifecycle or stop than `before`.
+fn lifecycle_changed(before: Option[Shown], seen: Shown) -> bool {
+    let Some(shown) = before else {
+        return true
+    }
+    return shown.lifecycle != seen.lifecycle or shown.stopped != seen.stopped
+} lifecycle_changed
+
+/// The reconciliation an instance in `state` shows: converged when running or hibernated, or stopped as its specification asks; failed when failed, with the code of its last fault; converging otherwise.
+fn reconciled(state: os::Lifecycle, stopped: bool, fault: Option[text::String], alloc: mem::Alloc) -> os::ReconcileState {
+    return match state {
+        os::Lifecycle.Running or os::Lifecycle.Hibernated => os::ReconcileState.Converged
+        os::Lifecycle.Stopped => match stopped {
+            true => os::ReconcileState.Converged
+            false => os::ReconcileState.Converging
+        }
+        os::Lifecycle.Failed => os::ReconcileState.Failed(code: match fault {
+            Some(code) => text::String.of(code.as_str(), alloc)
+            None => text::String.of("instance.failed", alloc)
+        }, detail: text::String.empty(alloc))
+        else => os::ReconcileState.Converging
+    }
+} reconciled
+
+/// The path of the record of the instance `moniker`.
+fn instance_path(moniker: ident::Moniker, alloc: mem::Alloc) -> text::String {
+    var path = text::String.of("/live/instances/", alloc)
+    mut path.append(moniker.text.as_str())
+    return path
+} instance_path
+
+fn copied(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    return copy
+} copied
