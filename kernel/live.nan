@@ -1,4 +1,4 @@
-//! The board: the core's task holding the latest record each provider published below `/live`, which computes `/live/status` from them and the clocks, and the records of `/live/cpus` from the scheduler's state, when they are read.
+//! The board: the core's task holding the latest record each provider published below `/live`, which computes `/live/status` from them and the clocks, the records of `/live/cpus` from the scheduler's state, and the counters of `/live/instances` and `/live/accounts` from the gauges of the running incarnations, when they are read.
 
 /// The path of the record the board computes.
 const LIVE_STATUS: Str = "/live/status"
@@ -11,6 +11,9 @@ const LIVE_STORE: Str = "/live/store"
 
 /// The path of the security record.
 const LIVE_SECURITY: Str = "/live/security"
+
+/// The dir of the records of accounts.
+const LIVE_ACCOUNTS: Str = "/live/accounts/"
 
 /// The dir of the records of CPUs.
 const LIVE_CPUS: Str = "/live/cpus"
@@ -37,42 +40,141 @@ fn Origin.of(handoff: bootfmt::Handoff, clock: sys::Clock, wall: ident::Wall) ->
     return Origin(generation: handoff.generation, mode: mode, clock: clock, wall: wall)
 } Origin.of
 
-/// Holds `machine`, `security` and the records published through `postings`, a withdrawal taking those below its path too, and answers their reads and those of the CPUs of `cpus`, until every sender is gone.
+/// Holds `machine`, `security` and the records published through `postings`, a withdrawal taking those below its path too, and answers their reads, those of the CPUs of `cpus` and those of the accounts and counters `gauges` reads, these on tasks of its own through `exec`, until every sender is gone.
 fn serve_board(
     take postings: task::Receiver[os::Posting],
     origin: Origin,
     machine: os::Machine,
     take security: os::LiveSecurity,
     cpus: mem::Shared[sched::State],
+    gauges: runner::Gauges,
+    exec: task::Executor,
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
     var records = mem::Map[text::String, os::Published].empty(alloc)
     discard mut records.insert(text::String.of("/live/machine", alloc), value: os::published("os::Machine", value: machine, alloc))
     discard mut records.insert(text::String.of(LIVE_SECURITY, alloc), value: os::published("os::LiveSecurity", value: security, alloc))
     var receiver = postings
-    loop {
-        let Some(posting) = try await mut receiver.receive() else {
-            return
-        }
-        match posting {
-            os::Posting.Publish(path: path, record: record) => {
-                discard mut records.insert(take path, value: take record)
+    try await task::scope(exec, body: fn[mut records, mut receiver](s: task::Scope) fails task::Cancelled uses wait {
+        loop {
+            let Some(posting) = try await mut receiver.receive() else {
+                s.cancel()
+                return
             }
-            os::Posting.Withdraw(path: path) => withdraw(mut records, path: path.as_str(), alloc)
-            os::Posting.Get(path: path, reply: reply) => {
-                let found = match path.as_str() == LIVE_STATUS {
-                    true => Some(status_of(records, origin, alloc))
-                    false => match records.get(path) {
-                        Some(record) => Some(os::Published(type: text::String.of(record.type.as_str(), alloc), schema: record.schema, bytes: copy_of(record.bytes.view(), alloc)))
-                        None => cpu_at(cpus.contents(), path: path.as_str(), origin, alloc)
+            match posting {
+                os::Posting.Publish(path: path, record: record) => {
+                    discard mut records.insert(take path, value: take record)
+                }
+                os::Posting.Withdraw(path: path) => withdraw(mut records, path: path.as_str(), alloc)
+                os::Posting.Get(path: path, reply: reply) => {
+                    match gauged_at(records, path: path.as_str(), alloc) {
+                        Some(wanted) => {
+                            let reading = gauges.share()
+                            discard s.spawn(fn[take wanted, take reading, take reply]() fails task::Cancelled uses wait limits stack 16_384 {
+                                let found = try await read_gauged(reading, take wanted, origin, alloc)
+                                try await answer(reply, value: take found)
+                            })
+                        }
+                        None => try await answer(reply, value: read_at(records, cpus: cpus.contents(), path: path.as_str(), origin, alloc))
                     }
                 }
-                try await answer(reply, value: take found)
+                os::Posting.List(path: path, after: after, limit: limit, reply: reply) => {
+                    var accounts = mem::List[text::String].empty(alloc)
+                    if path.as_str() == "/live/accounts" {
+                        accounts = try await gauges.instances(alloc)
+                    }
+                    try await answer(reply, value: children(records, accounts, cpus: cpus.contents().count(), path: path.as_str(), after, limit, alloc))
+                }
             }
-            os::Posting.List(path: path, after: after, limit: limit, reply: reply) => try await answer(reply, value: children(records, cpus: cpus.contents().count(), path: path.as_str(), after, limit, alloc))
+        }
+    })
+} serve_board
+
+/// What a read needs from the gauge of an instance's running incarnation: its account, or the counters of the record its provider published.
+enum Gauged {
+    Account(instance: text::String)
+    Instance(instance: text::String, record: os::Published)
+} Gauged
+
+/// What a read of `path` needs from a gauge, `None` when it needs none.
+fn gauged_at(records: mem::Map[text::String, os::Published], path: Str, alloc: mem::Alloc) -> Option[Gauged] {
+    match name_below(path, dir: LIVE_ACCOUNTS, alloc) {
+        Some(named) => return Some(Gauged.Account(instance: take named))
+        None => {
         }
     }
-} serve_board
+    let Some(named) = name_below(path, dir: LIVE_INSTANCES, alloc) else {
+        return None
+    }
+    let Some(record) = records.get(text::String.of(path, alloc)) else {
+        return None
+    }
+    return Some(Gauged.Instance(instance: take named, record: os::Published(type: text::String.of(record.type.as_str(), alloc), schema: record.schema, bytes: copy_of(record.bytes.view(), alloc))))
+} gauged_at
+
+/// The record a read of what `wanted` needs gives as `gauges` reads it now: an instance's account, `None` when no incarnation of it runs, or its published record with the counters of its running incarnation.
+fn read_gauged(gauges: runner::Gauges, take wanted: Gauged, origin: Origin, alloc: mem::Alloc) -> Option[os::Published] fails task::Cancelled uses wait {
+    match wanted {
+        Gauged.Account(instance: instance) => {
+            let Some(gauge) = try await gauges.read(instance.as_str(), alloc) else {
+                return None
+            }
+            let memory = gauge.memory
+            let account = os::Account(cpu_ns: gauge.cpu_ns, wakeups: 0, io_bytes: 0, energy_mj: 0, throttled: false, class: gauge.class, charge: memory.charged, peak: memory.peak, limit: memory.limit, as_of: journal::elapsed(origin.clock))
+            return Some(os::published("os::Account", value: account, alloc))
+        }
+        Gauged.Instance(instance: instance, record: record) => {
+            let Some(gauge) = try await gauges.read(instance.as_str(), alloc) else {
+                return Some(take record)
+            }
+            let Some(published) = instance_of(Untrusted.of(record.bytes.view()), alloc) else {
+                return Some(take record)
+            }
+            var gauged = published
+            gauged.intake = gauge.intake
+            gauged.memory = gauge.memory
+            gauged.cpu_ns = gauge.cpu_ns
+            gauged.as_of = journal::elapsed(origin.clock)
+            return Some(os::published("os::LiveInstance", value: gauged, alloc))
+        }
+    }
+} read_gauged
+
+/// The record at `path` as of now: the status or a CPU computed, or the record a provider published.
+fn read_at(
+    records: mem::Map[text::String, os::Published],
+    cpus: sched::State,
+    path: Str,
+    origin: Origin,
+    alloc: mem::Alloc,
+    ) -> Option[os::Published] {
+    if path == LIVE_STATUS {
+        return Some(status_of(records, origin, alloc))
+    }
+    return match records.get(text::String.of(path, alloc)) {
+        Some(record) => Some(os::Published(type: text::String.of(record.type.as_str(), alloc), schema: record.schema, bytes: copy_of(record.bytes.view(), alloc)))
+        None => cpu_at(cpus, path, origin, alloc)
+    }
+} read_at
+
+/// The name that `path` holds directly below `dir`, `None` when it lies elsewhere.
+fn name_below(path: Str, dir: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(parts) = path.as_bytes().split_at(dir.as_bytes().len()) else {
+        return None
+    }
+    if parts.head != dir.as_bytes() or parts.tail.len() == 0 {
+        return None
+    }
+    for byte in parts.tail {
+        if byte == b'/' {
+            return None
+        }
+    }
+    return match attempt text::String.try_from_utf8(parts.tail, alloc) {
+        Ok(name) => Some(take name)
+        Err(_) => None
+    }
+} name_below
 
 /// Removes the record at `path` and every record below it.
 fn withdraw(mut records: mem::Map[text::String, os::Published], path: Str, alloc: mem::Alloc) {
@@ -98,9 +200,10 @@ fn answer[T: Send](reply: task::Sender[T], take value: T) fails task::Cancelled 
     }
 } answer
 
-/// The children of `path` the records give, `status` and `cpus` below `/live`, and the `cpus` CPUs below `/live/cpus`, in name order, named after `after`, at most `limit`.
+/// The children of `path` the records give, `status`, `accounts` and `cpus` below `/live`, the `accounts` below `/live/accounts`, and the `cpus` CPUs below `/live/cpus`, in name order, named after `after`, at most `limit`.
 fn children(
     records: mem::Map[text::String, os::Published],
+    accounts: mem::List[text::String],
     cpus: u32,
     path: Str,
     after: Option[text::String],
@@ -115,6 +218,12 @@ fn children(
     if path == "/live" {
         add_child(mut entries, name: b"status", type: Some(text::String.of("os::LiveStatus", alloc)), parent: false, after, alloc)
         add_child(mut entries, name: b"cpus", type: None, parent: true, after, alloc)
+        add_child(mut entries, name: b"accounts", type: None, parent: true, after, alloc)
+    }
+    if path == "/live/accounts" {
+        for account in accounts {
+            add_child(mut entries, name: account.as_bytes(), type: Some(text::String.of("os::Account", alloc)), parent: false, after, alloc)
+        }
     }
     if path == LIVE_CPUS {
         for number in 0..<cpus {
@@ -379,7 +488,7 @@ test boards_list_what_providers_publish_and_compute_status_and_cpus for serve_bo
             return
         }
         discard s.spawn(fn[take board]() fails task::Cancelled uses wait limits stack 32_768 {
-            try await serve_board(take board, origin, machine, security: security_of(bootfmt::Handoff.empty(), machine, alloc), cpus: two_cpus(world.clock, alloc), alloc)
+            try await serve_board(take board, origin, machine, security: security_of(bootfmt::Handoff.empty(), machine, alloc), cpus: two_cpus(world.clock, alloc), gauges: runner::Gauges.empty(alloc), exec: world.exec, alloc)
         })
         try await os::publish(posted, path: "/live/instances/a", type: "os::LiveInstance", value: instance_record(os::Lifecycle.Running, reconciled: os::ReconcileState.Converged, alloc), alloc)
         try await os::publish(posted, path: "/live/instances/b", type: "os::LiveInstance", value: instance_record(os::Lifecycle.Failed, reconciled: os::ReconcileState.Failed(code: text::String.of("trap.unreachable", alloc), detail: text::String.empty(alloc)), alloc), alloc)
@@ -393,7 +502,18 @@ test boards_list_what_providers_publish_and_compute_status_and_cpus for serve_bo
         let cpus = try await live.list(LIVE_CPUS, after: None, limit: 8, alloc)
         let second = try await live.get("/live/cpus/1", alloc)
         let beyond = try await live.get("/live/cpus/2", alloc)
-        expect top.len() == 5 and top[0].name.as_str() == "cpus" and top[0].parent and top[1].name.as_str() == "instances" and top[1].parent and top[2].name.as_str() == "machine" and top[3].name.as_str() == "security" and top[4].name.as_str() == "status"
+        let accounts = try await live.list("/live/accounts", after: None, limit: 8, alloc)
+        let account = try await live.get("/live/accounts/a", alloc)
+        let Some(ungauged) = try await live.get("/live/instances/a", alloc) else {
+            expect false
+            return
+        }
+        let Some(published) = instance_of(Untrusted.of(ungauged.bytes.view()), alloc) else {
+            expect false
+            return
+        }
+        expect top.len() == 6 and top[0].name.as_str() == "accounts" and top[0].parent and top[1].name.as_str() == "cpus" and top[2].name.as_str() == "instances" and top[2].parent and top[3].name.as_str() == "machine" and top[4].name.as_str() == "security" and top[5].name.as_str() == "status"
+        expect accounts.len() == 0 and account.is_none() and published.memory.limit == 65_536
         expect instances.len() == 1 and instances[0].name.as_str() == "b"
         expect counts[0] == 1 and counts[1] == 1
         expect cpus.len() == 2 and cpus[0].name.as_str() == "0" and cpus[1].name.as_str() == "1"

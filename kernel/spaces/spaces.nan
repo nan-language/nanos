@@ -53,9 +53,41 @@ fn Access.flags(self) -> u64 {
     }
 } Access.flags
 
-/// The shared space for `cpus` CPUs over usable memory, `extents` being the regions `k.regions()` gave, in address order. Below 4 GiB it maps everything from 4 KiB to the end of the last region there, for the gaps between regions hold the image, the boot area and the start information, and maps the image, from 1 MiB to the first region above it, executable; it maps the rest of the first 4 GiB uncached, where device registers lie, as the entry root does; above 4 GiB it maps the regions alone. `None` when the frames run out.
+/// Where the image lies: the pages of its executable segments, and the end of the pages of all its segments.
+pkg struct Image derives Copy, Eq {
+    code: frames::Extent
+    end: u64
+} Image
+
+/// Where the image whose loadable segments `segments` lists lies.
+pkg fn Image.of(segments: Slice[boot::Segment]) -> Image {
+    var code = frames::Extent(base: FOUR_GIB, end: 0)
+    var end = LOW_MEMORY
+    for segment in segments {
+        let last = align_up(segment.base + segment.byte_len, to: PAGE_BYTES)
+        if last > end {
+            end = last
+        }
+        if segment.executable {
+            let start = segment.base / PAGE_BYTES * PAGE_BYTES
+            if start < code.base {
+                code.base = start
+            }
+            if last > code.end {
+                code.end = last
+            }
+        }
+    }
+    if code.end == 0 {
+        code = frames::Extent(base: LOW_MEMORY, end: LOW_MEMORY)
+    }
+    return Image(code: code, end: end)
+} Image.of
+
+/// The shared space for `cpus` CPUs over usable memory, `extents` being the regions `k.regions()` gave, in address order, and `image` where the image lies. Below 4 GiB it maps everything from 4 KiB to the end of the last region there or of the image, for the gaps between regions hold the image, the boot area and the start information, and maps the image's code executable; it maps the rest of the first 4 GiB uncached, where device registers lie, as the entry root does; above 4 GiB it maps the regions alone. `None` when the frames run out.
 pkg fn Shared.build(
     extents: Slice[frames::Extent],
+    image: Image,
     features: cpu::Features,
     cpus: u32,
     mut frames: frames::Frames,
@@ -65,8 +97,7 @@ pkg fn Shared.build(
         return None
     }
     var top = root_frame
-    let code_end = image_end(extents)
-    var low_end = code_end
+    var low_end = image.end
     for extent in extents {
         let below = align_up(min(extent.end, b: FOUR_GIB), to: PAGE_BYTES)
         if extent.base < FOUR_GIB and below > low_end {
@@ -74,8 +105,9 @@ pkg fn Shared.build(
         }
     }
     var mapped = map(mut top, base: PAGE_BYTES, end: LOW_MEMORY, access: Access.Data, huge: false, mut frames)
-    mapped = mapped and map(mut top, base: LOW_MEMORY, end: code_end, access: Access.Code, huge: false, mut frames)
-    mapped = mapped and map(mut top, base: code_end, end: low_end, access: Access.Data, huge: features.pages_1g, mut frames)
+    mapped = mapped and map(mut top, base: LOW_MEMORY, end: image.code.base, access: Access.Data, huge: features.pages_1g, mut frames)
+    mapped = mapped and map(mut top, base: image.code.base, end: image.code.end, access: Access.Code, huge: false, mut frames)
+    mapped = mapped and map(mut top, base: image.code.end, end: low_end, access: Access.Data, huge: features.pages_1g, mut frames)
     mapped = mapped and map(mut top, base: low_end, end: FOUR_GIB, access: Access.Device, huge: features.pages_1g, mut frames)
     for extent in extents {
         if mapped and extent.end > FOUR_GIB {
@@ -113,16 +145,6 @@ pkg fn Shared.build(
     let low = table_at(table_at(first_entry & ADDRESS_BITS, index: 0), index: 0)
     return Some(Shared(roots: take roots, low: low))
 } Shared.build
-
-/// The end of the image's pages: the image lies from 1 MiB to the first region above it.
-fn image_end(extents: Slice[frames::Extent]) -> u64 {
-    for extent in extents {
-        if extent.base >= LOW_MEMORY {
-            return align_up(extent.base, to: PAGE_BYTES)
-        }
-    }
-    return LOW_MEMORY
-} image_end
 
 /// Maps the pages from `base` to `end`, both 4 KiB-aligned, at their physical addresses with `access`: in 1 GiB pages where `huge` allows them, else in 2 MiB and 4 KiB pages. False when the frames run out.
 fn map(
@@ -264,13 +286,13 @@ pkg fn Shared.into_roots(take self) -> mem::List[hw::PageTableRoot] {
     return roots
 } Shared.into_roots
 
-test the_image_ends_at_the_first_region_above_1_mib for image_end {
+test images_lie_where_their_segments_were_placed for Image.of {
     let alloc = testing::world().alloc
-    var extents = mem::List[frames::Extent].empty(alloc)
-    mut extents.push(frames::Extent(base: 0x1000, end: 0x9_F000))
-    mut extents.push(frames::Extent(base: 0x14_1478, end: 0x14_2000))
-    mut extents.push(frames::Extent(base: 0x90_0000, end: 0x178_0000))
-    expect image_end(extents.view()) == 0x14_2000
-    let none = mem::List[frames::Extent].empty(alloc)
-    expect image_end(none.view()) == LOW_MEMORY
-} the_image_ends_at_the_first_region_above_1_mib
+    var segments = mem::List[boot::Segment].empty(alloc)
+    mut segments.push(boot::Segment(base: 0x190_0000, byte_len: 0x40_931A, writable: false, executable: true))
+    mut segments.push(boot::Segment(base: 0x1D0_A000, byte_len: 0x25_7FA0, writable: false, executable: false))
+    mut segments.push(boot::Segment(base: 0x1F6_2000, byte_len: 0xA_0700, writable: true, executable: false))
+    expect Image.of(segments.view()) == Image(code: frames::Extent(base: 0x190_0000, end: 0x1D0_A000), end: 0x200_3000)
+    let none = mem::List[boot::Segment].empty(alloc)
+    expect Image.of(none.view()) == Image(code: frames::Extent(base: LOW_MEMORY, end: LOW_MEMORY), end: LOW_MEMORY)
+} images_lie_where_their_segments_were_placed

@@ -24,7 +24,7 @@ enum Input {
     Revoke(grants: mem::Set[u64], done: task::Sender[Unit])
 } Input
 
-/// An instance as its driver holds it, `suspended` while its component is, `suspend_ms` the time without a message after which it is, and what it publishes of it.
+/// An instance as its driver holds it, `intake` the length of `queue` for readers of its gauge, `suspended` while its component is, `suspend_ms` the time without a message after which it is, and what it publishes of it.
 linear struct Driver {
     moniker: ident::Moniker
     slot: u32
@@ -34,6 +34,7 @@ linear struct Driver {
     incarnation: u64
     started_ns: u64
     queue: mem::List[os::Call]
+    intake: mem::Shared[core::atomic::AtomicU32]
     domain: Option[Domain]
     then: Then
     cause: Cause
@@ -101,6 +102,7 @@ struct Shared[C: Components and Copy and Send, R: Reservations and Send] {
     orders: task::Sender[os::Order]
     withheld: Withheld
     postings: task::Sender[os::Posting]
+    gauges: Gauges
 } Shared
 
 /// The driver of the instance `moniker`, not yet created, under `spec`, its calls passing `gate`.
@@ -111,7 +113,7 @@ fn Driver.of(
     take gate: os::Gate,
     alloc: mem::Alloc,
     ) -> Driver {
-    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, started_ns: 0, queue: mem::List.empty(alloc), domain: None, then: Then.Stop, cause: Cause.Inside, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false, showing: Showing.none(), alloc: alloc)
+    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, started_ns: 0, queue: mem::List.empty(alloc), intake: mem::Shared.of(core::atomic::AtomicU32.of(0), alloc), domain: None, then: Then.Stop, cause: Cause.Inside, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false, showing: Showing.none(), alloc: alloc)
 } Driver.of
 
 /// Carries out the lifecycle of the instance `driver` holds, as its inputs come, until they end or the instance, deleted, has stopped, left the directory and had its capabilities revoked; the tasks of its incarnations run in the driver's own scope.
@@ -184,6 +186,7 @@ fn Shared.take_input[J: Journal](
                 return
             }
             mut driver.queue.push(take call)
+            driver.counted()
             if driver.lifecycle == Some(os::Lifecycle.Hibernated) {
                 try await self.start(mut driver, sender, journal, s)
             }
@@ -205,6 +208,7 @@ fn Shared.take_input[J: Journal](
         }
         Input.Ended(incarnation: incarnation, outcome: outcome) => {
             if incarnation == driver.incarnation {
+                try await self.gauges.unwatch(driver.moniker, alloc: self.config.alloc)
                 try await self.ended(mut driver, take outcome, sender, journal, s)
             }
         }
@@ -384,11 +388,17 @@ fn Shared.start[J: Journal](
     }
     let task::Channel(sender: deliveries, receiver: delivered) = task::Channel[Delivery].bounded(2, alloc: self.config.alloc)
     let task::Channel(sender: marks, receiver: marked) = task::Channel[Mark].bounded(2, alloc: self.config.alloc)
+    let ending = marks.split()
+    let gauged = marks.split()
     let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: self.config.alloc)
     let serving = Serving(deliveries: take delivered, reports: sender.split(), marks: take marks, incarnation: driver.incarnation, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: driver.suspend_ms.value_or(0), keeping: keeping, restore: take restore)
-    self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, take budget, take account, abandoner: abandoner.share(), ended: sender.split(), incarnation: driver.incarnation)
-    self.watch(s, marks: take marked, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers)
+    let exec = account.executor()
+    let alloc = budget.alloc()
+    let held = Held(budget: take budget, account: take account, class: driver.spec.share.class, intake: driver.intake.share())
+    self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, exec, alloc, abandoner: abandoner.share(), take ending, ended: sender.split(), incarnation: driver.incarnation)
+    self.watch(s, marks: take marked, take held, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers)
     driver.domain = Some(Domain(deliveries: take deliveries, abandoner: take abandoner, outstanding: None, next_id: 0))
+    try await self.gauges.watch(ident::Moniker(text: driver.moniker.text), watch: take gauged, alloc: self.config.alloc)
 } Shared.start
 
 /// The cell of a new incarnation: split from the node pool at the specification's limit, or for a reserved instance from the store over its region, which its first start takes and later starts reuse; `None` when no free range holds the region.
@@ -406,26 +416,39 @@ fn Shared.cell(self, mut driver: Driver) -> Option[mem::Budget] fails task::Canc
     return Some(store.alloc().split(usize.widen(limit)))
 } Shared.cell
 
-/// Runs an incarnation's domain on a task of `s`, which closes its account and cell once the domain has ended and tells the driver how.
+/// What an incarnation's watch holds: its cell and account, its account's CPU class, and the length of its instance's queue.
+linear struct Held {
+    budget: mem::Budget
+    account: task::Account
+    class: os::CpuClass
+    intake: mem::Shared[core::atomic::AtomicU32]
+} Held
+
+/// The gauge of the incarnation `held` keeps.
+fn Held.gauge(self) -> os::Gauge {
+    return os::Gauge(intake: self.intake.contents().load(), memory: os::Usage(charged: u64.widen(self.budget.charged()), limit: u64.widen(self.budget.limit()), peak: u64.widen(self.budget.peak())), cpu_ns: self.account.used_ns(), class: self.class)
+} Held.gauge
+
+/// Runs an incarnation's domain on a task of `s` through `exec` and `alloc`, then tells its watch, through `ending`, and its driver how it ended.
 fn Shared.launch(
     self,
     s: task::Scope,
     take component: text::String,
     take world: nanos::World,
     take serving: Serving,
-    take budget: mem::Budget,
-    take account: task::Account,
+    exec: task::Executor,
+    alloc: mem::Alloc,
     take abandoner: mem::Shared[sys::Abandoner],
+    take ending: task::Sender[Mark],
     take ended: task::Sender[Input],
     incarnation: u64,
     ) {
     let components = self.components
-    discard s.spawn(fn[take component, take world, take serving, take budget, take account, take abandoner, take ended]() fails task::Cancelled uses wait limits stack 16_384 {
+    discard s.spawn(fn[take component, take world, take serving, take abandoner, take ending, take ended]() fails task::Cancelled uses wait limits stack 16_384 {
         let ran = attempt await abandoner.contents().run_sized(fn[take component, take world, take serving]() -> Ended fails task::Cancelled uses wait limits stack 131_072 {
             return try await components.serve(component.as_str(), take world, take serving)
-        }, stack: INSTANCE_STACK, exec: account.executor(), alloc: budget.alloc())
-        take account.close()
-        take budget.close()
+        }, stack: INSTANCE_STACK, exec, alloc)
+        discard attempt await ending.send(Mark.Ended)
         let outcome = match ran {
             Ok(result) => result
             Err(cancelled) => fail cancelled
@@ -434,42 +457,84 @@ fn Shared.launch(
     })
 } Shared.launch
 
-/// Watches an incarnation's handlers on a task of `s`: a handler call past `handlers.handler_s` abandons the domain, and one of `handlers.slow_ms` or more is reported slow.
+/// Watches an incarnation's handlers on a task of `s`, answering the readings of its gauge from `held` until its domain has ended, then closes its account and cell: a handler call past `handlers.handler_s` abandons the domain, and one of `handlers.slow_ms` or more is reported slow.
 fn Shared.watch(
     self,
     s: task::Scope,
     take marks: task::Receiver[Mark],
+    take held: Held,
     take abandoner: mem::Shared[sys::Abandoner],
     take inputs: task::Sender[Input],
     incarnation: u64,
     handlers: os::Limits,
     ) {
     let clock = self.config.clock
-    discard s.spawn(fn[take marks, take abandoner, take inputs]() fails task::Cancelled uses wait limits stack 16_384 {
-        var receiver = marks
-        loop {
-            let Some(Mark.Began) = try await mut receiver.receive() else {
-                return
+    discard s.spawn(fn[take marks, take held, take abandoner, take inputs]() fails task::Cancelled uses wait limits stack 16_384 {
+        let watched = attempt await watch_marks(take marks, held, abandoner, inputs, clock, incarnation, handlers)
+        let Held(budget: budget, account: account, class: _, intake: _) = held
+        take account.close()
+        take budget.close()
+        match watched {
+            Ok(_) => {
             }
-            let ended = try await task::within(clock, ms: u64.widen(handlers.handler_s) * 1_000, body: fn[mut receiver]() -> Option[Mark] fails task::Cancelled uses wait {
-                return try await mut receiver.receive()
-            })
-            match ended {
-                None => {
-                    discard attempt await inputs.send(Input.Overran(incarnation: incarnation))
-                    abandoner.contents().trigger()
-                    return
-                }
-                Some(Some(Mark.Took(ns: ns))) => {
-                    if ns >= u64.widen(handlers.slow_ms) * NS_PER_MS {
-                        discard attempt await inputs.send(Input.Slow(ns: ns))
-                    }
-                }
-                else => return
-            }
+            Err(cancelled) => fail cancelled
         }
     })
 } Shared.watch
+
+/// Takes the marks of an incarnation until its domain has ended, bounding each handler call it tells of and answering each reading with the gauge of `held`.
+fn watch_marks(
+    take marks: task::Receiver[Mark],
+    held: Held,
+    abandoner: mem::Shared[sys::Abandoner],
+    inputs: task::Sender[Input],
+    clock: sys::Clock,
+    incarnation: u64,
+    handlers: os::Limits,
+    ) fails task::Cancelled uses wait {
+    var receiver = marks
+    var overran_at: Option[u64] = None
+    loop {
+        var received: Option[Mark] = None
+        match overran_at {
+            None => {
+                received = try await mut receiver.receive()
+            }
+            Some(at) => {
+                let left = at.saturating_sub(now(clock))
+                let within = try await task::within_ns(clock, ns: left, body: fn[mut receiver]() -> Option[Mark] fails task::Cancelled uses wait {
+                    return try await mut receiver.receive()
+                })
+                match within {
+                    Some(given) => {
+                        received = given
+                    }
+                    None => {
+                        overran_at = None
+                        discard attempt await inputs.send(Input.Overran(incarnation: incarnation))
+                        abandoner.contents().trigger()
+                        continue
+                    }
+                }
+            }
+        }
+        match received {
+            Some(Mark.Began) => {
+                overran_at = Some(now(clock).saturating_add(u64.widen(handlers.handler_s) * 1_000 * NS_PER_MS))
+            }
+            Some(Mark.Took(ns: ns)) => {
+                overran_at = None
+                if ns >= u64.widen(handlers.slow_ms) * NS_PER_MS {
+                    discard attempt await inputs.send(Input.Slow(ns: ns))
+                }
+            }
+            Some(Mark.Read(reply: reply)) => {
+                discard attempt await reply.send(held.gauge())
+            }
+            else => return
+        }
+    }
+} watch_marks
 
 /// Stops the instance, or has it start again once stopped when `then` is `Restart`: queued calls stay for a restart and are dropped or failed for a stop, and an instance not yet created is created `stopped`.
 fn Shared.stop[J: Journal](self, mut driver: Driver, then: Then, journal: J) fails task::Cancelled uses wait {
@@ -768,6 +833,7 @@ fn Driver.deliver(mut self) fails task::Cancelled uses wait {
         return
     }
     let os::Call(hash: hash, encoded: encoded, reply: reply, lease: lease) = mut self.queue.remove(0)
+    self.counted()
     let id = current.next_id
     current.next_id += 1
     let request = reply.is_some()
@@ -831,7 +897,13 @@ fn Driver.refuse_queued(mut self) fails task::Cancelled uses wait {
     while self.queue.len() > 0 {
         try await refuse(mut self.queue.remove(0), answer: os::Answer.ServerStopped)
     }
+    self.counted()
 } Driver.refuse_queued
+
+/// Tells readers of the gauge the length of the queue.
+fn Driver.counted(self) {
+    self.intake.contents().store(u32.saturate(self.queue.len()))
+} Driver.counted
 
 /// Whether a call reaching the instance waits in its intake: it is not refused while the instance exists and is not `stopped`, `failed` or stopping for good.
 fn Driver.takes_calls(self) -> bool {
@@ -891,7 +963,7 @@ fn Driver.trigger(self) {
 
 /// Releases what the driver holds once its inputs have ended.
 fn Driver.abandon(take self) {
-    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, started_ns: _, queue: _, domain: _, then: _, cause: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _, showing: _, alloc: _) = self
+    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, started_ns: _, queue: _, intake: _, domain: _, then: _, cause: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _, showing: _, alloc: _) = self
     gate.set(open: false)
     take minted.close()
 } Driver.abandon

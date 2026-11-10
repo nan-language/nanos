@@ -130,7 +130,7 @@ Each failure prints the line `loader: <code> generation <n>` on the firmware con
 6. **Write the record**: the boot counter plus 1, `next once` cleared, the tries of the booting `trial` slot minus 1, the `bad` states of steps 3 and 4, and the handled requests cleared. A failed write prints `boot.record-unwritable`; the loader then abandons a `trial` candidate for the next candidate not in `trial` mode, from step 4, and boots any other with the handoff flag `record written` clear.
 7. **Measure** the candidate on a machine with `tpm` ([Measurement](#measurement)).
 8. **Draw entropy** ([Entropy](#entropy)) and copy the TPM event log into the loader's memory.
-9. **Hand off.** It copies the kernel's loadable segments to their physical addresses, in pages it takes from the firmware, then calls `exit_services`, writes the handoff block and enters the kernel ([Handoff record](#handoff-record)). When the firmware does not give those pages, it prints `boot.placement` and the loader stops.
+9. **Hand off.** It copies the kernel's loadable segments to their physical addresses moved by the least multiple of 2 MiB that puts them all in one range of free memory below 4 GiB, in pages it takes from the firmware, then calls `exit_services`, writes the handoff block and enters the kernel at its moved entry ([Handoff record](#handoff-record)). When no free range holds them or the firmware does not give those pages, it prints `boot.placement` and the loader stops.
 
 ## Measurement
 

@@ -1,6 +1,18 @@
-//! Placing the kernel image's loadable segments at their physical addresses.
+//! Placing the kernel image's loadable segments in free memory, at their physical addresses moved by a multiple of 2 MiB.
 
 const CONVENTIONAL_MEMORY: u32 = 7
+
+/// What a kernel image moves by: a multiple of 2 MiB.
+const MOVE_STEP: u64 = 0x20_0000
+
+/// The address a moved kernel image stays below.
+const MOVE_LIMIT: u64 = 0x1_0000_0000
+
+/// Free memory from `base` to `end`, excluded.
+struct Free derives Copy, Eq {
+    base: u64
+    end: u64
+} Free
 
 /// The pages the image's loadable segments fill, in address order.
 fn kernel_pages(image: Untrusted[mem::Bytes], kernel: bootfmt::KernelImage, alloc: mem::Alloc) -> mem::Set[u64] {
@@ -21,28 +33,76 @@ fn kernel_pages(image: Untrusted[mem::Bytes], kernel: bootfmt::KernelImage, allo
     return pages
 } kernel_pages
 
-/// Whether every page the image fills lies in free memory of the current memory map.
-fn placeable(services: boot::Services, image: Untrusted[mem::Bytes], kernel: bootfmt::KernelImage, alloc: mem::Alloc) -> bool {
+/// How far to move the image so that every page it fills lies in free memory of the current memory map, `None` when no free memory holds them.
+fn placement(services: boot::Services, image: Untrusted[mem::Bytes], kernel: bootfmt::KernelImage, alloc: mem::Alloc) -> Option[u64] {
     let Ok(map) = attempt services.memory_map(alloc) else {
-        return false
+        return None
     }
+    var low: u64 = MOVE_LIMIT
+    var high: u64 = 0
     for page in kernel_pages(image, kernel, alloc) {
-        if not in_free_memory(map, page) {
-            return false
+        if page < low {
+            low = page
+        }
+        if page + bootfmt::PAGE_BYTES > high {
+            high = page + bootfmt::PAGE_BYTES
         }
     }
-    return true
-} placeable
+    if high <= low or high > MOVE_LIMIT {
+        return None
+    }
+    return moved_into(low, high, free: free_ranges(map, alloc))
+} placement
 
-fn in_free_memory(map: mem::List[boot::MemoryRange], page: u64) -> bool {
-    for range in map {
-        let inside = page >= range.base and page - range.base < range.byte_len and range.byte_len - (page - range.base) >= bootfmt::PAGE_BYTES
-        if range.kind == CONVENTIONAL_MEMORY and inside {
-            return true
+/// The least multiple of `MOVE_STEP` that moves the memory from `low` to `high` into one range of `free`, below `MOVE_LIMIT`.
+fn moved_into(low: u64, high: u64, free: mem::List[Free]) -> Option[u64]
+    requires low < high and high <= MOVE_LIMIT
+{
+    var least: Option[u64] = None
+    for range in free {
+        var moved: u64 = 0
+        if range.base > low {
+            moved = (range.base - low).saturating_add(MOVE_STEP - 1) / MOVE_STEP * MOVE_STEP
+        }
+        let end = high.saturating_add(moved)
+        let fits = end <= range.end and end <= MOVE_LIMIT
+        let less = match least {
+            Some(found) => moved < found
+            None => true
+        }
+        if fits and less {
+            least = Some(moved)
         }
     }
-    return false
-} in_free_memory
+    return least
+} moved_into
+
+/// The conventional memory of `map` in address order, ranges that touch merged.
+fn free_ranges(map: mem::List[boot::MemoryRange], alloc: mem::Alloc) -> mem::List[Free] {
+    var sorted = mem::List[Free].empty(alloc)
+    for range in map {
+        if range.kind != CONVENTIONAL_MEMORY {
+            continue
+        }
+        let free = Free(base: range.base, end: range.base.saturating_add(range.byte_len))
+        var at: usize = 0
+        while at < sorted.len() and sorted[at].base < free.base {
+            at += 1
+        }
+        mut sorted.insert(at, value: free)
+    }
+    var merged = mem::List[Free].empty(alloc)
+    for range in sorted {
+        let count = merged.len()
+        if count > 0 and merged[count - 1].end == range.base {
+            let Free(base: start, end: _) = mut merged.remove(count - 1)
+            mut merged.push(Free(base: start, end: range.end))
+        } else {
+            mut merged.push(range)
+        }
+    }
+    return merged
+} free_ranges
 
 /// Consecutive pages: `count` of them from address `start`.
 struct Run derives Copy {
@@ -70,7 +130,7 @@ fn runs(pages: mem::Set[u64], alloc: mem::Alloc) -> mem::List[Run] {
     return found
 } runs
 
-/// The regions holding the candidate's segments at their physical addresses, the rest of their pages zero, `None` when the firmware cannot give the pages.
+/// The regions holding the candidate's segments at their physical addresses moved by its distance, the rest of their pages zero, `None` when the firmware cannot give the pages.
 fn place(services: boot::Services, candidate: Candidate, alloc: mem::Alloc) -> Option[mem::List[hw::Region]] {
     var regions = mem::List[hw::Region].empty(alloc)
     for run in runs(kernel_pages(candidate.image, kernel: candidate.kernel, alloc), alloc) {
@@ -90,7 +150,7 @@ fn allocate_run(
     mut regions: mem::List[hw::Region],
     alloc: mem::Alloc,
     ) -> bool {
-    let Ok(region) = attempt services.allocate(run.start, byte_len: run.count * bootfmt::PAGE_BYTES) else {
+    let Ok(region) = attempt services.allocate(run.start + candidate.moved, byte_len: run.count * bootfmt::PAGE_BYTES) else {
         return false
     }
     var frames = mem::List[hw::PhysFrame[4_096]].empty(alloc)
@@ -103,8 +163,9 @@ fn allocate_run(
     return true
 } allocate_run
 
+/// Fills `frame` with what the candidate's segments place at its address before the move.
 fn fill_page(mut frame: hw::PhysFrame[4_096], candidate: Candidate) {
-    let base = frame.base()
+    let base = frame.base() - candidate.moved
     let whole = hw::Offset[Array[u8, 4_096]](bytes: 0)
     clear(mut frame.contents_mut(whole))
     for index in 0..<candidate.kernel.header_count {
@@ -124,3 +185,24 @@ fn release(services: boot::Services, take regions: mem::List[hw::Region]) {
         discard attempt services.free(take region)
     }
 } release
+
+test images_move_past_the_firmware_into_free_memory for moved_into {
+    let alloc = testing::world().alloc
+    var free = mem::List[Free].empty(alloc)
+    mut free.push(Free(base: 0x10_0000, end: 0x80_0000))
+    mut free.push(Free(base: 0x80_8000, end: 0x80_B000))
+    mut free.push(Free(base: 0x178_0000, end: 0x1BB3_C000))
+    expect moved_into(low: 0x10_0000, high: 0x7F_8700, free) == Some(0)
+    expect moved_into(low: 0x10_0000, high: 0x80_2700, free) == Some(0x180_0000)
+    expect moved_into(low: 0x10_0000, high: 0x3000_0000, free) == None
+} images_move_past_the_firmware_into_free_memory
+
+test touching_ranges_merge for free_ranges {
+    let alloc = testing::world().alloc
+    var map = mem::List[boot::MemoryRange].empty(alloc)
+    mut map.push(boot::MemoryRange(base: 0x120_0000, byte_len: 0xE0_0000, kind: CONVENTIONAL_MEMORY, attributes: 0))
+    mut map.push(boot::MemoryRange(base: 0x80_0000, byte_len: 0x8000, kind: 10, attributes: 0))
+    mut map.push(boot::MemoryRange(base: 0x100_0000, byte_len: 0x20_0000, kind: CONVENTIONAL_MEMORY, attributes: 0))
+    let free = free_ranges(map, alloc)
+    expect free.len() == 1 and free[0] == Free(base: 0x100_0000, end: 0x200_0000)
+} touching_ranges_merge
