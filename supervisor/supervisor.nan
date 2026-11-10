@@ -84,7 +84,7 @@ pub fn Supervision.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut
 
 pub fn Supervision.stop(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
     let Some(view) = env.tree else {
-        carry_out(mut cx, control: env.control, take moniker, restart: false, alloc: env.alloc)
+        carry_out(mut cx, control: env.control, take moniker, restart: false, reached: None, alloc: env.alloc)
         return
     }
     let alloc = env.alloc
@@ -94,7 +94,7 @@ pub fn Supervision.stop(mut self, take moniker: ident::Moniker, mut env: Env, mu
 } Supervision.stop
 
 pub fn Supervision.restart(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
-    carry_out(mut cx, control: env.control, take moniker, restart: true, alloc: env.alloc)
+    carry_out(mut cx, control: env.control, take moniker, restart: true, reached: None, alloc: env.alloc)
 } Supervision.restart
 
 /// Reconciles the instances a commit's desired state names: a pass over every specification, and a restart of each instance whose configuration record it changed.
@@ -111,7 +111,7 @@ pub fn Supervision.changed(
         let Some(moniker) = configured(path, alloc: env.alloc) else {
             continue
         }
-        carry_out(mut cx, control: env.control, take moniker, restart: true, alloc: env.alloc)
+        carry_out(mut cx, control: env.control, take moniker, restart: true, reached: Some(commit.number), alloc: env.alloc)
     }
     mut self.reconcile(mut env, mut cx)
 } Supervision.changed
@@ -178,24 +178,25 @@ fn keyed(moniker: ident::Moniker) -> u64 {
     return key | 0x8000_0000_0000_0000
 } keyed
 
-/// Has the runner stop, or restart when `restart`, the instance `moniker` from a keyed task of its own, which a later order for the same instance does not cancel.
+/// Has the runner stop, or restart when `restart`, the instance `moniker` from a keyed task of its own, which a later order for the same instance does not cancel, then tells it the commit of the desired value it brought the instance to, when `reached` names one.
 fn carry_out(
     mut cx: sys::Cx[Supervisor],
     control: os::Control,
     take moniker: ident::Moniker,
     restart: bool,
+    reached: Option[u64],
     alloc: mem::Alloc,
     ) {
     mut cx.spawn(key: keyed(moniker), run: fn[take moniker](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
         let ordered = match restart {
-            false => attempt await control.stop(take moniker, alloc)
-            true => attempt await control.restart(take moniker, alloc)
+            false => attempt await control.stop(ident::Moniker(text: moniker.text), alloc)
+            true => attempt await control.restart(ident::Moniker(text: moniker.text), alloc)
         }
-        match ordered {
-            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
-            else => {
-            }
+        try settled(take ordered)
+        let Some(commit) = reached else {
+            return
         }
+        try settled(attempt await control.converge(take moniker, desired: commit, alloc))
     })
 } carry_out
 
@@ -278,8 +279,8 @@ fn reconcile(control: os::Control, view: store::service::View, take before: mem:
     return listed
 } reconcile
 
-/// The specification of the instance `moniker` the View's `/instances` holds, `None` when it holds none that decodes.
-fn spec_of(view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) -> Option[os::InstanceSpec] fails task::Cancelled uses wait {
+/// The specification of the instance `moniker` the View's `/instances` holds, with the commit that last wrote it; `None` when it holds none that decodes.
+fn spec_of(view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) -> Option[Specified] fails task::Cancelled uses wait {
     let Some(path) = desired("/instances", alloc).child(moniker.text.as_bytes(), alloc) else {
         return None
     }
@@ -294,30 +295,38 @@ fn spec_of(view: store::service::View, moniker: ident::Moniker, alloc: mem::Allo
     let Ok(spec) = attempt mem::wire::Codec[os::InstanceSpec].decode(value.view(), alloc) else {
         return None
     }
-    return Some(take spec)
+    return Some(Specified(spec: take spec, version: node.version.number))
 } spec_of
 
-/// Brings the instance `moniker` to its specification: stopped when it asks, else started, created first when the runner has none.
+/// A specification, and the commit that last wrote it.
+struct Specified {
+    spec: os::InstanceSpec
+    version: u64
+} Specified
+
+/// Brings the instance `moniker` to its specification: stopped when it asks, else started, created first when the runner has none; then tells the runner the commit of that specification.
 fn converge(control: os::Control, view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
-    let Some(spec) = try await spec_of(view, moniker, alloc) else {
+    let Some(Specified(spec: spec, version: version)) = try await spec_of(view, moniker, alloc) else {
         return
     }
     if spec.stopped {
         try settled(attempt await control.stop(ident::Moniker(text: moniker.text), alloc))
-        return
-    }
-    match attempt await control.start(ident::Moniker(text: moniker.text), alloc) {
-        Err(os::ControlError.Missing) => {
+    } else {
+        match attempt await control.start(ident::Moniker(text: moniker.text), alloc) {
+            Err(os::ControlError.Missing) => {
+                match attempt await control.create(ident::Moniker(text: moniker.text), take spec, grants: mem::Map.empty(alloc), alloc) {
+                    Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+                    else => {
+                    }
+                }
+                try settled(attempt await control.start(ident::Moniker(text: moniker.text), alloc))
+            }
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
         }
-        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
-        else => return
     }
-    match attempt await control.create(ident::Moniker(text: moniker.text), take spec, grants: mem::Map.empty(alloc), alloc) {
-        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
-        else => {
-        }
-    }
-    try settled(attempt await control.start(ident::Moniker(text: moniker.text), alloc))
+    try settled(attempt await control.converge(ident::Moniker(text: moniker.text), desired: version, alloc))
 } converge
 
 /// An order's outcome, which the next pass acts on again when it failed; a cancellation stays one.
@@ -331,7 +340,7 @@ fn settled[T](take outcome: Result[T, os::ControlError]) fails task::Cancelled {
 
 /// Sets `stopped` in the specification of the instance `moniker`, which the reconciling pass its commit starts then stops.
 fn mark_stopped(view: store::service::View, take moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
-    let Some(held) = try await spec_of(view, moniker, alloc) else {
+    let Some(Specified(spec: held, version: _)) = try await spec_of(view, moniker, alloc) else {
         return
     }
     let Some(path) = desired("/instances", alloc).child(moniker.text.as_bytes(), alloc) else {
