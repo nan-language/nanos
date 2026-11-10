@@ -1,0 +1,76 @@
+//! What `devices` publishes at `/live/devices`: each device's record, and below it its units' and their partitions', a keyed task publishing the records of the devices that changed in batches.
+
+/// The key of the keyed task publishing records.
+const SHOWING: u64 = 4
+
+/// A record of a device to publish, at a path below `/live/devices`.
+struct Shown {
+    below: text::Fixed[64]
+    value: os::Published
+} Shown
+
+/// Has the records of the device at `at` published afresh: its own, and its units' and their partitions' below it.
+fn Manager.show(mut self, at: usize, mut env: Env, mut cx: sys::Cx[Devices]) {
+    mut self.show_path(self.records[at].path, mut env, mut cx)
+} Manager.show
+
+/// Has the records of the device at `path` published afresh, or withdrawn when it has none.
+fn Manager.show_path(mut self, path: BusPath, mut env: Env, mut cx: sys::Cx[Devices]) {
+    for waiting in self.unshown {
+        if waiting == path {
+            return
+        }
+    }
+    mut self.unshown.push(path)
+    if not self.showing {
+        mut self.show_next(mut env, mut cx)
+    }
+} Manager.show_path
+
+/// Has the keyed task of `SHOWING` publish the records of the devices waiting, each withdrawn first.
+fn Manager.show_next(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
+    let alloc = env.alloc
+    var withdrawn = mem::List[text::Fixed[64]].empty(alloc)
+    var shown = mem::List[Shown].empty(alloc)
+    for path in self.unshown {
+        let device = text::Fixed[64].of(path.text().as_str())
+        mut withdrawn.push(device)
+        let Some(at) = self.index_of(path) else {
+            continue
+        }
+        mut shown.push(Shown(below: device, value: os::published("devices::LiveDevice", value: self.records[at], alloc)))
+        for unit in self.records[at].units {
+            var at_unit = device
+            mut at_unit.append("/u")
+            decimal(mut at_unit, value: u64.widen(unit.number))
+            mut shown.push(Shown(below: at_unit, value: os::published("devices::BlockInfo", value: unit.info, alloc)))
+            for partition in unit.partitions {
+                var at_partition = at_unit
+                mut at_partition.append("/p")
+                decimal(mut at_partition, value: u64.widen(partition.number))
+                mut shown.push(Shown(below: at_partition, value: os::published("devices::Partition", value: partition, alloc)))
+            }
+        }
+    }
+    mut self.unshown.truncate(0)
+    self.showing = true
+    let live = env.live
+    mut cx.spawn(key: SHOWING, run: fn[take withdrawn, take shown](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        for device in withdrawn {
+            try await live.withdraw_below(below: device.as_str(), alloc)
+        }
+        for each in take shown {
+            let Shown(below: below, value: value) = each
+            try await live.publish_below(below: below.as_str(), take value, alloc)
+        }
+        discard attempt await out.shown()
+    })
+} Manager.show_next
+
+/// Publishes the records of the devices that changed while a batch was published.
+fn Manager.shown(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
+    self.showing = false
+    if self.unshown.len() > 0 {
+        mut self.show_next(mut env, mut cx)
+    }
+} Manager.shown
