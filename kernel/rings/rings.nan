@@ -117,6 +117,34 @@ pkg fn Rings.record_store(self, event: store::Event) {
     self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: 0, kind: kind, severity: severity, flags: 0, argument: argument), continuation: None)
 } Rings.record_store
 
+/// Writes `boot.started` and one `boot.candidate-failed` per failure entry of `handoff` as the core's.
+pkg fn Rings.record_boot(self, handoff: bootfmt::Handoff) {
+    var started = Array[u8, 32].filled(0)
+    started[0] = handoff.mode
+    started[1] = handoff.slot
+    let flags = handoff.flags.to_bits()
+    var at: usize = 0
+    while at < 8 {
+        if at < 4 {
+            started[4 + at] = u8.truncate(flags >> u32.truncate(8 * at))
+        }
+        started[8 + at] = u8.truncate(handoff.boot_counter >> u32.truncate(8 * at))
+        at += 1
+    }
+    self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: 0, kind: journal::BOOT_STARTED, severity: 1, flags: 0, argument: handoff.generation), continuation: Some(journal::RingRecord.from_bits(started)))
+    for entry in 0..<usize.widen(handoff.failure_count) {
+        if entry >= handoff.failures.len() {
+            break
+        }
+        let failure = handoff.failures[entry]
+        var code = Array[u8, 32].filled(0)
+        for index in 0..<failure.code.len() {
+            code[index] = failure.code[index]
+        }
+        self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: 0, kind: journal::BOOT_CANDIDATE_FAILED, severity: 3, flags: 0, argument: failure.generation), continuation: Some(journal::RingRecord.from_bits(code)))
+    }
+} Rings.record_boot
+
 fn Rings.write(self, record: journal::RingRecord, continuation: Option[journal::RingRecord]) {
     var written = record
     if continuation.is_some() {
@@ -366,7 +394,7 @@ pkg fn push_decimal[N: usize where N > 0](mut text: text::Fixed[N], value: u64) 
     }
 } push_decimal
 
-/// What the continuation of a record of kind `kind` adds: the reason of an `auth.revoked`, the bus path of a device event, the checkpoint an `instance.started` restored, the code of an `instance.checkpoint-failed` or an `instance.trapped`.
+/// What the continuation of a record of kind `kind` adds: the reason of an `auth.revoked`, the bus path of a device event, the checkpoint an `instance.started` restored, the boot counter of a `boot.started`, the code of an `instance.checkpoint-failed`, an `instance.trapped` or a `boot.candidate-failed`.
 pkg fn detail(kind: u16, continuation: journal::RingRecord) -> text::Fixed[40] {
     if kind == journal::STARTED {
         var restored = text::Fixed[40].of("checkpoint ")
@@ -380,7 +408,19 @@ pkg fn detail(kind: u16, continuation: journal::RingRecord) -> text::Fixed[40] {
         push_decimal(mut restored, value: number)
         return restored
     }
-    if kind == journal::CHECKPOINT_FAILED or kind == journal::TRAPPED {
+    if kind == journal::BOOT_STARTED {
+        var counted = text::Fixed[40].of("counter ")
+        let bytes = continuation.to_bits()
+        var number: u64 = 0
+        var at: usize = 16
+        while at > 8 {
+            at -= 1
+            number = (number << 8) | u64.widen(bytes[at])
+        }
+        push_decimal(mut counted, value: number)
+        return counted
+    }
+    if kind == journal::CHECKPOINT_FAILED or kind == journal::TRAPPED or kind == journal::BOOT_CANDIDATE_FAILED {
         var code = text::Fixed[40].of("code ")
         for byte in continuation.to_bits() {
             if byte == 0 {
@@ -567,3 +607,47 @@ test continuations_name_the_checkpoint_restored_and_the_code_of_a_failed_one for
     }
     expect detail(kind: journal::CHECKPOINT_FAILED, continuation: too_large).as_str() == "code instance.checkpoint-too-large"
 } continuations_name_the_checkpoint_restored_and_the_code_of_a_failed_one
+
+test boots_give_their_start_and_each_failed_candidate for Rings.record_boot {
+    let world = testing::world()
+    let alloc = world.alloc
+    let cpus = hw::cpu_count()
+    let rings = Rings.of(cpus, clock: world.clock, alloc)
+    var handoff = bootfmt::Handoff.empty()
+    handoff.generation = 7
+    handoff.boot_counter = 0x1_0203
+    handoff.mode = bootfmt::Mode.Trial.to_bits()
+    handoff.slot = bootfmt::Slot.B.to_bits()
+    handoff.failure_count = 1
+    var code = Array[u8, 24].filled(0)
+    let named = "boot.hash-mismatch".as_bytes()
+    for at in 0..<named.len() {
+        code[at] = named[at]
+    }
+    var failures = handoff.failures
+    failures[0] = bootfmt::Failure(generation: 6, code: code)
+    handoff.failures = failures
+    rings.record_boot(handoff)
+    var records = mem::List[journal::RingRecord].empty(alloc)
+    for cpu in 0..<cpus {
+        discard rings.drain(cpu, into: mut records)
+    }
+    expect records.len() == 4
+    let system = ident::Cause.of(boot: 1, number: 1)
+    let started = journal::CoreRecord(record: records[0], more: single(records[1], alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor"))).event(system, alloc)
+    let failed = journal::CoreRecord(record: records[2], more: single(records[3], alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor"))).event(system, alloc)
+    let Ok(boot) = attempt mem::wire::Codec[journal::BootStarted].decode(Untrusted.of(started.payload.bytes.view()), alloc) else {
+        expect false
+        return
+    }
+    expect started.kind.as_str() == "boot.started" and boot.generation == 7 and boot.boot_counter == 0x1_0203 and boot.mode == bootfmt::Mode.Trial.to_bits() and boot.slot == bootfmt::Slot.B.to_bits()
+    expect failed.kind.as_str() == "boot.candidate-failed" and failed.severity == journal::Severity.Warn and records[2].argument == 6
+    expect detail(kind: journal::BOOT_STARTED, continuation: records[1]).as_str() == "counter 66051"
+    expect detail(kind: journal::BOOT_CANDIDATE_FAILED, continuation: records[3]).as_str() == "code boot.hash-mismatch"
+} boots_give_their_start_and_each_failed_candidate
+
+fn single(record: journal::RingRecord, alloc: mem::Alloc) -> mem::List[journal::RingRecord] {
+    var list = mem::List[journal::RingRecord].empty(alloc)
+    mut list.push(record)
+    return list
+} single
