@@ -1,4 +1,4 @@
-//! The core rings: each CPU's ring of the events the core and the runner write, with interrupts disabled, for the journal to drain.
+//! The core rings: each CPU's ring of the events the core and the runner write, with interrupts disabled, for `journal` to drain, their kinds indexed as the journal package's kind table gives them.
 
 /// The records of a ring: one 64 KiB chunk of the core reserve.
 const RING_RECORDS: usize = 2_048
@@ -9,20 +9,9 @@ const CRITICAL: u8 = 5
 /// How long a ring's oldest record waits before the ring is due.
 const DUE_NS: u64 = 1_000_000_000
 
-/// A record of a core ring.
-pkg layout Record: bytes 32 le {
-    time: u64 at 0
-    cause: u64 at 8
-    source: u32 at 16
-    kind: u16 at 20
-    severity: u8 at 22
-    flags: u8 at 23
-    argument: u64 at 24
-} Record
-
 /// A ring: its records, where the next goes and where the oldest it holds is, how many it holds for the journal, how many found it full, and whether a quarter of it filled or a critical record entered it since it was last empty.
 struct Ring {
-    records: mem::List[Record]
+    records: mem::List[journal::RingRecord]
     next: usize
     oldest: usize
     held: usize
@@ -30,12 +19,13 @@ struct Ring {
     due: bool
 } Ring
 
-/// The core rings, one per CPU by number, the running CPU's number, the clock their records are timed by, and the signal writers post when the journal must look at the rings.
+/// The core rings, one per CPU by number, the running CPU's number, the clock their records are timed by, the signal writers post when the journal must look at the rings, and the instance each slot of the runner's table names.
 pkg struct Rings {
     rings: mem::List[hw::SpinLock[Ring]]
     here: hw::PerCpu[u32]
     clock: sys::Clock
     signal: mem::Shared[hw::Signal[Unit]]
+    sources: task::Cown[mem::Map[u32, ident::Moniker]]
 } Rings
 
 impl Rings: runner::Journal
@@ -44,18 +34,49 @@ impl Rings: runner::Journal
 pkg fn Rings.of(cpus: u32, clock: sys::Clock, alloc: mem::Alloc) -> Rings {
     var rings = mem::List[hw::SpinLock[Ring]].empty(alloc)
     for _ in 0..<cpus {
-        var records = mem::List[Record].empty(alloc)
+        var records = mem::List[journal::RingRecord].empty(alloc)
         for _ in 0..<RING_RECORDS {
-            mut records.push(Record.from_bits(Array[u8, 32].filled(0)))
+            mut records.push(journal::RingRecord.from_bits(Array[u8, 32].filled(0)))
         }
         mut rings.push(hw::SpinLock.of(Ring(records: take records, next: 0, oldest: 0, held: 0, lost: 0, due: false)))
     }
-    return Rings(rings: take rings, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
+    return Rings(rings: take rings, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), sources: task::Cown.of(mem::Map.empty(alloc), alloc))
 } Rings.of
+
+/// Notes that the slot `slot` names the instance `moniker`.
+pkg fn Rings.name(self, slot: u32, take moniker: ident::Moniker) fails task::Cancelled uses wait {
+    let sources = self.sources.share()
+    var named = Some(take moniker)
+    await when mut sources {
+        match mut named.extract() {
+            Some(given) => {
+                discard mut sources.insert(slot, value: take given)
+            }
+            None => {
+            }
+        }
+    }
+} Rings.name
+
+/// The instance the slot `slot` names, `supervisor` for the core's slot 0 and for a slot naming none.
+pkg fn Rings.source_of(self, slot: u32) -> ident::Moniker fails task::Cancelled uses wait {
+    let sources = self.sources.share()
+    var named = text::Fixed[59].of("supervisor")
+    await when sources {
+        match sources.get(slot) {
+            Some(moniker) => {
+                named = moniker.text
+            }
+            None => {
+            }
+        }
+    }
+    return ident::Moniker(text: named)
+} Rings.source_of
 
 /// Writes the record of an event, and its continuation when it has one, in the running CPU's ring, counting the event lost when the ring has no room for it, and posts the signal when the journal must look at the ring.
 pkg fn Rings.record(self, slot: u32, event: runner::Event) {
-    self.write(Record(time: elapsed(self.clock), cause: 0, source: slot, kind: kind_of(event), severity: severity_of(event), flags: 0, argument: argument_of(event)), continuation: continuation_of(event))
+    self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: slot, kind: kind_of(event), severity: severity_of(event), flags: 0, argument: argument_of(event)), continuation: continuation_of(event))
 } Rings.record
 
 /// Writes the record of a device event as the core's, its continuation holding the device's bus path.
@@ -67,17 +88,17 @@ pkg fn Rings.record_device(self, event: devices::Event) {
         payload[at] = byte
         at += 1
     }
-    self.write(Record(time: elapsed(self.clock), cause: 0, source: 0, kind: device_kind(event.kind), severity: device_severity(event.kind), flags: 0, argument: event.argument), continuation: Some(Record.from_bits(payload)))
+    self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: 0, kind: device_kind(event.kind), severity: device_severity(event.kind), flags: 0, argument: event.argument), continuation: Some(journal::RingRecord.from_bits(payload)))
 } Rings.record_device
 
 /// Writes the record of an event of the store as the core's: its argument is the log bytes a mount replayed, the address of a corrupt structure, the commits thinned, or the free bytes when writes are refused.
 pkg fn Rings.record_store(self, event: store::Event) {
     let kind = match event {
-        store::Event.Mounted(format: _, replayed: _) => STORE_MOUNTED
-        store::Event.Corruption(address: _, kind: _) => STORE_CORRUPTION
-        store::Event.DeviceFailed => STORE_DEVICE_FAILED
-        store::Event.HistoryThinned(commits: _, bytes: _, oldest: _) => STORE_HISTORY_THINNED
-        store::Event.WritesRefused(free: _, history: _) => STORE_WRITES_REFUSED
+        store::Event.Mounted(format: _, replayed: _) => journal::STORE_MOUNTED
+        store::Event.Corruption(address: _, kind: _) => journal::STORE_CORRUPTION
+        store::Event.DeviceFailed => journal::STORE_DEVICE_FAILED
+        store::Event.HistoryThinned(commits: _, bytes: _, oldest: _) => journal::STORE_HISTORY_THINNED
+        store::Event.WritesRefused(free: _, history: _) => journal::STORE_WRITES_REFUSED
     }
     let severity: u8 = match event {
         store::Event.Mounted(format: _, replayed: _) => 1
@@ -93,13 +114,13 @@ pkg fn Rings.record_store(self, event: store::Event) {
         store::Event.HistoryThinned(commits: commits, bytes: _, oldest: _) => commits
         store::Event.WritesRefused(free: free, history: _) => free
     }
-    self.write(Record(time: elapsed(self.clock), cause: 0, source: 0, kind: kind, severity: severity, flags: 0, argument: argument), continuation: None)
+    self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: 0, kind: kind, severity: severity, flags: 0, argument: argument), continuation: None)
 } Rings.record_store
 
-fn Rings.write(self, record: Record, continuation: Option[Record]) {
+fn Rings.write(self, record: journal::RingRecord, continuation: Option[journal::RingRecord]) {
     var written = record
     if continuation.is_some() {
-        written.flags = CONTINUED
+        written.flags = journal::CONTINUED
     }
     hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
         let cpu = self.here.with(t, body: fn(mut number: u32) -> u32 limits notrap, terminates, noalloc {
@@ -156,7 +177,7 @@ pkg fn Rings.due(self, exec: task::Executor) -> u32 fails task::Cancelled uses w
 } Rings.due
 
 /// Moves the records `cpu`'s ring holds into `into`, oldest first, each event's continuation after it, and gives how many events found it full since its last drain.
-pkg fn Rings.drain(self, cpu: u32, mut into: mem::List[Record]) -> u64 {
+pkg fn Rings.drain(self, cpu: u32, mut into: mem::List[journal::RingRecord]) -> u64 {
     let Some(ring) = self.rings.get(usize.widen(cpu)) else {
         return 0
     }
@@ -166,8 +187,8 @@ pkg fn Rings.drain(self, cpu: u32, mut into: mem::List[Record]) -> u64 {
         })
     })
     for _ in 0..<count {
-        let taken = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Record] limits notrap, terminates {
-            return ring.with(t, body: fn(mut held: Ring) -> Option[Record] limits notrap, terminates, noalloc {
+        let taken = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[journal::RingRecord] limits notrap, terminates {
+            return ring.with(t, body: fn(mut held: Ring) -> Option[journal::RingRecord] limits notrap, terminates, noalloc {
                 return mut held.pop()
             })
         })
@@ -198,7 +219,7 @@ fn Rings.due_at(self, cpu: usize) -> Option[u64] {
 } Rings.due_at
 
 /// Writes `record` and its continuation, counting the event lost when the ring has no room for both; whether the journal must look at the ring: the event entered it empty, filled a quarter of it, or is critical.
-fn Ring.write(mut self, record: Record, continuation: Option[Record]) -> bool limits notrap, terminates, noalloc {
+fn Ring.write(mut self, record: journal::RingRecord, continuation: Option[journal::RingRecord]) -> bool limits notrap, terminates, noalloc {
     let size = self.records.len()
     let needed: usize = match continuation {
         Some(_) => 2
@@ -223,7 +244,7 @@ fn Ring.write(mut self, record: Record, continuation: Option[Record]) -> bool li
 } Ring.write
 
 /// Writes `record` after the newest record, when the ring has room for it.
-fn Ring.put(mut self, record: Record) limits notrap, terminates, noalloc {
+fn Ring.put(mut self, record: journal::RingRecord) limits notrap, terminates, noalloc {
     let size = self.records.len()
     if self.held >= size or self.next >= size {
         return
@@ -238,7 +259,7 @@ fn Ring.put(mut self, record: Record) limits notrap, terminates, noalloc {
 } Ring.put
 
 /// Takes the oldest record the ring holds; a ring holding none is no longer due.
-fn Ring.pop(mut self) -> Option[Record] limits notrap, terminates, noalloc {
+fn Ring.pop(mut self) -> Option[journal::RingRecord] limits notrap, terminates, noalloc {
     let size = self.records.len()
     if self.held == 0 or self.oldest >= size {
         return None
@@ -267,61 +288,8 @@ fn Ring.due_at(self) -> Option[u64] limits notrap, terminates, noalloc {
     return Some(self.records[self.oldest].time.saturating_add(DUE_NS))
 } Ring.due_at
 
-/// The flag of a record that a continuation record follows.
-const CONTINUED: u8 = 0x01
-
-/// The kernel image's kind table: the index of each kind the core and the runner record, `auth.revoked`'s continuation holding its reason.
-const STARTED: u16 = 0
-
-const STOPPED: u16 = 1
-
-const TRAPPED: u16 = 2
-
-const FAILED: u16 = 3
-
-const SLOW_HANDLER: u16 = 4
-
-const INTEGRITY: u16 = 5
-
-const REVOKED: u16 = 6
-
-/// The kinds of device events follow, in the order of `devices::EventKind`, their continuation holding the device's bus path.
-const DEVICE_ADDED: u16 = 7
-
-const DEVICE_REMOVED: u16 = 8
-
-const DEVICE_TABLE_INVALID: u16 = 9
-
-const DEVICE_BOUND: u16 = 10
-
-const DEVICE_UNBOUND: u16 = 11
-
-const DEVICE_CUT_OFF: u16 = 12
-
-const DEVICE_FAILED: u16 = 13
-
-const DEVICE_SUSPENDED: u16 = 14
-
-const DEVICE_RESUMED: u16 = 15
-
-const DEVICE_INTERRUPT_STORM: u16 = 16
-
-/// The kinds of the store's events follow, in the order of `store::Event`.
-const STORE_MOUNTED: u16 = 17
-
-const STORE_CORRUPTION: u16 = 18
-
-const STORE_DEVICE_FAILED: u16 = 19
-
-const STORE_HISTORY_THINNED: u16 = 20
-
-const STORE_WRITES_REFUSED: u16 = 21
-
-/// The kind of a failed checkpoint, its continuation holding the failure's code.
-const CHECKPOINT_FAILED: u16 = 22
-
-/// The continuation of an event that has more payload than its record holds: the reason of an `auth.revoked`, the checkpoint an `instance.started` restored, the code of an `instance.checkpoint-failed`.
-fn continuation_of(event: runner::Event) -> Option[Record] {
+/// The continuation of an event that has more payload than its record holds: the reason of an `auth.revoked`, the checkpoint an `instance.started` restored, the code of an `instance.checkpoint-failed`, the trap kind of an `instance.trapped`.
+fn continuation_of(event: runner::Event) -> Option[journal::RingRecord] {
     var payload = Array[u8, 32].filled(0)
     match event {
         runner::Event.Revoked(grant: _, reason: reason) => {
@@ -344,40 +312,40 @@ fn continuation_of(event: runner::Event) -> Option[Record] {
                 at += 1
             }
         }
+        runner::Event.Trapped(incarnation: _, kind: kind, limit: _) => {
+            var at: usize = 0
+            for byte in trap_name(kind).as_bytes() {
+                payload[at] = byte
+                at += 1
+            }
+        }
         else => return None
     }
-    return Some(Record.from_bits(payload))
+    return Some(journal::RingRecord.from_bits(payload))
 } continuation_of
 
-/// The name of the kind of index `kind` in the kernel image's kind table.
-pkg fn kind_name(kind: u16) -> text::Fixed[32] {
+/// The code of a trap kind.
+fn trap_name(kind: sys::TrapKind) -> text::Fixed[32] {
     return text::Fixed[32].of(match kind {
-        STARTED => "instance.started"
-        STOPPED => "instance.stopped"
-        TRAPPED => "instance.trapped"
-        FAILED => "instance.failed"
-        SLOW_HANDLER => "instance.slow-handler"
-        INTEGRITY => "fault.integrity"
-        REVOKED => "auth.revoked"
-        DEVICE_ADDED => "device.added"
-        DEVICE_REMOVED => "device.removed"
-        DEVICE_TABLE_INVALID => "device.table-invalid"
-        DEVICE_BOUND => "device.bound"
-        DEVICE_UNBOUND => "device.unbound"
-        DEVICE_CUT_OFF => "device.cut-off"
-        DEVICE_FAILED => "device.failed"
-        DEVICE_SUSPENDED => "device.suspended"
-        DEVICE_RESUMED => "device.resumed"
-        DEVICE_INTERRUPT_STORM => "device.interrupt-storm"
-        STORE_MOUNTED => "store.mounted"
-        STORE_CORRUPTION => "store.corruption"
-        STORE_DEVICE_FAILED => "store.device-failed"
-        STORE_HISTORY_THINNED => "store.history-thinned"
-        STORE_WRITES_REFUSED => "store.writes-refused"
-        CHECKPOINT_FAILED => "instance.checkpoint-failed"
-        else => "unknown"
+        sys::TrapKind.Bounds => "trap.bounds"
+        sys::TrapKind.Overflow => "trap.overflow"
+        sys::TrapKind.DivisionByZero => "trap.division-by-zero"
+        sys::TrapKind.Shift => "trap.shift"
+        sys::TrapKind.Conversion => "trap.conversion"
+        sys::TrapKind.StaleHandle => "trap.stale-handle"
+        sys::TrapKind.Exhausted => "trap.exhausted"
+        sys::TrapKind.Predicate => "trap.predicate"
+        sys::TrapKind.Requires => "trap.requires"
+        sys::TrapKind.Ensures => "trap.ensures"
+        sys::TrapKind.Expect => "trap.expect"
+        sys::TrapKind.Todo => "trap.todo"
+        sys::TrapKind.StackOverflow => "trap.stack-overflow"
+        sys::TrapKind.DuplicateAccess => "trap.duplicate-access"
+        sys::TrapKind.Poisoned => "trap.poisoned"
+        sys::TrapKind.Exception => "trap.exception"
+        sys::TrapKind.Abandoned => "trap.abandoned"
     })
-} kind_name
+} trap_name
 
 /// Appends the decimal digits of `value` to `text`.
 pkg fn push_decimal[N: usize where N > 0](mut text: text::Fixed[N], value: u64) {
@@ -398,24 +366,9 @@ pkg fn push_decimal[N: usize where N > 0](mut text: text::Fixed[N], value: u64) 
     }
 } push_decimal
 
-/// The name of a severity, from `debug` for 0 up to `critical` for 5.
-pkg fn severity_name(severity: u8) -> text::Fixed[8] {
-    return text::Fixed[8].of(match severity {
-        0 => "debug"
-        1 => "info"
-        2 => "notice"
-        3 => "warn"
-        4 => "error"
-        else => "critical"
-    })
-} severity_name
-
-/// Whether a record has a continuation after it.
-pkg fn Record.continued(self) -> bool = (self.flags & CONTINUED) != 0
-
-/// What the continuation of a record of kind `kind` adds: the reason of an `auth.revoked`, the bus path of a device event, the checkpoint an `instance.started` restored, the code of an `instance.checkpoint-failed`.
-pkg fn detail(kind: u16, continuation: Record) -> text::Fixed[40] {
-    if kind == STARTED {
+/// What the continuation of a record of kind `kind` adds: the reason of an `auth.revoked`, the bus path of a device event, the checkpoint an `instance.started` restored, the code of an `instance.checkpoint-failed` or an `instance.trapped`.
+pkg fn detail(kind: u16, continuation: journal::RingRecord) -> text::Fixed[40] {
+    if kind == journal::STARTED {
         var restored = text::Fixed[40].of("checkpoint ")
         let bytes = continuation.to_bits()
         var number: u64 = 0
@@ -427,7 +380,7 @@ pkg fn detail(kind: u16, continuation: Record) -> text::Fixed[40] {
         push_decimal(mut restored, value: number)
         return restored
     }
-    if kind == CHECKPOINT_FAILED {
+    if kind == journal::CHECKPOINT_FAILED or kind == journal::TRAPPED {
         var code = text::Fixed[40].of("code ")
         for byte in continuation.to_bits() {
             if byte == 0 {
@@ -437,7 +390,7 @@ pkg fn detail(kind: u16, continuation: Record) -> text::Fixed[40] {
         }
         return code
     }
-    if kind >= DEVICE_ADDED and kind <= DEVICE_INTERRUPT_STORM {
+    if kind >= journal::DEVICE_ADDED and kind <= journal::DEVICE_INTERRUPT_STORM {
         var path = text::Fixed[40].of("path ")
         for byte in continuation.to_bits() {
             if byte == 0 {
@@ -447,7 +400,7 @@ pkg fn detail(kind: u16, continuation: Record) -> text::Fixed[40] {
         }
         return path
     }
-    if kind != REVOKED {
+    if kind != journal::REVOKED {
         return text::Fixed[40].empty()
     }
     return text::Fixed[40].of(match continuation.to_bits()[0] {
@@ -459,16 +412,16 @@ pkg fn detail(kind: u16, continuation: Record) -> text::Fixed[40] {
 
 fn device_kind(kind: devices::EventKind) -> u16 {
     return match kind {
-        devices::EventKind.Added => DEVICE_ADDED
-        devices::EventKind.Removed => DEVICE_REMOVED
-        devices::EventKind.TableInvalid => DEVICE_TABLE_INVALID
-        devices::EventKind.Bound => DEVICE_BOUND
-        devices::EventKind.Unbound => DEVICE_UNBOUND
-        devices::EventKind.CutOff => DEVICE_CUT_OFF
-        devices::EventKind.Failed => DEVICE_FAILED
-        devices::EventKind.Suspended => DEVICE_SUSPENDED
-        devices::EventKind.Resumed => DEVICE_RESUMED
-        devices::EventKind.InterruptStorm => DEVICE_INTERRUPT_STORM
+        devices::EventKind.Added => journal::DEVICE_ADDED
+        devices::EventKind.Removed => journal::DEVICE_REMOVED
+        devices::EventKind.TableInvalid => journal::DEVICE_TABLE_INVALID
+        devices::EventKind.Bound => journal::DEVICE_BOUND
+        devices::EventKind.Unbound => journal::DEVICE_UNBOUND
+        devices::EventKind.CutOff => journal::DEVICE_CUT_OFF
+        devices::EventKind.Failed => journal::DEVICE_FAILED
+        devices::EventKind.Suspended => journal::DEVICE_SUSPENDED
+        devices::EventKind.Resumed => journal::DEVICE_RESUMED
+        devices::EventKind.InterruptStorm => journal::DEVICE_INTERRUPT_STORM
     }
 } device_kind
 
@@ -493,14 +446,14 @@ pkg fn elapsed(clock: sys::Clock) -> u64 {
 /// The index of an event's kind in the kernel image's kind table.
 fn kind_of(event: runner::Event) -> u16 {
     return match event {
-        runner::Event.Started(incarnation: _, checkpoint: _) => STARTED
-        runner::Event.Stopped(abandoned: _) => STOPPED
-        runner::Event.Trapped(incarnation: _, kind: _, limit: _) => TRAPPED
-        runner::Event.Failed(restarts: _) => FAILED
-        runner::Event.SlowHandler(ns: _) => SLOW_HANDLER
-        runner::Event.Integrity(incarnation: _) => INTEGRITY
-        runner::Event.Revoked(grant: _, reason: _) => REVOKED
-        runner::Event.CheckpointFailed(code: _, bytes: _) => CHECKPOINT_FAILED
+        runner::Event.Started(incarnation: _, checkpoint: _) => journal::STARTED
+        runner::Event.Stopped(abandoned: _) => journal::STOPPED
+        runner::Event.Trapped(incarnation: _, kind: _, limit: _) => journal::TRAPPED
+        runner::Event.Failed(restarts: _) => journal::FAILED
+        runner::Event.SlowHandler(ns: _) => journal::SLOW_HANDLER
+        runner::Event.Integrity(incarnation: _) => journal::INTEGRITY
+        runner::Event.Revoked(grant: _, reason: _) => journal::REVOKED
+        runner::Event.CheckpointFailed(code: _, bytes: _) => journal::CHECKPOINT_FAILED
     }
 } kind_of
 
@@ -532,14 +485,14 @@ fn argument_of(event: runner::Event) -> u64 {
 
 test rings_wake_the_journal_and_count_what_they_drop for Ring.write {
     let alloc = testing::world().alloc
-    var records = mem::List[Record].empty(alloc)
+    var records = mem::List[journal::RingRecord].empty(alloc)
     for _ in 0..<8u32 {
-        mut records.push(Record.from_bits(Array[u8, 32].filled(0)))
+        mut records.push(journal::RingRecord.from_bits(Array[u8, 32].filled(0)))
     }
     var ring = Ring(records: take records, next: 0, oldest: 0, held: 0, lost: 0, due: false)
     var woke = Array[bool, 10].filled(false)
     for at in 0..<10usize {
-        woke[at] = mut ring.write(Record(time: 1, cause: 0, source: 3, kind: 0, severity: 1, flags: 0, argument: u64.widen(at)), continuation: None)
+        woke[at] = mut ring.write(journal::RingRecord(time: 1, cause: 0, source: 3, kind: 0, severity: 1, flags: 0, argument: u64.widen(at)), continuation: None)
     }
     expect woke[0] and woke[1] and not woke[2] and not woke[7] and not woke[9]
     expect ring.held == 8 and ring.lost == 2 and ring.next == 0 and ring.due
@@ -551,7 +504,7 @@ test rings_wake_the_journal_and_count_what_they_drop for Ring.write {
         mut taken.push(record.argument)
     }
     for at in 10..<13u64 {
-        discard mut ring.write(Record(time: 1, cause: 0, source: 3, kind: 0, severity: 1, flags: 0, argument: at), continuation: None)
+        discard mut ring.write(journal::RingRecord(time: 1, cause: 0, source: 3, kind: 0, severity: 1, flags: 0, argument: at), continuation: None)
     }
     loop {
         let Some(record) = mut ring.pop() else {
@@ -573,7 +526,7 @@ test rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_o
         return try await rings.due(world.exec)
     })
     let aged = try await rings.due(world.exec)
-    var records = mem::List[Record].empty(alloc)
+    var records = mem::List[journal::RingRecord].empty(alloc)
     let lost = rings.drain(aged, into: mut records)
     expect early.is_none()
     expect lost == 0 and records.len() == 1 and records[0].source == 1
@@ -596,7 +549,7 @@ test rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_o
         expect false
         return
     }
-    var last = mem::List[Record].empty(alloc)
+    var last = mem::List[journal::RingRecord].empty(alloc)
     discard rings.drain(cpu, into: mut last)
     expect last.len() == 1 and last[0].severity == CRITICAL
 } rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_oldest
@@ -607,10 +560,10 @@ test continuations_name_the_checkpoint_restored_and_the_code_of_a_failed_one for
         expect false
         return
     }
-    expect detail(kind: STARTED, continuation: restored).as_str() == "checkpoint 1234"
+    expect detail(kind: journal::STARTED, continuation: restored).as_str() == "checkpoint 1234"
     let Some(too_large) = continuation_of(runner::Event.CheckpointFailed(code: text::Fixed[32].of("instance.checkpoint-too-large"), bytes: 9)) else {
         expect false
         return
     }
-    expect detail(kind: CHECKPOINT_FAILED, continuation: too_large).as_str() == "code instance.checkpoint-too-large"
+    expect detail(kind: journal::CHECKPOINT_FAILED, continuation: too_large).as_str() == "code instance.checkpoint-too-large"
 } continuations_name_the_checkpoint_restored_and_the_code_of_a_failed_one

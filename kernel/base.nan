@@ -25,6 +25,8 @@ const AHCI: Str = "drivers::ahci::Ahci"
 
 const STORE_SERVICE: Str = "store::service::Service"
 
+const JOURNAL: Str = "journal::Recorder"
+
 /// The canonical paths of the record types genesis writes besides specifications.
 const GRANT_TYPE: Str = "os::Grant"
 
@@ -34,10 +36,12 @@ const STORE_CONFIG_TYPE: Str = "store::service::StoreConfig"
 
 const PRINCIPAL_RECORD_TYPE: Str = "os::PrincipalRecord"
 
+const JOURNAL_CONFIG_TYPE: Str = "journal::JournalConfig"
+
 /// The memory limit of `store`, whose engine keeps index nodes of 16 KiB in memory.
 const STORE_LIMIT: u64 = 67_108_864
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock and the handoff record.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record and the feed of the core rings.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
@@ -49,6 +53,7 @@ struct Base derives Copy {
     devices_live: os::Live
     wall: ident::Wall
     handoff: bootfmt::Handoff
+    feed: journal::Feed
 } Base
 
 impl Base: runner::Components
@@ -90,8 +95,14 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == STORE_SERVICE {
         return Some(os::Protocols(own: sys::Wire[store::service::Store].hash(), serves: None))
     }
+    if component == JOURNAL {
+        return Some(os::Protocols(own: sys::Wire[journal::Journal].hash(), serves: None))
+    }
     return None
 } Base.protocols
+
+/// Whether the component's Env takes a configuration record: `journal`'s alone.
+fn Base.configured(self, component: Str) -> bool = component == JOURNAL
 
 fn Base.serve(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     if component == DEVICES {
@@ -147,6 +158,9 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     }
     if component == STORE_SERVICE {
         return try await self.serve_store(take world, take serving)
+    }
+    if component == JOURNAL {
+        return try await self.serve_journal(take world, take serving)
     }
     let exec = world.exec
     let alloc = world.alloc
@@ -323,6 +337,25 @@ fn Base.serve_store(self, take world: nanos::World, take serving: runner::Servin
     })
 } Base.serve_store
 
+/// Serves `journal` on the feed of the core rings and its View of `/journal`, with its configuration record, the configuration chapter 17 gives by default when it has none.
+fn Base.serve_journal(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Ok(tree) = attempt nanos::Cap[store::service::View].get(world.caps, key: "tree") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let config = match mut serving.take_config() {
+        Some(record) => match attempt mem::wire::Codec[journal::JournalConfig].decode(record.view(), alloc) {
+            Ok(configured) => configured
+            Err(_) => return runner::Ended.EnvIncomplete
+        }
+        None => journal::JournalConfig.default_of(alloc)
+    }
+    let system = ident::Cause.of(boot: self.handoff.boot_counter, number: 1)
+    let env = journal::Env.of(self.feed, tree, take config, system, clock: world.clock, alloc)
+    return try await runner::Driven[journal::Recorder, journal::Env, journal::Journal].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: journal::Env) limits stack 512 {
+    })
+} Base.serve_journal
+
 /// The schemas a block driver or view serves the calls of: `Block`'s.
 fn schema_of_block(alloc: mem::Alloc) -> mem::List[sys::ProtocolSchema] {
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
@@ -379,42 +412,69 @@ fn release_claimed(take claimed: Option[devices::Claimed]) {
     }
 } release_claimed
 
-/// The genesis record the kernel image holds: the specification of each base instance, acting for `system` and running the image's bundle `bundle`, the root grant `g0` and the base instances' grants.
+/// The genesis record the kernel image holds: the specification of each base instance, acting for `system` and running the image's bundle `bundle`, the root grant `g0`, the base instances' grants, and on a claimed machine or in `dev` mode the owner's grant.
 fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem::Alloc) -> runner::Known {
+    var building = Building(specs: mem::Map.empty(alloc), grants: mem::Map.empty(alloc))
+    discard mut building.grants.insert(0, value: os::Grant(holder: principal("system"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
     var supervising = os::InstanceSpec.of(principal: principal("system"), bundle, component: SUPERVISOR, alloc)
-    discard mut supervising.grants.insert(text::String.of("control", alloc), value: 1)
+    mut building.grant(mut supervising, holder: "supervisor", field: "control", object: os::Object.Machine, granted: rights(every: false, alloc), alloc)
     discard mut supervising.wiring.insert(text::String.of("devices", alloc), value: os::Wire.to(moniker("devices")))
     var managing = os::InstanceSpec.of(principal: principal("system"), bundle, component: DEVICES, alloc)
-    discard mut managing.grants.insert(text::String.of("control", alloc), value: 2)
-    discard mut managing.grants.insert(text::String.of("clock", alloc), value: 3)
+    mut building.grant(mut managing, holder: "devices", field: "control", object: os::Object.Instance(prefix: moniker("devices")), granted: rights(every: false, alloc), alloc)
+    mut building.grant(mut managing, holder: "devices", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
     discard mut managing.wiring.insert(text::String.of("fat", alloc), value: os::Wire.to(moniker("fat")))
-    discard mut supervising.grants.insert(text::String.of("tree", alloc), value: 6)
     var filing = os::InstanceSpec.of(principal: principal("system"), bundle, component: FAT, alloc)
     discard mut filing.wiring.insert(text::String.of("volume", alloc), value: os::Wire(target: os::Target.Role(os::Role.BootVolume), operations: None, credit: os::Credit(messages: 64, calls: 64)))
     var storing = os::InstanceSpec.of(principal: principal("system"), bundle, component: STORE_SERVICE, alloc)
     storing.budget = os::Budget(limit: STORE_LIMIT, reserved: false)
-    discard mut storing.grants.insert(text::String.of("clock", alloc), value: 4)
-    discard mut storing.grants.insert(text::String.of("random", alloc), value: 5)
+    mut building.grant(mut storing, holder: "store", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
+    mut building.grant(mut storing, holder: "store", field: "random", object: os::Object.Random, granted: mem::Set.empty(alloc), alloc)
     discard mut storing.wiring.insert(text::String.of("volume", alloc), value: os::Wire(target: os::Target.Role(os::Role.StoreVolume), operations: None, credit: os::Credit(messages: 64, calls: 64)))
     discard mut storing.wiring.insert(text::String.of("devices", alloc), value: os::Wire.to(moniker("devices")))
-    var specs = mem::Map[ident::Moniker, os::InstanceSpec].empty(alloc)
-    discard mut specs.insert(moniker("supervisor"), value: take supervising)
-    discard mut specs.insert(moniker("devices"), value: take managing)
-    discard mut specs.insert(moniker("fat"), value: take filing)
-    discard mut specs.insert(moniker("store"), value: take storing)
-    var grants = mem::Map[u64, os::Grant].empty(alloc)
-    discard mut grants.insert(0, value: os::Grant(holder: principal("system"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
-    discard mut grants.insert(1, value: os::Grant(holder: principal("inst.supervisor"), object: os::Object.Machine, rights: rights(every: false, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
-    discard mut grants.insert(2, value: os::Grant(holder: principal("inst.devices"), object: os::Object.Instance(prefix: moniker("devices")), rights: rights(every: false, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
-    discard mut grants.insert(3, value: os::Grant(holder: principal("inst.devices"), object: os::Object.Clock, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
-    discard mut grants.insert(4, value: os::Grant(holder: principal("inst.store"), object: os::Object.Clock, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
-    discard mut grants.insert(5, value: os::Grant(holder: principal("inst.store"), object: os::Object.Random, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
-    discard mut grants.insert(6, value: os::Grant(holder: principal("inst.supervisor"), object: os::Object.Tree(prefix: tree_path("/sys", alloc), branch: text::String.of("main", alloc)), rights: tree_rights(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    mut building.grant(mut supervising, holder: "supervisor", field: "tree", object: tree_of("/sys", alloc), granted: tree_rights(alloc), alloc)
+    var journaling = os::InstanceSpec.of(principal: principal("system"), bundle, component: JOURNAL, alloc)
+    mut building.grant(mut journaling, holder: "journal", field: "tree", object: tree_of("/journal", alloc), granted: tree_rights(alloc), alloc)
+    mut building.grant(mut journaling, holder: "journal", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
+    discard mut building.specs.insert(moniker("supervisor"), value: take supervising)
+    discard mut building.specs.insert(moniker("devices"), value: take managing)
+    discard mut building.specs.insert(moniker("fat"), value: take filing)
+    discard mut building.specs.insert(moniker("store"), value: take storing)
+    discard mut building.specs.insert(moniker("journal"), value: take journaling)
     if owner_of(handoff, alloc).is_some() {
-        discard mut grants.insert(7, value: os::Grant(holder: principal("owner"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+        let number = u64.widen(building.grants.len())
+        discard mut building.grants.insert(number, value: os::Grant(holder: principal("owner"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
     }
+    let Building(specs: specs, grants: grants) = building
     return runner::Known(specs: take specs, grants: take grants)
 } image_genesis
+
+/// The specifications and grants of the image's genesis record as they are built.
+struct Building {
+    specs: mem::Map[ident::Moniker, os::InstanceSpec]
+    grants: mem::Map[u64, os::Grant]
+} Building
+
+/// Grants `object` with the rights `granted` to the base instance `holder`, descending from `g0` under the next number, as the Env field `field` of its specification `spec`.
+fn Building.grant(
+    mut self,
+    mut spec: os::InstanceSpec,
+    holder: Str,
+    field: Str,
+    take object: os::Object,
+    take granted: mem::Set[os::Right],
+    alloc: mem::Alloc,
+    ) {
+    let number = u64.widen(self.grants.len())
+    var name = text::Fixed[64].of("inst.")
+    mut name.append(holder)
+    discard mut self.grants.insert(number, value: os::Grant(holder: ident::Principal(text: name), object: take object, rights: take granted, caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    discard mut spec.grants.insert(text::String.of(field, alloc), value: number)
+} Building.grant
+
+/// The `Tree` object of the subtree `prefix` of `main`.
+fn tree_of(prefix: Str, alloc: mem::Alloc) -> os::Object {
+    return os::Object.Tree(prefix: tree_path(prefix, alloc), branch: text::String.of("main", alloc))
+} tree_of
 
 /// The genesis record of generation `generation`: the dirs of `/sys`, `/data` and `/state`, the base instances' specifications and grants of the image's genesis, running `bundle`, and the store's retention defaults.
 fn genesis_record(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::Genesis {
@@ -428,9 +488,17 @@ fn genesis_record(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: me
     }
     var stored = mem::Bytes.empty(alloc)
     mem::wire::Codec[store::service::StoreConfig].encode(store::service::StoreConfig(retention: store::Retention.default_of(alloc)), out: mut stored)
+    let journaling = journal::JournalConfig.default_of(alloc)
+    var journaled = mem::Bytes.empty(alloc)
+    mem::wire::Codec[journal::JournalConfig].encode(journaling, out: mut journaled)
     var config = mem::Map[ident::Moniker, store::service::TypedValue].empty(alloc)
     discard mut config.insert(moniker("store"), value: store::service::TypedValue(type: store::TypeRef.of(STORE_CONFIG_TYPE, schema: mem::wire::Codec[store::service::StoreConfig].schema_hash(), alloc), bytes: take stored))
+    discard mut config.insert(moniker("journal"), value: store::service::TypedValue(type: store::TypeRef.of(JOURNAL_CONFIG_TYPE, schema: mem::wire::Codec[journal::JournalConfig].schema_hash(), alloc), bytes: take journaled))
     var nodes = genesis_nodes(alloc)
+    for node in take journal::declarations(journaling.retention(), alloc) {
+        let mem::KeyValue(key: path, value: declaration) = node
+        discard mut nodes.insert(take path, value: take declaration)
+    }
     var principals = mem::Map[ident::Principal, store::service::TypedValue].empty(alloc)
     match owner_of(handoff, alloc) {
         Some(record) => {
@@ -506,7 +574,7 @@ fn run_base(
     handoff: bootfmt::Handoff,
     machine: os::Machine,
     config: runner::Config,
-    rings: journal::Rings,
+    rings: rings::Rings,
     cpus: mem::Shared[sched::State],
     mut frames: frames::Frames,
     ) fails task::Cancelled uses wait {
@@ -522,7 +590,10 @@ fn run_base(
     defer take storing.close()
     let managing = os::MintedLive.of(posted, own: "/live/devices", alloc: config.alloc)
     defer take managing.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: storing.mint(), devices_live: managing.mint(), wall: config.wall, handoff: handoff)
+    let backlog = journal::Backlog.empty(alloc: config.alloc)
+    let feeding = journal::MintedFeed.of(backlog, alloc: config.alloc)
+    defer take feeding.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: storing.mint(), devices_live: managing.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint())
     var requested = incoming
     var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings))
     defer abandon_given(take given)
@@ -537,7 +608,7 @@ fn run_base(
             try await serve_board(take board, origin, machine, security: security_of(handoff, machine, alloc: config.alloc), cpus, gauges: reading, exec: config.exec, alloc: config.alloc)
         })
         discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
-            try await print_events(rings, exec: config.exec, alloc: config.alloc)
+            try await print_events(rings, backlog, exec: config.exec, alloc: config.alloc)
         })
         discard s.spawn(fn[take store_events]() fails task::Cancelled uses wait limits stack 8_192 {
             try await record_store_events(take store_events, rings)
@@ -570,7 +641,7 @@ fn run_base(
 } run_base
 
 /// Writes each event the store reports to the core rings, and halts the kernel with the code of a failed mount.
-fn record_store_events(take reports: task::Receiver[store::service::Report], rings: journal::Rings) fails task::Cancelled uses wait {
+fn record_store_events(take reports: task::Receiver[store::service::Report], rings: rings::Rings) fails task::Cancelled uses wait {
     var receiver = reports
     loop {
         let Some(report) = try await mut receiver.receive() else {
@@ -692,7 +763,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     var bundle = Array[u8, 33].filled(0)
     bundle[0] = 0x01
     let config = runner::Config(exec: world.exec, pool: alloc, alloc: alloc, clock: world.clock, wall: ident::Wall(at: ident::WallTime.unknown(), since_ns: 0), random: world.random, classes: sched::classes())
-    let rings = journal::Rings.of(cpus: hw::cpu_count(), clock: world.clock, alloc)
+    let rings = rings::Rings.of(cpus: hw::cpu_count(), clock: world.clock, alloc)
     let task::Channel(sender: requests, receiver: unanswered) = task::Channel[Reservation].bounded(1, alloc)
     discard unanswered
     let task::Channel(sender: orders, receiver: unserved) = task::Channel[devices::RootOrder].bounded(1, alloc)
@@ -707,7 +778,9 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unposted
     let living = os::MintedLive.of(posted, own: "/live/store", alloc)
     defer take living.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty())
+    let feeding = journal::MintedFeed.of(journal::Backlog.empty(alloc), alloc)
+    defer take feeding.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint())
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, gauges: runner::Gauges.empty(alloc), body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)

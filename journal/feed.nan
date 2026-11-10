@@ -1,0 +1,123 @@
+//! The feed: the capability through which `journal` takes the records the core drains from its rings, which the core holds until `journal` takes them.
+
+/// The most records the core holds for `journal`: the records of a drain past them are counted lost.
+const HELD_RECORDS: usize = 2_048
+
+/// A capability taking the records the core drained.
+pub open struct Feed {
+} Feed
+
+impl Feed: sys::Kind[Backlog, u8]
+
+/// What the core drained and `journal` has not taken, and the signal the core posts as it holds more.
+pub open struct Backlog derives Send {
+    held: task::Cown[Held]
+    signal: mem::Shared[hw::Signal[Unit]]
+} Backlog
+
+/// The drains held, oldest first, and the records they hold.
+struct Held {
+    drains: mem::List[Drained]
+    records: usize
+} Held
+
+/// What the core drained of one ring: its records, and how many events found it full or found the backlog full since its previous drain.
+pub closed struct Drained {
+    pub cpu: u32
+    pub records: mem::List[CoreRecord]
+    pub lost: u64
+} Drained
+
+/// The root entry of the feeds the core mints, revoked when it closes.
+pub open linear struct MintedFeed derives Send {
+    minter: sys::Minter[Feed, Backlog, u8]
+} MintedFeed
+
+pub fn Backlog.empty(alloc: mem::Alloc) -> Backlog {
+    return Backlog(held: task::Cown.of(Held(drains: mem::List.empty(alloc), records: 0), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
+} Backlog.empty
+
+pub fn Backlog.share(self) -> Backlog {
+    return Backlog(held: self.held.share(), signal: self.signal.share())
+} Backlog.share
+
+/// Holds `drained` for `journal`, counting its records lost when the backlog has no room for them, and signals it.
+pub fn Backlog.hold(self, take drained: Drained) fails task::Cancelled uses wait {
+    let held = self.held.share()
+    var given = Some(take drained)
+    await when mut held {
+        match mut given.extract() {
+            Some(Drained(cpu: cpu, records: records, lost: lost)) => {
+                var kept = records
+                var dropped = lost
+                if held.records + kept.len() > HELD_RECORDS {
+                    dropped += u64.widen(kept.len())
+                    mut kept.truncate(0)
+                }
+                held.records += kept.len()
+                mut held.drains.push(Drained(cpu: cpu, records: take kept, lost: dropped))
+            }
+            None => {
+            }
+        }
+    }
+    let signal = self.signal.share()
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        signal.contents().post(t, value: Unit)
+    })
+} Backlog.hold
+
+/// A root entry of feeds taking what `backlog` holds.
+pub fn MintedFeed.of(backlog: Backlog, alloc: mem::Alloc) -> MintedFeed {
+    return MintedFeed(minter: sys::Minter[Feed, Backlog, u8].of(backlog.share(), alloc))
+} MintedFeed.of
+
+pub fn MintedFeed.mint(self) -> Feed {
+    return self.minter.mint(0)
+} MintedFeed.mint
+
+/// Revokes every feed of this root entry.
+pub fn MintedFeed.close(take self) {
+    let MintedFeed(minter: minter) = self
+    take minter.close()
+} MintedFeed.close
+
+/// The drains the core holds, oldest first, waiting until it holds one; none once the feed is stale.
+pub fn Feed.next(self, alloc: mem::Alloc) -> mem::List[Drained] fails task::Cancelled uses wait {
+    let Some(backlog) = sys::reach(self, body: fn(state: Backlog, record: u8) => state.share()) else {
+        return mem::List.empty(alloc)
+    }
+    loop {
+        let held = backlog.held.share()
+        var taken = mem::List[Drained].empty(alloc)
+        await when mut held {
+            while held.drains.len() > 0 {
+                mut taken.push(mut held.drains.remove(0))
+            }
+            held.records = 0
+        }
+        if taken.len() > 0 {
+            return taken
+        }
+        try await backlog.signal.contents().wait()
+    }
+} Feed.next
+
+test feeds_give_what_the_core_holds_and_count_what_overflows for Feed.next {
+    let alloc = testing::world().alloc
+    let backlog = Backlog.empty(alloc)
+    let minted = MintedFeed.of(backlog, alloc)
+    defer take minted.close()
+    let feed = minted.mint()
+    var records = mem::List[CoreRecord].empty(alloc)
+    mut records.push(CoreRecord(record: RingRecord(time: 1, cause: 0, source: 0, kind: STARTED, severity: 1, flags: 0, argument: 1), more: mem::List.empty(alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor"))))
+    try await backlog.hold(Drained(cpu: 0, records: take records, lost: 2))
+    var many = mem::List[CoreRecord].empty(alloc)
+    for _ in 0..<(HELD_RECORDS + 1) {
+        mut many.push(CoreRecord(record: RingRecord(time: 1, cause: 0, source: 0, kind: STOPPED, severity: 1, flags: 0, argument: 0), more: mem::List.empty(alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor"))))
+    }
+    try await backlog.hold(Drained(cpu: 1, records: take many, lost: 0))
+    let drains = try await feed.next(alloc)
+    expect drains.len() == 2 and drains[0].records.len() == 1 and drains[0].lost == 2
+    expect drains[1].cpu == 1 and drains[1].records.len() == 0 and drains[1].lost == u64.widen(HELD_RECORDS + 1)
+} feeds_give_what_the_core_holds_and_count_what_overflows
