@@ -18,12 +18,13 @@ struct Surroundings derives Copy {
     alloc: mem::Alloc
 } Surroundings
 
-/// A subscription: its number, the subtree and branch it watches, and its port.
+/// A subscription: its number, the subtree and branch it watches, its port, and the commits it could not be told of since it was last told.
 struct Subscription {
     number: u64
     prefix: ident::Path
     branch: text::String
     port: os::PortHandle
+    lost: u64
 } Subscription
 
 /// The engine on its volume, the subscriptions, and where `devices` placed the volume.
@@ -272,7 +273,7 @@ fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::O
         var reply = mem::Bytes.empty(alloc)
         match outcome {
             Ok(done) => {
-                try await self.tell(branch: branches[at].as_str(), commit: done.number, paths: paths[at], alloc)
+                try await mut self.tell(branch: branches[at].as_str(), commit: done.number, paths: paths[at], alloc)
                 let accepted: Result[store::Committed, Failure] = Ok(take done)
                 reply = encoded(accepted, alloc)
             }
@@ -289,38 +290,41 @@ fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::O
 
 /// Tells each subscription on `branch` of the commit `commit`, which wrote `paths`, naming those below its prefix.
 fn Sequencer.tell(
-    self,
+    mut self,
     branch: Str,
     commit: ident::CommitId,
     paths: mem::List[ident::Path],
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
-    for subscription in self.subscriptions {
-        if subscription.branch.as_str() != branch {
-            continue
-        }
+    var at: usize = 0
+    while at < self.subscriptions.len() {
+        let subscription = self.subscriptions[at]
         var watched = mem::List[ident::Path].empty(alloc)
-        for path in paths {
-            if within(path, prefix: subscription.prefix, alloc) {
-                mut watched.push(ident::Path(text: text::String.of(path.text.as_str(), alloc)))
+        if subscription.branch.as_str() == branch {
+            for path in paths {
+                if within(path, prefix: subscription.prefix, alloc) {
+                    mut watched.push(ident::Path(text: text::String.of(path.text.as_str(), alloc)))
+                }
             }
         }
         if watched.len() > 0 {
-            try await changed(subscription.port, subscription: subscription.number, commit, paths: take watched, alloc)
+            self.subscriptions[at].lost = try await changed(subscription, commit, paths: take watched, alloc)
         }
+        at += 1
     }
 } Sequencer.tell
 
-/// Sends the port `port` the commit `commit` changing `paths`, at most 64 of them named; nothing when it is stale or serves no `Watcher`.
-fn changed(
-    port: os::PortHandle,
-    subscription: u64,
-    commit: ident::CommitId,
-    take paths: mem::List[ident::Path],
-    alloc: mem::Alloc,
-    ) fails task::Cancelled uses wait {
-    let Some(watcher) = os::Port[Watcher].of(port) else {
-        return
+/// Offers `subscription`'s port the commit `commit` changing `paths`, at most 64 of them named, after one `lost` for the commits it could not be told of; gives the commits it could not be told of now, none when it is stale or serves no `Watcher`.
+fn changed(subscription: Subscription, commit: ident::CommitId, take paths: mem::List[ident::Path], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let Some(watcher) = os::Port[Watcher].of(subscription.port) else {
+        return 0
+    }
+    if subscription.lost > 0 {
+        var told = sys::Encoded.empty(alloc)
+        sys::Wire[Watcher].lost(mut told, subscription: subscription.number, commits: subscription.lost)
+        if not try await offered(watcher, call: take told) {
+            return subscription.lost + 1
+        }
     }
     var named = paths
     var more: u64 = 0
@@ -329,13 +333,21 @@ fn changed(
         more += 1
     }
     var call = sys::Encoded.empty(alloc)
-    sys::Wire[Watcher].changed(mut call, subscription, commit, paths: take named, more)
-    match attempt await watcher.post(take call) {
-        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
-        else => {
-        }
+    sys::Wire[Watcher].changed(mut call, subscription: subscription.number, commit, paths: take named, more)
+    return match try await offered(watcher, take call) {
+        true => 0
+        false => 1
     }
 } changed
+
+/// Whether `watcher` took `call`, which it does not without credit; a stopped or revoked port takes nothing more.
+fn offered(watcher: os::Port[Watcher], take call: sys::Encoded) -> bool fails task::Cancelled uses wait {
+    return match first attempt await watcher.offer(take call) {
+        Ok(taken) => taken
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => true
+    }
+} offered
 
 /// The paths a transaction's writes name.
 fn written_paths(writes: mem::List[store::Write], alloc: mem::Alloc) -> mem::List[ident::Path] {

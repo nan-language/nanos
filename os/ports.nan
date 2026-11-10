@@ -165,6 +165,29 @@ pub fn Port.post(self, take call: sys::Encoded) fails PortError[Never] uses wait
     }
 } Port.post
 
+/// Posts the one-way call `call` when the port has a message's credit left, giving whether it did, once it is in the instance's intake.
+pub fn Port.offer(self, take call: sys::Encoded) -> bool fails PortError[Never] uses wait {
+    let reached = match self.reach(call.bytes.view()) {
+        Ok(reached) => reached
+        Err(Refusal.Revoked) => fail PortError.Revoked
+        Err(Refusal.Stopped) => fail PortError.Stopped
+    }
+    var granted = false
+    let credits = reached.credits
+    await when mut credits {
+        granted = mut credits.take_one(request: false)
+    }
+    if not granted {
+        return false
+    }
+    let sent = attempt await reached.intake.send(Call(hash: sys::Wire[P].hash(), encoded: take call, reply: None, lease: Lease(credits: credits.share(), request: false)))
+    return match sent {
+        Ok(_) => true
+        Err(task::SendError.Closed) => fail PortError.Stopped
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+    }
+} Port.offer
+
 /// Calls the request `call`, waiting for credit, and gives its reply, which `reply` decodes.
 pub fn Port.call[R: Send, E: Send](self, take call: sys::Encoded, reply: sys::Reply[R, E], alloc: mem::Alloc) -> R fails PortError[E] uses wait {
     let reached = match self.reach(call.bytes.view()) {
@@ -318,3 +341,37 @@ fn Credits.hand_over(mut self, request: bool) -> Option[task::Sender[Unit]] {
     self.messages += 1
     return None
 } Credits.hand_over
+
+protocol Pinging {
+    pub fn ping() limits traceless
+} Pinging
+
+test offers_take_the_credit_left_and_refuse_once_it_is_spent for Port.offer {
+    let alloc = testing::world().alloc
+    let task::Channel(sender: intake, receiver: calls) = task::Channel[Call].bounded(4, alloc)
+    let gate = Gate.of(alloc)
+    gate.set(open: true)
+    let minted = MintedPort.of(intake, gate: gate.share(), protocols: Protocols(own: sys::Wire[Pinging].hash(), serves: None), operations: None, credit: Credit(messages: 1, calls: 1), alloc)
+    defer take minted.close()
+    let Some(port) = Port[Pinging].of(minted.handle()) else {
+        expect false
+        return
+    }
+    var opening = sys::Encoded.empty(alloc)
+    sys::Wire[Pinging].ping(mut opening)
+    let taken = try await port.offer(call: take opening)
+    var second = sys::Encoded.empty(alloc)
+    sys::Wire[Pinging].ping(mut second)
+    let refused = try await port.offer(call: take second)
+    expect taken and not refused
+    var receiver = calls
+    let Some(Call(hash: _, encoded: _, reply: _, lease: lease)) = try await mut receiver.receive() else {
+        expect false
+        return
+    }
+    try await take lease.release()
+    var third = sys::Encoded.empty(alloc)
+    sys::Wire[Pinging].ping(mut third)
+    let again = try await port.offer(call: take third)
+    expect again
+} offers_take_the_credit_left_and_refuse_once_it_is_spent
