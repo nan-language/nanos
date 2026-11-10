@@ -23,7 +23,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `devices/` | The `devices` package: the device protocols and `fat`'s, the `drivers` registry, the AML evaluator, partition tables, volume views and the device manager |
 | `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries |
 | `fat/` | The `fat` package: the boot volume's file system |
-| `store/` | The `store` package: the store's engine, its log, index trees and item table, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol and Views |
+| `store/` | The `store` package: the store's engine, its log, index trees, item table and blob cache, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol, Views and mappings |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install` and `sandbox` scripts |

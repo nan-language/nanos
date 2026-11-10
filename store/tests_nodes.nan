@@ -69,29 +69,41 @@ test streams_append_read_and_trim for Store.read_stream {
     expect node.kind == NodeKind.Stream and node.size == 3 and node.version.number == 2
 } streams_append_read_and_trim
 
-test blobs_of_several_pieces_read_back for Store.read {
-    let alloc = testing::world().alloc
-    let device = test_volume(alloc)
-    var store = try await genesis_store(device, alloc)
-    let draft = mut store.draft(now: at_second(10), alloc)
+/// 150,000 bytes of a repeating pattern.
+fn patterned(alloc: mem::Alloc) -> mem::Bytes {
     var content = mem::Bytes.empty(alloc)
     for at in 0..<150_000usize {
         mut content.push(u8.truncate(at * 31 % 251))
     }
+    return content
+} patterned
+
+/// Writes `content` as the blob of `/data/file` on `main`, through a draft taking it 40,000 bytes at a time.
+fn put_file(mut store: Store, device: disk::MemoryVolume, content: Slice[u8], alloc: mem::Alloc) -> Closed fails StoreError uses wait {
+    let draft = mut store.draft(now: at_second(10), alloc)
     var offset: usize = 0
     while offset < content.len() {
         let size = match content.len() - offset < 40_000 {
             true => content.len() - offset
             false => 40_000
         }
-        let chunk = disk::copy_range(content.view(), at: offset, count: size, alloc)
+        let chunk = disk::copy_range(content, at: offset, count: size, alloc)
         try await mut store.draft_append(device, draft, bytes: chunk.view(), by: system_stamp(alloc).principal, now: at_second(10), alloc)
         offset += size
     }
-    let expected = ident::HashValue.of_content(content.view())
-    let closed = try await mut store.draft_close(device, draft, expected: Some(expected), now: at_second(10), alloc)
-    expect closed.size == 150_000
+    let closed = try await mut store.draft_close(device, draft, expected: Some(ident::HashValue.of_content(content)), now: at_second(10), alloc)
     discard try await commit_writes(mut store, device, writes: single(Write.Put(path: path_of("/data/file", alloc), value: Value.Blob(closed.id)), alloc), base: None, alloc)
+    return closed
+} put_file
+
+test blobs_of_several_pieces_read_back for Store.read {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    let content = patterned(alloc)
+    let expected = ident::HashValue.of_content(content.view())
+    let closed = try await put_file(mut store, device, content: content.view(), alloc)
+    expect closed.size == 150_000
     let whole = try await mut store.read(device, branch: "main", path: path_of("/data/file", alloc), offset: 0, length: 200_000, verify: true, now: at_second(11), alloc)
     expect testing::same(whole.view(), expected: Untrusted.of(content.view()))
     var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(12), alloc)
@@ -102,6 +114,20 @@ test blobs_of_several_pieces_read_back for Store.read {
     let mismatched = attempt await mut mounted.draft_close(device, draft: missing, expected: Some(expected), now: at_second(13), alloc)
     expect mismatched.is_err()
 } blobs_of_several_pieces_read_back
+
+test blobs_map_the_cached_pieces_of_a_range for Store.map {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    let content = patterned(alloc)
+    discard try await put_file(mut store, device, content: content.view(), alloc)
+    let mapped = try await mut store.map(device, branch: "main", path: path_of("/data/file", alloc), offset: 65_000, length: 70_000, now: at_second(11), alloc)
+    expect mapped.pieces.len() == 3 and mapped.start == 65_000 and mapped.length == 70_000
+    let second = disk::copy_range(content.view(), at: 65_536, count: 65_536, alloc)
+    expect testing::same(mapped.pieces[1].contents().view(), expected: Untrusted.of(second.view()))
+    let past = try await mut store.map(device, branch: "main", path: path_of("/data/file", alloc), offset: 150_000, length: 10, now: at_second(11), alloc)
+    expect past.pieces.len() == 0 and past.length == 0
+} blobs_map_the_cached_pieces_of_a_range
 
 test hashes_follow_content for Store.root_hash {
     let alloc = testing::world().alloc

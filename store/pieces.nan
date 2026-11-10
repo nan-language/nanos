@@ -1,0 +1,124 @@
+//! The blob cache: the pieces of blobs held in memory once, whatever the number of their readers, shared with the mappings that read them in place, the least recently used leaving first once the cache holds more than its bytes.
+
+/// The bytes of pieces the cache holds before it lets the least recently used go.
+const CACHED_BYTES: u64 = 8_388_608
+
+/// A cached piece: its bytes, shared with the mappings holding it, and the tick of its last use.
+pkg struct Cached {
+    pkg bytes: mem::Shared[Untrusted[mem::Bytes]]
+    pkg used: u64
+} Cached
+
+/// The cached pieces by key, the bytes they hold, and the tick of the latest use.
+pkg struct PieceCache {
+    pkg pieces: mem::Map[Array[u8, 32], Cached]
+    pkg bytes: u64
+    pkg tick: u64
+} PieceCache
+
+/// The pieces of a range of a blob, read in place: the piece holding its first byte and those after it, the offset of that byte in it, and the range's length.
+pub closed struct MappedPieces {
+    pub pieces: mem::List[mem::Shared[Untrusted[mem::Bytes]]]
+    pub start: u64
+    pub length: u64
+} MappedPieces
+
+pkg fn PieceCache.empty(alloc: mem::Alloc) -> PieceCache {
+    return PieceCache(pieces: mem::Map.empty(alloc), bytes: 0, tick: 0)
+} PieceCache.empty
+
+/// The pieces holding at most `length` bytes of the blob at `path` of the head of `branch` from `offset`, through the cache.
+pub fn Store.map[D: disk::Device](
+    mut self,
+    device: D,
+    branch: Str,
+    path: ident::Path,
+    offset: u64,
+    length: u32,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> MappedPieces fails StoreError uses wait {
+    let head = try self.head_named(branch)
+    let segments = path.segments(alloc)
+    let resolution = try await mut self.resolve(device, head, segments: segments.view(), now, alloc)
+    let Some(found) = resolution.node() else {
+        fail StoreError.NotFound
+    }
+    let Content.Blob(id: id, size: size) = found.entry.content else {
+        fail StoreError.Kind
+    }
+    var pieces = mem::List[mem::Shared[Untrusted[mem::Bytes]]].empty(alloc)
+    if offset >= size {
+        return MappedPieces(pieces: take pieces, start: 0, length: 0)
+    }
+    let end = match size - offset < u64.widen(length) {
+        true => size
+        false => offset + u64.widen(length)
+    }
+    let piece_bytes = u64.widen(ident::PIECE_BYTES)
+    var index = offset / piece_bytes
+    while index * piece_bytes < end {
+        mut pieces.push(try await mut self.cached_piece(device, id, index, verify: false, alloc))
+        index += 1
+    }
+    return MappedPieces(pieces: take pieces, start: offset % piece_bytes, length: end - offset)
+} Store.map
+
+/// Piece `index` of the blob `id`, from the cache, else read from the volume and cached, checked against its key when `verify`.
+pkg fn Store.cached_piece[D: disk::Device](
+    mut self,
+    device: D,
+    id: ident::HashValue,
+    index: u64,
+    verify: bool,
+    alloc: mem::Alloc,
+    ) -> mem::Shared[Untrusted[mem::Bytes]] fails StoreError uses wait {
+    let key = try await mut self.piece_key(device, id, index, alloc)
+    let named = disk::array32(key.view(), at: 0)
+    self.cache.tick += 1
+    let tick = self.cache.tick
+    match mut self.cache.pieces.remove(named) {
+        Some(held) => {
+            let Cached(bytes: bytes, used: _) = held
+            let shared = bytes.share()
+            discard mut self.cache.pieces.insert(named, value: Cached(bytes: take bytes, used: tick))
+            if verify and not piece_holds(shared.contents().view(), index, key: key.view()) {
+                fail StoreError.Corrupt
+            }
+            return shared
+        }
+        None => {
+        }
+    }
+    let read = try await mut self.read_keyed_piece(device, key: key.view(), alloc)
+    if verify and not piece_holds(read.view(), index, key: key.view()) {
+        fail StoreError.Corrupt
+    }
+    let bytes = u64.widen(read.byte_len())
+    let shared = mem::Shared.of(take read, alloc)
+    discard mut self.cache.pieces.insert(named, value: Cached(bytes: shared.share(), used: tick))
+    self.cache.bytes += bytes
+    mut self.cache.trim()
+    return shared
+} Store.cached_piece
+
+/// Lets the least recently used pieces go until the cache holds at most its bytes.
+fn PieceCache.trim(mut self) {
+    while self.bytes > CACHED_BYTES and self.pieces.len() > 1 {
+        var oldest: Option[Array[u8, 32]] = None
+        var least: u64 = 0xFFFF_FFFF_FFFF_FFFF
+        for entry in self.pieces {
+            if entry.value().used < least {
+                least = entry.value().used
+                oldest = Some(entry.key())
+            }
+        }
+        let Some(key) = oldest else {
+            return
+        }
+        let Some(gone) = mut self.pieces.remove(key) else {
+            return
+        }
+        self.bytes = self.bytes.saturating_sub(u64.widen(gone.bytes.contents().byte_len()))
+    }
+} PieceCache.trim

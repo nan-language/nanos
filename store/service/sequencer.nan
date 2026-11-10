@@ -68,11 +68,13 @@ fn sequence(
         Ok(ready) => {
             discard attempt await out.mounted(failure: None)
             var sequencer = ready
+            var mappings = Mappings.empty(alloc)
+            defer take mappings.close()
             try await mut sequencer.report(world)
             try await mut sequencer.show(world)
             loop {
                 let batch = try await handoff.take_all(alloc)
-                try await mut sequencer.serve(take batch, world, out)
+                try await mut sequencer.serve(take batch, mut mappings, world, out)
                 try await mut sequencer.tend(world)
             }
         }
@@ -89,7 +91,7 @@ fn sequence(
                 for queued in take batch {
                     var copy = mem::Bytes.empty(alloc)
                     mut copy.append(reply.view())
-                    discard attempt await out.answered(request: queued.request, reply: take copy)
+                    discard attempt await out.answered(request: queued.request, reply: plain(take copy, alloc))
                 }
             }
         }
@@ -161,6 +163,11 @@ fn encoded[T: Encode](outcome: Result[T, Failure], alloc: mem::Alloc) -> mem::By
     return bytes
 } encoded
 
+/// The reply of encoding `bytes`, which carries no handles.
+fn plain(take bytes: mem::Bytes, alloc: mem::Alloc) -> sys::Encoded {
+    return sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc))
+} plain
+
 /// A store outcome as a reply: its value, or its failure; a cancellation stays one.
 fn settled[T](take outcome: Result[T, store::StoreError]) -> Result[T, Failure] fails task::Cancelled {
     return match first outcome {
@@ -188,8 +195,14 @@ fn Sequencer.tend(mut self, world: Surroundings) fails task::Cancelled uses wait
     try await mut self.report(world)
 } Sequencer.tend
 
-/// Serves `batch` in order, each run of commits through one log flush, answering every request.
-fn Sequencer.serve(mut self, take batch: mem::List[Queued], world: Surroundings, out: sys::Outbox[Store]) fails task::Cancelled uses wait {
+/// Serves `batch` in order, each run of commits through one log flush, answering every request, the mappings it makes held in `mappings`.
+fn Sequencer.serve(
+    mut self,
+    take batch: mem::List[Queued],
+    mut mappings: Mappings,
+    world: Surroundings,
+    out: sys::Outbox[Store],
+    ) fails task::Cancelled uses wait {
     let alloc = world.alloc
     var run = Run.empty(alloc)
     for queued in take batch {
@@ -204,15 +217,21 @@ fn Sequencer.serve(mut self, take batch: mem::List[Queued], world: Surroundings,
                     }
                     Err(failure) => {
                         let outcome: Result[store::Committed, Failure] = Err(take failure)
-                        discard attempt await out.answered(request, reply: encoded(outcome, alloc))
+                        discard attempt await out.answered(request, reply: plain(encoded(outcome, alloc), alloc))
                     }
                 }
+            }
+            Job.Map(path: path, offset: offset, length: length) => {
+                try await mut self.flush_run(take run, world, out)
+                run = Run.empty(alloc)
+                let reply = try await mut self.map(scope, path, offset, length, mut mappings, world)
+                discard attempt await out.answered(request, take reply)
             }
             else => {
                 try await mut self.flush_run(take run, world, out)
                 run = Run.empty(alloc)
                 let reply = try await mut self.run(take scope, take job, world)
-                discard attempt await out.answered(request, take reply)
+                discard attempt await out.answered(request, reply: plain(take reply, alloc))
             }
         }
     }
@@ -249,7 +268,7 @@ fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::O
                 reply = encoded(refused, alloc)
             }
         }
-        discard attempt await out.answered(request: requests[at], take reply)
+        discard attempt await out.answered(request: requests[at], reply: plain(take reply, alloc))
         at += 1
     }
     try await mut self.show(world)
