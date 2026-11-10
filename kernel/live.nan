@@ -1,4 +1,4 @@
-//! The board: the core's task holding the latest record each provider published below `/live`, which computes `/live/status` from them and the clocks when it is read.
+//! The board: the core's task holding the latest record each provider published below `/live`, which computes `/live/status` from them and the clocks, and the records of `/live/cpus` from the scheduler's state, when they are read.
 
 /// The path of the record the board computes.
 const LIVE_STATUS: Str = "/live/status"
@@ -11,6 +11,12 @@ const LIVE_STORE: Str = "/live/store"
 
 /// The path of the security record.
 const LIVE_SECURITY: Str = "/live/security"
+
+/// The dir of the records of CPUs.
+const LIVE_CPUS: Str = "/live/cpus"
+
+/// The idle state a resting CPU is in.
+const HALTED: Str = "hlt"
 
 /// What `/live/status` reads besides the records: the generation booted and its mode, and the clocks.
 struct Origin derives Copy {
@@ -31,12 +37,13 @@ fn Origin.of(handoff: bootfmt::Handoff, clock: sys::Clock, wall: ident::Wall) ->
     return Origin(generation: handoff.generation, mode: mode, clock: clock, wall: wall)
 } Origin.of
 
-/// Holds `machine`, `security` and the records published through `postings`, a withdrawal taking those below its path too, and answers their reads, until every sender is gone.
+/// Holds `machine`, `security` and the records published through `postings`, a withdrawal taking those below its path too, and answers their reads and those of the CPUs of `cpus`, until every sender is gone.
 fn serve_board(
     take postings: task::Receiver[os::Posting],
     origin: Origin,
     machine: os::Machine,
     take security: os::LiveSecurity,
+    cpus: mem::Shared[sched::State],
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
     var records = mem::Map[text::String, os::Published].empty(alloc)
@@ -57,12 +64,12 @@ fn serve_board(
                     true => Some(status_of(records, origin, alloc))
                     false => match records.get(path) {
                         Some(record) => Some(os::Published(type: text::String.of(record.type.as_str(), alloc), schema: record.schema, bytes: copy_of(record.bytes.view(), alloc)))
-                        None => None
+                        None => cpu_at(cpus.contents(), path: path.as_str(), origin, alloc)
                     }
                 }
                 try await answer(reply, value: take found)
             }
-            os::Posting.List(path: path, after: after, limit: limit, reply: reply) => try await answer(reply, value: children(records, path: path.as_str(), after, limit, alloc))
+            os::Posting.List(path: path, after: after, limit: limit, reply: reply) => try await answer(reply, value: children(records, cpus: cpus.contents().count(), path: path.as_str(), after, limit, alloc))
         }
     }
 } serve_board
@@ -91,9 +98,10 @@ fn answer[T: Send](reply: task::Sender[T], take value: T) fails task::Cancelled 
     }
 } answer
 
-/// The children of `path` the records give, and `status` below `/live`, in name order, named after `after`, at most `limit`.
+/// The children of `path` the records give, `status` and `cpus` below `/live`, and the `cpus` CPUs below `/live/cpus`, in name order, named after `after`, at most `limit`.
 fn children(
     records: mem::Map[text::String, os::Published],
+    cpus: u32,
     path: Str,
     after: Option[text::String],
     limit: u32,
@@ -106,6 +114,13 @@ fn children(
     var entries = mem::List[os::LiveEntry].empty(alloc)
     if path == "/live" {
         add_child(mut entries, name: b"status", type: Some(text::String.of("os::LiveStatus", alloc)), parent: false, after, alloc)
+        add_child(mut entries, name: b"cpus", type: None, parent: true, after, alloc)
+    }
+    if path == LIVE_CPUS {
+        for number in 0..<cpus {
+            let name = store::decimal_name(u64.widen(number), alloc)
+            add_child(mut entries, name: name.view(), type: Some(text::String.of("os::LiveCpu", alloc)), parent: false, after, alloc)
+        }
     }
     for entry in records {
         let key = entry.key().as_bytes()
@@ -169,6 +184,47 @@ fn add_child(
     }
     mut entries.insert(at, value: os::LiveEntry(name: take named, type: take type, parent: parent))
 } add_child
+
+/// The record as of now of the CPU `path` names below `/live/cpus`, `None` when it names none.
+fn cpu_at(cpus: sched::State, path: Str, origin: Origin, alloc: mem::Alloc) -> Option[os::Published] {
+    let Some(parts) = path.as_bytes().split_at(LIVE_CPUS.as_bytes().len() + 1) else {
+        return None
+    }
+    if parts.head.prefix(LIVE_CPUS.as_bytes().len()) != Some(LIVE_CPUS.as_bytes()) or parts.head[LIVE_CPUS.as_bytes().len()] != b'/' {
+        return None
+    }
+    let Some(number) = store::decimal_value(parts.tail) else {
+        return None
+    }
+    if number >= u64.widen(cpus.count()) {
+        return None
+    }
+    let cpu = u32.truncate(number)
+    let Some(place) = cpus.place(cpu) else {
+        return None
+    }
+    let Some(reading) = cpus.reading(cpu) else {
+        return None
+    }
+    var siblings = mem::List[u32].empty(alloc)
+    for other in 0..<cpus.count() {
+        let shares_core = match cpus.place(other) {
+            Some(spot) => spot.core == place.core
+            None => false
+        }
+        if other != cpu and shares_core {
+            mut siblings.push(other)
+        }
+    }
+    var idle_state = text::String.empty(alloc)
+    if reading.resting {
+        mut idle_state.append(HALTED)
+    }
+    let times = reading.times
+    let time = os::CpuTime(normal: times.normal, background: times.background, latency: times.latency, interrupts: times.core, idle: times.idle)
+    let record = os::LiveCpu(online: reading.started, package_id: place.package_id, core: place.core, llc: u32.truncate(place.cache), node: place.node, siblings: take siblings, time: time, run_queue: reading.queued, idle_state: take idle_state, frequency_mhz: 0, wakeups: reading.wakeups, as_of: journal::elapsed(origin.clock))
+    return Some(os::published("os::LiveCpu", value: record, alloc))
+} cpu_at
 
 /// The record of `/live/status` as of now: the instances the records of `/live/instances` count running, converging and failed, and the share of the store's capacity in use its record tells.
 fn status_of(records: mem::Map[text::String, os::Published], origin: Origin, alloc: mem::Alloc) -> os::Published {
@@ -289,7 +345,25 @@ validator fn running_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Array[u
     return counts
 } running_of
 
-test boards_list_what_providers_publish_and_count_instances_in_the_status for serve_board {
+validator fn cpu_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[os::LiveCpu] {
+    return match attempt mem::wire::Codec[os::LiveCpu].decode(raw, alloc) {
+        Ok(found) => Some(take found)
+        Err(_) => None
+    }
+} cpu_of
+
+/// The scheduler's state for two CPUs of one core, both started.
+fn two_cpus(clock: sys::Clock, alloc: mem::Alloc) -> mem::Shared[sched::State] {
+    var places = mem::List[sched::Place].empty(alloc)
+    for _ in 0..<2u32 {
+        mut places.push(sched::Place(package_id: 0, core: 0, cache: 0, node: 0))
+    }
+    let state = mem::Shared.of(sched::State.of(take places, clock, alloc), alloc)
+    state.contents().start(1)
+    return state
+} two_cpus
+
+test boards_list_what_providers_publish_and_compute_status_and_cpus for serve_board {
     let world = testing::world()
     let alloc = world.alloc
     let task::Channel(sender: posted, receiver: postings) = task::Channel[os::Posting].bounded(4, alloc)
@@ -305,7 +379,7 @@ test boards_list_what_providers_publish_and_count_instances_in_the_status for se
             return
         }
         discard s.spawn(fn[take board]() fails task::Cancelled uses wait limits stack 32_768 {
-            try await serve_board(take board, origin, machine, security: security_of(bootfmt::Handoff.empty(), machine, alloc), alloc)
+            try await serve_board(take board, origin, machine, security: security_of(bootfmt::Handoff.empty(), machine, alloc), cpus: two_cpus(world.clock, alloc), alloc)
         })
         try await os::publish(posted, path: "/live/instances/a", type: "os::LiveInstance", value: instance_record(os::Lifecycle.Running, reconciled: os::ReconcileState.Converged, alloc), alloc)
         try await os::publish(posted, path: "/live/instances/b", type: "os::LiveInstance", value: instance_record(os::Lifecycle.Failed, reconciled: os::ReconcileState.Failed(code: text::String.of("trap.unreachable", alloc), detail: text::String.empty(alloc)), alloc), alloc)
@@ -316,9 +390,23 @@ test boards_list_what_providers_publish_and_count_instances_in_the_status for se
             return
         }
         let counts = running_of(Untrusted.of(status.bytes.view()), alloc)
-        expect top.len() == 4 and top[0].name.as_str() == "instances" and top[0].parent and top[1].name.as_str() == "machine" and top[2].name.as_str() == "security" and top[3].name.as_str() == "status"
+        let cpus = try await live.list(LIVE_CPUS, after: None, limit: 8, alloc)
+        let second = try await live.get("/live/cpus/1", alloc)
+        let beyond = try await live.get("/live/cpus/2", alloc)
+        expect top.len() == 5 and top[0].name.as_str() == "cpus" and top[0].parent and top[1].name.as_str() == "instances" and top[1].parent and top[2].name.as_str() == "machine" and top[3].name.as_str() == "security" and top[4].name.as_str() == "status"
         expect instances.len() == 1 and instances[0].name.as_str() == "b"
         expect counts[0] == 1 and counts[1] == 1
+        expect cpus.len() == 2 and cpus[0].name.as_str() == "0" and cpus[1].name.as_str() == "1"
+        expect beyond.is_none()
+        let Some(record) = second else {
+            expect false
+            return
+        }
+        let Some(cpu) = cpu_of(Untrusted.of(record.bytes.view()), alloc) else {
+            expect false
+            return
+        }
+        expect cpu.online and cpu.siblings.len() == 1 and cpu.siblings[0] == 0 and cpu.run_queue == 0
         s.cancel()
     })
-} boards_list_what_providers_publish_and_count_instances_in_the_status
+} boards_list_what_providers_publish_and_compute_status_and_cpus

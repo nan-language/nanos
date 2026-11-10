@@ -30,9 +30,11 @@ pkg struct Features derives Copy, Eq {
     pkg topology: Topology
 } Features
 
-/// How a CPU's APIC id names its last-level cache: the id shifted right by `cache_shift`.
+/// How a CPU's APIC id names its core, last-level cache and package: the id shifted right by `core_shift`, `cache_shift` and `package_shift`.
 pkg struct Topology derives Copy, Eq {
+    pkg core_shift: u8
     pkg cache_shift: u8
+    pkg package_shift: u8
 } Topology
 
 /// The leaves of the boot CPU's identification that the features come from.
@@ -69,7 +71,7 @@ pkg fn Features.read(cpu: hw::Ring0) -> Features {
         x2apic: bit(leaves.features.ecx, at: 21),
         level: level(leaves),
         smt: threads_per_core(cpu, max: basic.eax) > 1,
-        topology: Topology(cache_shift: cache_shift(cpu, max: basic.eax)),
+        topology: topology_of(cpu, max: basic.eax),
     )
 } Features.read
 
@@ -126,12 +128,20 @@ fn level(leaves: Leaves) -> Level {
 
 fn all_bits(value: u32, mask: u32) -> bool = (value & mask) == mask
 
-/// The hardware threads of a core, from the SMT level of leaf 0x1F, or of leaf 0xB where the CPU has no leaf 0x1F reporting levels; 1 without either.
-fn threads_per_core(cpu: hw::Ring0, max: u32) -> u32 {
-    var leaf: u32 = 0xB
+/// The leaf reporting the levels of the CPU's topology: 0x1F where it reports them, else 0xB; none below leaf 0xB.
+fn levels_leaf(cpu: hw::Ring0, max: u32) -> Option[u32] {
     if max >= 0x1F and cpu.cpuid(0x1F, subleaf: 0).ebx != 0 {
-        leaf = 0x1F
-    } else if max < 0xB {
+        return Some(0x1F)
+    }
+    if max < 0xB {
+        return None
+    }
+    return Some(0xB)
+} levels_leaf
+
+/// The hardware threads of a core, from the SMT level of the levels' leaf; 1 without it.
+fn threads_per_core(cpu: hw::Ring0, max: u32) -> u32 {
+    let Some(leaf) = levels_leaf(cpu, max) else {
         return 1
     }
     let smt_level = cpu.cpuid(leaf, subleaf: 0)
@@ -140,6 +150,27 @@ fn threads_per_core(cpu: hw::Ring0, max: u32) -> u32 {
     }
     return smt_level.ebx & 0xFFFF
 } threads_per_core
+
+/// The topology the levels' leaf and leaf 4 give: the bits of the APIC id below the core's id, those of the SMT level, and below the package's, those of the highest level; 0 without the levels, each CPU then counting as a core and a package of its own.
+fn topology_of(cpu: hw::Ring0, max: u32) -> Topology {
+    var topology = Topology(core_shift: 0, cache_shift: cache_shift(cpu, max), package_shift: 0)
+    let Some(leaf) = levels_leaf(cpu, max) else {
+        return topology
+    }
+    for subleaf in 0u32..<8 {
+        let reported = cpu.cpuid(leaf, subleaf)
+        let kind = (reported.ecx >> 8) & 0xFF
+        if kind == 0 {
+            break
+        }
+        let shift = u8.truncate(reported.eax & 0x1F)
+        if kind == 1 {
+            topology.core_shift = shift
+        }
+        topology.package_shift = shift
+    }
+    return topology
+} topology_of
 
 /// The bits of the APIC id below the id of the last-level cache, from the highest cache level of leaf 4; 0 without it, each CPU then counting as having a cache of its own.
 fn cache_shift(cpu: hw::Ring0, max: u32) -> u8 {

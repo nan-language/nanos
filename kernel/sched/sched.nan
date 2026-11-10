@@ -39,8 +39,10 @@ const VALUE_MASK: u64 = 0x3FFF_FFFF_FFFF_FFFF
 /// The accounts with ready work that each CPU keeps the virtual time of.
 const ENTITIES: usize = 64
 
-/// Where a CPU lies: its last-level cache and NUMA node.
+/// Where a CPU lies: its package, core, last-level cache and NUMA node.
 pkg struct Place derives Copy, Eq {
+    pkg package_id: u32
+    pkg core: u32
     pkg cache: u64
     pkg node: u32
 } Place
@@ -59,7 +61,7 @@ pkg struct Scheduler {
     state: mem::Shared[State]
 } Scheduler
 
-/// A CPU's run queue as the policy sees it.
+/// A CPU's run queue as the policy sees it, with the time it spent, whether it rests and since when, and the rests it left.
 struct Cpu {
     started: bool
     idle: bool
@@ -68,7 +70,29 @@ struct Cpu {
     virtual_ns: u64
     running: Running
     entities: mem::Bounded[Entity, ENTITIES]
+    times: Times
+    resting: bool
+    rested_ns: u64
+    wakeups: u64
 } Cpu
+
+/// The time a CPU spent on work of each class, core work counting all of its classes, and idle.
+pkg struct Times derives Copy, Eq {
+    pkg normal: u64
+    pkg background: u64
+    pkg latency: u64
+    pkg core: u64
+    pkg idle: u64
+} Times
+
+/// What a CPU's state tells at a moment: whether it started and rests, its time, the work queued on it and the rests it left.
+pkg struct Reading derives Copy {
+    pkg started: bool
+    pkg resting: bool
+    pkg times: Times
+    pkg queued: u32
+    pkg wakeups: u64
+} Reading
 
 /// The work a CPU runs: its account, weight and class, since when, and whether it runs any.
 struct Running derives Copy {
@@ -133,7 +157,7 @@ pkg fn State.of(take places: mem::List[Place], clock: sys::Clock, alloc: mem::Al
     var cpus = mem::List[hw::SpinLock[Cpu]].empty(alloc)
     for index in 0..<places.len() {
         let idle = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-        mut cpus.push(hw::SpinLock.of(Cpu(started: index == 0, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: idle, entities: mem::Bounded.empty())))
+        mut cpus.push(hw::SpinLock.of(Cpu(started: index == 0, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: idle, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, wakeups: 0)))
     }
     return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false))
 } State.of
@@ -154,6 +178,30 @@ pkg fn State.start(self, cpu: u32) {
 pkg fn State.all_started(self) {
     self.started.store(true)
 } State.all_started
+
+/// The number of CPUs.
+pkg fn State.count(self) -> u32 = u32.truncate(self.places.len())
+
+/// Where CPU `cpu` lies.
+pkg fn State.place(self, cpu: u32) -> Option[Place] {
+    return match self.places.get(usize.widen(cpu)) {
+        Some(found) => Some(found)
+        None => None
+    }
+} State.place
+
+/// What CPU `cpu`'s state tells now.
+pkg fn State.reading(self, cpu: u32) -> Option[Reading] {
+    let Some(lock) = self.cpus.get(usize.widen(cpu)) else {
+        return None
+    }
+    let now = self.now()
+    return Some(hw::without_irqs(fn(t: hw::IrqsDisabled) -> Reading limits notrap, terminates {
+        return lock.with(t, body: fn(mut current: Cpu) -> Reading limits notrap, terminates, noalloc {
+            return current.reading(now_ns: now)
+        })
+    }))
+} State.reading
 
 fn State.now(self) -> u64 limits notrap, terminates, noalloc {
     return match attempt self.clock.elapsed_ns() {
@@ -341,13 +389,14 @@ pkg fn Scheduler.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]
     return hw::Idle.Halt
 } Scheduler.idle
 
-/// Charges the running work for the time since it started or was last charged: `normal` and `background` work to its account's virtual runtime.
+/// Charges the running work for the time since it started or was last charged: to the CPU's time of its class, and `normal` and `background` work to its account's virtual runtime.
 fn Cpu.charge(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     if not self.running.active {
         return
     }
     let ran = now_ns.saturating_sub(self.running.since_ns)
     self.running.since_ns = now_ns
+    self.times = self.times.charged(self.running.class, ns: ran)
     if self.running.class != NORMAL and self.running.class != BACKGROUND {
         return
     }
@@ -406,9 +455,14 @@ fn Cpu.ready_entity(mut self, executor: u64) -> u64 limits notrap, terminates, n
     return floor
 } Cpu.ready_entity
 
-/// Switches this CPU to `task` at `now_ns` and gives its slice: `normal` and `background` work gets one while other work waits on the CPU, other work none.
+/// Switches this CPU to `task` at `now_ns` and gives its slice: `normal` and `background` work gets one while other work waits on the CPU, other work none. A rest it leaves counts as idle time and a wakeup.
 fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, terminates, noalloc {
     mut self.charge(now_ns)
+    if self.resting {
+        self.times.idle = self.times.idle.saturating_add(now_ns.saturating_sub(self.rested_ns))
+        self.resting = false
+        self.wakeups = self.wakeups.saturating_add(1)
+    }
     self.queued = self.queued.saturating_sub(1)
     let class = task.share.class
     if binds(class) {
@@ -432,9 +486,13 @@ fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap
     return 0
 } Cpu.switch_to
 
-/// Makes this CPU idle at `now_ns`: its queue is empty.
+/// Makes this CPU idle at `now_ns`: its queue is empty, and it rests from then on unless it already does.
 fn Cpu.go_idle(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     mut self.charge(now_ns)
+    if not self.resting {
+        self.resting = true
+        self.rested_ns = now_ns
+    }
     self.running.active = false
     self.idle = true
     self.queued = 0
@@ -444,14 +502,61 @@ fn Cpu.go_idle(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     }
 } Cpu.go_idle
 
+/// What this CPU's state tells at `now_ns`, the work it runs and its rest counted until then.
+fn Cpu.reading(self, now_ns: u64) -> Reading limits notrap, terminates, noalloc {
+    var times = self.times
+    if self.running.active {
+        times = times.charged(self.running.class, ns: now_ns.saturating_sub(self.running.since_ns))
+    }
+    if self.resting {
+        times.idle = times.idle.saturating_add(now_ns.saturating_sub(self.rested_ns))
+    }
+    return Reading(started: self.started, resting: self.resting, times: times, queued: self.queued, wakeups: self.wakeups)
+} Cpu.reading
+
+fn Times.none() -> Times = Times(normal: 0, background: 0, latency: 0, core: 0, idle: 0)
+
+/// These times with `ns` more of work of `class`.
+fn Times.charged(self, class: u8, ns: u64) -> Times limits notrap, terminates, noalloc {
+    var times = self
+    if class == NORMAL {
+        times.normal = times.normal.saturating_add(ns)
+    } else if class == BACKGROUND {
+        times.background = times.background.saturating_add(ns)
+    } else if class == LATENCY {
+        times.latency = times.latency.saturating_add(ns)
+    } else {
+        times.core = times.core.saturating_add(ns)
+    }
+    return times
+} Times.charged
+
 fn view(executor: u64, class: u8, weight: u32) -> hw::TaskView {
     return hw::TaskView(task: executor, executor: executor, share: task::Share(weight: weight, class: class, reserve_ppm: 0), last_cpu: None, ran_ns: 0, deadline_ns: None)
 } view
 
 fn idle_cpu() -> Cpu {
     let nothing = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-    return Cpu(started: true, idle: true, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty())
+    return Cpu(started: true, idle: true, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, wakeups: 0)
 } idle_cpu
+
+/// A CPU charges each class the time it ran work of it and counts its rests as idle time, each rest it leaves a wakeup, until the moment it is read.
+test cpus_count_their_time_by_class_and_their_wakeups for Cpu.reading {
+    var cpu = idle_cpu()
+    discard mut cpu.switch_to(view(executor: 1, class: NORMAL, weight: 100), now_ns: 0)
+    discard mut cpu.switch_to(view(executor: 2, class: LATENCY, weight: 100), now_ns: 30)
+    discard mut cpu.switch_to(view(executor: 0, class: CORE, weight: 1), now_ns: 50)
+    mut cpu.go_idle(now_ns: 60)
+    mut cpu.go_idle(now_ns: 80)
+    discard mut cpu.switch_to(view(executor: 3, class: BACKGROUND, weight: 100), now_ns: 100)
+    let running = cpu.reading(now_ns: 110)
+    expect running.times == Times(normal: 30, background: 10, latency: 20, core: 10, idle: 40)
+    expect running.wakeups == 1 and not running.resting
+    mut cpu.go_idle(now_ns: 120)
+    let rested = cpu.reading(now_ns: 150)
+    expect rested.times == Times(normal: 30, background: 20, latency: 20, core: 10, idle: 70)
+    expect rested.resting and rested.wakeups == 1
+} cpus_count_their_time_by_class_and_their_wakeups
 
 test classes_order_every_queue for key {
     expect key(LATENCY, value: 1_000_000_000_000_000) < key(CORE, value: 0)
@@ -515,7 +620,7 @@ test slices_end_only_shared_work for Cpu.switch_to {
 fn four_cpus(clock: sys::Clock, alloc: mem::Alloc) -> Scheduler {
     var places = mem::List[Place].empty(alloc)
     for cpu in 0u64..<4 {
-        mut places.push(Place(cache: cpu / 2, node: 0))
+        mut places.push(Place(package_id: 0, core: u32.truncate(cpu), cache: cpu / 2, node: 0))
     }
     let state = mem::Shared.of(State.of(take places, clock, alloc), alloc)
     for cpu in 1u32..<4 {

@@ -164,7 +164,7 @@ Jobs are instances and appear under `/live/instances`. An [account](08-schedulin
 | `probation` | `Option[WallTime]` | the end of a [probation](10-code.md#probation) in progress |
 | `summary` | `Option[TypedValue]` | the summary it last published |
 
-`LiveCpu`: `online: bool`; `package`, `core`, `llc` and `node`, each `u32`, its place in the topology the core records ([04-kernel.md](04-kernel.md#cpus)); `siblings: mem::List[u32]`; `time: { normal: u64, background: u64, latency: u64, interrupts: u64, idle: u64 }`, by [CPU class](08-scheduling.md#cpu-classes), for interrupt and core work, and idle; `run_queue: u32`; `idle_state: text::String`; `frequency_mhz: u32`; `wakeups: u64`.
+`LiveCpu`: `online: bool`; `package_id`, `core`, `llc` and `node`, each `u32`, its place in the topology the core records ([04-kernel.md](04-kernel.md#cpus)); `siblings: mem::List[u32]`; `time: { normal: u64, background: u64, latency: u64, interrupts: u64, idle: u64 }`, by [CPU class](08-scheduling.md#cpu-classes), for interrupt and core work, and idle; `run_queue: u32`; `idle_state: text::String`; `frequency_mhz: u32`; `wakeups: u64`.
 
 `Account`: `cpu_ns: u64`; `wakeups: u64`; `io_bytes: u64`; `energy_mj: u64`; `throttled: bool`, its energy budget spent ([08-scheduling.md](08-scheduling.md#energy)); `class`, its CPU class; `charge`, `peak` and `limit`, each `u64`, its cell ([05-memory.md](05-memory.md#cells-and-limits)).
 
