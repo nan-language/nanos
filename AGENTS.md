@@ -27,6 +27,9 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `journal/` | The `journal` package: events and the kernel image's kind table, the streams of `/journal`, sources, and the `journal` instance |
 | `keys/` | The `keys` package: the `keys` instance, the machine's keys and the principals' |
 | `policy/` | The `policy` package: the policy's records, presets, patterns and evaluation, and the `policy` instance |
+| `generations/` | The `generations` package: the `boot` instance, recording each boot in the boot record, `/sys/boot` and `/live/boot` |
+| `clock/` | The `clock` package: the `clock` instance and its time sources |
+| `power/` | The `power` package: the `power` instance, the power settings and the switch the core carries out |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install` and `sandbox` scripts |

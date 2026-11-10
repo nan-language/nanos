@@ -1,0 +1,200 @@
+//! The `power` instance: power off and reboot, which the core carries out through the switch it mints for `power`, and the power settings, `/sys/config/power`.
+
+/// The type of `power`'s configuration record.
+const POWER_CONFIG_TYPE: Str = "power::PowerConfig"
+
+/// How long the machine may still run after the write before the operation fails.
+const SETTLE_MS: u64 = 5_000
+
+/// The key of the keyed task answering a request, plus its number.
+const ANSWERING: u64 = 0x1_0000_0000
+
+/// What `power` serves.
+pub protocol Power {
+    /// Powers the machine off.
+    pub fn off() fails PowerFailure limits restorable
+    /// Reboots the machine.
+    pub fn reboot() fails PowerFailure limits restorable
+    /// Writes `config` as the power settings.
+    pub fn configure(config: PowerConfig) fails PowerFailure limits recorded
+    /// The request `request` ended with `reply`.
+    fn answered(request: u64, reply: sys::Encoded) limits traceless
+} Power
+
+pub closed enum PowerFailure derives Eq, Encode {
+    /// The machine still ran 5 s after the write.
+    PowerFailed
+    /// The settings name no idle state.
+    Invalid
+    /// The store refused the write with `code`.
+    Store(code: text::String)
+} PowerFailure
+
+/// An MWAIT idle state: its hint and exit latency in µs.
+pub closed struct IdleState derives Copy, Eq, Encode {
+    pub hint: u32
+    pub exit_latency_us: u32
+} IdleState
+
+/// The power settings: the MWAIT idle states, the energy-performance preference of each class, and the power of a running CPU without a calibration source in mW.
+pub closed struct PowerConfig derives Encode {
+    pub idle_states: mem::List[IdleState]
+    pub preference_latency: u8
+    pub preference_normal: u8
+    pub preference_background: u8
+    pub busy_mw: u32
+} PowerConfig
+
+/// What the core does with the machine's power.
+pub closed enum Switching derives Copy, Eq {
+    Off
+    Reboot
+} Switching
+
+/// A capability having the core power the machine off or reboot it.
+pub open struct Switch {
+} Switch
+
+impl Switch: sys::Kind[Switches, u8]
+
+struct Switches {
+    orders: task::Sender[Switching]
+} Switches
+
+/// The root entry of the switches the core mints, revoked when it closes.
+pub open linear struct MintedSwitch derives Send {
+    minter: sys::Minter[Switch, Switches, u8]
+} MintedSwitch
+
+/// The Env of `power`: its switch, its View of its configuration record, the monotonic clock and its cell.
+pub open struct Env derives Send {
+    switch: Switch
+    configuring: store::service::View
+    clock: sys::Clock
+    alloc: mem::Alloc
+} Env
+
+/// The state of `power`: it holds none.
+pub closed struct Powering derives Encode {
+} Powering
+
+impl Powering: sys::Component[Env, Power]
+
+/// A root entry of switches sending their orders to `orders`.
+pub fn MintedSwitch.of(orders: task::Sender[Switching], alloc: mem::Alloc) -> MintedSwitch {
+    return MintedSwitch(minter: sys::Minter[Switch, Switches, u8].of(Switches(orders: orders.split()), alloc))
+} MintedSwitch.of
+
+pub fn MintedSwitch.mint(self) -> Switch {
+    return self.minter.mint(0)
+} MintedSwitch.mint
+
+pub fn MintedSwitch.close(take self) {
+    let MintedSwitch(minter: minter) = self
+    take minter.close()
+} MintedSwitch.close
+
+/// Has the core carry out `switching`; nothing once the switch is stale.
+pub fn Switch.order(self, switching: Switching) fails task::Cancelled uses wait {
+    let Some(orders) = sys::reach(self, body: fn(state: Switches, record: u8) => state.orders.split()) else {
+        return
+    }
+    match attempt await orders.send(switching) {
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} Switch.order
+
+pub fn Env.of(switch: Switch, configuring: store::service::View, clock: sys::Clock, alloc: mem::Alloc) -> Env {
+    return Env(switch: switch, configuring: configuring, clock: clock, alloc: alloc)
+} Env.of
+
+/// The settings by default: MWAIT C1 with an exit latency of 1 µs, preferences 0, 128 and 255, and 2 W for a running CPU.
+pub fn PowerConfig.default_of(alloc: mem::Alloc) -> PowerConfig {
+    var idle_states = mem::List[IdleState].empty(alloc)
+    mut idle_states.push(IdleState(hint: 0, exit_latency_us: 1))
+    return PowerConfig(idle_states: take idle_states, preference_latency: 0, preference_normal: 128, preference_background: 255, busy_mw: 2_000)
+} PowerConfig.default_of
+
+pub fn Powering.start(mut env: Env) -> Powering = Powering()
+
+pub fn Powering.off(mut self, mut env: Env, mut cx: sys::Cx[Power]) fails PowerFailure {
+    fail mut self.switched(Switching.Off, mut env, mut cx)
+} Powering.off
+
+pub fn Powering.reboot(mut self, mut env: Env, mut cx: sys::Cx[Power]) fails PowerFailure {
+    fail mut self.switched(Switching.Reboot, mut env, mut cx)
+} Powering.reboot
+
+pub fn Powering.configure(mut self, take config: PowerConfig, mut env: Env, mut cx: sys::Cx[Power]) fails PowerFailure {
+    if config.idle_states.len() == 0 {
+        fail PowerFailure.Invalid
+    }
+    let configuring = env.configuring
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail PowerFailure.PowerFailed
+    }
+    mut cx.spawn(key: ANSWERING + request, run: fn[take config](out: sys::Outbox[Power]) fails task::Cancelled uses wait limits stack 65_536 {
+        let outcome = try await write_config(configuring, config, alloc)
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail PowerFailure.PowerFailed
+} Powering.configure
+
+fn Powering.answered(
+    mut self,
+    take request: u64,
+    take reply: sys::Encoded,
+    mut env: Env,
+    mut cx: sys::Cx[Power],
+    ) {
+    discard attempt mut cx.reply(request, reply)
+} Powering.answered
+
+/// Has the core carry out `switching` from a keyed task, which answers `fault.power-failed` once the machine still runs 5 s after; the failure returned is the one a postponed request drops.
+fn Powering.switched(mut self, switching: Switching, mut env: Env, mut cx: sys::Cx[Power]) -> PowerFailure {
+    let switch = env.switch
+    let clock = env.clock
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        return PowerFailure.PowerFailed
+    }
+    mut cx.spawn(key: ANSWERING + request, run: fn(out: sys::Outbox[Power]) fails task::Cancelled uses wait limits stack 16_384 {
+        try await switch.order(switching)
+        try await clock.sleep(SETTLE_MS)
+        let failed: Result[Unit, PowerFailure] = Err(PowerFailure.PowerFailed)
+        discard attempt await out.answered(request, reply: reply_of(failed, alloc))
+    })
+    return PowerFailure.PowerFailed
+} Powering.switched
+
+/// Writes `config` as `power`'s configuration record.
+fn write_config(configuring: store::service::View, config: PowerConfig, alloc: mem::Alloc) -> Result[Unit, PowerFailure] fails task::Cancelled uses wait {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[PowerConfig].encode(config, out: mut bytes)
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: ident::Path(text: text::String.of("/", alloc)), value: store::Value.Record(type: store::TypeRef.of(POWER_CONFIG_TYPE, schema: mem::wire::Codec[PowerConfig].schema_hash(), alloc), bytes: take bytes, secret: false)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+    return match first attempt await configuring.commit(take transaction, typed: true, alloc) {
+        Ok(_) => Ok(Unit)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(PowerFailure.Store(code: text::String.of(failed.code().as_str(), alloc)))
+    }
+} write_config
+
+/// The code of a failure: `fault.power-failed`, `schema.invalid`, or the store's.
+pub fn PowerFailure.code(self) -> text::Fixed[32] {
+    return match self {
+        PowerFailure.PowerFailed => text::Fixed[32].of("fault.power-failed")
+        PowerFailure.Invalid => text::Fixed[32].of("schema.invalid")
+        PowerFailure.Store(code: code) => text::Fixed[32].of(code.as_str())
+    }
+} PowerFailure.code
+
+fn reply_of(outcome: Result[Unit, PowerFailure], alloc: mem::Alloc) -> sys::Encoded {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Result[Unit, PowerFailure]].encode(outcome, out: mut bytes)
+    return sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc))
+} reply_of

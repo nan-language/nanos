@@ -31,6 +31,12 @@ const KEYS: Str = "keys::Keyring"
 
 const POLICY: Str = "policy::Overseer"
 
+const GENERATIONS: Str = "generations::Boot"
+
+const TIMEKEEPER: Str = "clock::Timekeeper"
+
+const POWER: Str = "power::Powering"
+
 /// The canonical paths of the record types genesis writes besides specifications.
 const GRANT_TYPE: Str = "os::Grant"
 
@@ -44,10 +50,14 @@ const JOURNAL_CONFIG_TYPE: Str = "journal::JournalConfig"
 
 const SIGNED_POLICY_TYPE: Str = "policy::SignedPolicy"
 
+const CLOCK_CONFIG_TYPE: Str = "clock::ClockConfig"
+
+const POWER_CONFIG_TYPE: Str = "power::PowerConfig"
+
 /// The memory limit of `store`, whose engine keeps index nodes of 16 KiB in memory.
 const STORE_LIMIT: u64 = 67_108_864
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security`, and the machine's measured facts.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, and the switch of the machine's power.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
@@ -61,7 +71,9 @@ struct Base derives Copy {
     handoff: bootfmt::Handoff
     feed: journal::Feed
     keys_live: os::Live
+    boot_live: os::Live
     machine: os::Machine
+    switch: power::Switch
 } Base
 
 impl Base: runner::Components
@@ -112,11 +124,20 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == POLICY {
         return Some(os::Protocols(own: sys::Wire[policy::Oversight].hash(), serves: Some(sys::Wire[store::service::Watcher].hash())))
     }
+    if component == GENERATIONS {
+        return Some(os::Protocols(own: sys::Wire[generations::Generations].hash(), serves: None))
+    }
+    if component == TIMEKEEPER {
+        return Some(os::Protocols(own: sys::Wire[clock::Timekeeping].hash(), serves: None))
+    }
+    if component == POWER {
+        return Some(os::Protocols(own: sys::Wire[power::Power].hash(), serves: None))
+    }
     return None
 } Base.protocols
 
-/// Whether the component's Env takes a configuration record: `journal`'s and `policy`'s.
-fn Base.configured(self, component: Str) -> bool = component == JOURNAL or component == POLICY
+/// Whether the component's Env takes a configuration record: `journal`'s, `policy`'s and `clock`'s.
+fn Base.configured(self, component: Str) -> bool = component == JOURNAL or component == POLICY or component == TIMEKEEPER
 
 fn Base.serve(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     if component == DEVICES {
@@ -152,23 +173,11 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
         mut peers.push(sys::Wire[devices::Fat].schema(alloc))
         return try await runner::Driven[fat::Files, fat::Env, fat::FatFiles].run(take env, exec, alloc, take serving, take peers, release: fat::Env.abandon)
     }
-    if component == VIRTIO_RNG {
-        return try await self.serve_rng(take world, take serving)
-    }
-    if component == VIRTIO_BLK {
-        return try await self.serve_blk(take world, take serving)
-    }
-    if component == NVME {
-        return try await self.serve_nvme(take world, take serving)
+    if component.starts_with("drivers::") {
+        return try await self.serve_driver(component, take world, take serving)
     }
     if component == AML_EVALUATOR {
         return try await runner::Served[devices::aml::Evaluator, devices::aml::EvaluatorEnv, devices::aml::Aml].run(take world, take serving)
-    }
-    if component == UART_DRIVER or component == CMOS_DRIVER {
-        return try await self.serve_platform(component, take world, take serving)
-    }
-    if component == AHCI {
-        return try await self.serve_ahci(take world, take serving)
     }
     if component == STORE_SERVICE {
         return try await self.serve_store(take world, take serving)
@@ -182,6 +191,15 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     if component == POLICY {
         return try await self.serve_policy(take world, take serving)
     }
+    if component == GENERATIONS {
+        return try await self.serve_boot(take world, take serving)
+    }
+    if component == TIMEKEEPER {
+        return try await self.serve_clock(take world, take serving)
+    }
+    if component == POWER {
+        return try await self.serve_power(take world, take serving)
+    }
     let exec = world.exec
     let alloc = world.alloc
     let Ok(env) = attempt supervisor::Env.build(take world) else {
@@ -192,6 +210,23 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     return try await runner::Driven[supervisor::Supervision, supervisor::Env, supervisor::Supervisor].run(take env, exec, alloc, take serving, take peers, release: fn(take ended: supervisor::Env) limits stack 512 {
     })
 } Base.serve
+
+/// Serves the base driver `component`.
+fn Base.serve_driver(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    if component == VIRTIO_RNG {
+        return try await self.serve_rng(take world, take serving)
+    }
+    if component == VIRTIO_BLK {
+        return try await self.serve_blk(take world, take serving)
+    }
+    if component == NVME {
+        return try await self.serve_nvme(take world, take serving)
+    }
+    if component == AHCI {
+        return try await self.serve_ahci(take world, take serving)
+    }
+    return try await self.serve_platform(component, take world, take serving)
+} Base.serve_driver
 
 /// Serves `virtio-rng` on the function its claim names.
 fn Base.serve_rng(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
@@ -433,6 +468,56 @@ fn Base.serve_policy(self, take world: nanos::World, take serving: runner::Servi
     })
 } Base.serve_policy
 
+/// Serves `boot` on its port to `fat`, its View of `/sys/boot`, its source of events and the handoff record.
+fn Base.serve_boot(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Ok(filing) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "fat") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Some(files) = os::Port[devices::Fat].of(filing) else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(mirror) = attempt nanos::Cap[store::service::View].get(world.caps, key: "mirror") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let env = generations::Env.of(fat: files, mirror, live: self.boot_live, events, handoff: self.handoff, clock: world.clock, alloc)
+    return try await runner::Driven[generations::Boot, generations::Env, generations::Generations].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: generations::Env) limits stack 512 {
+    })
+} Base.serve_boot
+
+/// Serves `clock` on its port to the RTC of the `rtc` role when it has one, the wall clock of the core's start and its configuration record, the configuration by default when it has none.
+fn Base.serve_clock(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let rtc = match attempt nanos::Cap[os::PortHandle].get(world.caps, key: "rtc") {
+        Ok(handle) => os::Port[devices::Rtc].of(handle)
+        Err(_) => None
+    }
+    let config = match mut serving.take_config() {
+        Some(record) => match attempt mem::wire::Codec[clock::ClockConfig].decode(record.view(), alloc) {
+            Ok(configured) => configured
+            Err(_) => return runner::Ended.EnvIncomplete
+        }
+        None => clock::ClockConfig.default_of(alloc)
+    }
+    let env = clock::Env.of(rtc, clock: world.clock, start: self.wall, take config, alloc)
+    return try await runner::Driven[clock::Timekeeper, clock::Env, clock::Timekeeping].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: clock::Env) limits stack 512 {
+    })
+} Base.serve_clock
+
+/// Serves `power` on the switch of the machine's power and its View of its configuration record.
+fn Base.serve_power(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Ok(configuring) = attempt nanos::Cap[store::service::View].get(world.caps, key: "configuring") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let env = power::Env.of(switch: self.switch, configuring, clock: world.clock, alloc)
+    return try await runner::Driven[power::Powering, power::Env, power::Power].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: power::Env) limits stack 512 {
+    })
+} Base.serve_power
+
 /// The schemas a block driver or view serves the calls of: `Block`'s.
 fn schema_of_block(alloc: mem::Alloc) -> mem::List[sys::ProtocolSchema] {
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
@@ -532,6 +617,21 @@ fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem
     discard mut overseeing.wiring.insert(text::String.of("keys", alloc), value: os::Wire.to(moniker("keys")))
     discard mut overseeing.wiring.insert(text::String.of("own", alloc), value: os::Wire(target: os::Target.Instance(moniker("policy")), operations: None, credit: os::Credit(messages: 16, calls: 1)))
     discard mut building.specs.insert(moniker("policy"), value: take overseeing)
+    var booting = os::InstanceSpec.of(principal: principal("system"), bundle, component: GENERATIONS, alloc)
+    mut building.grant(mut booting, holder: "boot", field: "mirror", object: tree_of("/sys/boot", alloc), granted: tree_rights(alloc), alloc)
+    mut building.grant(mut booting, holder: "boot", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
+    discard mut booting.wiring.insert(text::String.of("fat", alloc), value: os::Wire.to(moniker("fat")))
+    discard mut building.specs.insert(moniker("boot"), value: take booting)
+    var timekeeping = os::InstanceSpec.of(principal: principal("system"), bundle, component: TIMEKEEPER, alloc)
+    timekeeping.lazy = true
+    mut building.grant(mut timekeeping, holder: "clock", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
+    discard mut timekeeping.wiring.insert(text::String.of("rtc", alloc), value: os::Wire(target: os::Target.Role(os::Role.Rtc), operations: None, credit: os::Credit(messages: 4, calls: 4)))
+    discard mut building.specs.insert(moniker("clock"), value: take timekeeping)
+    var powering = os::InstanceSpec.of(principal: principal("system"), bundle, component: POWER, alloc)
+    powering.lazy = true
+    mut building.grant(mut powering, holder: "power", field: "configuring", object: tree_of("/sys/config/power", alloc), granted: tree_rights(alloc), alloc)
+    mut building.grant(mut powering, holder: "power", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
+    discard mut building.specs.insert(moniker("power"), value: take powering)
     if owner_of(handoff, alloc).is_some() {
         let number = u64.widen(building.grants.len())
         discard mut building.grants.insert(number, value: os::Grant(holder: principal("owner"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
@@ -586,6 +686,12 @@ fn genesis_record(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: me
     var config = mem::Map[ident::Moniker, store::service::TypedValue].empty(alloc)
     discard mut config.insert(moniker("store"), value: store::service::TypedValue(type: store::TypeRef.of(STORE_CONFIG_TYPE, schema: mem::wire::Codec[store::service::StoreConfig].schema_hash(), alloc), bytes: take stored))
     discard mut config.insert(moniker("journal"), value: store::service::TypedValue(type: store::TypeRef.of(JOURNAL_CONFIG_TYPE, schema: mem::wire::Codec[journal::JournalConfig].schema_hash(), alloc), bytes: take journaled))
+    var timed = mem::Bytes.empty(alloc)
+    mem::wire::Codec[clock::ClockConfig].encode(clock::ClockConfig.default_of(alloc), out: mut timed)
+    discard mut config.insert(moniker("clock"), value: store::service::TypedValue(type: store::TypeRef.of(CLOCK_CONFIG_TYPE, schema: mem::wire::Codec[clock::ClockConfig].schema_hash(), alloc), bytes: take timed))
+    var powered = mem::Bytes.empty(alloc)
+    mem::wire::Codec[power::PowerConfig].encode(power::PowerConfig.default_of(alloc), out: mut powered)
+    discard mut config.insert(moniker("power"), value: store::service::TypedValue(type: store::TypeRef.of(POWER_CONFIG_TYPE, schema: mem::wire::Codec[power::PowerConfig].schema_hash(), alloc), bytes: take powered))
     var nodes = genesis_nodes(alloc)
     for node in take journal::declarations(journaling.retention(), alloc) {
         let mem::KeyValue(key: path, value: declaration) = node
@@ -690,12 +796,17 @@ fn run_base(
     defer take feeding.close()
     let securing = os::MintedLive.of(posted, own: "/live/security/keys", alloc: config.alloc)
     defer take securing.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: storing.mint(), devices_live: managing.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: securing.mint(), machine: machine)
+    let booting = os::MintedLive.of(posted, own: "/live/boot", alloc: config.alloc)
+    defer take booting.close()
+    let task::Channel(sender: switched, receiver: switches) = task::Channel[power::Switching].bounded(1, alloc: config.alloc)
+    let switching = power::MintedSwitch.of(switched, alloc: config.alloc)
+    defer take switching.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: storing.mint(), devices_live: managing.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: securing.mint(), boot_live: booting.mint(), machine: machine, switch: switching.mint())
     var requested = incoming
-    var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings))
+    var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches))
     defer abandon_given(take given)
     try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Given(known: genesis, reservations: reserver, keeper: held, orders: root_orders, store_events: store_events, postings: board)) = mut given.extract() else {
+        let Some(Given(known: genesis, reservations: reserver, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders)) = mut given.extract() else {
             return
         }
         let origin = Origin.of(handoff, clock: config.clock, wall: config.wall)
@@ -709,6 +820,9 @@ fn run_base(
         })
         discard s.spawn(fn[take store_events]() fails task::Cancelled uses wait limits stack 8_192 {
             try await record_store_events(take store_events, rings)
+        })
+        discard s.spawn(fn[take switch_orders]() fails task::Cancelled uses wait limits stack 4_096 {
+            try await switch_power(take switch_orders)
         })
         let signal = held.slot_signal()
         let task::Channel(sender: inputs, receiver: received) = task::Channel[keeper::Input].bounded(16, alloc: config.alloc)
@@ -755,7 +869,7 @@ fn record_store_events(take reports: task::Receiver[store::service::Report], rin
 fn abandon_given(take given: Option[Given]) {
     match given {
         Some(left) => {
-            let Given(known: _, reservations: _, keeper: kept, orders: _, store_events: _, postings: _) = left
+            let Given(known: _, reservations: _, keeper: kept, orders: _, store_events: _, postings: _, switches: _) = left
             take kept.release()
         }
         None => {
@@ -763,7 +877,7 @@ fn abandon_given(take given: Option[Given]) {
     }
 } abandon_given
 
-/// What the tasks of `run_base` take: the genesis record and the reservations the runner makes, the keeper with the device root's orders, the events the store reports, and the postings to the board.
+/// What the tasks of `run_base` take: the genesis record and the reservations the runner makes, the keeper with the device root's orders, the events the store reports, the postings to the board, and the orders of the power switch.
 linear struct Given {
     known: runner::Known
     reservations: Reserver
@@ -771,6 +885,7 @@ linear struct Given {
     orders: task::Receiver[devices::RootOrder]
     store_events: task::Receiver[store::service::Report]
     postings: task::Receiver[os::Posting]
+    switches: task::Receiver[power::Switching]
 } Given
 
 /// A reserved instance's request for a region of `bytes`, and where the store over it goes, `None` when no free range holds one.
@@ -884,7 +999,11 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     defer take living.close()
     let feeding = journal::MintedFeed.of(journal::Backlog.empty(alloc), alloc)
     defer take feeding.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains))
+    let task::Channel(sender: switched, receiver: unswitched) = task::Channel[power::Switching].bounded(1, alloc)
+    discard unswitched
+    let switching = power::MintedSwitch.of(switched, alloc)
+    defer take switching.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint())
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, gauges: runner::Gauges.empty(alloc), body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)

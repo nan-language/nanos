@@ -1,0 +1,184 @@
+//! The `clock` instance: wall time as monotonic time plus an offset, from the RTC's reading at the core's start and the readings `set` gives, a correction below 128 ms slewing the offset at 500 µs per second and a larger one stepping it, the RTC written when a reading moves the time by more than 1 s.
+
+/// A correction below this slews the offset, a larger one steps it.
+const SLEW_BELOW_NS: i64 = 128_000_000
+
+/// The share of the time passed by which a slew moves the offset: 500 µs per second.
+const SLEW_DIVISOR: u64 = 2_000
+
+/// A reading moving the time by more than this has the RTC written.
+const RTC_WRITE_NS: i64 = 1_000_000_000
+
+const NS_PER_S: i64 = 1_000_000_000
+
+/// The key of the keyed task writing the RTC.
+const WRITING: u64 = 1
+
+/// What `clock` serves.
+pub protocol Timekeeping {
+    /// Sets the wall time to `utc_ns`.
+    pub fn set(utc_ns: i64) limits restorable
+    /// Each source with its offset, its uncertainty now and its last reading.
+    pub fn sources() -> mem::List[TimeSource] limits traceless
+} Timekeeping
+
+/// The configuration of `clock`, `/sys/config/clock`: the host names of its network time sources.
+pub closed struct ClockConfig derives Encode {
+    pub sources: mem::List[text::String]
+} ClockConfig
+
+/// A source of wall time, `rtc`, `set` or a host name: the difference between its last reading and the time the clock kept then, the reading's uncertainty now, and the reading, none for a source not read.
+pub closed struct TimeSource derives Encode {
+    pub name: text::String
+    pub offset_ns: i64
+    pub uncertainty_ns: u64
+    pub reading: Option[ident::WallTime]
+} TimeSource
+
+/// The offset of wall time from monotonic time: `from_ns` at the monotonic time `since_ns`, moving toward `to_ns` by 500 µs per second.
+pub closed struct Slew derives Copy, Eq, Encode {
+    pub from_ns: i64
+    pub to_ns: i64
+    pub since_ns: u64
+} Slew
+
+/// A reading `set` gave, the correction it made and the monotonic time it was taken at.
+pub closed struct Given derives Copy, Eq, Encode {
+    pub time: ident::WallTime
+    pub correction_ns: i64
+    pub at_ns: u64
+} Given
+
+/// The Env of `clock`: the port to the RTC of the `rtc` role, the monotonic clock, the wall clock of the core's start, its configuration and its cell.
+pub open struct Env derives Send {
+    rtc: Option[os::Port[devices::Rtc]]
+    clock: sys::Clock
+    start: ident::Wall
+    config: ClockConfig
+    alloc: mem::Alloc
+} Env
+
+/// The state of `clock`: the offset, the uncertainty of the last reading and the monotonic time it was taken at, and the last reading `set` gave.
+pub closed struct Timekeeper derives Encode {
+    pub offset: Slew
+    pub uncertainty_ns: u64
+    pub read_ns: u64
+    pub given: Option[Given]
+} Timekeeper
+
+impl Timekeeper: sys::Component[Env, Timekeeping]
+
+pub fn Env.of(
+    rtc: Option[os::Port[devices::Rtc]],
+    clock: sys::Clock,
+    start: ident::Wall,
+    take config: ClockConfig,
+    alloc: mem::Alloc,
+    ) -> Env {
+    return Env(rtc: rtc, clock: clock, start: start, config: take config, alloc: alloc)
+} Env.of
+
+/// The configuration by default: no network time source.
+pub fn ClockConfig.default_of(alloc: mem::Alloc) -> ClockConfig = ClockConfig(sources: mem::List.empty(alloc))
+
+/// The offset at the monotonic time `now`.
+pub fn Slew.at(self, now: u64) -> i64 {
+    let moved = i64.saturate(now.saturating_sub(self.since_ns) / SLEW_DIVISOR)
+    if self.to_ns >= self.from_ns {
+        let reached = self.from_ns.saturating_add(moved)
+        return match reached > self.to_ns {
+            true => self.to_ns
+            false => reached
+        }
+    }
+    let reached = self.from_ns.saturating_sub(moved)
+    return match reached < self.to_ns {
+        true => self.to_ns
+        false => reached
+    }
+} Slew.at
+
+/// The offset after the correction to `to_ns` at the monotonic time `now`: slewing from the offset then when the correction is below 128 ms, stepped otherwise.
+pub fn Slew.corrected(self, to_ns: i64, now: u64) -> Slew {
+    let from_ns = self.at(now)
+    let correction = to_ns.saturating_sub(from_ns)
+    if correction < SLEW_BELOW_NS and correction > -SLEW_BELOW_NS {
+        return Slew(from_ns: from_ns, to_ns: to_ns, since_ns: now)
+    }
+    return Slew(from_ns: to_ns, to_ns: to_ns, since_ns: now)
+} Slew.corrected
+
+pub fn Timekeeper.start(mut env: Env) -> Timekeeper {
+    let start = env.start
+    let offset = start.at.utc_ns.saturating_sub(i64.saturate(start.since_ns))
+    return Timekeeper(offset: Slew(from_ns: offset, to_ns: offset, since_ns: start.since_ns), uncertainty_ns: start.at.uncertainty_ns, read_ns: start.since_ns, given: None)
+} Timekeeper.start
+
+pub fn Timekeeper.set(mut self, take utc_ns: i64, mut env: Env, mut cx: sys::Cx[Timekeeping]) {
+    let now = elapsed(env.clock)
+    let correction = utc_ns.saturating_sub(self.time(now).utc_ns)
+    self.offset = self.offset.corrected(to_ns: utc_ns.saturating_sub(i64.saturate(now)), now)
+    self.uncertainty_ns = 0
+    self.read_ns = now
+    self.given = Some(Given(time: ident::WallTime(utc_ns: utc_ns, uncertainty_ns: 0), correction_ns: correction, at_ns: now))
+    if correction <= RTC_WRITE_NS and correction >= -RTC_WRITE_NS {
+        return
+    }
+    let Some(rtc) = env.rtc else {
+        return
+    }
+    let alloc = env.alloc
+    mut cx.spawn(key: WRITING, run: fn(out: sys::Outbox[Timekeeping]) fails task::Cancelled uses wait limits stack 16_384 {
+        var call = sys::Encoded.empty(alloc)
+        let reply = sys::Wire[devices::Rtc].set(mut call, utc_s: utc_ns.div_floor(NS_PER_S))
+        match attempt await rtc.call(take call, reply, alloc) {
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    })
+} Timekeeper.set
+
+pub fn Timekeeper.sources(mut self, mut env: Env, mut cx: sys::Cx[Timekeeping]) -> mem::List[TimeSource] {
+    let alloc = env.alloc
+    let now = elapsed(env.clock)
+    let start = env.start
+    var listed = mem::List[TimeSource].empty(alloc)
+    let read = match start.at.uncertainty_ns < ident::WallTime.unknown().uncertainty_ns {
+        true => Some(start.at)
+        false => None
+    }
+    mut listed.push(TimeSource(name: text::String.of("rtc", alloc), offset_ns: 0, uncertainty_ns: ident::drifted(start.at.uncertainty_ns, passed_ns: now.saturating_sub(start.since_ns)), reading: read))
+    match self.given {
+        Some(given) => mut listed.push(TimeSource(name: text::String.of("set", alloc), offset_ns: given.correction_ns, uncertainty_ns: ident::drifted(given.time.uncertainty_ns, passed_ns: now.saturating_sub(given.at_ns)), reading: Some(given.time)))
+        None => {
+        }
+    }
+    for host in env.config.sources {
+        mut listed.push(TimeSource(name: text::String.of(host.as_str(), alloc), offset_ns: 0, uncertainty_ns: ident::WallTime.unknown().uncertainty_ns, reading: None))
+    }
+    return listed
+} Timekeeper.sources
+
+/// The wall time at the monotonic time `now`.
+fn Timekeeper.time(self, now: u64) -> ident::WallTime {
+    return ident::WallTime(utc_ns: i64.saturate(now).saturating_add(self.offset.at(now)), uncertainty_ns: ident::drifted(self.uncertainty_ns, passed_ns: now.saturating_sub(self.read_ns)))
+} Timekeeper.time
+
+fn elapsed(clock: sys::Clock) -> u64 {
+    return match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} elapsed
+
+test small_corrections_slew_and_large_ones_step for Slew.corrected {
+    let kept = Slew(from_ns: 1_000, to_ns: 1_000, since_ns: 0)
+    let slewed = kept.corrected(to_ns: 1_000 + 100_000_000, now: 0)
+    expect slewed.at(1_000_000_000) == 1_000 + 500_000
+    expect slewed.at(1_000_000_000_000) == 1_000 + 100_000_000
+    let stepped = kept.corrected(to_ns: 1_000 - 200_000_000, now: 5)
+    expect stepped.at(5) == 1_000 - 200_000_000
+    let back = kept.corrected(to_ns: 1_000 - 100_000_000, now: 0)
+    expect back.at(2_000_000_000) == 1_000 - 1_000_000
+} small_corrections_slew_and_large_ones_step

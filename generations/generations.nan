@@ -1,0 +1,319 @@
+//! The `boot` instance: at each start it records the boot, writing the boot counter into the boot record when the loader did not, mirroring the record in `/sys/boot`, emitting `fault.previous-boot-unhealthy` when the record shows a boot that ended before its health gate, and publishing `/live/boot`.
+
+/// The key of the keyed task recording the boot.
+const RECORDING: u64 = 1
+
+/// The files of the boot record's two copies on the boot volume.
+const RECORD_COPIES: Str = "/nanos/boot.rec /nanos/boot.bak"
+
+const BOOT_STATE_TYPE: Str = "bootfmt::BootState"
+
+const LIVE_BOOT_TYPE: Str = "os::LiveBoot"
+
+/// What `boot` serves: what its recording task reports.
+pub protocol Generations {
+    /// The boot was recorded, `/sys/boot` written anew when `written`.
+    fn noted(written: bool) limits traceless
+} Generations
+
+/// The Env of `boot`: the port to `fat`, its View of `/sys/boot`, where it publishes `/live/boot`, its source of events, the handoff record, the monotonic clock and its cell.
+pub open struct Env derives Send {
+    fat: os::Port[devices::Fat]
+    mirror: store::service::View
+    live: os::Live
+    events: journal::Source
+    handoff: bootfmt::Handoff
+    clock: sys::Clock
+    alloc: mem::Alloc
+} Env
+
+/// The state of `boot`: whether it recorded this boot.
+pub closed struct Boot derives Encode {
+    pub recorded: bool
+} Boot
+
+/// The payload of `fault.previous-boot-unhealthy`: the generation, slot, tries left and state of the slot whose boot ended before its health gate.
+pub closed struct PreviousUnhealthy derives Encode {
+    pub generation: u64
+    pub slot: text::String
+    pub tries_left: u8
+    pub state: bootfmt::SlotCondition
+} PreviousUnhealthy
+
+impl Boot: sys::Component[Env, Generations]
+
+impl Boot: sys::Resume[Env, Generations]
+
+pub fn Env.of(
+    fat: os::Port[devices::Fat],
+    mirror: store::service::View,
+    live: os::Live,
+    events: journal::Source,
+    handoff: bootfmt::Handoff,
+    clock: sys::Clock,
+    alloc: mem::Alloc,
+    ) -> Env {
+    return Env(fat: fat, mirror: mirror, live: live, events: events, handoff: handoff, clock: clock, alloc: alloc)
+} Env.of
+
+pub fn Boot.start(mut env: Env) -> Boot = Boot(recorded: false)
+
+/// Records the boot from a keyed task.
+pub fn Boot.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Generations]) {
+    let world = env.surroundings()
+    mut cx.spawn(key: RECORDING, run: fn(out: sys::Outbox[Generations]) fails task::Cancelled uses wait limits stack 65_536 {
+        let written = try await world.record()
+        discard attempt await out.noted(written)
+    })
+} Boot.resume
+
+fn Boot.noted(mut self, take written: bool, mut env: Env, mut cx: sys::Cx[Generations]) {
+    self.recorded = true
+} Boot.noted
+
+/// What the recording task reads of the Env.
+struct Surroundings derives Copy {
+    fat: os::Port[devices::Fat]
+    mirror: store::service::View
+    live: os::Live
+    events: journal::Source
+    handoff: bootfmt::Handoff
+    clock: sys::Clock
+    alloc: mem::Alloc
+} Surroundings
+
+fn Env.surroundings(self) -> Surroundings {
+    return Surroundings(fat: self.fat, mirror: self.mirror, live: self.live, events: self.events, handoff: self.handoff, clock: self.clock, alloc: self.alloc)
+} Env.surroundings
+
+/// Records the boot: the boot counter written into the boot record when the loader did not, the record mirrored in `/sys/boot`, a boot that ended before its health gate reported, and `/live/boot` published; whether it wrote `/sys/boot`.
+fn Surroundings.record(self) -> bool fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var held = try await self.read_record()
+    let flags = self.handoff.flags
+    match held {
+        Some(found) => {
+            if not flags.record_written {
+                var counted = found.record
+                counted.boot_counter = self.handoff.boot_counter
+                let written = counted.write_over(Some(found))
+                if try await self.write_record(written) {
+                    held = Some(written)
+                }
+            }
+        }
+        None => {
+        }
+    }
+    let state = match held {
+        Some(found) => state_of(found.record, floor: self.handoff.floor, alloc)
+        None => bootfmt::BootState.of_handoff(self.handoff, alloc)
+    }
+    let previous = try await self.mirrored()
+    let unhealthy = match previous {
+        Some(mirror) => ended_early(state, mirror, alloc)
+        None => None
+    }
+    let health = match unhealthy {
+        Some(_) => os::PreviousBoot.Unhealthy
+        None => os::PreviousBoot.Healthy
+    }
+    match unhealthy {
+        Some(slot) => try await self.events.emit("fault.previous-boot-unhealthy", severity: journal::Severity.Warn, payload: slot, alloc)
+        None => {
+        }
+    }
+    let written = try await self.write_mirror(state)
+    try await self.live.publish(type: LIVE_BOOT_TYPE, value: self.live_boot(health), alloc)
+    return written
+} Surroundings.record
+
+/// The boot record the boot volume holds and the copy holding it, `None` when neither copy is valid.
+fn Surroundings.read_record(self) -> Option[bootfmt::Held] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let names = copy_names(alloc)
+    let rec = try await self.read_copy(text::String.of(names[0].as_str(), alloc))
+    let bak = try await self.read_copy(text::String.of(names[1].as_str(), alloc))
+    return bootfmt::BootRecord.current(rec, bak)
+} Surroundings.read_record
+
+/// The record the copy at `path` holds when it is valid.
+fn Surroundings.read_copy(self, take path: text::String) -> Option[bootfmt::BootRecord] fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(self.alloc)
+    let reply = sys::Wire[devices::Fat].read(mut call, take path, offset: 0, count: 512)
+    return match first attempt await self.fat.call(take call, reply, alloc: self.alloc) {
+        Ok(bytes) => bootfmt::BootRecord.read(bytes.view())
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} Surroundings.read_copy
+
+/// Writes `held` over its copy on the boot volume; whether the write succeeded.
+fn Surroundings.write_record(self, held: bootfmt::Held) -> bool fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let names = copy_names(alloc)
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(held.record.to_bits().view())
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Fat].overwrite(mut call, path: text::String.of(names[usize.widen(held.copy)].as_str(), alloc), offset: 0, data: take bytes)
+    return match first attempt await self.fat.call(take call, reply, alloc) {
+        Ok(_) => true
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => false
+    }
+} Surroundings.write_record
+
+/// The state `/sys/boot` holds, `None` when it holds none that decodes.
+fn Surroundings.mirrored(self) -> Option[bootfmt::BootState] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let node = match first attempt await self.mirror.get(ident::Path(text: text::String.of("/", alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(value) = node.value else {
+        return None
+    }
+    return state_from(value.view(), alloc)
+} Surroundings.mirrored
+
+/// Writes `state` at `/sys/boot`; whether the commit succeeded.
+fn Surroundings.write_mirror(self, state: bootfmt::BootState) -> bool fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[bootfmt::BootState].encode(state, out: mut bytes)
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: ident::Path(text: text::String.of("/", alloc)), value: store::Value.Record(type: store::TypeRef.of(BOOT_STATE_TYPE, schema: mem::wire::Codec[bootfmt::BootState].schema_hash(), alloc), bytes: take bytes, secret: false)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: Some(text::String.of("boot", alloc)))
+    return match first attempt await self.mirror.commit(take transaction, typed: true, alloc) {
+        Ok(_) => true
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => false
+    }
+} Surroundings.write_mirror
+
+/// The record of `/live/boot` the handoff record tells, the previous boot ending as `previous`.
+fn Surroundings.live_boot(self, previous: os::PreviousBoot) -> os::LiveBoot {
+    let alloc = self.alloc
+    let handoff = self.handoff
+    let mode = match bootfmt::Mode.checked_from_bits(handoff.mode) {
+        Some(bootfmt::Mode.Trial) => os::BootMode.Trial
+        Some(bootfmt::Mode.Recovery) => os::BootMode.Recovery
+        Some(bootfmt::Mode.Dev) => os::BootMode.Dev
+        else => os::BootMode.Normal
+    }
+    var slot: Option[text::String] = None
+    if handoff.slot == bootfmt::Slot.A.to_bits() {
+        slot = Some(text::String.of("a", alloc))
+    } else if handoff.slot == bootfmt::Slot.B.to_bits() {
+        slot = Some(text::String.of("b", alloc))
+    }
+    var failures = mem::List[text::String].empty(alloc)
+    for at in 0..<usize.widen(handoff.failure_count) {
+        if at < handoff.failures.len() {
+            mut failures.push(failure_text(handoff.failures[at], alloc))
+        }
+    }
+    let now = match attempt self.clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+    return os::LiveBoot(generation: handoff.generation, mode: mode, slot: take slot, boot_counter: handoff.boot_counter, loader: handoff.loader_version, floor: handoff.floor, loader_entry: handoff.entry_counter, kernel_entry: 0, counter_hz: 0, support: unexported(), previous: previous, failures: take failures, as_of: now)
+} Surroundings.live_boot
+
+/// The boot state a boot record gives, the floor being `floor`.
+fn state_of(record: bootfmt::BootRecord, floor: u64, alloc: mem::Alloc) -> bootfmt::BootState {
+    var slots = mem::List[bootfmt::BootSlot].empty(alloc)
+    mut slots.push(slot_of("a", entry: record.slot_a, alloc))
+    mut slots.push(slot_of("b", entry: record.slot_b, alloc))
+    return bootfmt::BootState(slots: take slots, recovery: record.recovery_generation, floor: floor, floor_request: record.floor_request, generations: mem::List.empty(alloc))
+} state_of
+
+fn slot_of(name: Str, entry: bootfmt::SlotEntry, alloc: mem::Alloc) -> bootfmt::BootSlot {
+    let state = match bootfmt::SlotState.checked_from_bits(entry.state) {
+        Some(bootfmt::SlotState.Trial) => bootfmt::SlotCondition.Trial
+        Some(bootfmt::SlotState.Good) => bootfmt::SlotCondition.Good
+        Some(bootfmt::SlotState.Bad) => bootfmt::SlotCondition.Bad
+        else => bootfmt::SlotCondition.Empty
+    }
+    return bootfmt::BootSlot(name: text::String.of(name, alloc), generation: entry.generation, state: state, tries_left: entry.tries)
+} slot_of
+
+/// The slot of `state` whose boot ended before its health gate, as `mirror`, the state `boot` wrote last, lacks: a `bad` slot it shows otherwise, or a trial slot with a try fewer than this boot consumed.
+fn ended_early(state: bootfmt::BootState, mirror: bootfmt::BootState, alloc: mem::Alloc) -> Option[PreviousUnhealthy] {
+    for slot in state.slots {
+        for mirrored in mirror.slots {
+            if mirrored.name != slot.name or mirrored.generation != slot.generation {
+                continue
+            }
+            let badly = slot.state == bootfmt::SlotCondition.Bad and mirrored.state != bootfmt::SlotCondition.Bad
+            let tried = slot.state == bootfmt::SlotCondition.Trial and mirrored.state == bootfmt::SlotCondition.Trial and slot.tries_left + 1 < mirrored.tries_left
+            if badly or tried {
+                return Some(PreviousUnhealthy(generation: slot.generation, slot: text::String.of(slot.name.as_str(), alloc), tries_left: slot.tries_left, state: slot.state))
+            }
+        }
+    }
+    return None
+} ended_early
+
+/// A failure entry as `/live/boot` lists it: the generation, then its code.
+fn failure_text(failure: bootfmt::Failure, alloc: mem::Alloc) -> text::String {
+    var text = text::String.empty(alloc)
+    for digit in store::decimal_name(failure.generation, alloc) {
+        mut text.push(char.checked_from_bits(u32.widen(digit)).value_or('0'))
+    }
+    mut text.push(' ')
+    for byte in failure.code {
+        if byte == 0 {
+            break
+        }
+        mut text.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+    }
+    return text
+} failure_text
+
+/// The hash of the support routines the kernel image exports, which it exports none of.
+fn unexported() -> ident::HashValue {
+    var bytes = Array[u8, 33].filled(0)
+    bytes[0] = 0x01
+    return ident::HashValue(bytes: bytes)
+} unexported
+
+/// The paths of the boot record's copies, copy 0 first.
+fn copy_names(alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    var name = text::String.empty(alloc)
+    for byte in RECORD_COPIES.as_bytes() {
+        if byte == b' ' {
+            mut names.push(take name)
+            name = text::String.empty(alloc)
+        } else {
+            mut name.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+        }
+    }
+    mut names.push(take name)
+    return names
+} copy_names
+
+validator fn state_from(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[bootfmt::BootState] {
+    return match attempt mem::wire::Codec[bootfmt::BootState].decode(raw, alloc) {
+        Ok(found) => Some(take found)
+        Err(_) => None
+    }
+} state_from
+
+test boots_ending_before_their_gate_show_against_the_mirror for ended_early {
+    let alloc = testing::world().alloc
+    var record = bootfmt::BootRecord.empty()
+    record.slot_a = bootfmt::SlotEntry(generation: 4, state: bootfmt::SlotState.Trial.to_bits(), tries: 1, reserved: Array[u8, 6].filled(0))
+    let mirror = state_of(record, floor: 1, alloc)
+    var later = record
+    later.slot_a.tries = 0
+    let consumed = state_of(later, floor: 1, alloc)
+    var failed = record
+    failed.slot_a.state = bootfmt::SlotState.Bad.to_bits()
+    let rejected = state_of(failed, floor: 1, alloc)
+    let tried = ended_early(consumed, mirror, alloc)
+    let bad = ended_early(rejected, mirror, alloc)
+    expect tried.is_none() and bad.is_some()
+} boots_ending_before_their_gate_show_against_the_mirror
