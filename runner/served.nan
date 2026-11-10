@@ -1,6 +1,6 @@
-//! The task of an instance's domain: it builds the Env, starts the component and serves the calls its driver delivers, one at a time, and hands its driver the replies the component gives postponed requests.
+//! The task of an instance's domain: it builds the Env, starts or restores the component, serves the calls its driver delivers, one at a time, keeps its checkpoints, and hands its driver the replies the component gives postponed requests.
 
-/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, and the time without a message after which the component is suspended, never when 0.
+/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, and for a checkpointed instance how its checkpoints are kept and the checkpoint it restores.
 pub open struct Serving {
     deliveries: task::Receiver[Delivery]
     reports: task::Sender[Input]
@@ -9,6 +9,8 @@ pub open struct Serving {
     clock: sys::Clock
     pub abandoner: mem::Shared[sys::Abandoner]
     suspend_ms: u32
+    keeping: Option[Keeping]
+    restore: Option[os::Checkpoint]
 } Serving
 
 /// What a driver delivers to its instance's domain: a call, the time without a message after which its component is suspended, never when 0, or the order to stop once the handler running returns.
@@ -20,13 +22,14 @@ enum Delivery {
 
 /// What the task of an instance's domain tells its driver.
 enum Report {
-    Running
+    Running(checkpoint: Option[u64])
     Taken(id: u64)
     Postponed(id: u64)
     Answered(id: u64, answer: os::Answer)
     Suspended
     Woken
     Ending
+    CheckpointFailed(code: text::Fixed[32], bytes: u64)
 } Report
 
 /// When the handlers of an instance run, which its watchdog bounds: their start, then how long they took.
@@ -35,11 +38,12 @@ enum Mark {
     Took(ns: u64)
 } Mark
 
-/// How an instance's domain ended other than by abandonment: stopped, without an Env, or unhealthy at its start.
+/// How an instance's domain ended other than by abandonment: stopped, without an Env, unhealthy at its start, or with a latest checkpoint that does not decode.
 pub closed enum Ended derives Copy, Eq {
     Stopped
     EnvIncomplete
     Unhealthy
+    CheckpointUndecodable
 } Ended
 
 /// The instances of a component of state S serving P whose Env is Env, which they build from their world.
@@ -67,7 +71,7 @@ pub fn Served.run(take world: nanos::World, take serving: Serving) -> Ended fail
     })
 } Served.run
 
-/// Runs an instance on `env`: starts the component, ends it at once when its health is not `Healthy`, then serves what `serving` delivers, P's calls and those of the protocols whose schemas `peers` holds, until it is told to stop, letting the handler running return and handling every message that waits, and ends the component, handing its Env to `release`. The replies its handlers give the requests they postponed go to the driver as they come. A component that has had no message for the time `serving` sets is suspended until its next message.
+/// Runs an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, ends it at once when its health is not `Healthy`, then serves what `serving` delivers, P's calls and those of the protocols whose schemas `peers` holds, until it is told to stop, letting the handler running return and handling every message that waits, keeps a checkpoint of the component when it is dirty, and ends it, handing its Env to `release`. The replies its handlers give the requests they postponed go to the driver as they come. A component that has had no message for the time `serving` sets is suspended until its next message.
 pub fn Driven.run(
     take env: Env,
     exec: task::Executor,
@@ -76,33 +80,38 @@ pub fn Driven.run(
     take peers: mem::List[sys::ProtocolSchema],
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms) = serving
-    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Replied, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), alloc: alloc)
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore) = serving
+    let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
+    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Replied, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
     let signal = pending.signal.share()
     let replier = sys::Minter[Replier, Pending, u8].of(take pending, alloc)
     defer take replier.close()
-    var stepper = try sys::Stepper[S, Env, P].start(take env, exec, alloc)
+    let Some(Begun(stepper: begun, reason: reason, restored: restored)) = try Driven[S, Env, P].begin(take env, take restore, exec, alloc, release) else {
+        return Ended.CheckpointUndecodable
+    }
+    var stepper = begun
+    var due_at = epoch_after(keeping, clock)
     defer take stepper.abandon()
     match attempt sys::Runner.served(replier.mint(0)) {
         Ok(runner) => mut stepper.attach(runner)
         Err(_) => {
         }
     }
-    mut stepper.resumed(sys::ResumeReason.Started)
+    mut stepper.resumed(reason)
     discard mut stepper.start_keyed()
     match mut stepper.health() {
         sys::HealthReply.Healthy => {
         }
         sys::HealthReply.Unhealthy(_) => return Ended.Unhealthy
     }
-    try await tell(reports, incarnation, report: Report.Running)
+    try await tell(reports, incarnation, report: Report.Running(checkpoint: restored))
     let out = stepper.outbox()
     let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0)), alloc)
     let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
     let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
     var given = Some(Given(deliveries: take deliveries, finishes: take finishes, peers: take peers))
-    let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given](s: task::Scope) fails Stopping uses wait {
+    let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given, mut due_at](s: task::Scope) fails Stopping uses wait {
         let Some(Given(deliveries: receiver, finishes: finishing, peers: known)) = mut given.extract() else {
             return
         }
@@ -118,10 +127,7 @@ pub fn Driven.run(
         discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
             try await hand_replies(queued, signal: ringing, reports: answering, incarnation)
         })
-        loop {
-            try await idle(mut stepper, quiet: quiet.contents(), clock, reports, incarnation)
-            try await call_handlers(mut stepper, marks, steps, finished, clock)
-        }
+        try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), clock, reports, marks, steps, finished, incarnation, alloc)
     })
     match looped {
         Ok(_) => {
@@ -130,13 +136,115 @@ pub fn Driven.run(
         }
         Err(Stopping.Cancelled(cancelled)) => fail cancelled
     }
-    try await call_handlers(mut stepper, marks, steps, finished, clock)
+    let handled = try await call_handlers(mut stepper, marks, steps, finished, clock)
+    match first keeping {
+        Some(kept) if handled or due_at.is_some() => {
+            discard try await checkpoint(stepper, keeping: kept, reports, incarnation, alloc)
+        }
+        else => {
+        }
+    }
     try await tell(reports, incarnation, report: Report.Ending)
     undefer stepper
     let sys::Stopped(state: _, env: ended) = try await take stepper.end()
     release(take ended)
     return Ended.Stopped
 } Driven.run
+
+/// A component's stepper, the reason its `resume` is called with, and the number of the checkpoint it was restored from.
+linear struct Begun[S, Env: Any, P: Any] {
+    stepper: sys::Stepper[S, Env, P]
+    reason: sys::ResumeReason
+    restored: Option[u64]
+} Begun
+
+/// The stepper of a component on `env`: resumed from `restore` when given, else started; `None` once `env` is released when `restore` does not decode as the state.
+fn Driven.begin(
+    take env: Env,
+    take restore: Option[os::Checkpoint],
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    release: fn(take ended: Env) limits stack 8_192,
+    ) -> Option[Begun[S, Env, P]] fails task::Cancelled {
+    let Some(saved) = restore else {
+        return Some(Begun(stepper: try sys::Stepper[S, Env, P].start(take env, exec, alloc), reason: sys::ResumeReason.Started, restored: None))
+    }
+    if saved.schema.bytes != mem::wire::Codec[S].schema_hash().bytes {
+        release(take env)
+        return None
+    }
+    let Ok(state) = attempt mem::wire::Codec[S].decode(Untrusted.of(saved.state.view()), alloc) else {
+        release(take env)
+        return None
+    }
+    return Some(Begun(stepper: try sys::Stepper[S, Env, P].resume(take state, take env, exec, alloc), reason: sys::ResumeReason.Restored, restored: Some(saved.number)))
+} Driven.begin
+
+/// Holds the component: waits for its messages, suspending it after `quiet` without one, and calls their handlers. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the component is idle.
+fn hold[S: Encode, Env: Any, P: Any](
+    mut stepper: sys::Stepper[S, Env, P],
+    keeping: Option[Keeping],
+    mut due_at: Option[u64],
+    syncing: core::atomic::AtomicBool,
+    quiet: core::atomic::AtomicU64,
+    clock: sys::Clock,
+    reports: task::Sender[Input],
+    marks: task::Sender[Mark],
+    steps: mem::Shared[Steps],
+    finished: task::Sender[u64],
+    incarnation: u64,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    loop {
+        if syncing.swap(false) {
+            due_at = Some(now(clock))
+        }
+        match first keeping {
+            Some(kept) if due_at.is_some() => {
+                let arrived = try await task::within_ns(clock, ns: due_at.value_or(0).saturating_sub(now(clock)), body: fn() fails task::Cancelled uses wait {
+                    try await stepper.incoming()
+                })
+                if arrived.is_none() and not try await stepper.ready() {
+                    due_at = match try await checkpoint(stepper, keeping: kept, reports, incarnation, alloc) {
+                        true => None
+                        false => epoch_after(keeping, clock)
+                    }
+                    continue
+                }
+            }
+            else => try await idle(mut stepper, quiet, clock, reports, incarnation)
+        }
+        if try await call_handlers(mut stepper, marks, steps, finished, clock) and due_at.is_none() {
+            due_at = epoch_after(keeping, clock)
+        }
+    }
+} hold
+
+/// When a checkpoint of the component `keeping` keeps falls due once it is dirty from now: an epoch later, never without `keeping`.
+fn epoch_after(keeping: Option[Keeping], clock: sys::Clock) -> Option[u64] {
+    let Some(kept) = keeping else {
+        return None
+    }
+    return Some(now(clock) + kept.epoch_ms * NS_PER_MS)
+} epoch_after
+
+/// Keeps the quiescent state of the component as its next checkpoint, telling the driver when that fails; whether it was kept.
+fn checkpoint[S: Encode, Env: Any, P: Any](
+    stepper: sys::Stepper[S, Env, P],
+    keeping: Keeping,
+    reports: task::Sender[Input],
+    incarnation: u64,
+    alloc: mem::Alloc,
+    ) -> bool fails task::Cancelled uses wait {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[S].encode(stepper.state(), out: mut bytes)
+    let encoded = u64.widen(bytes.len())
+    let Some(code) = try await keeping.keep(take bytes, schema: mem::wire::Codec[S].schema_hash(), incarnation) else {
+        return true
+    }
+    try await tell(reports, incarnation, report: Report.CheckpointFailed(code: code, bytes: encoded))
+    return false
+} checkpoint
 
 /// The steps of an instance's holder: how many it began and finished, and the count of finished steps the dispatcher waits for, 0 when it waits for none.
 struct Steps {
@@ -260,17 +368,18 @@ fn idle[S, Env: Any, P: Any](
     try await tell(reports, incarnation, report: Report.Woken)
 } idle
 
-/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took.
+/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and returns whether it called any.
 fn call_handlers[S, Env: Any, P: Any](
     mut stepper: sys::Stepper[S, Env, P],
     marks: task::Sender[Mark],
     steps: mem::Shared[Steps],
     finished: task::Sender[u64],
     clock: sys::Clock,
-    ) fails task::Cancelled uses wait {
+    ) -> bool fails task::Cancelled uses wait {
     try await mark(marks, marked: Mark.Began)
     let started = now(clock)
     let counts = steps.contents()
+    var handled = false
     loop {
         discard counts.begun.fetch_add(1)
         let stepped = mut stepper.step()
@@ -285,9 +394,11 @@ fn call_handlers[S, Env: Any, P: Any](
         if not stepped {
             break
         }
+        handled = true
         discard mut stepper.start_keyed()
     }
     try await mark(marks, marked: Mark.Took(ns: now(clock).saturating_sub(started)))
+    return handled
 } call_handlers
 
 /// Sends a report of the incarnation `incarnation` to the driver, which a driver that has stopped listening no longer needs.
@@ -318,7 +429,7 @@ fn now(clock: sys::Clock) -> u64 {
 /// The replies an incarnation's queue holds before a task of its domain hands them to the driver.
 const QUEUED_REPLIES: usize = 64
 
-/// The runner capability of an incarnation's component, which takes the replies to the requests it postponed.
+/// The runner capability of an incarnation's component, which takes the replies to the requests it postponed and its requests for checkpoints.
 pub open struct Replier {
 } Replier
 
@@ -326,10 +437,12 @@ impl Replier: sys::Kind[Pending, u8]
 
 impl Replier: sys::RunnerService
 
-/// The replies of an incarnation's postponed requests waiting for its driver, the signal its replies post, and where their copies are drawn from.
+/// The replies of an incarnation's postponed requests waiting for its driver, the signal its replies post, whether its checkpoints are kept and one is asked for, and where the replies' copies are drawn from.
 struct Pending {
     replies: mem::Shared[hw::SpinLock[mem::Bounded[Replied, QUEUED_REPLIES]]]
     signal: mem::Shared[hw::Signal[Unit]]
+    keeps: bool
+    syncing: mem::Shared[core::atomic::AtomicBool]
     alloc: mem::Alloc
 } Pending
 
@@ -395,8 +508,17 @@ pub fn Replier.publish(self, summary: Slice[u8]) fails sys::RunnerError limits s
     fail sys::RunnerError.Unknown
 } Replier.publish
 
+/// Asks for a checkpoint of the component once it is idle; unknown when the instance keeps none.
 pub fn Replier.sync(self) fails sys::RunnerError limits stack 4_096 {
-    fail sys::RunnerError.Unknown
+    let asked = sys::reach(self, body: fn(state: Pending, record: u8) -> bool {
+        if state.keeps {
+            state.syncing.contents().store(true)
+        }
+        return state.keeps
+    })
+    if asked != Some(true) {
+        fail sys::RunnerError.Unknown
+    }
 } Replier.sync
 
 pub fn Replier.capability(self, id: u64) -> sys::Handle fails sys::RunnerError limits stack 4_096 {
