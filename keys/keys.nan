@@ -1,0 +1,534 @@
+//! The `keys` instance: the link, audit and keyring master keys it generates from the kernel's entropy and keeps in plaintext in its checkpoint, the principal records it writes at enrollment, rotation and revocation, and the signatures it verifies against them.
+
+/// The key of the keyed task bringing `/sys/principals/owner` to the loader's owner key.
+const OWNING: u64 = 1
+
+/// The key of the keyed task publishing what `keys` tells of the machine's security.
+const SHOWING: u64 = 2
+
+/// The key of the keyed task serving a request, plus its number.
+const SERVING: u64 = 0x1_0000_0000
+
+/// The type of the records of `/sys/principals`.
+const PRINCIPAL_RECORD_TYPE: Str = "os::PrincipalRecord"
+
+/// The type of the part of `/live/security` `keys` publishes.
+const KEYS_SECURITY_TYPE: Str = "os::KeysSecurity"
+
+/// What `keys` serves.
+pub protocol Keys {
+    /// Verifies that `signature` is the signature of the object of hash `subject` and purpose `kind` by the current key of `principal`, a signer of that purpose, or, when `former` holds and the purpose admits it, by a key rotation replaced.
+    pub fn verify(
+        principal: ident::Principal,
+        kind: text::String,
+        subject: ident::HashValue,
+        signature: ident::Signature,
+        former: bool,
+        ) fails KeysFailure limits traceless
+    /// Enrolls the `human.*`, `agent.*`, `builder.*` or `vendor.*` principal `principal` with the Ed25519 public key `key`, writing its record and `/data/<principal>`.
+    pub fn enroll(principal: ident::Principal, key: Array[u8, 32]) fails KeysFailure limits recorded
+    /// A new Ed25519 key pair for the child principal `child`: its public key and its private seed, of which `keys` keeps no copy.
+    pub fn issue(child: ident::Principal) -> Issued fails KeysFailure limits traceless
+    /// Rotates the key `rotation` names: a principal's to the key it gives, or the link or audit key to a new one.
+    pub fn rotate(rotation: Rotation) fails KeysFailure limits irreversible(erase)
+    /// Revokes the key of `principal`: its record holds no key and no former one.
+    pub fn revoke(principal: ident::Principal) fails KeysFailure limits recorded
+    /// The keyed task serving request `request` gives its reply.
+    fn answered(request: u64, reply: sys::Encoded) limits traceless
+} Keys
+
+/// Why an operation of `keys` failed.
+pub closed enum KeysFailure derives Eq, Encode {
+    BadSignature
+    NameTaken
+    InvalidOperand
+    UnknownName
+    Unavailable
+    Store(store::service::Failure)
+} KeysFailure
+
+/// A key `rotate` rotates.
+pub closed enum Rotation derives Eq, Encode {
+    Principal(principal: ident::Principal, key: Array[u8, 32])
+    Link
+    Audit
+} Rotation
+
+/// A key pair `issue` gives: the public key and the private seed.
+pub closed struct Issued derives Eq, Encode {
+    pub key: Array[u8, 32]
+    pub seed: Array[u8, 32]
+} Issued
+
+/// The payload of `auth.key-rotated`: the principal whose key rotated, or the link or audit key.
+pub closed enum KeyRotated derives Eq, Encode {
+    Principal(ident::Principal)
+    Link
+    Audit
+} KeyRotated
+
+/// The payload of `auth.key-revoked`.
+pub closed struct KeyRevoked derives Eq, Encode {
+    pub principal: ident::Principal
+} KeyRevoked
+
+/// The payload of `policy.owner-mismatch`: the fingerprints of the key `/sys/principals/owner` held and of the loader's.
+pub closed struct OwnerMismatch derives Eq, Encode {
+    pub stored: Option[ident::HashValue]
+    pub loader: ident::HashValue
+} OwnerMismatch
+
+/// The Env of `keys`: its Views of `/sys/principals` and `/data`, the kernel's entropy, its source of events, its part of `/live/security`, the owner key the loader keeps, whether its checkpoints are kept, which they are not when it starts before `store`, and its cell.
+pub open struct Env derives Send {
+    principals: store::service::View
+    data: store::service::View
+    random: sys::Random
+    events: journal::Source
+    live: os::Live
+    owner: Option[Array[u8, 32]]
+    kept: bool
+    alloc: mem::Alloc
+} Env
+
+/// The state of `keys`, its checkpoint: the machine's keys once generated.
+pub closed struct Keyring derives Encode {
+    pub held: Option[Held]
+} Keyring
+
+/// The machine's keys: the link key's X25519 static key and Ed25519 identity seed, the audit key's Ed25519 seed, and the keyring master key.
+pub closed struct Held derives Encode {
+    pub link_static: Array[u8, 32]
+    pub link_identity: Array[u8, 32]
+    pub audit: Array[u8, 32]
+    pub master: Array[u8, 32]
+} Held
+
+impl Keyring: sys::Component[Env, Keys]
+
+impl Keyring: sys::Resume[Env, Keys]
+
+pub fn Env.of(
+    principals: store::service::View,
+    data: store::service::View,
+    random: sys::Random,
+    events: journal::Source,
+    live: os::Live,
+    owner: Option[Array[u8, 32]],
+    kept: bool,
+    alloc: mem::Alloc,
+    ) -> Env {
+    return Env(principals: principals, data: data, random: random, events: events, live: live, owner: owner, kept: kept, alloc: alloc)
+} Env.of
+
+/// The code of the failure: `auth.*`, `request.*`, `port.server-stopped` while `keys` runs without its checkpoint, or the store's.
+pub fn KeysFailure.code(self) -> text::Fixed[32] {
+    return match self {
+        KeysFailure.BadSignature => text::Fixed[32].of("auth.bad-signature")
+        KeysFailure.NameTaken => text::Fixed[32].of("auth.name-taken")
+        KeysFailure.InvalidOperand => text::Fixed[32].of("request.invalid-operand")
+        KeysFailure.UnknownName => text::Fixed[32].of("request.unknown-name")
+        KeysFailure.Unavailable => text::Fixed[32].of("port.server-stopped")
+        KeysFailure.Store(failure) => failure.code()
+    }
+} KeysFailure.code
+
+pub fn Keyring.start(mut env: Env) -> Keyring = Keyring(held: None)
+
+/// Once its checkpoints are kept, generates the machine's keys when it holds none and has them checkpointed at once, publishes its part of `/live/security`, and brings the owner's record to the loader's owner key.
+pub fn Keyring.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Keys]) {
+    if not env.kept {
+        return
+    }
+    if self.held.is_none() {
+        self.held = Some(generated(env.random))
+        discard attempt mut cx.sync()
+    }
+    mut self.show(mut env, mut cx)
+    let principals = env.principals
+    let events = env.events
+    let owner = env.owner
+    let alloc = env.alloc
+    mut cx.spawn(key: OWNING, run: fn(out: sys::Outbox[Keys]) fails task::Cancelled uses wait limits stack 65_536 {
+        try await own(principals, events, owner, alloc)
+    })
+} Keyring.resume
+
+pub fn Keyring.verify(
+    mut self,
+    take principal: ident::Principal,
+    take kind: text::String,
+    take subject: ident::HashValue,
+    take signature: ident::Signature,
+    take former: bool,
+    mut env: Env,
+    mut cx: sys::Cx[Keys],
+    ) fails KeysFailure {
+    let principals = env.principals
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail KeysFailure.Unavailable
+    }
+    mut cx.spawn(key: SERVING + request, run: fn[take principal, take kind](out: sys::Outbox[Keys]) fails task::Cancelled uses wait limits stack 65_536 {
+        let outcome = try await verify(principals, principal, kind: kind.as_str(), subject, signature, former, alloc)
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail KeysFailure.Unavailable
+} Keyring.verify
+
+pub fn Keyring.enroll(
+    mut self,
+    take principal: ident::Principal,
+    take key: Array[u8, 32],
+    mut env: Env,
+    mut cx: sys::Cx[Keys],
+    ) fails KeysFailure {
+    if not env.kept {
+        fail KeysFailure.Unavailable
+    }
+    if not enrollable(principal) {
+        fail KeysFailure.InvalidOperand
+    }
+    let principals = env.principals
+    let data = env.data
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail KeysFailure.Unavailable
+    }
+    mut cx.spawn(key: SERVING + request, run: fn[take principal](out: sys::Outbox[Keys]) fails task::Cancelled uses wait limits stack 65_536 {
+        let outcome = try await enroll(principals, data, take principal, key, alloc)
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail KeysFailure.Unavailable
+} Keyring.enroll
+
+pub fn Keyring.issue(mut self, take child: ident::Principal, mut env: Env, mut cx: sys::Cx[Keys]) -> Issued fails KeysFailure {
+    if not env.kept {
+        fail KeysFailure.Unavailable
+    }
+    let seed = drawn(env.random)
+    return Issued(key: core::crypto::SecretKey.of_seed(seed).public_key().bytes, seed: seed)
+} Keyring.issue
+
+pub fn Keyring.rotate(mut self, take rotation: Rotation, mut env: Env, mut cx: sys::Cx[Keys]) fails KeysFailure {
+    if not env.kept {
+        fail KeysFailure.Unavailable
+    }
+    let events = env.events
+    let alloc = env.alloc
+    match rotation {
+        Rotation.Principal(principal: principal, key: key) => {
+            let principals = env.principals
+            let Some(request) = mut cx.postpone() else {
+                fail KeysFailure.Unavailable
+            }
+            mut cx.spawn(key: SERVING + request, run: fn[take principal](out: sys::Outbox[Keys]) fails task::Cancelled uses wait limits stack 65_536 {
+                let outcome = try await rotate(principals, principal: ident::Principal(text: principal.text), key, alloc)
+                if outcome.is_ok() {
+                    try await events.emit("auth.key-rotated", severity: journal::Severity.Notice, payload: KeyRotated.Principal(take principal), alloc)
+                }
+                discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+            })
+            fail KeysFailure.Unavailable
+        }
+        Rotation.Link => {
+            let Some(held) = mut self.held.extract() else {
+                fail KeysFailure.Unavailable
+            }
+            self.held = Some(Held(link_static: drawn(env.random), link_identity: drawn(env.random), audit: held.audit, master: held.master))
+            mut self.rotated(KeyRotated.Link, mut env, mut cx)
+        }
+        Rotation.Audit => {
+            let Some(held) = mut self.held.extract() else {
+                fail KeysFailure.Unavailable
+            }
+            self.held = Some(Held(link_static: held.link_static, link_identity: held.link_identity, audit: drawn(env.random), master: held.master))
+            mut self.rotated(KeyRotated.Audit, mut env, mut cx)
+        }
+    }
+} Keyring.rotate
+
+pub fn Keyring.revoke(mut self, take principal: ident::Principal, mut env: Env, mut cx: sys::Cx[Keys]) fails KeysFailure {
+    if not env.kept {
+        fail KeysFailure.Unavailable
+    }
+    let principals = env.principals
+    let events = env.events
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail KeysFailure.Unavailable
+    }
+    mut cx.spawn(key: SERVING + request, run: fn[take principal](out: sys::Outbox[Keys]) fails task::Cancelled uses wait limits stack 65_536 {
+        let outcome = try await revoke(principals, principal: ident::Principal(text: principal.text), alloc)
+        if outcome.is_ok() {
+            try await events.emit("auth.key-revoked", severity: journal::Severity.Notice, payload: KeyRevoked(principal: take principal), alloc)
+        }
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail KeysFailure.Unavailable
+} Keyring.revoke
+
+fn Keyring.answered(
+    mut self,
+    take request: u64,
+    take reply: sys::Encoded,
+    mut env: Env,
+    mut cx: sys::Cx[Keys],
+    ) {
+    discard attempt mut cx.reply(request, reply)
+} Keyring.answered
+
+/// Has the rotated machine keys checkpointed at once, emits `auth.key-rotated` naming `rotated` and publishes the new public keys.
+fn Keyring.rotated(mut self, take rotated: KeyRotated, mut env: Env, mut cx: sys::Cx[Keys]) {
+    discard attempt mut cx.sync()
+    mut self.show(mut env, mut cx)
+    let events = env.events
+    let alloc = env.alloc
+    mut cx.spawn(key: SERVING, run: fn[take rotated](out: sys::Outbox[Keys]) fails task::Cancelled uses wait limits stack 65_536 {
+        try await events.emit("auth.key-rotated", severity: journal::Severity.Notice, payload: rotated, alloc)
+    })
+} Keyring.rotated
+
+/// Publishes the part of `/live/security` `keys` tells: it runs unconfined, keeps its keys in software, and the public halves of the link key.
+fn Keyring.show(mut self, mut env: Env, mut cx: sys::Cx[Keys]) {
+    let alloc = env.alloc
+    let identity = match self.held {
+        Some(held) => core::crypto::SecretKey.of_seed(held.link_identity).public_key().bytes
+        None => return
+    }
+    var ed25519 = mem::Bytes.empty(alloc)
+    mut ed25519.append(identity.view())
+    let part = os::KeysSecurity(keys: os::KeysSpace.Unconfined, key_storage: os::KeyStorage.Software, link_keys: os::LinkKeys(x25519: mem::Bytes.empty(alloc), ed25519: take ed25519))
+    let live = env.live
+    mut cx.spawn(key: SHOWING, run: fn[take part](out: sys::Outbox[Keys]) fails task::Cancelled uses wait limits stack 65_536 {
+        try await live.publish(type: KEYS_SECURITY_TYPE, value: part, alloc)
+    })
+} Keyring.show
+
+/// The machine's keys drawn from `random`.
+fn generated(random: sys::Random) -> Held {
+    return Held(link_static: drawn(random), link_identity: drawn(random), audit: drawn(random), master: drawn(random))
+} generated
+
+/// 32 bytes drawn from `random`, zeros once it is revoked.
+fn drawn(random: sys::Random) -> Array[u8, 32] {
+    var bytes = Array[u8, 32].filled(0)
+    discard attempt random.fill(mut bytes.view_mut())
+    return bytes
+} drawn
+
+/// Whether `principal` is of a kind enrollment adds: `human.*`, `agent.*`, `builder.*` or `vendor.*`.
+fn enrollable(principal: ident::Principal) -> bool {
+    let name = principal.text.as_bytes()
+    return prefixed(name, prefix: b"human.") or prefixed(name, prefix: b"agent.") or prefixed(name, prefix: b"builder.") or prefixed(name, prefix: b"vendor.")
+} enrollable
+
+/// Whether `principal` may sign objects of the purpose `kind`, those of the purposes whose signers the policy names included; the audit key's anchors are no principal's.
+fn signs(principal: ident::Principal, kind: Str) -> bool {
+    let name = principal.text.as_bytes()
+    let owner = name == b"owner"
+    let purpose = kind.as_bytes()
+    if purpose == b"manifest" {
+        return owner or prefixed(name, prefix: b"vendor.")
+    }
+    if purpose == b"bundle" {
+        return prefixed(name, prefix: b"vendor.")
+    }
+    if purpose == b"approval" {
+        return owner or prefixed(name, prefix: b"human.")
+    }
+    if purpose == b"policy" {
+        return owner
+    }
+    return purpose == b"review" or purpose == b"seal" or purpose == b"certificate" or purpose == b"request" or purpose == b"handshake"
+} signs
+
+/// Whether `name` starts with `prefix`.
+fn prefixed(name: Slice[u8], prefix: Slice[u8]) -> bool {
+    return name.prefix(prefix.len()) == Some(prefix)
+} prefixed
+
+/// Whether a key rotation replaced verifies signatures of the purpose `kind`.
+fn admits_former(kind: Str) -> bool {
+    let purpose = kind.as_bytes()
+    return purpose == b"bundle" or purpose == b"review" or purpose == b"seal" or purpose == b"certificate"
+} admits_former
+
+/// Verifies `signature` over `subject` by `principal` for the purpose `kind`, as the operation `verify` states.
+fn verify(
+    principals: store::service::View,
+    principal: ident::Principal,
+    kind: Str,
+    subject: ident::HashValue,
+    signature: ident::Signature,
+    former: bool,
+    alloc: mem::Alloc,
+    ) -> Result[Unit, KeysFailure] fails task::Cancelled uses wait {
+    if not signs(principal, kind) {
+        return Err(KeysFailure.BadSignature)
+    }
+    let record = match first try await record_of(principals, principal, alloc) {
+        Ok(found) => found
+        Err(KeysFailure.UnknownName) => return Err(KeysFailure.BadSignature)
+        Err(failure) => return Err(take failure)
+    }
+    match record.key {
+        Some(key) => {
+            if signature.verifies(key, object: subject) {
+                return Ok(Unit)
+            }
+        }
+        None => {
+        }
+    }
+    if former and admits_former(kind) {
+        for key in record.former {
+            if signature.verifies(key, object: subject) {
+                return Ok(Unit)
+            }
+        }
+    }
+    return Err(KeysFailure.BadSignature)
+} verify
+
+/// Writes the record of `principal` holding `key` and makes `/data/<principal>`, `auth.name-taken` when it has a record.
+fn enroll(
+    principals: store::service::View,
+    data: store::service::View,
+    take principal: ident::Principal,
+    key: Array[u8, 32],
+    alloc: mem::Alloc,
+    ) -> Result[Unit, KeysFailure] fails task::Cancelled uses wait {
+    let record = os::PrincipalRecord(key: Some(key), former: mem::List.empty(alloc), parent: None, expires_utc_ns: None)
+    var expects = mem::List[store::Expect].empty(alloc)
+    mut expects.push(store::Expect(path: named(principal, alloc), version: store::Version.Absent))
+    match first try await write(principals, path: named(principal, alloc), record, take expects, alloc) {
+        Ok(_) => {
+        }
+        Err(KeysFailure.Store(store::service::Failure.ConflictExpect)) => return Err(KeysFailure.NameTaken)
+        Err(failure) => return Err(take failure)
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Make(path: named(principal, alloc), declaration: store::Declaration.Dir(store::DirDecl(element: None, ephemeral: false, secret: false, numbered: false, keep: None))))
+    return try await commit(data, take writes, expects: mem::List.empty(alloc), alloc)
+} enroll
+
+/// Moves the current key of `principal` to its former keys and installs `key`.
+fn rotate(principals: store::service::View, principal: ident::Principal, key: Array[u8, 32], alloc: mem::Alloc) -> Result[Unit, KeysFailure] fails task::Cancelled uses wait {
+    var record = match try await record_of(principals, principal, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    match record.key {
+        Some(current) => mut record.former.push(current)
+        None => {
+        }
+    }
+    record.key = Some(key)
+    return try await write(principals, path: named(principal, alloc), record, expects: mem::List.empty(alloc), alloc)
+} rotate
+
+/// Leaves `principal`'s record without a key or a former one.
+fn revoke(principals: store::service::View, principal: ident::Principal, alloc: mem::Alloc) -> Result[Unit, KeysFailure] fails task::Cancelled uses wait {
+    var record = match try await record_of(principals, principal, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    record.key = None
+    record.former = mem::List.empty(alloc)
+    return try await write(principals, path: named(principal, alloc), record, expects: mem::List.empty(alloc), alloc)
+} revoke
+
+/// Brings the owner's record to the loader's owner key `owner` when it holds another, emitting `policy.owner-mismatch` with both fingerprints; nothing on an unclaimed machine or when `/sys/principals/owner` cannot be read or written.
+fn own(principals: store::service::View, events: journal::Source, owner: Option[Array[u8, 32]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(loader) = owner else {
+        return
+    }
+    let name = ident::Principal(text: text::Fixed[64].of("owner"))
+    var record = match first try await record_of(principals, principal: name, alloc) {
+        Ok(found) => found
+        Err(KeysFailure.UnknownName) => os::PrincipalRecord(key: None, former: mem::List.empty(alloc), parent: None, expires_utc_ns: None)
+        Err(_) => return
+    }
+    if record.key == Some(loader) {
+        return
+    }
+    let stored = match record.key {
+        Some(key) => Some(ident::HashValue.of_content(key.view()))
+        None => None
+    }
+    record.key = Some(loader)
+    if (try await write(principals, path: named(name, alloc), record, expects: mem::List.empty(alloc), alloc)).is_err() {
+        return
+    }
+    try await events.emit("policy.owner-mismatch", severity: journal::Severity.Critical, payload: OwnerMismatch(stored: stored, loader: ident::HashValue.of_content(loader.view())), alloc)
+} own
+
+/// The record of `principal`, `request.unknown-name` when it has none.
+fn record_of(principals: store::service::View, principal: ident::Principal, alloc: mem::Alloc) -> Result[os::PrincipalRecord, KeysFailure] fails task::Cancelled uses wait {
+    let node = match first attempt await principals.get(named(principal, alloc), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(store::service::ViewError.Failed(store::service::Failure.NotFound)) => return Err(KeysFailure.UnknownName)
+        Err(store::service::ViewError.Failed(failure)) => return Err(KeysFailure.Store(take failure))
+        Err(_) => return Err(KeysFailure.Unavailable)
+    }
+    let Some(value) = node.value else {
+        return Err(KeysFailure.UnknownName)
+    }
+    return match attempt mem::wire::Codec[os::PrincipalRecord].decode(value.view(), alloc) {
+        Ok(record) => Ok(take record)
+        Err(_) => Err(KeysFailure.Store(store::service::Failure.Corrupt))
+    }
+} record_of
+
+/// Writes `record` at `path` of `principals` once `expects` hold.
+fn write(
+    principals: store::service::View,
+    take path: ident::Path,
+    record: os::PrincipalRecord,
+    take expects: mem::List[store::Expect],
+    alloc: mem::Alloc,
+    ) -> Result[Unit, KeysFailure] fails task::Cancelled uses wait {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::PrincipalRecord].encode(record, out: mut bytes)
+    let type = store::TypeRef.of(PRINCIPAL_RECORD_TYPE, schema: mem::wire::Codec[os::PrincipalRecord].schema_hash(), alloc)
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: take path, value: store::Value.Record(type: take type, bytes: take bytes, secret: false)))
+    return try await commit(principals, take writes, take expects, alloc)
+} write
+
+/// Commits `writes` through `view` once `expects` hold, their records written by derived encoders.
+fn commit(view: store::service::View, take writes: mem::List[store::Write], take expects: mem::List[store::Expect], alloc: mem::Alloc) -> Result[Unit, KeysFailure] fails task::Cancelled uses wait {
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: take expects, writes: take writes, key: None, plan: None, intent: None)
+    return match first attempt await view.commit(take transaction, typed: true, alloc) {
+        Ok(_) => Ok(Unit)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(store::service::ViewError.Failed(failure)) => Err(KeysFailure.Store(take failure))
+        Err(_) => Err(KeysFailure.Unavailable)
+    }
+} commit
+
+/// The child of a View's root that `principal` names.
+fn named(principal: ident::Principal, alloc: mem::Alloc) -> ident::Path {
+    var text = text::String.of("/", alloc)
+    mut text.append(principal.text.as_str())
+    return ident::Path(text: take text)
+} named
+
+/// An outcome as its reply carries it.
+fn reply_of[T: Encode](outcome: Result[T, KeysFailure], alloc: mem::Alloc) -> sys::Encoded {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Result[T, KeysFailure]].encode(outcome, out: mut bytes)
+    return sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc))
+} reply_of
+
+test purposes_take_their_signers for signs {
+    let owner = ident::Principal(text: text::Fixed[64].of("owner"))
+    let vendor = ident::Principal(text: text::Fixed[64].of("vendor.acme"))
+    let agent = ident::Principal(text: text::Fixed[64].of("agent.ops"))
+    expect signs(owner, kind: "policy") and not signs(vendor, kind: "policy")
+    expect signs(vendor, kind: "bundle") and not signs(owner, kind: "bundle")
+    expect signs(owner, kind: "manifest") and signs(vendor, kind: "manifest") and not signs(agent, kind: "manifest")
+    expect signs(agent, kind: "handshake") and not signs(agent, kind: "approval") and not signs(owner, kind: "anchor")
+    expect enrollable(agent) and enrollable(vendor) and not enrollable(owner)
+} purposes_take_their_signers

@@ -24,7 +24,8 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries |
 | `fat/` | The `fat` package: the boot volume's file system |
 | `store/` | The `store` package: the store's engine, its log, index trees, item table and blob cache, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol, Views and mappings |
-| `journal/` | The `journal` package: events and the kernel image's kind table, the streams of `/journal`, and the `journal` instance |
+| `journal/` | The `journal` package: events and the kernel image's kind table, the streams of `/journal`, sources, and the `journal` instance |
+| `keys/` | The `keys` package: the `keys` instance, the machine's keys and the principals' |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install` and `sandbox` scripts |

@@ -1,11 +1,32 @@
-//! The `journal` instance: it declares the streams of `/journal` as its configuration and the store's capacity keep them, and appends the events the core drains from its rings to `/journal/events`.
+//! The `journal` instance: it declares the streams of `/journal` as its configuration and the store's capacity keep them, appends the events the core drains from its rings to `/journal/events`, and appends those instances emit, refused when their kind's family is the core's and base instances' and dropped past their source's rate.
 
 /// The key of the keyed task draining the core rings.
 const DRAINING: u64 = 1
 
-/// What `journal` serves: what its draining task reports.
+/// The key of the first keyed task appending held events; each later one takes the next.
+const APPENDING: u64 = 2
+
+/// How long an emitted event waits to be appended, at most.
+const HOLD_MS: u64 = 100
+
+/// The bytes of held events that are appended at once.
+const HOLD_BYTES: u64 = 1_048_576
+
+/// The events one source may emit in a second; `journal` drops the rest.
+const RATE: u32 = 1_000
+
+/// The bytes of a payload beyond which an event holds its schema, size and hash in its place.
+const PAYLOAD_BYTES: usize = 4_096
+
+const NS_PER_S: u64 = 1_000_000_000
+
+/// What `journal` serves: the events instances emit, and what its own timer and tasks report.
 pub protocol Journal {
-    /// The task appended `events` events, `lost` of them counting the events the rings lost.
+    /// Takes the event of kind `kind`, severity `severity` and payload `payload` that the instance `source` names emits.
+    pub fn emit(source: Source, kind: text::String, severity: Severity, payload: Payload) limits traceless
+    /// The held events are due to be appended.
+    fn flush() limits traceless
+    /// The draining task appended `events` events, `lost` of them counting the events the rings lost.
     fn drained(events: u64, lost: u64) limits traceless
 } Journal
 
@@ -19,11 +40,36 @@ pub open struct Env derives Send {
     alloc: mem::Alloc
 } Env
 
-/// The state of `journal`: the events it appended since it started, and the events lost among them.
+/// The state of `journal`: the events it appended since it started and the events lost among them, the emitted events it holds, their bytes, whether their append is due, the number of the next append, and the rate of each source.
 pub closed struct Recorder derives Encode {
     pub events: u64
     pub lost: u64
+    pub held: mem::List[mem::Bytes]
+    pub held_bytes: u64
+    pub flushing: bool
+    pub batch: u64
+    pub rates: mem::Map[ident::Moniker, Rate]
 } Recorder
+
+/// A source's events in its current second: when the second began, the events taken in it and those dropped.
+pub closed struct Rate derives Copy, Eq, Encode {
+    pub since_ns: u64
+    pub taken: u32
+    pub dropped: u64
+} Rate
+
+/// The payload of `journal.kind-refused`: the source and the kind it may not emit.
+pub closed struct KindRefused derives Encode {
+    pub source: ident::Moniker
+    pub kind: text::String
+} KindRefused
+
+/// What an event holds in place of a payload of more than 4 KiB: its schema, size and hash.
+pub closed struct ElidedPayload derives Encode {
+    pub schema: ident::HashValue
+    pub size: u64
+    pub hash: ident::HashValue
+} ElidedPayload
 
 impl Recorder: sys::Component[Env, Journal]
 
@@ -40,7 +86,7 @@ pub fn Env.of(
     return Env(feed: feed, tree: tree, config: take config, system: system, clock: clock, alloc: alloc)
 } Env.of
 
-pub fn Recorder.start(mut env: Env) -> Recorder = Recorder(events: 0, lost: 0)
+pub fn Recorder.start(mut env: Env) -> Recorder = Recorder(events: 0, lost: 0, held: mem::List.empty(env.alloc), held_bytes: 0, flushing: false, batch: 0, rates: mem::Map.empty(env.alloc))
 
 /// Declares the streams and drains the core rings from a keyed task, at each resume of a new domain.
 pub fn Recorder.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Journal]) {
@@ -57,6 +103,37 @@ pub fn Recorder.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx
     })
 } Recorder.resume
 
+pub fn Recorder.emit(
+    mut self,
+    take source: Source,
+    take kind: text::String,
+    take severity: Severity,
+    take payload: Payload,
+    mut env: Env,
+    mut cx: sys::Cx[Journal],
+    ) {
+    let Some(emitter) = source.emitter() else {
+        return
+    }
+    let now = now_ns(env.clock)
+    let alloc = env.alloc
+    if reserved(kind.as_str()) and not is_base(emitter.instance) {
+        let refused = KindRefused(source: take emitter.instance, kind: take kind)
+        mut self.hold(journal_event("journal.kind-refused", severity: Severity.Warn, payload: payload_of(refused, alloc), now, system: env.system, alloc), mut env, mut cx)
+        return
+    }
+    if not mut self.admit(emitter.instance, now, mut env, mut cx) {
+        return
+    }
+    let event = Event(time_ns: now, source: take emitter.instance, kind: take kind, severity: severity, cause: env.system, principal: ident::Principal(text: text::Fixed[64].of("system")), payload: bounded(take payload, alloc))
+    mut self.hold(take event, mut env, mut cx)
+} Recorder.emit
+
+fn Recorder.flush(mut self, mut env: Env, mut cx: sys::Cx[Journal]) {
+    self.flushing = false
+    mut self.append(mut env, mut cx)
+} Recorder.flush
+
 fn Recorder.drained(
     mut self,
     take events: u64,
@@ -67,6 +144,75 @@ fn Recorder.drained(
     self.events = self.events.saturating_add(events)
     self.lost = self.lost.saturating_add(lost)
 } Recorder.drained
+
+/// Whether the source `instance` may emit one more event in its current second; a new second first holds a `journal.lost` of the events it dropped in its previous one.
+fn Recorder.admit(
+    mut self,
+    instance: ident::Moniker,
+    now: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Journal],
+    ) -> bool {
+    let alloc = env.alloc
+    var window = match self.rates.get(instance) {
+        Some(held) => held
+        None => Rate(since_ns: now, taken: 0, dropped: 0)
+    }
+    if now.saturating_sub(window.since_ns) >= NS_PER_S {
+        if window.dropped > 0 {
+            let lost = Lost(cpu: None, source: Some(ident::Moniker(text: instance.text)), count: window.dropped)
+            mut self.hold(journal_event("journal.lost", severity: Severity.Warn, payload: payload_of(lost, alloc), now, system: env.system, alloc), mut env, mut cx)
+        }
+        window = Rate(since_ns: now, taken: 0, dropped: 0)
+    }
+    let admitted = window.taken < RATE
+    if admitted {
+        window.taken += 1
+    } else {
+        window.dropped = window.dropped.saturating_add(1)
+    }
+    discard mut self.rates.insert(ident::Moniker(text: instance.text), value: window)
+    return admitted
+} Recorder.admit
+
+/// Holds `event` for the next append, `debug` ones only when the configuration keeps them: at once for a critical event or once the held events reach 1 MiB, else at most 100 ms later.
+fn Recorder.hold(mut self, take event: Event, mut env: Env, mut cx: sys::Cx[Journal]) {
+    if event.severity == Severity.Debug and not env.config.keep_debug {
+        return
+    }
+    let critical = event.severity == Severity.Critical
+    let bytes = encoded(event, alloc: env.alloc)
+    self.held_bytes = self.held_bytes.saturating_add(u64.widen(bytes.len()))
+    mut self.held.push(take bytes)
+    if critical or self.held_bytes >= HOLD_BYTES {
+        mut self.append(mut env, mut cx)
+        return
+    }
+    if not self.flushing {
+        self.flushing = true
+        mut cx.after(ms: HOLD_MS, send: Journal.flush())
+    }
+} Recorder.hold
+
+/// Appends the held events to `/journal/events` from a keyed task of their own.
+fn Recorder.append(mut self, mut env: Env, mut cx: sys::Cx[Journal]) {
+    if self.held.len() == 0 {
+        return
+    }
+    var entries = mem::List[mem::Bytes].empty(env.alloc)
+    while self.held.len() > 0 {
+        mut entries.push(mut self.held.remove(0))
+    }
+    self.held_bytes = 0
+    self.events = self.events.saturating_add(u64.widen(entries.len()))
+    let tree = env.tree
+    let alloc = env.alloc
+    let key = APPENDING + self.batch
+    self.batch += 1
+    mut cx.spawn(key: key, run: fn[take entries](out: sys::Outbox[Journal]) fails task::Cancelled uses wait limits stack 16_384 {
+        try await append(tree, take entries, alloc)
+    })
+} Recorder.append
 
 /// Declares the streams of `/journal` with what `retention` keeps of the store's capacity, leaving their declarations as they are when the store tells no capacity.
 fn declare(tree: store::service::View, retention: Retention, alloc: mem::Alloc) fails task::Cancelled uses wait {
@@ -105,34 +251,62 @@ fn drain(
             }
             if drained.lost > 0 {
                 lost = lost.saturating_add(drained.lost)
-                mut entries.push(encoded(ring_lost(cpu: drained.cpu, count: drained.lost, system, clock, alloc), alloc))
+                let count = Lost(cpu: Some(drained.cpu), source: None, count: drained.lost)
+                mut entries.push(encoded(journal_event("journal.lost", severity: Severity.Warn, payload: payload_of(count, alloc), now: now_ns(clock), system, alloc), alloc))
             }
         }
         if entries.len() == 0 {
             continue
         }
         let appended = u64.widen(entries.len())
-        var writes = mem::List[store::Write].empty(alloc)
-        mut writes.push(store::Write.Append(path: Kept.Events.path(alloc), entries: take entries))
-        try await commit(tree, take writes, alloc)
+        try await append(tree, take entries, alloc)
         discard attempt await out.drained(events: appended, lost)
     }
 } drain
 
-/// The `journal.lost` event of `count` events the ring of `cpu` lost, as `journal` records it now.
-fn ring_lost(
-    cpu: u32,
-    count: u64,
+/// An event `journal` records itself at the monotonic time `now`.
+fn journal_event(
+    kind: Str,
+    severity: Severity,
+    take payload: Payload,
+    now: u64,
     system: ident::Cause,
-    clock: sys::Clock,
     alloc: mem::Alloc,
     ) -> Event {
-    let now = match attempt clock.elapsed_ns() {
-        Ok(ns) => ns
-        Err(_) => 0
+    return Event(time_ns: now, source: ident::Moniker(text: text::Fixed[59].of("journal")), kind: text::String.of(kind, alloc), severity: severity, cause: system, principal: ident::Principal(text: text::Fixed[64].of("system")), payload: take payload)
+} journal_event
+
+/// `payload` as an event holds it: its schema, size and hash in place of a payload of more than 4 KiB.
+fn bounded(take payload: Payload, alloc: mem::Alloc) -> Payload {
+    if payload.bytes.len() <= PAYLOAD_BYTES {
+        return payload
     }
-    return Event(time_ns: now, source: ident::Moniker(text: text::Fixed[59].of("journal")), kind: text::String.of("journal.lost", alloc), severity: Severity.Warn, cause: system, principal: ident::Principal(text: text::Fixed[64].of("system")), payload: payload_of(Lost(cpu: Some(cpu), source: None, count: count), alloc))
-} ring_lost
+    let elided = ElidedPayload(schema: payload.schema, size: u64.widen(payload.bytes.len()), hash: ident::HashValue.of_content(payload.bytes.view()))
+    return payload_of(elided, alloc)
+} bounded
+
+/// Whether the kind `kind` belongs to a family of the core and the base instances.
+fn reserved(kind: Str) -> bool {
+    let bytes = kind.as_bytes()
+    var end: usize = 0
+    while end < bytes.len() and bytes[end] != b'.' {
+        end += 1
+    }
+    let Some(family) = bytes.prefix(end) else {
+        return false
+    }
+    return family == b"boot" or family == b"fault" or family == b"instance" or family == b"port" or family == b"auth" or family == b"place" or family == b"code" or family == b"update" or family == b"store" or family == b"schema" or family == b"conflict" or family == b"plan" or family == b"device" or family == b"net" or family == b"journal" or family == b"request" or family == b"link" or family == b"budget" or family == b"policy" or family == b"taint"
+} reserved
+
+/// Whether `moniker` names a base instance: it has one segment.
+fn is_base(moniker: ident::Moniker) -> bool {
+    for byte in moniker.text.as_bytes() {
+        if byte == b'.' {
+            return false
+        }
+    }
+    return true
+} is_base
 
 /// The `mem::wire` encoding of `event`.
 fn encoded(event: Event, alloc: mem::Alloc) -> mem::Bytes {
@@ -140,6 +314,13 @@ fn encoded(event: Event, alloc: mem::Alloc) -> mem::Bytes {
     mem::wire::Codec[Event].encode(event, out: mut bytes)
     return bytes
 } encoded
+
+/// Appends `entries` to `/journal/events` through `tree`.
+fn append(tree: store::service::View, take entries: mem::List[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Append(path: Kept.Events.path(alloc), entries: take entries))
+    try await commit(tree, take writes, alloc)
+} append
 
 /// Commits `writes` through `tree`, their records written by derived encoders; a failure loses them.
 fn commit(tree: store::service::View, take writes: mem::List[store::Write], alloc: mem::Alloc) fails task::Cancelled uses wait {
@@ -150,3 +331,16 @@ fn commit(tree: store::service::View, take writes: mem::List[store::Write], allo
         }
     }
 } commit
+
+/// The monotonic time in nanoseconds, 0 through a revoked clock.
+fn now_ns(clock: sys::Clock) -> u64 {
+    return match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} now_ns
+
+test families_of_the_core_and_base_instances_are_reserved for reserved {
+    expect reserved("auth.key-rotated") and reserved("journal.lost") and reserved("policy")
+    expect not reserved("mail.sent") and not reserved("authority.x")
+} families_of_the_core_and_base_instances_are_reserved

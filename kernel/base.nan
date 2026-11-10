@@ -27,6 +27,8 @@ const STORE_SERVICE: Str = "store::service::Service"
 
 const JOURNAL: Str = "journal::Recorder"
 
+const KEYS: Str = "keys::Keyring"
+
 /// The canonical paths of the record types genesis writes besides specifications.
 const GRANT_TYPE: Str = "os::Grant"
 
@@ -41,7 +43,7 @@ const JOURNAL_CONFIG_TYPE: Str = "journal::JournalConfig"
 /// The memory limit of `store`, whose engine keeps index nodes of 16 KiB in memory.
 const STORE_LIMIT: u64 = 67_108_864
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record and the feed of the core rings.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings and where `keys` publishes its part of `/live/security`.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
@@ -54,6 +56,7 @@ struct Base derives Copy {
     wall: ident::Wall
     handoff: bootfmt::Handoff
     feed: journal::Feed
+    keys_live: os::Live
 } Base
 
 impl Base: runner::Components
@@ -97,6 +100,9 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     }
     if component == JOURNAL {
         return Some(os::Protocols(own: sys::Wire[journal::Journal].hash(), serves: None))
+    }
+    if component == KEYS {
+        return Some(os::Protocols(own: sys::Wire[keys::Keys].hash(), serves: None))
     }
     return None
 } Base.protocols
@@ -161,6 +167,9 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     }
     if component == JOURNAL {
         return try await self.serve_journal(take world, take serving)
+    }
+    if component == KEYS {
+        return try await self.serve_keys(take world, take serving)
     }
     let exec = world.exec
     let alloc = world.alloc
@@ -356,6 +365,27 @@ fn Base.serve_journal(self, take world: nanos::World, take serving: runner::Serv
     })
 } Base.serve_journal
 
+/// Serves `keys` on its Views of `/sys/principals` and `/data`, the kernel's entropy, its source of events, its part of `/live/security` and the owner key the handoff record names, keeping its checkpoints when `serving` does.
+fn Base.serve_keys(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Ok(principals) = attempt nanos::Cap[store::service::View].get(world.caps, key: "principals") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(data) = attempt nanos::Cap[store::service::View].get(world.caps, key: "data") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
+        return runner::Ended.EnvIncomplete
+    }
+    var owner: Option[Array[u8, 32]] = None
+    if self.handoff.owner_key != Array[u8, 32].filled(0) {
+        owner = Some(self.handoff.owner_key)
+    }
+    let env = keys::Env.of(principals, data, random: world.random, events, live: self.keys_live, owner, kept: serving.keeps(), alloc)
+    return try await runner::Driven[keys::Keyring, keys::Env, keys::Keys].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: keys::Env) limits stack 512 {
+    })
+} Base.serve_keys
+
 /// The schemas a block driver or view serves the calls of: `Block`'s.
 fn schema_of_block(alloc: mem::Alloc) -> mem::List[sys::ProtocolSchema] {
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
@@ -439,7 +469,13 @@ fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem
     discard mut building.specs.insert(moniker("devices"), value: take managing)
     discard mut building.specs.insert(moniker("fat"), value: take filing)
     discard mut building.specs.insert(moniker("store"), value: take storing)
+    var keeping = os::InstanceSpec.of(principal: principal("system"), bundle, component: KEYS, alloc)
+    keeping.durability = os::Durability(class: os::DurabilityClass.Checkpointed, epoch_s: None, max_bytes: 65_536)
+    mut building.grant(mut keeping, holder: "keys", field: "principals", object: tree_of("/sys/principals", alloc), granted: tree_rights(alloc), alloc)
+    mut building.grant(mut keeping, holder: "keys", field: "data", object: tree_of("/data", alloc), granted: tree_rights(alloc), alloc)
+    mut building.grant(mut keeping, holder: "keys", field: "random", object: os::Object.Random, granted: mem::Set.empty(alloc), alloc)
     discard mut building.specs.insert(moniker("journal"), value: take journaling)
+    discard mut building.specs.insert(moniker("keys"), value: take keeping)
     if owner_of(handoff, alloc).is_some() {
         let number = u64.widen(building.grants.len())
         discard mut building.grants.insert(number, value: os::Grant(holder: principal("owner"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
@@ -593,7 +629,9 @@ fn run_base(
     let backlog = journal::Backlog.empty(alloc: config.alloc)
     let feeding = journal::MintedFeed.of(backlog, alloc: config.alloc)
     defer take feeding.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: storing.mint(), devices_live: managing.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint())
+    let securing = os::MintedLive.of(posted, own: "/live/security/keys", alloc: config.alloc)
+    defer take securing.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: storing.mint(), devices_live: managing.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: securing.mint())
     var requested = incoming
     var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings))
     defer abandon_given(take given)
@@ -780,7 +818,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     defer take living.close()
     let feeding = journal::MintedFeed.of(journal::Backlog.empty(alloc), alloc)
     defer take feeding.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint())
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, gauges: runner::Gauges.empty(alloc), body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)
