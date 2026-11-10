@@ -9,6 +9,9 @@ const LIVE_INSTANCES: Str = "/live/instances/"
 /// The path of the store's record.
 const LIVE_STORE: Str = "/live/store"
 
+/// The path of the security record.
+const LIVE_SECURITY: Str = "/live/security"
+
 /// What `/live/status` reads besides the records: the generation booted and its mode, and the clocks.
 struct Origin derives Copy {
     generation: u64
@@ -28,12 +31,17 @@ fn Origin.of(handoff: bootfmt::Handoff, clock: sys::Clock, wall: ident::Wall) ->
     return Origin(generation: handoff.generation, mode: mode, clock: clock, wall: wall)
 } Origin.of
 
-/// Holds `machine` and the records published through `postings`, a withdrawal taking those below its path too, and answers their reads, until every sender is gone.
-fn serve_board(take postings: task::Receiver[os::Posting], origin: Origin, machine: os::Machine, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Holds `machine`, `security` and the records published through `postings`, a withdrawal taking those below its path too, and answers their reads, until every sender is gone.
+fn serve_board(
+    take postings: task::Receiver[os::Posting],
+    origin: Origin,
+    machine: os::Machine,
+    take security: os::LiveSecurity,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
     var records = mem::Map[text::String, os::Published].empty(alloc)
-    var measured = mem::Bytes.empty(alloc)
-    mem::wire::Codec[os::Machine].encode(machine, out: mut measured)
-    discard mut records.insert(text::String.of("/live/machine", alloc), value: os::Published(type: text::String.of("os::Machine", alloc), schema: mem::wire::Codec[os::Machine].schema_hash(), bytes: take measured))
+    discard mut records.insert(text::String.of("/live/machine", alloc), value: os::published("os::Machine", value: machine, alloc))
+    discard mut records.insert(text::String.of(LIVE_SECURITY, alloc), value: os::published("os::LiveSecurity", value: security, alloc))
     var receiver = postings
     loop {
         let Some(posting) = try await mut receiver.receive() else {
@@ -166,6 +174,7 @@ fn add_child(
 fn status_of(records: mem::Map[text::String, os::Published], origin: Origin, alloc: mem::Alloc) -> os::Published {
     var counts = os::InstanceCounts(running: 0, converging: 0, failed: 0)
     var used_pct: u8 = 0
+    var exposures = mem::List[text::String].empty(alloc)
     for entry in records {
         if entry.key().starts_with(LIVE_INSTANCES) {
             let Some(instance) = instance_of(Untrusted.of(entry.value().bytes.view()), alloc) else {
@@ -186,10 +195,12 @@ fn status_of(records: mem::Map[text::String, os::Published], origin: Origin, all
             }
         } else if entry.key().as_str() == LIVE_STORE {
             used_pct = used_share(Untrusted.of(entry.value().bytes.view()), alloc)
+        } else if entry.key().as_str() == LIVE_SECURITY {
+            exposures = exposures_of(Untrusted.of(entry.value().bytes.view()), alloc)
         }
     }
     let now = journal::elapsed(origin.clock)
-    let status = os::LiveStatus(generation: origin.generation, mode: origin.mode, claimed: false, uptime: now, time: origin.wall.now(origin.clock), instances: counts, approvals: 0, store_used_pct: used_pct, exposures: mem::List.empty(alloc), cursor: ident::Cursor(seq: 0), as_of: now)
+    let status = os::LiveStatus(generation: origin.generation, mode: origin.mode, claimed: false, uptime: now, time: origin.wall.now(origin.clock), instances: counts, approvals: 0, store_used_pct: used_pct, exposures: take exposures, cursor: ident::Cursor(seq: 0), as_of: now)
     var bytes = mem::Bytes.empty(alloc)
     mem::wire::Codec[os::LiveStatus].encode(status, out: mut bytes)
     return os::Published(type: text::String.of("os::LiveStatus", alloc), schema: mem::wire::Codec[os::LiveStatus].schema_hash(), bytes: take bytes)
@@ -202,6 +213,14 @@ validator fn instance_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option
     }
 } instance_of
 
+/// The fields of the security record `raw` away from their protected value.
+validator fn exposures_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::List[text::String] {
+    return match attempt mem::wire::Codec[os::LiveSecurity].decode(raw, alloc) {
+        Ok(security) => security.exposures(alloc)
+        Err(_) => mem::List.empty(alloc)
+    }
+} exposures_of
+
 /// The share of the store's capacity in use, in percent, that its record `raw` tells.
 validator fn used_share(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> u8 {
     let Ok(stored) = attempt mem::wire::Codec[store::service::LiveStore].decode(raw, alloc) else {
@@ -212,6 +231,25 @@ validator fn used_share(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> u8 {
     }
     return u8.saturate(stored.used.saturating_mul(100) / stored.capacity)
 } used_share
+
+/// The record of `/live/security` as the core knows it at start from the handoff record and `machine`: the loader's floor and build, secure boot and measurement, unconfined DMA, no isolated space, `keys` unconfined with its keys sealed in the TPM when the machine has one, no link or audit key yet, and a plain volume.
+fn security_of(handoff: bootfmt::Handoff, machine: os::Machine, alloc: mem::Alloc) -> os::LiveSecurity {
+    let flags = handoff.flags
+    let rollback = match flags.floor_in_tpm or flags.floor_in_variable {
+        true => os::Rollback.Protected
+        false => os::Rollback.Unprotected
+    }
+    let loader = match flags.development {
+        true => os::LoaderBuild.Development
+        false => os::LoaderBuild.Production
+    }
+    let key_storage = match machine.conditions.tpm {
+        true => os::KeyStorage.Tpm
+        false => os::KeyStorage.Software
+    }
+    let link_keys = os::LinkKeys(x25519: mem::Bytes.empty(alloc), ed25519: mem::Bytes.empty(alloc))
+    return os::LiveSecurity(rollback: rollback, loader: loader, secure_boot: machine.conditions.secure_boot, measured: machine.conditions.tpm and handoff.event_log_size > 0, dma: os::Confinement.Unconfined, isolated_spaces: false, keys: os::KeysSpace.Unconfined, key_storage: key_storage, link_keys: take link_keys, audit: os::AuditChain.Intact, audit_key: mem::Bytes.empty(alloc), volume: os::VolumeCipher.Plain, as_of: 0)
+} security_of
 
 /// The record of `/live/machine` the measured facts `facts` give, the store's device not yet measured, on mains power.
 fn machine_of(facts: Facts) -> os::Machine {
@@ -267,7 +305,7 @@ test boards_list_what_providers_publish_and_count_instances_in_the_status for se
             return
         }
         discard s.spawn(fn[take board]() fails task::Cancelled uses wait limits stack 32_768 {
-            try await serve_board(take board, origin, machine, alloc)
+            try await serve_board(take board, origin, machine, security: security_of(bootfmt::Handoff.empty(), machine, alloc), alloc)
         })
         try await os::publish(posted, path: "/live/instances/a", type: "os::LiveInstance", value: instance_record(os::Lifecycle.Running, reconciled: os::ReconcileState.Converged, alloc), alloc)
         try await os::publish(posted, path: "/live/instances/b", type: "os::LiveInstance", value: instance_record(os::Lifecycle.Failed, reconciled: os::ReconcileState.Failed(code: text::String.of("trap.unreachable", alloc), detail: text::String.empty(alloc)), alloc), alloc)
@@ -278,7 +316,7 @@ test boards_list_what_providers_publish_and_count_instances_in_the_status for se
             return
         }
         let counts = running_of(Untrusted.of(status.bytes.view()), alloc)
-        expect top.len() == 3 and top[0].name.as_str() == "instances" and top[0].parent and top[1].name.as_str() == "machine" and top[2].name.as_str() == "status"
+        expect top.len() == 4 and top[0].name.as_str() == "instances" and top[0].parent and top[1].name.as_str() == "machine" and top[2].name.as_str() == "security" and top[3].name.as_str() == "status"
         expect instances.len() == 1 and instances[0].name.as_str() == "b"
         expect counts[0] == 1 and counts[1] == 1
         s.cancel()
