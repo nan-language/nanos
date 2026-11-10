@@ -4,7 +4,10 @@
 pub open struct View {
 } View
 
-impl View: sys::Kind[Scope, Rights]
+impl View: sys::Kind[Scope, Reach]
+
+/// The bytes of the path a View's record holds below its root entry's subtree.
+const BELOW_BYTES: usize = 240
 
 /// What a View may do: read; write, which covers commits, appends, drafts, reverts and erasures; admin, which covers branches, merges, pins, scrubs and collections; read the plaintext of secret records; and own, which writes the nodes below `/sys` and `/state` that their owning operations write.
 pub layout Rights: u8 {
@@ -25,9 +28,19 @@ struct Scope {
     instance: Option[ident::Moniker]
 } Scope
 
+/// What a View reaches within its root entry's scope: its rights, the commit it reads as of when `dated` is 1, and the path below the scope's subtree it is narrowed to, the first `length` bytes of `below`, each segment led by `/`.
+layout Reach: bytes 256 le {
+    rights: Rights at 0
+    dated: u8 at 1
+    length: u8 at 2
+    reserved: Array[u8, 5] at 3
+    as_of: u64 at 8
+    below: Array[u8, 240] at 16
+} Reach
+
 /// The root entry the Views of one grant and holder derive from, revoked when it closes.
 pub open linear struct MintedView derives Send {
-    minter: sys::Minter[View, Scope, Rights]
+    minter: sys::Minter[View, Scope, Reach]
 } MintedView
 
 /// Why a call through a View failed: the store's failure, a stale View, or a store that does not take calls.
@@ -69,11 +82,12 @@ pub fn MintedView.of(
     alloc: mem::Alloc,
     ) -> MintedView {
     let scope = Scope(store: store, prefix: take prefix, branch: text::String.of(branch, alloc), principal: take principal, instance: take instance)
-    return MintedView(minter: sys::Minter[View, Scope, Rights].of(take scope, alloc))
+    return MintedView(minter: sys::Minter[View, Scope, Reach].of(take scope, alloc))
 } MintedView.of
 
+/// A View of the whole subtree with `rights`, reading at the head.
 pub fn MintedView.mint(self, rights: Rights) -> View {
-    return self.minter.mint(rights)
+    return self.minter.mint(Reach(rights: rights, dated: 0, length: 0, reserved: Array[u8, 5].filled(0), as_of: 0, below: Array[u8, 240].filled(0)))
 } MintedView.mint
 
 /// Revokes every View of this root entry.
@@ -84,18 +98,95 @@ pub fn MintedView.close(take self) {
 
 /// A View of the same subtree reading alone.
 pub fn View.read_only(self) -> View fails sys::Revoked {
-    return try sys::derive(self, narrow: fn(state: Scope, record: Rights) => Rights(read: record.read, write: false, admin: false, secret_read: false, own: false, reserved: 0))
+    return try sys::derive(self, narrow: fn(state: Scope, record: Reach) -> Reach {
+        var narrowed = record
+        narrowed.rights = Rights(read: record.rights.read, write: false, admin: false, secret_read: false, own: false, reserved: 0)
+        return narrowed
+    })
 } View.read_only
+
+/// A View of the subtree at `path` within this View's, with its rights and its commit; `store.too-large` when the paths it is narrowed to pass `BELOW_BYTES`.
+pub fn View.below(self, take path: ident::Path, alloc: mem::Alloc) -> View fails ViewError {
+    let Some(length) = sys::reach(self, body: fn(state: Scope, record: Reach) => record.length) else {
+        fail ViewError.Revoked
+    }
+    var added = mem::Bytes.empty(alloc)
+    for segment in take path.segments(alloc) {
+        mut added.push(b'/')
+        mut added.append(segment.view())
+    }
+    if usize.widen(length) + added.len() > BELOW_BYTES {
+        fail ViewError.Failed(Failure.TooLarge)
+    }
+    let narrowed = attempt sys::derive(self, narrow: fn(state: Scope, record: Reach) -> Reach {
+        var reach = record
+        var tail = record.below
+        var at = usize.widen(record.length)
+        for byte in added.view() {
+            if at < BELOW_BYTES {
+                tail[at] = byte
+                at += 1
+            }
+        }
+        reach.below = tail
+        reach.length = u8.truncate(at)
+        return reach
+    })
+    return match narrowed {
+        Ok(view) => view
+        Err(_) => fail ViewError.Revoked
+    }
+} View.below
+
+/// A View of the same subtree reading alone as of the commit `commit` of its branch, or as of this View's own commit when that is earlier.
+pub fn View.at_commit(self, commit: ident::CommitId) -> View fails sys::Revoked {
+    return try sys::derive(self, narrow: fn(state: Scope, record: Reach) -> Reach {
+        var narrowed = record
+        narrowed.rights = Rights(read: record.rights.read, write: false, admin: false, secret_read: record.rights.secret_read, own: false, reserved: 0)
+        if record.dated == 0 or commit.number < record.as_of {
+            narrowed.dated = 1
+            narrowed.as_of = commit.number
+        }
+        return narrowed
+    })
+} View.at_commit
 
 /// The scope a View gives the requests made through it, `None` once it is stale.
 fn View.scoped(self, alloc: mem::Alloc) -> Option[Scoped] {
-    return sys::reach(self, body: fn(state: Scope, record: Rights) -> Scoped {
+    let reached = sys::reach(self, body: fn(state: Scope, record: Reach) -> Option[Scoped] {
+        var segments = state.prefix.segments(alloc)
+        var segment = mem::Bytes.empty(alloc)
+        var at: usize = 0
+        while at < usize.widen(record.length) and at < BELOW_BYTES {
+            let byte = record.below[at]
+            if byte != b'/' {
+                mut segment.push(byte)
+            } else if segment.len() > 0 {
+                mut segments.push(take segment)
+                segment = mem::Bytes.empty(alloc)
+            }
+            at += 1
+        }
+        if segment.len() > 0 {
+            mut segments.push(take segment)
+        }
+        let Some(prefix) = ident::Path.of_segments(segments.view(), alloc) else {
+            return None
+        }
         let instance = match state.instance {
             Some(moniker) => Some(ident::Moniker(text: moniker.text))
             None => None
         }
-        return Scoped(store: state.store, prefix: ident::Path(text: text::String.of(state.prefix.text.as_str(), alloc)), branch: text::String.of(state.branch.as_str(), alloc), rights: record.to_bits(), principal: ident::Principal(text: state.principal.text), instance: take instance)
+        let as_of = match record.dated == 1 {
+            true => Some(ident::CommitId(number: record.as_of))
+            false => None
+        }
+        return Some(Scoped(store: state.store, prefix: take prefix, branch: text::String.of(state.branch.as_str(), alloc), rights: record.rights.to_bits(), as_of: as_of, principal: ident::Principal(text: state.principal.text), instance: take instance))
     })
+    return match reached {
+        Some(scoped) => scoped
+        None => None
+    }
 } View.scoped
 
 /// The node at `path` of the View's subtree, as of the commit `at` or at the head.
@@ -182,7 +273,7 @@ pub fn View.stats(self, alloc: mem::Alloc) -> LiveStore fails ViewError uses wai
 
 /// Calls the store through the port the View holds, with `call` naming the View.
 fn View.call[R: Send](self, take call: sys::Encoded, reply: sys::Reply[R, Failure], alloc: mem::Alloc) -> R fails ViewError uses wait {
-    let Some(handle) = sys::reach(self, body: fn(state: Scope, record: Rights) => state.store) else {
+    let Some(handle) = sys::reach(self, body: fn(state: Scope, record: Reach) => state.store) else {
         fail ViewError.Revoked
     }
     let Some(port) = os::Port[Store].of(handle) else {
@@ -196,3 +287,63 @@ fn View.call[R: Send](self, take call: sys::Encoded, reply: sys::Reply[R, Failur
         Err(_) => fail ViewError.Unreachable
     }
 } View.call
+
+/// A port reaching no store and a root entry of Views of its `/data` on a branch, for tests.
+linear struct TestViews {
+    port: os::MintedPort
+    root: MintedView
+} TestViews
+
+fn TestViews.of(branch: Str, alloc: mem::Alloc) -> TestViews {
+    let task::Channel(sender: intake, receiver: unread) = task::Channel[os::Call].bounded(1, alloc)
+    discard unread
+    let port = os::MintedPort.of(intake, gate: os::Gate.of(alloc), protocols: os::Protocols(own: sys::Wire[Store].hash(), serves: None), operations: None, credit: os::Credit(messages: 1, calls: 1), alloc)
+    let root = MintedView.of(store: port.handle(), prefix: ident::Path(text: text::String.of("/data", alloc)), branch, principal: ident::Principal(text: text::Fixed[64].of("owner")), instance: None, alloc)
+    return TestViews(port: take port, root: take root)
+} TestViews.of
+
+fn TestViews.close(take self) {
+    let TestViews(port: port, root: root) = self
+    take root.close()
+    take port.close()
+} TestViews.close
+
+test views_narrow_to_subtrees_and_earlier_commits for View.scoped {
+    let alloc = testing::world().alloc
+    var views = TestViews.of(branch: "main", alloc)
+    defer take views.close()
+    let whole = views.root.mint(Rights.all())
+    let Ok(notes) = attempt whole.below(ident::Path(text: text::String.of("/agent/notes", alloc)), alloc) else {
+        expect false
+        return
+    }
+    let Ok(dated) = attempt notes.at_commit(ident::CommitId(number: 7)) else {
+        expect false
+        return
+    }
+    let Ok(later) = attempt dated.at_commit(ident::CommitId(number: 9)) else {
+        expect false
+        return
+    }
+    var long = text::String.of("/", alloc)
+    for _ in 0..<241u32 {
+        mut long.push('a')
+    }
+    let refused = match attempt whole.below(ident::Path(text: take long), alloc) {
+        Err(ViewError.Failed(Failure.TooLarge)) => true
+        else => false
+    }
+    let Some(narrow) = later.scoped(alloc) else {
+        expect false
+        return
+    }
+    let Some(top) = whole.scoped(alloc) else {
+        expect false
+        return
+    }
+    let rights = Rights.from_bits(narrow.rights)
+    expect narrow.prefix.text.as_str() == "/data/agent/notes" and narrow.as_of == Some(ident::CommitId(number: 7))
+    expect rights.read and not rights.write and not rights.admin
+    expect top.prefix.text.as_str() == "/data" and top.as_of.is_none() and Rights.from_bits(top.rights).write
+    expect refused
+} views_narrow_to_subtrees_and_earlier_commits

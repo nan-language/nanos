@@ -98,33 +98,66 @@ fn Scoped.write(self, take write: store::Write, alloc: mem::Alloc) -> store::Wri
     }
 } Scoped.write
 
-/// A point of a diff on the View's branch, `store.denied` for a point naming another branch.
+/// A point of a diff on the View's branch, its head being the View's commit when it reads as of one; `store.denied` for a point naming another branch or a commit after the View's.
 fn Scoped.point(self, take point: store::Point) -> store::Point fails Failure {
     match point {
         store::Point.Head(branch) => {
             if branch.as_str() != self.branch.as_str() {
                 fail Failure.Denied
             }
-            return store::Point.Head(take branch)
+            return match self.as_of {
+                Some(own) => store::Point.Commit(branch: take branch, commit: own)
+                None => store::Point.Head(take branch)
+            }
         }
         store::Point.Commit(branch: branch, commit: commit) => {
             if branch.as_str() != self.branch.as_str() {
                 fail Failure.Denied
             }
-            return store::Point.Commit(branch: take branch, commit: commit)
+            let checked = try self.at(Some(commit))
+            return store::Point.Commit(branch: take branch, commit: checked.value_or(commit))
         }
     }
 } Scoped.point
+
+/// The commit a read through the View reads at: `at`, or the View's own when it reads as of one, a later commit than the View's failing `store.denied`.
+fn Scoped.at(self, at: Option[ident::CommitId]) -> Option[ident::CommitId] fails Failure {
+    let Some(own) = self.as_of else {
+        return at
+    }
+    let Some(asked) = at else {
+        return Some(own)
+    }
+    if asked.number > own.number {
+        fail Failure.Denied
+    }
+    return Some(asked)
+} Scoped.at
+
+/// The commit a history through the View lists before: `before`, or past the View's own commit when it reads as of one and `before` is later.
+fn Scoped.before(self, before: Option[ident::CommitId]) -> Option[ident::CommitId] {
+    let Some(own) = self.as_of else {
+        return before
+    }
+    let past = ident::CommitId(number: own.number.saturating_add(1))
+    return match before {
+        Some(asked) => match asked.number < past.number {
+            true => Some(asked)
+            false => Some(past)
+        }
+        None => Some(past)
+    }
+} Scoped.before
 
 /// Runs a request other than a commit, a mapping, or the creation or deletion of a branch, and gives its reply's encoding.
 fn Sequencer.run(mut self, take scope: Scoped, take job: Job, world: Surroundings) -> mem::Bytes fails task::Cancelled uses wait {
     let alloc = world.alloc
     return match job {
-        Job.Get(path: path, at: at) => encoded(try await mut self.get(scope, path, at, world), alloc)
-        Job.List(path: path, at: at, after: after, limit: limit) => encoded(try await mut self.list(scope, path, at, take after, limit, world), alloc)
+        Job.Get(path: path, at: at) => encoded(try await mut self.get(scope, path, asked: at, world), alloc)
+        Job.List(path: path, at: at, after: after, limit: limit) => encoded(try await mut self.list(scope, path, asked: at, take after, limit, world), alloc)
         Job.Count(path: path, from: from, to: to) => encoded(try await mut self.count(scope, path, from, to, world), alloc)
         Job.Scan(path: path, at: at, from: from, to: to, limit: limit) => encoded(try await mut self.scan(scope, path, at, from, to, limit, world), alloc)
-        Job.Read(path: path, at: at, offset: offset, length: length, verify: verify) => encoded(try await mut self.read(scope, path, at, offset, length, verify, world), alloc)
+        Job.Read(path: path, at: at, offset: offset, length: length, verify: verify) => encoded(try await mut self.read(scope, path, asked: at, offset, length, verify, world), alloc)
         Job.Draft => encoded(mut self.draft(scope, world), alloc)
         Job.DraftAppend(draft: draft, bytes: bytes) => encoded(try await mut self.draft_append(scope, draft, bytes, world), alloc)
         Job.DraftClose(draft: draft, expected: expected) => encoded(try await mut self.draft_close(scope, draft, expected, world), alloc)
@@ -149,11 +182,15 @@ fn Sequencer.get(
     mut self,
     scope: Scoped,
     path: ident::Path,
-    at: Option[ident::CommitId],
+    asked: Option[ident::CommitId],
     world: Surroundings,
     ) -> Result[store::Node, Failure] fails task::Cancelled uses wait {
     let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
         Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let at = match attempt scope.at(asked) {
+        Ok(point) => point
         Err(failure) => return Err(take failure)
     }
     if segments_below(resolved, top: b"live", alloc: world.alloc).is_some() {
@@ -178,13 +215,17 @@ fn Sequencer.list(
     mut self,
     scope: Scoped,
     path: ident::Path,
-    at: Option[ident::CommitId],
+    asked: Option[ident::CommitId],
     take after: Option[text::String],
     limit: u32,
     world: Surroundings,
     ) -> Result[store::Listing, Failure] fails task::Cancelled uses wait {
     let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
         Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let at = match attempt scope.at(asked) {
+        Ok(point) => point
         Err(failure) => return Err(take failure)
     }
     if segments_below(resolved, top: b"live", alloc: world.alloc).is_some() {
@@ -220,6 +261,9 @@ fn Sequencer.count(
     to: text::String,
     world: Surroundings,
     ) -> Result[store::Count, Failure] fails task::Cancelled uses wait {
+    if scope.as_of.is_some() {
+        return Err(Failure.Kind)
+    }
     let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
         Ok(found) => found
         Err(failure) => return Err(take failure)
@@ -237,7 +281,7 @@ fn Sequencer.scan(
     limit: u32,
     world: Surroundings,
     ) -> Result[mem::List[store::Node], Failure] fails task::Cancelled uses wait {
-    if at.is_some() {
+    if at.is_some() or scope.as_of.is_some() {
         return Err(Failure.Kind)
     }
     let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
@@ -251,7 +295,7 @@ fn Sequencer.read(
     mut self,
     scope: Scoped,
     path: ident::Path,
-    at: Option[ident::CommitId],
+    asked: Option[ident::CommitId],
     offset: u64,
     length: u32,
     verify: bool,
@@ -259,6 +303,10 @@ fn Sequencer.read(
     ) -> Result[Untrusted[mem::Bytes], Failure] fails task::Cancelled uses wait {
     let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
         Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let at = match attempt scope.at(asked) {
+        Ok(point) => point
         Err(failure) => return Err(take failure)
     }
     return try settled(attempt await mut self.engine.read(self.volume, branch: scope.branch.as_str(), path: resolved, at, offset, length, verify, now: world.now(), alloc: world.alloc))
@@ -269,7 +317,7 @@ fn Sequencer.map(
     mut self,
     scope: Scoped,
     path: ident::Path,
-    at: Option[ident::CommitId],
+    asked: Option[ident::CommitId],
     offset: u64,
     length: u32,
     mut mappings: Mappings,
@@ -278,6 +326,10 @@ fn Sequencer.map(
     let alloc = world.alloc
     let resolved = match attempt scope.resolve(path, need: Need.Read, alloc) {
         Ok(found) => found
+        Err(failure) => return plain(encoded(Err[u64, Failure](take failure), alloc), alloc)
+    }
+    let at = match attempt scope.at(asked) {
+        Ok(point) => point
         Err(failure) => return plain(encoded(Err[u64, Failure](take failure), alloc), alloc)
     }
     let mapped = match try settled(attempt await mut self.engine.map(self.volume, branch: scope.branch.as_str(), path: resolved, at, offset, length, now: world.now(), alloc)) {
@@ -357,6 +409,9 @@ fn Sequencer.read_stream(
     limit: u32,
     world: Surroundings,
     ) -> Result[store::StreamRead, Failure] fails task::Cancelled uses wait {
+    if scope.as_of.is_some() {
+        return Err(Failure.Unversioned)
+    }
     let resolved = match attempt scope.resolve(path, need: Need.Read, alloc: world.alloc) {
         Ok(found) => found
         Err(failure) => return Err(take failure)
@@ -375,6 +430,9 @@ fn Sequencer.subscribe(
     world: Surroundings,
     ) -> Result[u64, Failure] fails task::Cancelled uses wait {
     let alloc = world.alloc
+    if scope.as_of.is_some() {
+        return Err(Failure.Denied)
+    }
     let resolved = match attempt scope.resolve(prefix, need: Need.Read, alloc) {
         Ok(found) => found
         Err(failure) => return Err(take failure)
@@ -424,7 +482,7 @@ fn Sequencer.history(
         Ok(found) => found
         Err(failure) => return Err(take failure)
     }
-    return try settled(attempt await mut self.engine.history(self.volume, branch: scope.branch.as_str(), path: resolved, before, limit, now: world.now(), alloc: world.alloc))
+    return try settled(attempt await mut self.engine.history(self.volume, branch: scope.branch.as_str(), path: resolved, before: scope.before(before), limit, now: world.now(), alloc: world.alloc))
 } Sequencer.history
 
 fn Sequencer.diff(
@@ -448,7 +506,7 @@ fn Sequencer.diff(
     return try settled(attempt await mut self.engine.diff(self.volume, from: old, to: new, path: resolved, alloc: world.alloc))
 } Sequencer.diff
 
-/// Creates the branch `name`: the reply holds the handle of a View of it, which `roots` holds the root entry of, its encoding the index of that handle.
+/// Creates the branch `name`: the reply holds its record and the handle of a View of it, which `roots` holds the root entry of, its encoding the index of that handle.
 fn Sequencer.branch(
     mut self,
     scope: Scoped,
@@ -459,17 +517,14 @@ fn Sequencer.branch(
     ) -> sys::Encoded fails task::Cancelled uses wait {
     let alloc = world.alloc
     if (attempt scope.check(need: Need.Admin)).is_err() {
-        return plain(encoded(Err[u64, Failure](Failure.Denied), alloc), alloc)
+        return plain(encoded(Err[BranchedReply, Failure](Failure.Denied), alloc), alloc)
     }
-    match try settled(attempt await mut self.engine.branch(self.volume, name: name.as_str(), from: scope.branch.as_str(), at, by: scope.principal, expires: None, system: false, now: world.now(), alloc)) {
-        Ok(_) => {
-        }
-        Err(failure) => return plain(encoded(Err[u64, Failure](take failure), alloc), alloc)
+    let made = match try settled(attempt await mut self.engine.branch(self.volume, name: name.as_str(), from: scope.branch.as_str(), at, by: scope.principal, expires: None, system: false, now: world.now(), alloc)) {
+        Ok(branch) => branch
+        Err(failure) => return plain(encoded(Err[BranchedReply, Failure](take failure), alloc), alloc)
     }
     let view = mut roots.mint(scope, name: name.as_str(), alloc)
-    var reply = plain(encoded(Ok[u64, Failure](0), alloc), alloc)
-    mut reply.handles.push(sys::Handle.of(view))
-    return reply
+    return branched_reply(take made, view, alloc)
 } Sequencer.branch
 
 /// Deletes the branch `name`, revoking the Views of it `roots` holds the root entries of.
@@ -572,3 +627,28 @@ fn Sequencer.live_store(mut self, world: Surroundings) -> Result[LiveStore, Fail
     }
     return Ok(LiveStore(placement: text::String.of(self.placement.placement.as_str(), alloc), others: take others, capacity: capacity, used: used, history: history, agents: agents, free: free, format: format, encrypted: false, head: head.number, branches: branches, pins: pins, replayed: replayed, flushed: flushed, free_segments: free_segments, scrub: take scrub, as_of: now_ns(world.clock)))
 } Sequencer.live_store
+
+test dated_views_read_at_their_commit_or_earlier for Scoped.at {
+    let alloc = testing::world().alloc
+    var views = TestViews.of(branch: "main", alloc)
+    defer take views.close()
+    let Ok(dated) = attempt views.root.mint(Rights.all()).at_commit(ident::CommitId(number: 5)) else {
+        expect false
+        return
+    }
+    let Some(scope) = dated.scoped(alloc) else {
+        expect false
+        return
+    }
+    let head = attempt scope.at(None)
+    let earlier = attempt scope.at(Some(ident::CommitId(number: 3)))
+    let later = attempt scope.at(Some(ident::CommitId(number: 6)))
+    let point = attempt scope.point(store::Point.Head(text::String.of("main", alloc)))
+    let dated_head = match point {
+        Ok(store::Point.Commit(branch: _, commit: commit)) => commit == ident::CommitId(number: 5)
+        else => false
+    }
+    expect head == Ok(Some(ident::CommitId(number: 5))) and earlier == Ok(Some(ident::CommitId(number: 3))) and later == Err(Failure.Denied)
+    expect scope.before(None) == Some(ident::CommitId(number: 6)) and scope.before(Some(ident::CommitId(number: 9))) == Some(ident::CommitId(number: 6)) and scope.before(Some(ident::CommitId(number: 2))) == Some(ident::CommitId(number: 2))
+    expect dated_head
+} dated_views_read_at_their_commit_or_earlier

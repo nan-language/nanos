@@ -1,6 +1,6 @@
 # 0045. Branches give their View
 
-Status: accepted
+Status: superseded by 0047
 
 ## Context
 
