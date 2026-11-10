@@ -32,6 +32,8 @@ const BOOT_STATE_TYPE: Str = "bootfmt::BootState"
 
 const STORE_CONFIG_TYPE: Str = "store::service::StoreConfig"
 
+const PRINCIPAL_RECORD_TYPE: Str = "os::PrincipalRecord"
+
 /// The memory limit of `store`, whose engine keeps index nodes of 16 KiB in memory.
 const STORE_LIMIT: u64 = 67_108_864
 
@@ -309,7 +311,7 @@ fn Base.serve_store(self, take world: nanos::World, take serving: runner::Servin
     let Some(volume) = os::Port[devices::Block].of(handle) else {
         return runner::Ended.EnvIncomplete
     }
-    let genesis = genesis_record(self.bundle, generation: self.handoff.generation, alloc)
+    let genesis = genesis_record(self.bundle, handoff: self.handoff, alloc)
     let env = store::service::Env.of(volume, take genesis, boot: boot_record(self.handoff, alloc), clock: world.clock, wall: self.wall, random: world.random, reporter: self.reporter, live: self.store_live, alloc)
     return try await runner::Driven[store::service::Service, store::service::Env, store::service::Store].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: store::service::Env) limits stack 8_192 {
     })
@@ -372,7 +374,7 @@ fn release_claimed(take claimed: Option[devices::Claimed]) {
 } release_claimed
 
 /// The genesis record the kernel image holds: the specification of each base instance, acting for `system` and running the image's bundle `bundle`, the root grant `g0` and the base instances' grants.
-fn image_genesis(bundle: ident::HashValue, alloc: mem::Alloc) -> runner::Known {
+fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem::Alloc) -> runner::Known {
     var supervising = os::InstanceSpec.of(principal: principal("system"), bundle, component: SUPERVISOR, alloc)
     discard mut supervising.grants.insert(text::String.of("control", alloc), value: 1)
     discard mut supervising.wiring.insert(text::String.of("devices", alloc), value: os::Wire.to(moniker("devices")))
@@ -401,12 +403,15 @@ fn image_genesis(bundle: ident::HashValue, alloc: mem::Alloc) -> runner::Known {
     discard mut grants.insert(4, value: os::Grant(holder: principal("inst.store"), object: os::Object.Clock, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
     discard mut grants.insert(5, value: os::Grant(holder: principal("inst.store"), object: os::Object.Random, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
     discard mut grants.insert(6, value: os::Grant(holder: principal("inst.supervisor"), object: os::Object.Tree(prefix: tree_path("/sys", alloc), branch: text::String.of("main", alloc)), rights: tree_rights(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    if owner_of(handoff, alloc).is_some() {
+        discard mut grants.insert(7, value: os::Grant(holder: principal("owner"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    }
     return runner::Known(specs: take specs, grants: take grants)
 } image_genesis
 
 /// The genesis record of generation `generation`: the dirs of `/sys`, `/data` and `/state`, the base instances' specifications and grants of the image's genesis, running `bundle`, and the store's retention defaults.
-fn genesis_record(bundle: ident::HashValue, generation: u64, alloc: mem::Alloc) -> store::service::Genesis {
-    let runner::Known(specs: specs, grants: grants) = image_genesis(bundle, alloc)
+fn genesis_record(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::Genesis {
+    let runner::Known(specs: specs, grants: grants) = image_genesis(bundle, handoff, alloc)
     var granted = mem::List[store::service::TypedValue].empty(alloc)
     for entry in take grants {
         let mem::KeyValue(key: _, value: grant) = entry
@@ -418,8 +423,38 @@ fn genesis_record(bundle: ident::HashValue, generation: u64, alloc: mem::Alloc) 
     mem::wire::Codec[store::service::StoreConfig].encode(store::service::StoreConfig(retention: store::Retention.default_of(alloc)), out: mut stored)
     var config = mem::Map[ident::Moniker, store::service::TypedValue].empty(alloc)
     discard mut config.insert(moniker("store"), value: store::service::TypedValue(type: store::TypeRef.of(STORE_CONFIG_TYPE, schema: mem::wire::Codec[store::service::StoreConfig].schema_hash(), alloc), bytes: take stored))
-    return store::service::Genesis(format: 1, generation: generation, nodes: genesis_nodes(alloc), instances: take specs, config: take config, grants: take granted)
+    var nodes = genesis_nodes(alloc)
+    var principals = mem::Map[ident::Principal, store::service::TypedValue].empty(alloc)
+    match owner_of(handoff, alloc) {
+        Some(record) => {
+            var bytes = mem::Bytes.empty(alloc)
+            mem::wire::Codec[os::PrincipalRecord].encode(record, out: mut bytes)
+            discard mut principals.insert(principal("owner"), value: store::service::TypedValue(type: principal_ref(alloc), bytes: take bytes))
+            discard mut nodes.insert(tree_path("/data/owner", alloc), value: dir_of(None))
+        }
+        None => {
+        }
+    }
+    return store::service::Genesis(format: 1, generation: handoff.generation, nodes: take nodes, instances: take specs, config: take config, principals: take principals, grants: take granted)
 } genesis_record
+
+/// The owner's principal record: holding the owner key the handoff record names on a claimed machine, no key in `dev` mode on an unclaimed one, `None` otherwise.
+fn owner_of(handoff: bootfmt::Handoff, alloc: mem::Alloc) -> Option[os::PrincipalRecord] {
+    let claimed = handoff.owner_key != Array[u8, 32].filled(0)
+    if not claimed and handoff.mode != bootfmt::Mode.Dev.to_bits() {
+        return None
+    }
+    let key = match claimed {
+        true => Some(handoff.owner_key)
+        false => None
+    }
+    return Some(os::PrincipalRecord(key: key, former: mem::List.empty(alloc), parent: None, expires_utc_ns: None))
+} owner_of
+
+/// The type of the records of `/sys/principals`.
+fn principal_ref(alloc: mem::Alloc) -> store::TypeRef {
+    return store::TypeRef.of(PRINCIPAL_RECORD_TYPE, schema: mem::wire::Codec[os::PrincipalRecord].schema_hash(), alloc)
+} principal_ref
 
 /// The dirs genesis declares: `/sys` and the dirs below it, their children records of the type each holds where it is one, `/data` and `/state`.
 fn genesis_nodes(alloc: mem::Alloc) -> mem::Map[ident::Path, store::Declaration] {
@@ -429,7 +464,7 @@ fn genesis_nodes(alloc: mem::Alloc) -> mem::Map[ident::Path, store::Declaration]
     discard mut nodes.insert(tree_path("/sys/grants", alloc), value: dir_of(Some(store::Element(kind: store::NodeKind.Record, type: Some(store::TypeRef.of(GRANT_TYPE, schema: mem::wire::Codec[os::Grant].schema_hash(), alloc))))))
     discard mut nodes.insert(tree_path("/sys/code", alloc), value: dir_of(Some(store::Element(kind: store::NodeKind.Dir, type: None))))
     discard mut nodes.insert(tree_path("/sys/config", alloc), value: records_dir())
-    discard mut nodes.insert(tree_path("/sys/principals", alloc), value: records_dir())
+    discard mut nodes.insert(tree_path("/sys/principals", alloc), value: dir_of(Some(store::Element(kind: store::NodeKind.Record, type: Some(principal_ref(alloc))))))
     discard mut nodes.insert(tree_path("/sys/approvals", alloc), value: records_dir())
     discard mut nodes.insert(tree_path("/sys/plans", alloc), value: records_dir())
     discard mut nodes.insert(tree_path("/sys/outbox", alloc), value: records_dir())
@@ -663,7 +698,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     let living = os::MintedLive.of(posted, own: "/live/store", alloc)
     defer take living.close()
     let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty())
-    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
+    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)
         return started
