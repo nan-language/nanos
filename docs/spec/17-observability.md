@@ -95,7 +95,7 @@ Each CPU has a **core ring**: one 64 KiB chunk of the core reserve ([core reserv
 | `source` | 16 | 4 | the source instance's slot in the runner's table, 0 for the core |
 | `kind` | 20 | 2 | the kind's index in the kernel image's kind table |
 | `severity` | 22 | 1 | 0 for `debug` up to 5 for `critical` |
-| `flags` | 23 | 1 | bit 0: a continuation record follows; bit 1: a span ([traces](#traces)); other bits 0 |
+| `flags` | 23 | 1 | bit 0: a continuation record follows; bit 1: a span ([traces](#traces)); bit 2: a cause the core opened ([causes](#causes)); other bits 0 |
 | `argument` | 24 | 8 | the first 8 bytes of the payload |
 
 A continuation record holds 32 further payload bytes; an event takes at most 3. A larger payload, a fault report among them, goes through `emit`. A record that finds its ring full is dropped and counted; `journal` reports the count as `journal.lost`, with the CPU.
@@ -166,7 +166,7 @@ A cause whose record the stream no longer keeps ends the walk with that cause.
 
 ## Traces
 
-A **trace** is the set of spans of one cause. A cause is **traced** when its bit 63 is set in headers: `link` sets it on every 100th request cause (`JournalConfig.trace_every`, 0 for none) and on every request cause of a session that `JournalConfig.trace_sessions`, a list of sessions with expiries, names; causes opened under a traced cause are traced. A **span** is one handler call: the runner writes one to the core ring for each handler call under a traced cause, and for each handler call of an instance that `JournalConfig.trace_instances`, a list of monikers with expiries, names. Commits, device requests and flows appear as the spans of `store`, the drivers and `net`.
+A **trace** is the set of spans of one cause. A cause is **traced** when its bit 63 is set in headers: `link` sets it on every 100th request cause (`JournalConfig.trace_every`, 0 for none) and on every request cause of a session that `JournalConfig.trace_sessions`, a list of sessions with expiries, names; causes opened under a traced cause are traced. A **span** is one handler call: the runner writes one to the core ring for each handler call under a traced cause, and for each handler call of an instance that `JournalConfig.trace_instances`, a list of monikers with expiries, names (requires [N36](22-nan.md#n36)). Commits, device requests and flows appear as the spans of `store`, the drivers and `net`.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -215,7 +215,7 @@ Samples of 1 s are kept 1 h, then merged into 60 s samples kept 24 h, then into 
 
 ## Flight recorders
 
-The **flight recorder** of an instance always holds the headers of its last 16 inputs, 768 bytes of its runner record:
+The **flight recorder** of an instance always holds the headers of its last 16 inputs, 768 bytes of its runner record (requires [N36](22-nan.md#n36)):
 
 | Field | Offset | Size | Meaning |
 | --- | --- | --- | --- |

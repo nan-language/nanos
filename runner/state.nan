@@ -12,7 +12,7 @@ const DEAD_LETTER_TYPE: Str = "os::DeadLetter"
 /// The type of the records of `checkpoint`.
 const CHECKPOINT_TYPE: Str = "os::Checkpoint"
 
-/// How the holder of a checkpointed instance keeps its checkpoints: through the instance's View of `/state`, one epoch after its state became dirty, each at most `max_bytes`, naming the bundle that encoded it and the wall time.
+/// How the holder of a checkpointed instance keeps its checkpoints: through the instance's View of `/state`, one epoch after its state became dirty, each at most `max_bytes`, naming the bundle that encoded it and the wall time, as work of the runner's `header`.
 pub open struct Keeping derives Copy, Send {
     view: store::service::View
     moniker: text::Fixed[59]
@@ -21,6 +21,7 @@ pub open struct Keeping derives Copy, Send {
     bundle: ident::HashValue
     wall: ident::Wall
     clock: sys::Clock
+    header: os::Header
     alloc: mem::Alloc
 } Keeping
 
@@ -73,7 +74,7 @@ fn Shared.restoring(self, mut driver: Driver) -> Restoring fails task::Cancelled
         return Restoring.Fresh(keeping: None)
     }
     try await keep_state(view, moniker: ident::Moniker(text: driver.moniker.text), alloc)
-    let keeping = Keeping(view: view, moniker: driver.moniker.text, epoch_ms: u64.widen(driver.spec.durability.epoch_s.value_or(1)) * 1_000, max_bytes: driver.spec.durability.max_bytes, bundle: driver.spec.bundle, wall: self.config.wall, clock: self.config.clock, alloc: alloc)
+    let keeping = Keeping(view: view, moniker: driver.moniker.text, epoch_ms: u64.widen(driver.spec.durability.epoch_s.value_or(1)) * 1_000, max_bytes: driver.spec.durability.max_bytes, bundle: driver.spec.bundle, wall: self.config.wall, clock: self.config.clock, header: self.config.work(), alloc: alloc)
     let dir = keeping.dir(name: "checkpoint")
     let number = match first attempt await last_number(view, dir: ident::Path(text: text::String.of(dir.text.as_str(), alloc)), keep: CHECKPOINTS, alloc) {
         Ok(found) => found
@@ -206,8 +207,19 @@ fn Keeping.dir(self, name: Str) -> ident::Path {
     return state_dir(ident::Moniker(text: self.moniker), name, alloc: self.alloc)
 } Keeping.dir
 
-/// Keeps `state`, the encoding of the state of schema `schema` of incarnation `incarnation`, as the instance's next checkpoint; the code of the failure that kept it from being the latest, `None` once kept.
+/// Keeps `state`, the encoding of the state of schema `schema` of incarnation `incarnation`, as the instance's next checkpoint, as the runner's work; the code of the failure that kept it from being the latest, `None` once kept.
 fn Keeping.keep(self, take state: mem::Bytes, schema: mem::wire::SchemaHash, incarnation: u64) -> Option[text::Fixed[32]] fails task::Cancelled uses wait {
+    var given = Some(take state)
+    return try await sys::run_headed(self.header.carried(), body: fn[mut given]() -> Option[text::Fixed[32]] fails task::Cancelled uses wait {
+        let Some(kept) = mut given.extract() else {
+            return None
+        }
+        return try await self.write(take kept, schema, incarnation)
+    })
+} Keeping.keep
+
+/// Writes `state` as `keep` keeps it.
+fn Keeping.write(self, take state: mem::Bytes, schema: mem::wire::SchemaHash, incarnation: u64) -> Option[text::Fixed[32]] fails task::Cancelled uses wait {
     let alloc = self.alloc
     if u64.widen(state.len()) > self.max_bytes {
         return Some(text::Fixed[32].of("instance.checkpoint-too-large"))
@@ -223,7 +235,7 @@ fn Keeping.keep(self, take state: mem::Bytes, schema: mem::wire::SchemaHash, inc
     mem::wire::Codec[os::Checkpoint].encode(record, out: mut bytes)
     let type = store::TypeRef.of(CHECKPOINT_TYPE, schema: mem::wire::Codec[os::Checkpoint].schema_hash(), alloc)
     return try await add_kept(self.view, take dir, take type, take bytes, keep: CHECKPOINTS, alloc)
-} Keeping.keep
+} Keeping.write
 
 /// The highest number among the children of the numbered dir `dir`, which keeps at most `keep`, 0 when it holds none or does not exist.
 fn last_number(view: store::service::View, take dir: ident::Path, keep: u32, alloc: mem::Alloc) -> u64 fails store::service::ViewError uses wait {
@@ -242,13 +254,9 @@ fn last_number(view: store::service::View, take dir: ident::Path, keep: u32, all
     return highest
 } last_number
 
-/// The name of the operation a call's encoding calls: the key of its wire variant, empty when it does not read or was not kept.
-fn operation_of(message: Option[mem::Bytes], alloc: mem::Alloc) -> text::String {
+/// The name of the operation a call's encoding calls: the key of its wire variant, empty when it does not read.
+fn operation_of(encoded: Slice[u8], alloc: mem::Alloc) -> text::String {
     var name = text::String.empty(alloc)
-    let Some(kept) = message else {
-        return name
-    }
-    let encoded = kept.view()
     var length: u64 = 0
     var shift: u32 = 0
     var at: usize = 0
@@ -276,6 +284,19 @@ fn operation_of(message: Option[mem::Bytes], alloc: mem::Alloc) -> text::String 
     return name
 } operation_of
 
+/// The name of the operation a call's encoding calls, cut to 20 bytes.
+fn operation_name(encoded: Slice[u8], alloc: mem::Alloc) -> text::Fixed[20] {
+    let whole = operation_of(encoded, alloc)
+    var name = text::Fixed[20].empty()
+    for character in whole.as_str().cursor() {
+        if character.utf8_len() > name.room() {
+            break
+        }
+        mut name.push(character)
+    }
+    return name
+} operation_name
+
 /// A protocol whose calls the test encodes.
 protocol Probe {
     pub fn ping(count: u32) limits traceless
@@ -285,7 +306,8 @@ test dead_letters_name_the_operation_called for operation_of {
     let alloc = testing::world().alloc
     var call = sys::Encoded.empty(alloc)
     sys::Wire[Probe].ping(mut call, count: 3)
-    let name = operation_of(Some(take call.bytes), alloc)
-    let none = operation_of(None, alloc)
-    expect name.as_str() == "ping" and none.as_str() == ""
+    let name = operation_of(call.bytes.view(), alloc)
+    let none = operation_of(b"", alloc)
+    let cut = operation_name(call.bytes.view(), alloc)
+    expect name.as_str() == "ping" and none.as_str() == "" and cut.as_str() == "ping"
 } dead_letters_name_the_operation_called

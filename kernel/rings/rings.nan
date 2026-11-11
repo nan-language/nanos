@@ -19,19 +19,22 @@ struct Ring {
     due: bool
 } Ring
 
-/// The core rings, one per CPU by number, the running CPU's number, the clock their records are timed by, the signal writers post when the journal must look at the rings, and the instance each slot of the runner's table names.
+/// The core rings, one per CPU by number, the running CPU's number, the clock their records are timed by, the signal writers post when the journal must look at the rings, the instance each slot of the runner's table names, the boot counter, the causes the core opened in this boot, its system cause first, and their principals.
 pkg struct Rings {
     rings: mem::List[hw::SpinLock[Ring]]
     here: hw::PerCpu[u32]
     clock: sys::Clock
     signal: mem::Shared[hw::Signal[Unit]]
     sources: task::Cown[mem::Map[u32, ident::Moniker]]
+    boot: u64
+    causes: mem::Shared[core::atomic::AtomicU64]
+    opened: journal::Principals
 } Rings
 
 impl Rings: runner::Journal
 
-/// The rings of `cpus` CPUs, drawn through `alloc`.
-pkg fn Rings.of(cpus: u32, clock: sys::Clock, alloc: mem::Alloc) -> Rings {
+/// The rings of `cpus` CPUs in the boot of counter `boot`, drawn through `alloc`.
+pkg fn Rings.of(cpus: u32, clock: sys::Clock, boot: u64, alloc: mem::Alloc) -> Rings {
     var rings = mem::List[hw::SpinLock[Ring]].empty(alloc)
     for _ in 0..<cpus {
         var records = mem::List[journal::RingRecord].empty(alloc)
@@ -40,7 +43,7 @@ pkg fn Rings.of(cpus: u32, clock: sys::Clock, alloc: mem::Alloc) -> Rings {
         }
         mut rings.push(hw::SpinLock.of(Ring(records: take records, next: 0, oldest: 0, held: 0, lost: 0, due: false)))
     }
-    return Rings(rings: take rings, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), sources: task::Cown.of(mem::Map.empty(alloc), alloc))
+    return Rings(rings: take rings, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), sources: task::Cown.of(mem::Map.empty(alloc), alloc), boot: boot, causes: mem::Shared.of(core::atomic::AtomicU64.of(1), alloc), opened: journal::Principals.empty(alloc))
 } Rings.of
 
 /// Notes that the slot `slot` names the instance `moniker`.
@@ -74,10 +77,46 @@ pkg fn Rings.source_of(self, slot: u32) -> ident::Moniker fails task::Cancelled 
     return ident::Moniker(text: named)
 } Rings.source_of
 
-/// Writes the record of an event, and its continuation when it has one, in the running CPU's ring, counting the event lost when the ring has no room for it, and posts the signal when the journal must look at the ring.
-pkg fn Rings.record(self, slot: u32, event: runner::Event) {
-    self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: slot, kind: kind_of(event), severity: severity_of(event), flags: 0, argument: argument_of(event)), continuation: continuation_of(event))
+/// Writes the record of an event of the cause `cause`, and its continuation when it has one, in the running CPU's ring, counting the event lost when the ring has no room for it, and posts the signal when the journal must look at the ring.
+pkg fn Rings.record(self, slot: u32, cause: u64, event: runner::Event) {
+    self.write(journal::RingRecord(time: elapsed(self.clock), cause: cause, source: slot, kind: kind_of(event), severity: severity_of(event), flags: 0, argument: argument_of(event)), continuation: continuation_of(event))
 } Rings.record
+
+/// The principals of the causes the core opened.
+pkg fn Rings.principals(self) -> journal::Principals {
+    return self.opened.share()
+} Rings.principals
+
+/// Opens the start cause of the incarnation `incarnation` of the instance `moniker` of slot `slot` under the cause `parent`, noting its principal and writing its record, and gives it, traced when `parent` is; causes as a header holds them.
+pkg fn Rings.open(self, slot: u32, moniker: ident::Moniker, incarnation: u64, parent: u64) -> u64 {
+    let count = self.causes.contents().fetch_add(1).value_or(0) + 1
+    let opened = ident::Cause.counted(self.boot, count)
+    var principal = text::Fixed[64].of("inst.")
+    mut principal.append(moniker.text.as_str())
+    self.opened.note(opened, principal: ident::Principal(text: principal))
+    let cause = os::Header.of_work(cause: parent, slot: slot).child(opened)
+    var subject = Array[u8, 32].filled(0)
+    for at in 0..<8usize {
+        subject[at] = u8.truncate(incarnation >> u32.truncate(8 * at))
+    }
+    self.write(journal::RingRecord(time: elapsed(self.clock), cause: cause, source: slot, kind: journal::CauseKind.Start.number(), severity: 0, flags: journal::CAUSE_RECORD, argument: parent), continuation: Some(journal::RingRecord.from_bits(subject)))
+    return cause
+} Rings.open
+
+/// Writes the record of the span of a handler call of the instance of slot `slot`.
+pkg fn Rings.span(self, slot: u32, span: runner::Span) {
+    var operation = Array[u8, 20].filled(0)
+    var at: usize = 0
+    for byte in span.operation.as_str().as_bytes() {
+        if at == operation.len() {
+            break
+        }
+        operation[at] = byte
+        at += 1
+    }
+    let call = journal::SpanDetail(wait_ns: span.wait_ns, sender: span.sender, operation: operation)
+    self.write(journal::RingRecord(time: span.start_ns, cause: span.cause, source: slot, kind: journal::trap_number(span.trapped), severity: 0, flags: journal::SPAN_RECORD, argument: span.run_ns), continuation: Some(journal::RingRecord.from_bits(call.to_bits())))
+} Rings.span
 
 /// Writes the record of a device event as the core's, its continuation holding the device's bus path.
 pkg fn Rings.record_device(self, event: devices::Event) {
@@ -148,7 +187,7 @@ pkg fn Rings.record_boot(self, handoff: bootfmt::Handoff) {
 fn Rings.write(self, record: journal::RingRecord, continuation: Option[journal::RingRecord]) {
     var written = record
     if continuation.is_some() {
-        written.flags = journal::CONTINUED
+        written.flags = written.flags | journal::CONTINUED
     }
     hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
         let cpu = self.here.with(t, body: fn(mut number: u32) -> u32 limits notrap, terminates, noalloc {
@@ -342,7 +381,7 @@ fn continuation_of(event: runner::Event) -> Option[journal::RingRecord] {
         }
         runner::Event.Trapped(incarnation: _, kind: kind, limit: _) => {
             var at: usize = 0
-            for byte in trap_name(kind).as_bytes() {
+            for byte in journal::trap_code(kind).as_bytes() {
                 payload[at] = byte
                 at += 1
             }
@@ -351,29 +390,6 @@ fn continuation_of(event: runner::Event) -> Option[journal::RingRecord] {
     }
     return Some(journal::RingRecord.from_bits(payload))
 } continuation_of
-
-/// The code of a trap kind.
-fn trap_name(kind: sys::TrapKind) -> text::Fixed[32] {
-    return text::Fixed[32].of(match kind {
-        sys::TrapKind.Bounds => "trap.bounds"
-        sys::TrapKind.Overflow => "trap.overflow"
-        sys::TrapKind.DivisionByZero => "trap.division-by-zero"
-        sys::TrapKind.Shift => "trap.shift"
-        sys::TrapKind.Conversion => "trap.conversion"
-        sys::TrapKind.StaleHandle => "trap.stale-handle"
-        sys::TrapKind.Exhausted => "trap.exhausted"
-        sys::TrapKind.Predicate => "trap.predicate"
-        sys::TrapKind.Requires => "trap.requires"
-        sys::TrapKind.Ensures => "trap.ensures"
-        sys::TrapKind.Expect => "trap.expect"
-        sys::TrapKind.Todo => "trap.todo"
-        sys::TrapKind.StackOverflow => "trap.stack-overflow"
-        sys::TrapKind.DuplicateAccess => "trap.duplicate-access"
-        sys::TrapKind.Poisoned => "trap.poisoned"
-        sys::TrapKind.Exception => "trap.exception"
-        sys::TrapKind.Abandoned => "trap.abandoned"
-    })
-} trap_name
 
 /// Appends the decimal digits of `value` to `text`.
 pkg fn push_decimal[N: usize where N > 0](mut text: text::Fixed[N], value: u64) {
@@ -560,8 +576,8 @@ test rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_o
     let world = testing::world()
     let alloc = world.alloc
     let cpus = hw::cpu_count()
-    let rings = Rings.of(cpus, clock: world.clock, alloc)
-    rings.record(slot: 1, event: runner::Event.Started(incarnation: 1, checkpoint: None))
+    let rings = Rings.of(cpus, clock: world.clock, boot: 1, alloc)
+    rings.record(slot: 1, cause: 0, event: runner::Event.Started(incarnation: 1, checkpoint: None))
     let early = try await task::within(world.clock, ms: 500, body: fn() -> u32 fails task::Cancelled uses wait {
         return try await rings.due(world.exec)
     })
@@ -572,7 +588,7 @@ test rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_o
     expect lost == 0 and records.len() == 1 and records[0].source == 1
     let quarters = (RING_RECORDS / 4) * usize.widen(cpus)
     for _ in 0..<quarters {
-        rings.record(slot: 2, event: runner::Event.Started(incarnation: 1, checkpoint: None))
+        rings.record(slot: 2, cause: 0, event: runner::Event.Started(incarnation: 1, checkpoint: None))
     }
     let quarter = try await task::within(world.clock, ms: 100, body: fn() -> u32 fails task::Cancelled uses wait {
         return try await rings.due(world.exec)
@@ -580,7 +596,7 @@ test rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_o
     for cpu in 0..<cpus {
         discard rings.drain(cpu, into: mut records)
     }
-    rings.record(slot: 3, event: runner::Event.Integrity(incarnation: 1))
+    rings.record(slot: 3, cause: 0, event: runner::Event.Integrity(incarnation: 1))
     let urgent = try await task::within(world.clock, ms: 100, body: fn() -> u32 fails task::Cancelled uses wait {
         return try await rings.due(world.exec)
     })
@@ -612,7 +628,7 @@ test boots_give_their_start_and_each_failed_candidate for Rings.record_boot {
     let world = testing::world()
     let alloc = world.alloc
     let cpus = hw::cpu_count()
-    let rings = Rings.of(cpus, clock: world.clock, alloc)
+    let rings = Rings.of(cpus, clock: world.clock, boot: 1, alloc)
     var handoff = bootfmt::Handoff.empty()
     handoff.generation = 7
     handoff.boot_counter = 0x1_0203
@@ -634,8 +650,8 @@ test boots_give_their_start_and_each_failed_candidate for Rings.record_boot {
     }
     expect records.len() == 4
     let system = ident::Cause.of(boot: 1, number: 1)
-    let started = journal::CoreRecord(record: records[0], more: single(records[1], alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor"))).event(system, alloc)
-    let failed = journal::CoreRecord(record: records[2], more: single(records[3], alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor"))).event(system, alloc)
+    let started = journal::CoreRecord(record: records[0], more: single(records[1], alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor")), sender: None).event(system, alloc)
+    let failed = journal::CoreRecord(record: records[2], more: single(records[3], alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor")), sender: None).event(system, alloc)
     let Ok(boot) = attempt mem::wire::Codec[journal::BootStarted].decode(Untrusted.of(started.payload.bytes.view()), alloc) else {
         expect false
         return
@@ -645,6 +661,37 @@ test boots_give_their_start_and_each_failed_candidate for Rings.record_boot {
     expect detail(kind: journal::BOOT_STARTED, continuation: records[1]).as_str() == "counter 66051"
     expect detail(kind: journal::BOOT_CANDIDATE_FAILED, continuation: records[3]).as_str() == "code boot.hash-mismatch"
 } boots_give_their_start_and_each_failed_candidate
+
+test start_causes_open_under_their_parent_and_spans_name_their_call for Rings.open {
+    let world = testing::world()
+    let alloc = world.alloc
+    let cpus = hw::cpu_count()
+    let rings = Rings.of(cpus, clock: world.clock, boot: 5, alloc)
+    let system = ident::Cause.of(boot: 5, number: 1)
+    let traced = system.bits | 0x8000_0000_0000_0000
+    let fat = ident::Moniker(text: text::Fixed[59].of("fat"))
+    let fat_cause = rings.open(slot: 3, moniker: ident::Moniker(text: fat.text), incarnation: 2, parent: traced)
+    let store_cause = rings.open(slot: 4, moniker: ident::Moniker(text: text::Fixed[59].of("store")), incarnation: 1, parent: 0)
+    rings.span(slot: 3, span: runner::Span(cause: fat_cause, start_ns: 10, wait_ns: 4, run_ns: 6, sender: 4, operation: text::Fixed[20].of("read"), trapped: Some(sys::TrapKind.Bounds)))
+    var records = mem::List[journal::RingRecord].empty(alloc)
+    for cpu in 0..<cpus {
+        discard rings.drain(cpu, into: mut records)
+    }
+    expect records.len() == 6
+    let wall = ident::Wall(at: ident::WallTime(utc_ns: 1_000, uncertainty_ns: 0), since_ns: 0)
+    let Some(journal::TraceRecord.Cause(opened)) = journal::CoreRecord(record: records[0], more: single(records[1], alloc), source: ident::Moniker(text: fat.text), sender: None).trace(system, wall, alloc) else {
+        expect false
+        return
+    }
+    let Some(journal::TraceRecord.Span(span)) = journal::CoreRecord(record: records[4], more: single(records[5], alloc), source: ident::Moniker(text: fat.text), sender: Some(ident::Moniker(text: text::Fixed[59].of("store")))).trace(system, wall, alloc) else {
+        expect false
+        return
+    }
+    let principal = rings.principals().of(ident::Cause.of(boot: 5, number: 2), system)
+    expect fat_cause == (ident::Cause.of(boot: 5, number: 2).bits | 0x8000_0000_0000_0000) and store_cause == ident::Cause.of(boot: 5, number: 3).bits
+    expect opened.parent == Some(system) and opened.subject.as_str() == "fat 2" and principal.text.as_str() == "inst.fat"
+    expect span.operation.as_str() == "read" and span.wait_ns == 4 and span.run_ns == 6 and records[5].to_bits()[8] == 4 and not records[4].is_event()
+} start_causes_open_under_their_parent_and_spans_name_their_call
 
 fn single(record: journal::RingRecord, alloc: mem::Alloc) -> mem::List[journal::RingRecord] {
     var list = mem::List[journal::RingRecord].empty(alloc)

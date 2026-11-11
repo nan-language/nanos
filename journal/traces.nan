@@ -1,0 +1,289 @@
+//! Traces: the entries of `/journal/traces`, the causes the core opens and the spans of handler calls, and the records of the core rings that give them.
+
+/// The flag of a span's record: its time is when the handler call began, its kind the number of its trap's kind, 0 when it returned, its argument its run time, and its continuation a `SpanDetail`.
+pub const SPAN_RECORD: u8 = 0x02
+
+/// The flag of the record of a cause the core opened: its cause is the cause opened, its kind the `CauseKind`'s number, its argument the parent cause, 0 for the system cause, and its continuation holds the incarnation of a `start` cause in its first 8 bytes.
+pub const CAUSE_RECORD: u8 = 0x04
+
+/// The continuation of a span's record: the time the call waited in the intake, the sending instance's slot, 0 for the core, and the name of the operation handled, its bytes up to the first 0.
+pub layout SpanDetail: bytes 32 le {
+    wait_ns: u64 at 0
+    sender: u32 at 8
+    operation: Array[u8, 20] at 12
+} SpanDetail
+
+/// An entry of `/journal/traces`.
+pub closed enum TraceRecord derives Encode {
+    Cause(CauseRecord)
+    Span(Span)
+} TraceRecord
+
+/// An entry of `/journal/traces` for one handler call: its cause, the instance, the operation handled, the sending instance, when it began, its time queued in the intake and running, and how it ended.
+pub closed struct Span derives Encode {
+    pub cause: ident::Cause
+    pub source: ident::Moniker
+    pub operation: text::String
+    pub sender: Option[ident::Moniker]
+    pub start: ident::WallTime
+    pub wait_ns: u64
+    pub run_ns: u64
+    pub outcome: SpanOutcome
+} Span
+
+pub closed enum SpanOutcome derives Encode {
+    Returned
+    Trapped(kind: text::String)
+} SpanOutcome
+
+/// The causes the table of principals holds, the latest opened.
+const HELD_PRINCIPALS: usize = 256
+
+/// The principals of the latest causes the core opened, which the core notes as it opens them and `journal` reads.
+pub open struct Principals derives Send {
+    recent: mem::Shared[hw::SpinLock[Recent]]
+} Principals
+
+/// The latest causes opened, `HELD_PRINCIPALS` of them, `next` the entry the next one takes.
+struct Recent {
+    entries: mem::List[Opened]
+    next: usize
+} Recent
+
+/// A cause opened and the text of its principal.
+struct Opened derives Copy {
+    cause: ident::Cause
+    principal: text::Fixed[64]
+} Opened
+
+pub fn Principals.empty(alloc: mem::Alloc) -> Principals {
+    var entries = mem::List[Opened].empty(alloc)
+    for _ in 0..<HELD_PRINCIPALS {
+        mut entries.push(Opened(cause: ident::Cause(bits: 0), principal: text::Fixed[64].empty()))
+    }
+    return Principals(recent: mem::Shared.of(hw::SpinLock.of(Recent(entries: take entries, next: 0)), alloc))
+} Principals.empty
+
+pub fn Principals.share(self) -> Principals {
+    return Principals(recent: self.recent.share())
+} Principals.share
+
+/// Notes that the cause `cause` acts for `principal`, in place of the oldest cause noted when the table is full.
+pub fn Principals.note(self, cause: ident::Cause, principal: ident::Principal) {
+    let recent = self.recent.share()
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        recent.contents().with(t, body: fn(mut held: Recent) limits notrap, terminates, noalloc {
+            var at = held.next
+            if at >= held.entries.len() {
+                at = 0
+            }
+            if at < held.entries.len() {
+                held.entries[at] = Opened(cause: cause, principal: principal.text)
+                held.next = at + 1
+            }
+        })
+    })
+} Principals.note
+
+/// The principal the cause `cause` acts for: `system` for the system cause `system` and for a cause the table does not hold.
+pub fn Principals.of(self, cause: ident::Cause, system: ident::Cause) -> ident::Principal {
+    if cause == system {
+        return ident::Principal(text: text::Fixed[64].of("system"))
+    }
+    let recent = self.recent.share()
+    let found = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[text::Fixed[64]] limits notrap, terminates {
+        return recent.contents().with(t, body: fn(mut held: Recent) -> Option[text::Fixed[64]] limits notrap, terminates, noalloc {
+            for entry in held.entries {
+                if entry.cause == cause {
+                    return Some(entry.principal)
+                }
+            }
+            return None
+        })
+    })
+    let Some(text) = found else {
+        return ident::Principal(text: text::Fixed[64].of("system"))
+    }
+    if not ident::is_principal(text) {
+        return ident::Principal(text: text::Fixed[64].of("system"))
+    }
+    return ident::Principal(text: text)
+} Principals.of
+
+/// The number of a cause kind in the records of opened causes.
+pub fn CauseKind.number(self) -> u16 {
+    return match self {
+        CauseKind.Request => 0
+        CauseKind.Schedule => 1
+        CauseKind.Start => 2
+        CauseKind.Connection => 3
+        CauseKind.System => 4
+    }
+} CauseKind.number
+
+fn CauseKind.of_number(number: u16) -> Option[CauseKind] {
+    return match number {
+        0 => Some(CauseKind.Request)
+        1 => Some(CauseKind.Schedule)
+        2 => Some(CauseKind.Start)
+        3 => Some(CauseKind.Connection)
+        4 => Some(CauseKind.System)
+        else => None
+    }
+} CauseKind.of_number
+
+/// The number of the kind of a span's trap, 0 when it returned.
+pub fn trap_number(kind: Option[sys::TrapKind]) -> u16 {
+    let Some(trap) = kind else {
+        return 0
+    }
+    var number: u16 = 1
+    while number <= TRAP_KINDS {
+        if trap_kind(number) == Some(trap) {
+            return number
+        }
+        number += 1
+    }
+    return 0
+} trap_number
+
+const TRAP_KINDS: u16 = 17
+
+/// The code of a trap kind.
+pub fn trap_code(kind: sys::TrapKind) -> text::Fixed[32] {
+    return text::Fixed[32].of(match kind {
+        sys::TrapKind.Bounds => "trap.bounds"
+        sys::TrapKind.Overflow => "trap.overflow"
+        sys::TrapKind.DivisionByZero => "trap.division-by-zero"
+        sys::TrapKind.Shift => "trap.shift"
+        sys::TrapKind.Conversion => "trap.conversion"
+        sys::TrapKind.StaleHandle => "trap.stale-handle"
+        sys::TrapKind.Exhausted => "trap.exhausted"
+        sys::TrapKind.Predicate => "trap.predicate"
+        sys::TrapKind.Requires => "trap.requires"
+        sys::TrapKind.Ensures => "trap.ensures"
+        sys::TrapKind.Expect => "trap.expect"
+        sys::TrapKind.Todo => "trap.todo"
+        sys::TrapKind.StackOverflow => "trap.stack-overflow"
+        sys::TrapKind.DuplicateAccess => "trap.duplicate-access"
+        sys::TrapKind.Poisoned => "trap.poisoned"
+        sys::TrapKind.Exception => "trap.exception"
+        sys::TrapKind.Abandoned => "trap.abandoned"
+    })
+} trap_code
+
+fn trap_kind(number: u16) -> Option[sys::TrapKind] {
+    return match number {
+        1 => Some(sys::TrapKind.Bounds)
+        2 => Some(sys::TrapKind.Overflow)
+        3 => Some(sys::TrapKind.DivisionByZero)
+        4 => Some(sys::TrapKind.Shift)
+        5 => Some(sys::TrapKind.Conversion)
+        6 => Some(sys::TrapKind.StaleHandle)
+        7 => Some(sys::TrapKind.Exhausted)
+        8 => Some(sys::TrapKind.Predicate)
+        9 => Some(sys::TrapKind.Requires)
+        10 => Some(sys::TrapKind.Ensures)
+        11 => Some(sys::TrapKind.Expect)
+        12 => Some(sys::TrapKind.Todo)
+        13 => Some(sys::TrapKind.StackOverflow)
+        14 => Some(sys::TrapKind.DuplicateAccess)
+        15 => Some(sys::TrapKind.Poisoned)
+        16 => Some(sys::TrapKind.Exception)
+        17 => Some(sys::TrapKind.Abandoned)
+        else => None
+    }
+} trap_kind
+
+/// Whether the record tells of an event, not a span or an opened cause.
+pub fn RingRecord.is_event(self) -> bool = (self.flags & (SPAN_RECORD | CAUSE_RECORD)) == 0
+
+/// The slot of the instance that sent the call a span's record tells of, its continuation `detail`; `None` for another record.
+pub fn RingRecord.sender_slot(self, detail: RingRecord) -> Option[u32] {
+    if (self.flags & SPAN_RECORD) == 0 {
+        return None
+    }
+    return Some(SpanDetail.from_bits(detail.to_bits()).sender)
+} RingRecord.sender_slot
+
+/// The entry of `/journal/traces` the record gives, its times read on `wall`: a span, a cause the core opened, or the system cause `system` a `boot.started` opens; `None` for any other.
+pub fn CoreRecord.trace(self, system: ident::Cause, wall: ident::Wall, alloc: mem::Alloc) -> Option[TraceRecord] {
+    let record = self.record
+    if (record.flags & SPAN_RECORD) != 0 {
+        return Some(TraceRecord.Span(self.span(system, wall, alloc)))
+    }
+    if (record.flags & CAUSE_RECORD) != 0 {
+        let Some(kind) = CauseKind.of_number(record.kind) else {
+            return None
+        }
+        var subject = text::String.of(self.source.text.as_str(), alloc)
+        mut subject.push(' ')
+        mut subject.write(Dyn[Render].view(number_of(self.continuation()).value_or(0)), budget: 20)
+        var principal = text::Fixed[64].of("inst.")
+        mut principal.append(self.source.text.as_str())
+        return Some(TraceRecord.Cause(CauseRecord(cause: self.cause(system), kind: kind, parent: Some(cause_of(record.argument, system)), session: None, principal: ident::Principal(text: principal), subject: take subject, time: wall.at_ns(record.time))))
+    }
+    if record.kind != BOOT_STARTED {
+        return None
+    }
+    var subject = text::String.empty(alloc)
+    mut subject.write(Dyn[Render].view(record.argument), budget: 20)
+    return Some(TraceRecord.Cause(CauseRecord(cause: system, kind: CauseKind.System, parent: None, session: None, principal: ident::Principal(text: text::Fixed[64].of("system")), subject: take subject, time: wall.at_ns(record.time))))
+} CoreRecord.trace
+
+/// The span a span's record gives.
+fn CoreRecord.span(self, system: ident::Cause, wall: ident::Wall, alloc: mem::Alloc) -> Span {
+    let detail = SpanDetail.from_bits(self.continuation().value_or(Array[u8, 32].filled(0)))
+    var operation = text::String.empty(alloc)
+    for byte in detail.operation {
+        if byte == 0 {
+            break
+        }
+        mut operation.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+    }
+    let outcome = match trap_kind(self.record.kind) {
+        Some(kind) => SpanOutcome.Trapped(kind: text::String.of(trap_code(kind).as_str(), alloc))
+        None => SpanOutcome.Returned
+    }
+    let sender = match self.sender {
+        Some(moniker) => Some(ident::Moniker(text: moniker.text))
+        None => None
+    }
+    return Span(cause: self.cause(system), source: ident::Moniker(text: self.source.text), operation: take operation, sender: take sender, start: wall.at_ns(self.record.time), wait_ns: detail.wait_ns, run_ns: self.record.argument, outcome: take outcome)
+} CoreRecord.span
+
+test spans_and_opened_causes_give_trace_entries for CoreRecord.trace {
+    let alloc = testing::world().alloc
+    let system = ident::Cause.of(boot: 2, number: 1)
+    let wall = ident::Wall(at: ident::WallTime(utc_ns: 1_000, uncertainty_ns: 0), since_ns: 0)
+    let begun = ident::Cause.of(boot: 2, number: 9)
+    var incarnation = Array[u8, 32].filled(0)
+    incarnation[0] = 3
+    var opening = mem::List[RingRecord].empty(alloc)
+    mut opening.push(RingRecord.from_bits(incarnation))
+    let opened = CoreRecord(record: RingRecord(time: 5, cause: begun.bits, source: 4, kind: CauseKind.Start.number(), severity: 0, flags: CAUSE_RECORD | CONTINUED, argument: 0), more: take opening, source: ident::Moniker(text: text::Fixed[59].of("fat")), sender: None)
+    var name = Array[u8, 20].filled(0)
+    name[0] = b'r'
+    name[1] = b'e'
+    name[2] = b'a'
+    name[3] = b'd'
+    var detailing = mem::List[RingRecord].empty(alloc)
+    mut detailing.push(RingRecord.from_bits(SpanDetail(wait_ns: 40, sender: 2, operation: name).to_bits()))
+    let traced = begun.bits | 0x8000_0000_0000_0000
+    let spanned = CoreRecord(record: RingRecord(time: 7, cause: traced, source: 4, kind: trap_number(Some(sys::TrapKind.Bounds)), severity: 0, flags: SPAN_RECORD | CONTINUED, argument: 600), more: take detailing, source: ident::Moniker(text: text::Fixed[59].of("fat")), sender: Some(ident::Moniker(text: text::Fixed[59].of("store"))))
+    let Some(TraceRecord.Cause(cause)) = opened.trace(system, wall, alloc) else {
+        expect false
+        return
+    }
+    let Some(TraceRecord.Span(span)) = spanned.trace(system, wall, alloc) else {
+        expect false
+        return
+    }
+    let SpanOutcome.Trapped(kind: kind) = span.outcome else {
+        expect false
+        return
+    }
+    expect cause.cause == begun and cause.kind == CauseKind.Start and cause.parent == Some(system) and cause.subject.as_str() == "fat 3" and cause.principal.text.as_str() == "inst.fat"
+    expect span.cause == begun and span.operation.as_str() == "read" and span.sender.is_some() and span.wait_ns == 40 and span.run_ns == 600 and span.start.utc_ns == 1_007
+    expect kind.as_str() == "trap.bounds" and not opened.record.is_event() and not spanned.record.is_event()
+} spans_and_opened_causes_give_trace_entries

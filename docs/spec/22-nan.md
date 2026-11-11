@@ -397,3 +397,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a kernel enables and disables ASPM on a function's link, at the function and its upstream port, as both support.
 - **Chapters:** [15](15-devices.md).
 - **Issue:** [nan-language/nan#126](https://github.com/nan-language/nan/issues/126).
+
+## N36
+
+**What a step handled.**
+
+- **Language 1:** `Stepper.step` returns whether it handled a message, which runs under its header; a runner sees that header only for a message it delivered itself (NaN 26 §Headers).
+- **NaN OS requires:** each step gives the runner the header and the operation's number of the message it handled.
+- **Chapters:** [17](17-observability.md).
+- **Issue:** [nan-language/nan#159](https://github.com/nan-language/nan/issues/159).

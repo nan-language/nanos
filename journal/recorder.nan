@@ -30,12 +30,13 @@ pub protocol Journal {
     fn drained(events: u64, lost: u64) limits traceless
 } Journal
 
-/// The Env of `journal`: the feed of what the core drains from its rings, its View of `/journal`, its configuration, the boot's system cause, the monotonic clock, the wall clock of the core's start and its cell.
+/// The Env of `journal`: the feed of what the core drains from its rings, its View of `/journal`, its configuration, the boot's system cause, the principals of the causes the core opened, the monotonic clock, the wall clock of the core's start and its cell.
 pub open struct Env derives Send {
     feed: Feed
     tree: store::service::View
     config: JournalConfig
     system: ident::Cause
+    principals: Principals
     clock: sys::Clock
     wall: ident::Wall
     alloc: mem::Alloc
@@ -85,24 +86,34 @@ pub fn Env.of(
     wall: ident::Wall,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(feed: feed, tree: tree, config: take config, system: system, clock: clock, wall: wall, alloc: alloc)
+    let principals = match feed.principals() {
+        Some(opened) => opened
+        None => Principals.empty(alloc)
+    }
+    return Env(feed: feed, tree: tree, config: take config, system: system, principals: take principals, clock: clock, wall: wall, alloc: alloc)
 } Env.of
 
 pub fn Recorder.start(mut env: Env) -> Recorder = Recorder(events: 0, lost: 0, held: mem::List.empty(env.alloc), held_bytes: 0, flushing: false, batch: 0, rates: mem::Map.empty(env.alloc))
 
-/// Declares the streams and drains the core rings from a keyed task, at each resume of a new domain.
+/// Has the core trace the instances the configuration names, declares the streams and drains the core rings from a keyed task, at each resume of a new domain.
 pub fn Recorder.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Journal]) {
     let feed = env.feed
     let tree = env.tree
     let retention = env.config.retention()
     let keep_debug = env.config.keep_debug
     let system = env.system
+    let principals = env.principals.share()
     let clock = env.clock
     let wall = env.wall
     let alloc = env.alloc
-    mut cx.spawn(key: DRAINING, run: fn(out: sys::Outbox[Journal]) fails task::Cancelled uses wait limits stack 32_768 {
+    var traced = mem::List[TracedInstance].empty(alloc)
+    for instance in env.config.trace_instances {
+        mut traced.push(TracedInstance(moniker: ident::Moniker(text: instance.moniker.text), expires: instance.expires))
+    }
+    mut cx.spawn(key: DRAINING, run: fn[take traced, take principals](out: sys::Outbox[Journal]) fails task::Cancelled uses wait limits stack 32_768 {
+        try await feed.trace(take traced)
         try await declare(tree, retention, alloc)
-        try await drain(feed, tree, keep_debug, system, clock, wall, out, alloc)
+        try await drain(feed, tree, keep_debug, system, principals, clock, wall, out, alloc)
     })
 } Recorder.resume
 
@@ -120,15 +131,16 @@ pub fn Recorder.emit(
     }
     let now = now_ns(env.clock)
     let alloc = env.alloc
+    let cause = cause_of(os::Header.current().cause, system: env.system)
     if reserved(kind.as_str()) and not is_base(emitter.instance) {
         let refused = KindRefused(source: take emitter.instance, kind: take kind)
-        mut self.hold(journal_event("journal.kind-refused", severity: Severity.Warn, payload: payload_of(refused, alloc), now, system: env.system, alloc), mut env, mut cx)
+        mut self.hold(journal_event("journal.kind-refused", severity: Severity.Warn, payload: payload_of(refused, alloc), now, cause, principal: env.principals.of(cause, system: env.system), alloc), mut env, mut cx)
         return
     }
-    if not mut self.admit(emitter.instance, now, mut env, mut cx) {
+    if not mut self.admit(emitter.instance, now, cause, mut env, mut cx) {
         return
     }
-    let event = Event(time_ns: now, source: take emitter.instance, kind: take kind, severity: severity, cause: env.system, principal: ident::Principal(text: text::Fixed[64].of("system")), payload: bounded(take payload, alloc))
+    let event = Event(time_ns: now, source: take emitter.instance, kind: take kind, severity: severity, cause: cause, principal: env.principals.of(cause, system: env.system), payload: bounded(take payload, alloc))
     mut self.hold(take event, mut env, mut cx)
 } Recorder.emit
 
@@ -148,11 +160,12 @@ fn Recorder.drained(
     self.lost = self.lost.saturating_add(lost)
 } Recorder.drained
 
-/// Whether the source `instance` may emit one more event in its current second; a new second first holds a `journal.lost` of the events it dropped in its previous one.
+/// Whether the source `instance` may emit one more event in its current second, in work of the cause `cause`; a new second first holds a `journal.lost` of the events it dropped in its previous one.
 fn Recorder.admit(
     mut self,
     instance: ident::Moniker,
     now: u64,
+    cause: ident::Cause,
     mut env: Env,
     mut cx: sys::Cx[Journal],
     ) -> bool {
@@ -164,7 +177,7 @@ fn Recorder.admit(
     if now.saturating_sub(window.since_ns) >= NS_PER_S {
         if window.dropped > 0 {
             let lost = Lost(cpu: None, source: Some(ident::Moniker(text: instance.text)), count: window.dropped)
-            mut self.hold(journal_event("journal.lost", severity: Severity.Warn, payload: payload_of(lost, alloc), now, system: env.system, alloc), mut env, mut cx)
+            mut self.hold(journal_event("journal.lost", severity: Severity.Warn, payload: payload_of(lost, alloc), now, cause, principal: env.principals.of(cause, system: env.system), alloc), mut env, mut cx)
         }
         window = Rate(since_ns: now, taken: 0, dropped: 0)
     }
@@ -231,12 +244,13 @@ fn declare(tree: store::service::View, retention: Retention, alloc: mem::Alloc) 
     try await commit(tree, take writes, alloc)
 } declare
 
-/// Appends what the core holds for `journal` as `Gathered.writes` lays it out, and tells `out` the events it appended and those the rings lost.
+/// Appends what the core holds for `journal` as `Gathered.writes` lays it out, each event of the principal `principals` gives its cause, and tells `out` the events it appended and those the rings lost.
 fn drain(
     feed: Feed,
     tree: store::service::View,
     keep_debug: bool,
     system: ident::Cause,
+    principals: Principals,
     clock: sys::Clock,
     wall: ident::Wall,
     out: sys::Outbox[Journal],
@@ -251,7 +265,7 @@ fn drain(
             mut gathered.metric(take metric, mut minutes, mut hours, alloc)
         }
         for drained in drains {
-            mut gathered.drained(drained, keep_debug, system, wall, now: now_ns(clock), alloc)
+            mut gathered.drained(drained, keep_debug, system, principals, wall, now: now_ns(clock), alloc)
         }
         for logged in take logs {
             mut gathered.logged(take logged, system, now: now_ns(clock), alloc)
@@ -303,28 +317,33 @@ fn Gathered.metric(
     }
 } Gathered.metric
 
-/// Gathers each event of a drain, `debug` ones only when `keep_debug`, the ring's lost events as one `journal.lost`, the record of each trap and integrity fault, and the system cause a `boot.started` opens.
+/// Gathers each event of a drain, of the principal `principals` gives its cause, `debug` ones only when `keep_debug`, the ring's lost events as one `journal.lost`, the record of each trap and integrity fault, each span, and the record of each cause the core opened.
 fn Gathered.drained(
     mut self,
     drained: Drained,
     keep_debug: bool,
     system: ident::Cause,
+    principals: Principals,
     wall: ident::Wall,
     now: u64,
     alloc: mem::Alloc,
     ) {
     for record in drained.records {
-        let event = record.event(system, alloc)
+        match record.trace(system, wall, alloc) {
+            Some(entry) => mut self.traces.push(wire_of(entry, alloc))
+            None => {
+            }
+        }
+        if not record.record.is_event() {
+            continue
+        }
+        var event = record.event(system, alloc)
+        event.principal = principals.of(event.cause, system)
         if event.severity != Severity.Debug or keep_debug {
             mut self.events.push(wire_of(event, alloc))
         }
         match record.fault(system, alloc) {
             Some(fault) => mut self.faults.push(wire_of(fault, alloc))
-            None => {
-            }
-        }
-        match record.opened(system, wall, alloc) {
-            Some(opened) => mut self.traces.push(wire_of(opened, alloc))
             None => {
             }
         }
@@ -346,7 +365,7 @@ fn Gathered.logged(
     if logged.lost > 0 {
         mut self.lost(Lost(cpu: None, source: Some(ident::Moniker(text: logged.source.text)), count: logged.lost), system, now, alloc)
     }
-    mut self.logs.push(wire_of(take logged.entry(cause: system), alloc))
+    mut self.logs.push(wire_of(take logged.entry(system), alloc))
 } Gathered.logged
 
 /// Gathers a `journal.lost` of `count`.
@@ -357,7 +376,7 @@ fn Gathered.lost(
     now: u64,
     alloc: mem::Alloc,
     ) {
-    mut self.events.push(wire_of(journal_event("journal.lost", severity: Severity.Warn, payload: payload_of(count, alloc), now, system, alloc), alloc))
+    mut self.events.push(wire_of(journal_event("journal.lost", severity: Severity.Warn, payload: payload_of(count, alloc), now, cause: system, principal: ident::Principal(text: text::Fixed[64].of("system")), alloc), alloc))
 } Gathered.lost
 
 /// The appends of what was gathered, one per stream holding any.
@@ -388,16 +407,17 @@ fn Gathered.writes(take self, alloc: mem::Alloc) -> mem::List[store::Write] {
     return writes
 } Gathered.writes
 
-/// An event `journal` records itself at the monotonic time `now`.
+/// An event `journal` records itself at the monotonic time `now`, in work of the cause `cause` acting for `principal`.
 fn journal_event(
     kind: Str,
     severity: Severity,
     take payload: Payload,
     now: u64,
-    system: ident::Cause,
+    cause: ident::Cause,
+    take principal: ident::Principal,
     alloc: mem::Alloc,
     ) -> Event {
-    return Event(time_ns: now, source: ident::Moniker(text: text::Fixed[59].of("journal")), kind: text::String.of(kind, alloc), severity: severity, cause: system, principal: ident::Principal(text: text::Fixed[64].of("system")), payload: take payload)
+    return Event(time_ns: now, source: ident::Moniker(text: text::Fixed[59].of("journal")), kind: text::String.of(kind, alloc), severity: severity, cause: cause, principal: take principal, payload: take payload)
 } journal_event
 
 /// `payload` as an event holds it: its schema, size and hash in place of a payload of more than 4 KiB.

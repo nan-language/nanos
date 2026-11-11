@@ -15,10 +15,12 @@ pub open struct Feed {
 
 impl Feed: sys::Kind[Backlog, u8]
 
-/// What the core drained and `journal` has not taken, and the signal the core posts as it holds more.
+/// What the core drained and `journal` has not taken, the signal the core posts as it holds more, where the instances `journal` traces go, and the principals of the causes the core opened.
 pub open struct Backlog derives Send {
     held: task::Cown[Held]
     signal: mem::Shared[hw::Signal[Unit]]
+    tracings: task::Sender[mem::List[TracedInstance]]
+    principals: Principals
 } Backlog
 
 /// The drains held, oldest first, and the records they hold; the log records held, oldest first, and those counted lost since `journal` last took them.
@@ -50,12 +52,13 @@ pub open linear struct MintedFeed derives Send {
     minter: sys::Minter[Feed, Backlog, u8]
 } MintedFeed
 
-pub fn Backlog.empty(alloc: mem::Alloc) -> Backlog {
-    return Backlog(held: task::Cown.of(Held(drains: mem::List.empty(alloc), records: 0, logs: mem::List.empty(alloc), logs_lost: 0, metrics: mem::List.empty(alloc)), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
-} Backlog.empty
+/// An empty backlog, the instances `journal` traces going to `tracings`, the principals of causes read from `principals`.
+pub fn Backlog.of(tracings: task::Sender[mem::List[TracedInstance]], principals: Principals, alloc: mem::Alloc) -> Backlog {
+    return Backlog(held: task::Cown.of(Held(drains: mem::List.empty(alloc), records: 0, logs: mem::List.empty(alloc), logs_lost: 0, metrics: mem::List.empty(alloc)), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), tracings: tracings.split(), principals: principals.share())
+} Backlog.of
 
 pub fn Backlog.share(self) -> Backlog {
-    return Backlog(held: self.held.share(), signal: self.signal.share())
+    return Backlog(held: self.held.share(), signal: self.signal.share(), tracings: self.tracings.split(), principals: self.principals.share())
 } Backlog.share
 
 /// Holds `drained` for `journal`, counting its records lost when the backlog has no room for them, and signals it.
@@ -143,6 +146,23 @@ pub fn MintedFeed.close(take self) {
     take minter.close()
 } MintedFeed.close
 
+/// Has the core trace the handler calls of the instances `instances` names, each until it expires, and of no other; nothing once the feed is stale.
+pub fn Feed.trace(self, take instances: mem::List[TracedInstance]) fails task::Cancelled uses wait {
+    let Some(tracings) = sys::reach(self, body: fn(state: Backlog, record: u8) => state.tracings.split()) else {
+        return
+    }
+    match attempt await tracings.send(take instances) {
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} Feed.trace
+
+/// The principals of the causes the core opened, `None` once the feed is stale.
+pub fn Feed.principals(self) -> Option[Principals] {
+    return sys::reach(self, body: fn(state: Backlog, record: u8) => state.principals.share())
+} Feed.principals
+
 /// What the core holds, oldest first, waiting until it holds a drain or a log record or has counted one lost; nothing once the feed is stale.
 pub fn Feed.next(self, alloc: mem::Alloc) -> Fed fails task::Cancelled uses wait {
     var fed = Fed(drains: mem::List.empty(alloc), logs: mem::List.empty(alloc), logs_lost: 0, metrics: mem::List.empty(alloc))
@@ -174,20 +194,30 @@ pub fn Feed.next(self, alloc: mem::Alloc) -> Fed fails task::Cancelled uses wait
 
 test feeds_give_what_the_core_holds_and_count_what_overflows for Feed.next {
     let alloc = testing::world().alloc
-    let backlog = Backlog.empty(alloc)
+    let task::Channel(sender: tracings, receiver: traced) = task::Channel[mem::List[TracedInstance]].bounded(1, alloc)
+    let backlog = Backlog.of(tracings, principals: Principals.empty(alloc), alloc)
     let minted = MintedFeed.of(backlog, alloc)
     defer take minted.close()
     let feed = minted.mint()
     var records = mem::List[CoreRecord].empty(alloc)
-    mut records.push(CoreRecord(record: RingRecord(time: 1, cause: 0, source: 0, kind: STARTED, severity: 1, flags: 0, argument: 1), more: mem::List.empty(alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor"))))
+    mut records.push(CoreRecord(record: RingRecord(time: 1, cause: 0, source: 0, kind: STARTED, severity: 1, flags: 0, argument: 1), more: mem::List.empty(alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor")), sender: None))
     try await backlog.hold(Drained(cpu: 0, records: take records, lost: 2))
     var many = mem::List[CoreRecord].empty(alloc)
     for _ in 0..<(HELD_RECORDS + 1) {
-        mut many.push(CoreRecord(record: RingRecord(time: 1, cause: 0, source: 0, kind: STOPPED, severity: 1, flags: 0, argument: 0), more: mem::List.empty(alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor"))))
+        mut many.push(CoreRecord(record: RingRecord(time: 1, cause: 0, source: 0, kind: STOPPED, severity: 1, flags: 0, argument: 0), more: mem::List.empty(alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor")), sender: None))
     }
     try await backlog.hold(Drained(cpu: 1, records: take many, lost: 0))
     let fed = try await feed.next(alloc)
     let drains = fed.drains
     expect drains.len() == 2 and drains[0].records.len() == 1 and drains[0].lost == 2
     expect drains[1].cpu == 1 and drains[1].records.len() == 0 and drains[1].lost == u64.widen(HELD_RECORDS + 1)
+    var instances = mem::List[TracedInstance].empty(alloc)
+    mut instances.push(TracedInstance(moniker: ident::Moniker(text: text::Fixed[59].of("fat")), expires: ident::WallTime(utc_ns: 9, uncertainty_ns: 0)))
+    try await feed.trace(take instances)
+    var receiver = traced
+    let Some(set) = try await mut receiver.receive() else {
+        expect false
+        return
+    }
+    expect set.len() == 1 and set[0].moniker.text.as_str() == "fat"
 } feeds_give_what_the_core_holds_and_count_what_overflows

@@ -22,9 +22,10 @@ enum Input {
     Slow(ns: u64)
     Lingered(incarnation: u64)
     Revoke(grants: mem::Set[u64], done: task::Sender[Unit])
+    Trace(until_ns: Option[u64])
 } Input
 
-/// An instance as its driver holds it, `intake` the length of `queue` for readers of its gauge, `suspended` while its component is, `suspend_ms` the time without a message after which it is, and what it publishes of it.
+/// An instance as its driver holds it, `intake` the length of `queue` for readers of its gauge, `cause` the start cause of its latest incarnation, `changed_by` the cause of the order, trap or call that last changed its lifecycle, under which its next start cause opens, `traced_until` the monotonic time until which its handler calls are traced, `suspended` while its component is, `suspend_ms` the time without a message after which it is, and what it publishes of it; causes as a header holds them.
 linear struct Driver {
     moniker: ident::Moniker
     slot: u32
@@ -34,11 +35,14 @@ linear struct Driver {
     incarnation: u64
     traps: u64
     started_ns: u64
-    queue: mem::List[os::Call]
+    queue: mem::List[Queued]
     intake: mem::Shared[core::atomic::AtomicU32]
     domain: Option[Domain]
     then: Then
-    cause: Cause
+    abandonment: Abandonment
+    cause: u64
+    changed_by: u64
+    traced_until: Option[u64]
     restarts: Restarts
     waiters: mem::List[Waiter]
     minted: Minted
@@ -60,12 +64,20 @@ struct Domain {
     next_id: u64
 } Domain
 
-/// A call delivered to the running domain: its number, where its reply goes, its credit, and its encoding when it holds at most `MOST_DEAD_BYTES`, which a dead letter keeps when its handler call is abandoned.
+/// A call waiting in the instance's intake since the monotonic time `since_ns`.
+struct Queued {
+    call: os::Call
+    since_ns: u64
+} Queued
+
+/// A call delivered to the running domain: its number, where its reply goes, its credit, its header, its encoding when it holds at most `MOST_DEAD_BYTES`, which a dead letter keeps when its handler call is abandoned, and for a traced call the span its handler call starts.
 struct Outstanding {
     id: u64
     reply: Option[task::Sender[os::Answer]]
     lease: os::Lease
+    header: os::Header
     message: Option[mem::Bytes]
+    span: Option[Span]
 } Outstanding
 
 /// What follows the stop of the running incarnation.
@@ -75,11 +87,11 @@ enum Then derives Copy, Eq {
 } Then
 
 /// Why the runner abandoned the running incarnation's domain from outside.
-enum Cause derives Copy, Eq {
+enum Abandonment derives Copy, Eq {
     Inside
     HandlerLimit
     Lingered
-} Cause
+} Abandonment
 
 /// An order waiting for its instance's lifecycle to run, hibernate or fail, to stop, or to differ from the one an order saw, or for its suspension to differ from the one an order saw.
 struct Waiter {
@@ -105,6 +117,7 @@ struct Shared[C: Components and Copy and Send, R: Reservations and Send] {
     postings: task::Sender[os::Posting]
     logs: task::Sender[journal::Logged]
     gauges: Gauges
+    traced: task::Cown[mem::List[journal::TracedInstance]]
 } Shared
 
 /// The driver of the instance `moniker`, not yet created, under `spec`, its calls passing `gate`.
@@ -115,7 +128,7 @@ fn Driver.of(
     take gate: os::Gate,
     alloc: mem::Alloc,
     ) -> Driver {
-    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, traps: 0, started_ns: 0, queue: mem::List.empty(alloc), intake: mem::Shared.of(core::atomic::AtomicU32.of(0), alloc), domain: None, then: Then.Stop, cause: Cause.Inside, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false, showing: Showing.none(), alloc: alloc)
+    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, traps: 0, started_ns: 0, queue: mem::List.empty(alloc), intake: mem::Shared.of(core::atomic::AtomicU32.of(0), alloc), domain: None, then: Then.Stop, abandonment: Abandonment.Inside, cause: 0, changed_by: 0, traced_until: None, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false, showing: Showing.none(), alloc: alloc)
 } Driver.of
 
 /// Carries out the lifecycle of the instance `driver` holds, as its inputs come, until they end or the instance, deleted, has stopped, left the directory and had its capabilities revoked; the tasks of its incarnations run in the driver's own scope.
@@ -129,6 +142,9 @@ fn Shared.drive[J: Journal and Send](
     var held = driver
     defer take held.abandon()
     try await journal.name(held.slot, moniker: ident::Moniker(text: held.moniker.text))
+    let traced = self.traced.share()
+    let config = self.config
+    held.traced_until = await when traced => traced_until(traced, moniker: held.moniker, config)
     var receiver = inputs
     try await self.show(mut held)
     try await task::scope(self.config.exec, body: fn[mut held, mut receiver](s: task::Scope) fails task::Cancelled uses wait {
@@ -181,6 +197,7 @@ fn Shared.take_input[J: Journal](
     journal: J,
     s: task::Scope,
     ) fails task::Cancelled uses wait {
+    let now_ns = now(self.config.clock)
     match input {
         Input.Order(order) => try await self.order(mut driver, take order, sender, journal, s)
         Input.Call(call) => {
@@ -188,12 +205,14 @@ fn Shared.take_input[J: Journal](
                 try await refuse(take call, answer: os::Answer.Stopped)
                 return
             }
-            mut driver.queue.push(take call)
+            let cause = call.header.cause
+            mut driver.queue.push(Queued(call: take call, since_ns: now_ns))
             driver.counted()
             if driver.lifecycle == Some(os::Lifecycle.Hibernated) {
+                driver.changed_by = cause
                 try await self.start(mut driver, sender, journal, s)
             }
-            try await mut driver.deliver()
+            try await mut driver.deliver(now_ns)
         }
         Input.Report(incarnation: incarnation, report: report) => {
             if incarnation != driver.incarnation {
@@ -206,7 +225,7 @@ fn Shared.take_input[J: Journal](
             if ending {
                 self.linger(s, inputs: sender.split(), incarnation)
             } else {
-                try await mut driver.report(take report, journal)
+                try await mut driver.report(take report, journal, now_ns)
             }
         }
         Input.Ended(incarnation: incarnation, outcome: outcome) => {
@@ -222,19 +241,22 @@ fn Shared.take_input[J: Journal](
         }
         Input.Overran(incarnation: incarnation) => {
             if incarnation == driver.incarnation {
-                driver.cause = Cause.HandlerLimit
+                driver.abandonment = Abandonment.HandlerLimit
             }
         }
-        Input.Slow(ns: ns) => journal.record(driver.slot, event: Event.SlowHandler(ns: ns))
+        Input.Slow(ns: ns) => journal.record(driver.slot, cause: driver.at_fault(), event: Event.SlowHandler(ns: ns))
         Input.Lingered(incarnation: incarnation) => {
             if incarnation == driver.incarnation and driver.lifecycle == Some(os::Lifecycle.Stopping) {
-                driver.cause = Cause.Lingered
+                driver.abandonment = Abandonment.Lingered
                 driver.trigger()
             }
         }
         Input.Revoke(grants: grants, done: done) => {
             mut driver.minted.revoke(grants)
             discard attempt await done.send(Unit)
+        }
+        Input.Trace(until_ns: until) => {
+            driver.traced_until = until
         }
     }
 } Shared.take_input
@@ -248,7 +270,14 @@ fn Shared.order[J: Journal](
     journal: J,
     s: task::Scope,
     ) fails task::Cancelled uses wait {
-    let os::Order(action: action, moniker: _, grant: _, done: done) = order
+    let os::Order(action: action, moniker: _, grant: _, done: done, cause: cause) = order
+    match action {
+        os::Action.Start or os::Action.Stop or os::Action.Restart or os::Action.Delete(unplugged: _) => {
+            driver.changed_by = cause
+        }
+        else => {
+        }
+    }
     match action {
         os::Action.Read => {
             let answer: Result[os::Outcome, os::ControlError] = match driver.lifecycle {
@@ -353,7 +382,8 @@ fn Shared.start[J: Journal](
     s: task::Scope,
     ) fails task::Cancelled uses wait {
     driver.lifecycle = Some(os::Lifecycle.Starting)
-    driver.cause = Cause.Inside
+    driver.abandonment = Abandonment.Inside
+    driver.cause = driver.changed_by
     driver.suspended = false
     driver.started_ns = now(self.config.clock)
     var keeping: Option[Keeping] = None
@@ -370,14 +400,15 @@ fn Shared.start[J: Journal](
             restore = Some(take saved)
         }
         Restoring.Unreadable => {
-            try await self.give_up(mut driver, journal)
+            try await self.give_up(mut driver, journal, cause: driver.cause)
             return
         }
     }
     driver.incarnation += 1
+    driver.cause = journal.open(driver.slot, moniker: ident::Moniker(text: driver.moniker.text), incarnation: driver.incarnation, parent: driver.changed_by)
     let config = try await self.configuration(mut driver)
     let Some(budget) = try await self.cell(mut driver) else {
-        try await self.give_up(mut driver, journal)
+        try await self.give_up(mut driver, journal, cause: driver.cause)
         return
     }
     let account = self.config.exec.split_on(self.config.share(driver.spec.share), alloc: budget.alloc())
@@ -387,7 +418,7 @@ fn Shared.start[J: Journal](
     let Some(world) = built else {
         take account.close()
         take budget.close()
-        try await self.give_up(mut driver, journal)
+        try await self.give_up(mut driver, journal, cause: driver.cause)
         return
     }
     let task::Channel(sender: deliveries, receiver: delivered) = task::Channel[Delivery].bounded(2, alloc: self.config.alloc)
@@ -399,7 +430,7 @@ fn Shared.start[J: Journal](
     let exec = account.executor()
     let alloc = budget.alloc()
     let held = Held(budget: take budget, account: take account, class: driver.spec.share.class, intake: driver.intake.share(), bundle: driver.spec.bundle, traps: driver.traps)
-    self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, exec, alloc, abandoner: abandoner.share(), take ending, ended: sender.split(), incarnation: driver.incarnation)
+    self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, exec, alloc, abandoner: abandoner.share(), take ending, ended: sender.split(), incarnation: driver.incarnation, header: os::Header.of_work(cause: driver.cause, slot: driver.slot))
     self.watch(s, marks: take marked, take held, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers)
     driver.domain = Some(Domain(deliveries: take deliveries, abandoner: take abandoner, outstanding: None, next_id: 0))
     try await self.gauges.watch(ident::Moniker(text: driver.moniker.text), watch: take gauged, alloc: self.config.alloc)
@@ -452,7 +483,7 @@ fn latency_bucket(ns: u64) -> usize {
     return bucket
 } latency_bucket
 
-/// Runs an incarnation's domain on a task of `s` through `exec` and `alloc`, then tells its watch, through `ending`, and its driver how it ended.
+/// Runs an incarnation's domain under `header` on a task of `s` through `exec` and `alloc`, then tells its watch, through `ending`, and its driver how it ended.
 fn Shared.launch(
     self,
     s: task::Scope,
@@ -465,11 +496,18 @@ fn Shared.launch(
     take ending: task::Sender[Mark],
     take ended: task::Sender[Input],
     incarnation: u64,
+    header: os::Header,
     ) {
     let components = self.components
     discard s.spawn(fn[take component, take world, take serving, take abandoner, take ending, take ended]() fails task::Cancelled uses wait limits stack 16_384 {
         let ran = attempt await abandoner.contents().run_sized(fn[take component, take world, take serving]() -> Ended fails task::Cancelled uses wait limits stack 131_072 {
-            return try await components.serve(component.as_str(), take world, take serving)
+            var given = Some(Launched(component: take component, world: take world, serving: take serving))
+            return try await sys::run_headed(header.carried(), body: fn[mut given]() -> Ended fails task::Cancelled uses wait {
+                let Some(Launched(component: path, world: built, serving: served)) = mut given.extract() else {
+                    return Ended.Stopped
+                }
+                return try await components.serve(path.as_str(), world: take built, serving: take served)
+            })
         }, stack: INSTANCE_STACK, exec, alloc)
         discard attempt await ending.send(Mark.Ended)
         let outcome = match ran {
@@ -479,6 +517,13 @@ fn Shared.launch(
         discard attempt await ended.send(Input.Ended(incarnation: incarnation, outcome: take outcome))
     })
 } Shared.launch
+
+/// What the first task of an incarnation's domain runs: the path of its component, its world and what it serves.
+struct Launched {
+    component: text::String
+    world: nanos::World
+    serving: Serving
+} Launched
 
 /// Watches an incarnation's handlers on a task of `s`, answering the readings of its gauge from `held` until its domain has ended, then closes its account and cell: a handler call past `handlers.handler_s` abandons the domain, and one of `handlers.slow_ms` or more is reported slow.
 fn Shared.watch(
@@ -608,9 +653,11 @@ fn Shared.ended[J: Journal](
     s: task::Scope,
     ) fails task::Cancelled uses wait {
     let dead = match first outcome {
-        Err(_) if driver.cause != Cause.Lingered => driver.handled_message()
+        Err(_) if driver.abandonment != Abandonment.Lingered => driver.handled_message()
         else => None
     }
+    let trapped = driver.at_fault()
+    let running = driver.running_span(now_ns: now(self.config.clock))
     try await mut driver.end_domain()
     match outcome {
         Ok(Ended.Stopped) => {
@@ -619,28 +666,37 @@ fn Shared.ended[J: Journal](
                 try await self.create_or_start(mut driver, sender, journal, s)
             }
         }
-        Ok(Ended.EnvIncomplete) or Ok(Ended.Unhealthy) or Ok(Ended.CheckpointUndecodable) => try await self.give_up(mut driver, journal)
+        Ok(Ended.EnvIncomplete) or Ok(Ended.Unhealthy) or Ok(Ended.CheckpointUndecodable) => try await self.give_up(mut driver, journal, cause: driver.cause)
         Err(trap) => {
-            if driver.cause == Cause.Lingered {
+            match running {
+                Some(span) => {
+                    var ended = span
+                    ended.trapped = Some(trap.kind())
+                    journal.span(driver.slot, span: ended)
+                }
+                None => {
+                }
+            }
+            if driver.abandonment == Abandonment.Lingered {
                 mut driver.stopped(journal, abandoned: true)
                 if driver.then == Then.Restart {
                     try await self.create_or_start(mut driver, sender, journal, s)
                 }
             } else {
                 match dead {
-                    Some(message) => try await self.record_dead(mut driver, trap, take message, s)
+                    Some(handled) => try await self.record_dead(mut driver, trap, take handled, s)
                     None => {
                     }
                 }
-                try await self.abandoned(mut driver, kind: trap.kind(), sender, journal, s)
+                try await self.abandoned(mut driver, kind: trap.kind(), trapped, sender, journal, s)
             }
         }
     }
     try await mut driver.settle()
 } Shared.ended
 
-/// The call whose handler call is running: a copy of its encoding when the driver kept one; `None` when no handler call runs.
-fn Driver.handled_message(self) -> Option[Option[mem::Bytes]] {
+/// The call whose handler call is running: its header, and a copy of its encoding when the driver kept one; `None` when no handler call runs.
+fn Driver.handled_message(self) -> Option[Handled] {
     let Some(domain) = self.domain else {
         return None
     }
@@ -648,27 +704,75 @@ fn Driver.handled_message(self) -> Option[Option[mem::Bytes]] {
         return None
     }
     let Some(kept) = outstanding.message else {
-        return Some(None)
+        return Some(Handled(header: outstanding.header, message: None))
     }
     var message = mem::Bytes.empty(self.alloc)
     mut message.append(kept.view())
-    return Some(Some(take message))
+    return Some(Handled(header: outstanding.header, message: Some(take message)))
 } Driver.handled_message
 
-/// Records the call the handler call of the incarnation `trap` abandoned was handling, `message` its encoding when kept, as the instance's next dead letter, written from a task of `s` through the instance's View of `/state`.
+/// The call a handler call was handling: its header, and its encoding when kept.
+struct Handled {
+    header: os::Header
+    message: Option[mem::Bytes]
+} Handled
+
+/// The name of the operation `message` calls, empty when it was not kept.
+fn operation_in(message: Option[mem::Bytes], alloc: mem::Alloc) -> text::String {
+    return match message {
+        Some(kept) => operation_of(kept.view(), alloc)
+        None => text::String.empty(alloc)
+    }
+} operation_in
+
+/// The cause of the work running in the domain: the call whose handler call runs, else the incarnation's start.
+fn Driver.at_fault(self) -> u64 {
+    let Some(domain) = self.domain else {
+        return self.cause
+    }
+    let Some(outstanding) = domain.outstanding else {
+        return self.cause
+    }
+    return outstanding.header.cause
+} Driver.at_fault
+
+/// The span of the handler call of the outstanding call when traced, ending at `now_ns`.
+fn Driver.running_span(self, now_ns: u64) -> Option[Span] {
+    let Some(domain) = self.domain else {
+        return None
+    }
+    let Some(outstanding) = domain.outstanding else {
+        return None
+    }
+    let Some(begun) = outstanding.span else {
+        return None
+    }
+    var span = begun
+    span.run_ns = now_ns.saturating_sub(span.start_ns)
+    return Some(span)
+} Driver.running_span
+
+/// Records the call `handled`, which the handler call of the incarnation `trap` abandoned was handling, as the instance's next dead letter with the call's header, written from a task of `s` through the instance's View of `/state`.
 fn Shared.record_dead(
     self,
     mut driver: Driver,
     trap: sys::Trap,
-    take message: Option[mem::Bytes],
+    take handled: Handled,
     s: task::Scope,
     ) fails task::Cancelled uses wait {
+    let Handled(header: header, message: message) = handled
     let alloc = self.config.alloc
+    var bytes = Array[u8, 24].filled(0)
+    let carried = header.to_bits()
+    for at in 0..<bytes.len() {
+        bytes[at] = carried[at]
+    }
+    let operation = operation_in(message, alloc)
     var kind = text::String.empty(alloc)
     mut kind.write(Dyn[Render].view(trap.kind()), budget: 64)
     var report = text::String.empty(alloc)
     mut report.write(Dyn[Render].view(trap), budget: 1_024)
-    let letter = os::DeadLetter(seq: 0, incarnation: driver.incarnation, time: self.config.wall.now(self.config.clock), header: Array[u8, 24].filled(0), sender: None, operation: operation_of(message, alloc), message: take message, kind: take kind, report: take report, redeliveries: mem::List.empty(alloc))
+    let letter = os::DeadLetter(seq: 0, incarnation: driver.incarnation, time: self.config.wall.now(self.config.clock), header: bytes, sender: None, operation: take operation, message: take message, kind: take kind, report: take report, redeliveries: mem::List.empty(alloc))
     let directory = self.directory.share()
     let moniker = ident::Moniker(text: driver.moniker.text)
     let principal = ident::Principal(text: driver.spec.principal.text)
@@ -682,19 +786,21 @@ fn Shared.record_dead(
     })
 } Shared.record_dead
 
-/// Applies the restart policy after an abandonment of kind `kind`: a restart after the backoff, or `failed`.
+/// Applies the restart policy after an abandonment of kind `kind` in work of the cause `trapped`: a restart under it after the backoff, or `failed`.
 fn Shared.abandoned[J: Journal](
     self,
     mut driver: Driver,
     kind: sys::TrapKind,
+    trapped: u64,
     sender: task::Sender[Input],
     journal: J,
     s: task::Scope,
     ) fails task::Cancelled uses wait {
     if kind == sys::TrapKind.Exception {
-        journal.record(driver.slot, event: Event.Integrity(incarnation: driver.incarnation))
+        journal.record(driver.slot, cause: trapped, event: Event.Integrity(incarnation: driver.incarnation))
     }
-    journal.record(driver.slot, event: Event.Trapped(incarnation: driver.incarnation, kind: kind, limit: driver.cause == Cause.HandlerLimit))
+    journal.record(driver.slot, cause: trapped, event: Event.Trapped(incarnation: driver.incarnation, kind: kind, limit: driver.abandonment == Abandonment.HandlerLimit))
+    driver.changed_by = trapped
     driver.traps += 1
     var code = text::String.empty(self.config.alloc)
     mut code.write(Dyn[Render].view(kind), budget: 64)
@@ -702,11 +808,11 @@ fn Shared.abandoned[J: Journal](
     let supervisor = driver.moniker.text.as_str() == "supervisor"
     let policy = driver.spec.restart.policy
     if policy == os::RestartPolicy.Temporary and not supervisor {
-        try await self.give_up(mut driver, journal)
+        try await self.give_up(mut driver, journal, cause: trapped)
         return
     }
     match mut driver.restarts.next(driver.spec.restart, bounded: not supervisor, started_ns: driver.started_ns, now_ns: now(self.config.clock)) {
-        Next.Fail => try await self.give_up(mut driver, journal)
+        Next.Fail => try await self.give_up(mut driver, journal, cause: trapped)
         Next.After(ns: ns) => {
             driver.lifecycle = Some(os::Lifecycle.Starting)
             self.elapse(s, ns, inputs: sender.split(), incarnation: driver.incarnation)
@@ -738,33 +844,33 @@ fn Shared.elapse(
     })
 } Shared.elapse
 
-/// Sends the instance to `failed`: its queued calls are dropped or failed, and its gate closes.
-fn Shared.give_up[J: Journal](self, mut driver: Driver, journal: J) fails task::Cancelled uses wait {
+/// Sends the instance to `failed` in work of the cause `cause`: its queued calls are dropped or failed, and its gate closes.
+fn Shared.give_up[J: Journal](self, mut driver: Driver, journal: J, cause: u64) fails task::Cancelled uses wait {
     driver.lifecycle = Some(os::Lifecycle.Failed)
     driver.gate.set(open: false)
     try await mut driver.refuse_queued()
-    journal.record(driver.slot, event: Event.Failed(restarts: u32.fit(driver.restarts.times.len())))
+    journal.record(driver.slot, cause: cause, event: Event.Failed(restarts: u32.fit(driver.restarts.times.len())))
 } Shared.give_up
 
-/// Records the instance stopped.
+/// Records the instance stopped, by the order that last changed its lifecycle.
 fn Driver.stopped[J: Journal](mut self, journal: J, abandoned: bool) {
     self.lifecycle = Some(os::Lifecycle.Stopped)
-    journal.record(self.slot, event: Event.Stopped(abandoned: abandoned))
+    journal.record(self.slot, cause: self.changed_by, event: Event.Stopped(abandoned: abandoned))
 } Driver.stopped
 
-/// Handles what the domain reports: that it runs, that it took a call, a request's answer, that its component was suspended or woken, or that a checkpoint failed.
-fn Driver.report[J: Journal](mut self, take report: Report, journal: J) fails task::Cancelled uses wait {
+/// Handles what the domain reports at `now_ns`: that it runs, that it took a call, a request's answer, that its component was suspended or woken, or that a checkpoint failed.
+fn Driver.report[J: Journal](mut self, take report: Report, journal: J, now_ns: u64) fails task::Cancelled uses wait {
     match report {
         Report.Running(checkpoint: restored) => {
             if self.lifecycle == Some(os::Lifecycle.Starting) {
                 self.lifecycle = Some(os::Lifecycle.Running)
-                journal.record(self.slot, event: Event.Started(incarnation: self.incarnation, checkpoint: restored))
+                journal.record(self.slot, cause: self.cause, event: Event.Started(incarnation: self.incarnation, checkpoint: restored))
             }
         }
-        Report.CheckpointFailed(code: code, bytes: bytes) => journal.record(self.slot, event: Event.CheckpointFailed(code: code, bytes: bytes))
+        Report.CheckpointFailed(code: code, bytes: bytes) => journal.record(self.slot, cause: 0, event: Event.CheckpointFailed(code: code, bytes: bytes))
         Report.Published(summary: summary) => mut self.showing.summarize(take summary)
         Report.Taken(id: id) => {
-            let taken = mut self.take_outstanding(id, request: false)
+            let taken = mut self.take_outstanding(id, request: false, journal, now_ns)
             match taken {
                 Some(outstanding) => try await take outstanding.lease.release()
                 None => {
@@ -780,7 +886,7 @@ fn Driver.report[J: Journal](mut self, take report: Report, journal: J) fails ta
             self.suspended = false
         }
         Report.Postponed(id: id) => {
-            let postponed = mut self.take_outstanding(id, request: true)
+            let postponed = mut self.take_outstanding(id, request: true, journal, now_ns)
             match postponed {
                 Some(outstanding) => mut self.postponed.push(take outstanding)
                 None => {
@@ -788,7 +894,7 @@ fn Driver.report[J: Journal](mut self, take report: Report, journal: J) fails ta
             }
         }
         Report.Answered(id: id, answer: answer) => {
-            var answered = mut self.take_outstanding(id, request: true)
+            var answered = mut self.take_outstanding(id, request: true, journal, now_ns)
             if answered.is_none() {
                 answered = mut self.take_postponed(id)
             }
@@ -808,12 +914,12 @@ fn Driver.report[J: Journal](mut self, take report: Report, journal: J) fails ta
             }
         }
     }
-    try await mut self.deliver()
+    try await mut self.deliver(now_ns)
     try await mut self.settle()
 } Driver.report
 
-/// The outstanding call `id` when it ends now: a one-way call once taken, a request once answered.
-fn Driver.take_outstanding(mut self, id: u64, request: bool) -> Option[Outstanding] {
+/// The outstanding call `id` when its handler call ends at `now_ns`, recording its span when traced: a one-way call once taken, a request once answered or postponed.
+fn Driver.take_outstanding[J: Journal](mut self, id: u64, request: bool, journal: J, now_ns: u64) -> Option[Outstanding] {
     let Some(domain) = mut self.domain.extract() else {
         return None
     }
@@ -823,7 +929,20 @@ fn Driver.take_outstanding(mut self, id: u64, request: bool) -> Option[Outstandi
         ended = mut current.outstanding.extract()
     }
     self.domain = Some(take current)
-    return ended
+    let Some(found) = ended else {
+        return None
+    }
+    var outstanding = found
+    match mut outstanding.span.extract() {
+        Some(begun) => {
+            var span = begun
+            span.run_ns = now_ns.saturating_sub(span.start_ns)
+            journal.span(self.slot, span)
+        }
+        None => {
+        }
+    }
+    return Some(take outstanding)
 } Driver.take_outstanding
 
 /// The postponed request `id`, which its answer ends.
@@ -846,8 +965,8 @@ fn Domain.ends(self, id: u64, request: bool) -> bool {
     return outstanding.id == id and outstanding.reply.is_some() == request
 } Domain.ends
 
-/// Delivers the next queued call to a running domain with no call outstanding.
-fn Driver.deliver(mut self) fails task::Cancelled uses wait {
+/// Delivers the next queued call at `now_ns` to a running domain with no call outstanding, beginning its span when its cause or the instance is traced.
+fn Driver.deliver(mut self, now_ns: u64) fails task::Cancelled uses wait {
     if self.lifecycle != Some(os::Lifecycle.Running) or self.queue.len() == 0 {
         return
     }
@@ -859,7 +978,8 @@ fn Driver.deliver(mut self) fails task::Cancelled uses wait {
         self.domain = Some(take current)
         return
     }
-    let os::Call(hash: hash, encoded: encoded, reply: reply, lease: lease) = mut self.queue.remove(0)
+    let Queued(call: call, since_ns: since_ns) = mut self.queue.remove(0)
+    let os::Call(hash: hash, encoded: encoded, reply: reply, lease: lease, header: header) = call
     self.counted()
     let id = current.next_id
     current.next_id += 1
@@ -870,11 +990,23 @@ fn Driver.deliver(mut self) fails task::Cancelled uses wait {
         mut copy.append(encoded.bytes.view())
         message = Some(take copy)
     }
-    current.outstanding = Some(Outstanding(id: id, reply: take reply, lease: take lease, message: take message))
+    var span: Option[Span] = None
+    if header.traced() or self.traced(now_ns) {
+        span = Some(Span(cause: header.cause, start_ns: now_ns, wait_ns: now_ns.saturating_sub(since_ns), run_ns: 0, sender: header.sender, operation: operation_name(encoded.bytes.view(), alloc: self.alloc), trapped: None))
+    }
+    current.outstanding = Some(Outstanding(id: id, reply: take reply, lease: take lease, header: header, message: take message, span: span))
     let deliveries = current.deliveries.split()
     self.domain = Some(take current)
-    discard attempt await deliveries.send(Delivery.Call(id: id, hash: hash, encoded: take encoded, request: request))
+    discard attempt await deliveries.send(Delivery.Call(id: id, hash: hash, encoded: take encoded, request: request, header: header))
 } Driver.deliver
+
+/// Whether the instance's handler calls are traced at `now_ns`.
+fn Driver.traced(self, now_ns: u64) -> bool {
+    return match self.traced_until {
+        Some(until) => now_ns < until
+        None => false
+    }
+} Driver.traced
 
 /// Ends the running incarnation's domain: its outstanding call and the requests it postponed end with `port.server-stopped`, or for a driver with `device.reset`, `device.unplugged` once its device left, and its deliveries close.
 fn Driver.end_domain(mut self) fails task::Cancelled uses wait {
@@ -922,7 +1054,8 @@ fn stop_outstanding(take ended: Outstanding, ending: Ending) fails task::Cancell
 /// Drops the queued one-way calls and fails the queued requests with `port.server-stopped`.
 fn Driver.refuse_queued(mut self) fails task::Cancelled uses wait {
     while self.queue.len() > 0 {
-        try await refuse(mut self.queue.remove(0), answer: os::Answer.ServerStopped)
+        let Queued(call: call, since_ns: _) = mut self.queue.remove(0)
+        try await refuse(take call, answer: os::Answer.ServerStopped)
     }
     self.counted()
 } Driver.refuse_queued
@@ -943,7 +1076,7 @@ fn Driver.takes_calls(self) -> bool {
 
 /// Ends a call without delivering it: a one-way call is dropped, a request answered with `answer`, and its credit returns.
 fn refuse(take call: os::Call, take answer: os::Answer) fails task::Cancelled uses wait {
-    let os::Call(hash: _, encoded: _, reply: reply, lease: lease) = call
+    let os::Call(hash: _, encoded: _, reply: reply, lease: lease, header: _) = call
     match reply {
         Some(sender) => {
             discard attempt await sender.send(take answer)
@@ -990,7 +1123,7 @@ fn Driver.trigger(self) {
 
 /// Releases what the driver holds once its inputs have ended.
 fn Driver.abandon(take self) {
-    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, traps: _, started_ns: _, queue: _, intake: _, domain: _, then: _, cause: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _, showing: _, alloc: _) = self
+    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, traps: _, started_ns: _, queue: _, intake: _, domain: _, then: _, abandonment: _, cause: _, changed_by: _, traced_until: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _, showing: _, alloc: _) = self
     gate.set(open: false)
     take minted.close()
 } Driver.abandon

@@ -14,6 +14,8 @@ protocol Counter {
     pub fn settle() -> u32 limits recorded
     /// Whether the tally is suspended.
     pub fn asleep() -> bool limits pure
+    /// The cause of the handler call, as a header holds it.
+    pub fn cause() -> u64 limits pure
 } Counter
 
 struct TallyEnv {
@@ -46,14 +48,22 @@ struct Spare {
 
 impl Spare: Reservations
 
-/// A journal counting each kind of event.
+/// A journal counting each kind of event and the spans, keeping the cause of the last start and of the last span, and opening causes numbered from `OPENED` up, the last under `parent`.
 struct Counts {
     started: mem::Shared[core::atomic::AtomicU64]
     stopped: mem::Shared[core::atomic::AtomicU64]
     trapped: mem::Shared[core::atomic::AtomicU64]
     failed: mem::Shared[core::atomic::AtomicU64]
     revoked: mem::Shared[core::atomic::AtomicU64]
+    spans: mem::Shared[core::atomic::AtomicU64]
+    start_cause: mem::Shared[core::atomic::AtomicU64]
+    span_cause: mem::Shared[core::atomic::AtomicU64]
+    opened: mem::Shared[core::atomic::AtomicU64]
+    parent: mem::Shared[core::atomic::AtomicU64]
 } Counts
+
+/// The first cause a `Counts` opens.
+const OPENED: u64 = 0x1000
 
 impl Counts: Journal
 
@@ -104,6 +114,10 @@ fn Tally.asleep(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> bool {
     return self.suspended
 } Tally.asleep
 
+fn Tally.cause(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 {
+    return os::Header.current().cause
+} Tally.cause
+
 fn Tally.suspend(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) {
     self.suspended = true
 } Tally.suspend
@@ -139,6 +153,13 @@ fn unlogged(alloc: mem::Alloc) -> task::Sender[journal::Logged] {
     return logs
 } unlogged
 
+/// No set of traced instances.
+fn untraced(alloc: mem::Alloc) -> task::Receiver[mem::List[journal::TracedInstance]] {
+    let task::Channel(sender: dropped, receiver: tracings) = task::Channel[mem::List[journal::TracedInstance]].bounded(1, alloc)
+    discard dropped
+    return tracings
+} untraced
+
 fn unread(alloc: mem::Alloc) -> task::Sender[os::Posting] {
     let task::Channel(sender: posted, receiver: dropped) = task::Channel[os::Posting].bounded(1, alloc)
     discard dropped
@@ -146,10 +167,15 @@ fn unread(alloc: mem::Alloc) -> task::Sender[os::Posting] {
 } unread
 
 fn Counts.of(alloc: mem::Alloc) -> Counts {
-    return Counts(started: counter(alloc), stopped: counter(alloc), trapped: counter(alloc), failed: counter(alloc), revoked: counter(alloc))
+    return Counts(started: counter(alloc), stopped: counter(alloc), trapped: counter(alloc), failed: counter(alloc), revoked: counter(alloc), spans: counter(alloc), start_cause: counter(alloc), span_cause: counter(alloc), opened: counter(alloc), parent: counter(alloc))
 } Counts.of
 
-fn Counts.record(self, slot: u32, event: Event) {
+fn Counts.record(self, slot: u32, cause: u64, event: Event) {
+    match event {
+        Event.Started(incarnation: _, checkpoint: _) => self.start_cause.contents().store(cause)
+        else => {
+        }
+    }
     let count = match event {
         Event.Started(incarnation: _, checkpoint: _) => self.started.share()
         Event.Stopped(abandoned: _) => self.stopped.share()
@@ -160,6 +186,16 @@ fn Counts.record(self, slot: u32, event: Event) {
     }
     discard count.contents().fetch_add(1)
 } Counts.record
+
+fn Counts.open(self, slot: u32, moniker: ident::Moniker, incarnation: u64, parent: u64) -> u64 {
+    self.parent.contents().store(parent)
+    return OPENED + self.opened.contents().fetch_add(1).value_or(0)
+} Counts.open
+
+fn Counts.span(self, slot: u32, span: Span) {
+    self.span_cause.contents().store(span.cause)
+    discard self.spans.contents().fetch_add(1)
+} Counts.span
 
 fn Counts.name(self, slot: u32, take moniker: ident::Moniker) {
 } Counts.name
@@ -186,7 +222,7 @@ fn configured(world: host::World) -> Config {
     classes[1] = 2
     classes[2] = 3
     classes[3] = 4
-    return Config(exec: world.exec, pool: world.alloc, alloc: world.alloc, clock: world.clock, wall: ident::Wall(at: ident::WallTime(utc_ns: NOON_NS, uncertainty_ns: 1_000_000_000), since_ns: 0), random: world.random, classes: classes)
+    return Config(exec: world.exec, pool: world.alloc, alloc: world.alloc, clock: world.clock, wall: ident::Wall(at: ident::WallTime(utc_ns: NOON_NS, uncertainty_ns: 1_000_000_000), since_ns: 0), random: world.random, classes: classes, system: ident::Cause.of(1, number: 1))
 } configured
 
 /// One tally named `tally`, whose specification `adjust` changes, and no grant.
@@ -211,6 +247,12 @@ fn note(port: os::Port[Counter], amount: u32, alloc: mem::Alloc) fails os::PortE
     sys::Wire[Counter].note(mut call, amount)
     try await port.post(take call)
 } note
+
+fn cause_of(port: os::Port[Counter], alloc: mem::Alloc) -> u64 fails os::PortError[Never] uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Counter].cause(mut call)
+    return try await port.call(take call, reply, alloc)
+} cause_of
 
 fn divide(port: os::Port[Counter], by: u32, alloc: mem::Alloc) fails os::PortError[Never] uses wait {
     var call = sys::Encoded.empty(alloc)
@@ -294,7 +336,7 @@ test running_incarnations_read_their_gauges_until_they_end for Gauges.read {
     let world = testing::world()
     let gauges = Gauges.empty(world.alloc)
     let reading = gauges.share()
-    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: Counts.of(world.alloc), reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges, body: fn(core: Core) -> Array[bool, 2] fails Failure uses wait {
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: Counts.of(world.alloc), reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges, tracings: untraced(world.alloc), body: fn(core: Core) -> Array[bool, 2] fails Failure uses wait {
         return try await read_tally(core, gauges: reading, alloc: world.alloc)
     })
     let Some(read) = seen else {
@@ -304,10 +346,63 @@ test running_incarnations_read_their_gauges_until_they_end for Gauges.read {
     expect read[0] and read[1]
 } running_incarnations_read_their_gauges_until_they_end
 
+/// The causes the tally's handler calls saw: of a call sent under `traced`, then of one sent as the runner's work.
+fn caused(core: Core, traced: u64, alloc: mem::Alloc) -> Array[u64, 2] fails Failure uses wait {
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    var seen = Array[u64, 2].filled(0)
+    seen[0] = try await sys::run_headed(os::Header.of_work(cause: traced, slot: 0).carried(), body: fn() -> u64 fails Failure uses wait {
+        return try await cause_of(port, alloc)
+    })
+    seen[1] = try await cause_of(port, alloc)
+    discard try await core.control.stop(named("tally"), alloc)
+    return seen
+} caused
+
+test calls_carry_their_cause_and_traced_ones_a_span for run {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let traced = ident::Cause.of(1, number: 7).bits | 0x8000_0000_0000_0000
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[u64, 2] fails Failure uses wait {
+        return try await caused(core, traced, alloc: world.alloc)
+    })
+    let Some(causes) = seen else {
+        expect false
+        return
+    }
+    let spans = counts.spans.contents().load()
+    let span_cause = counts.span_cause.contents().load()
+    let start_cause = counts.start_cause.contents().load()
+    let parent = counts.parent.contents().load()
+    let system_cause = ident::Cause.of(1, number: 1).bits
+    expect causes[0] == traced and causes[1] == system_cause
+    expect spans == 1 and span_cause == traced and start_cause == OPENED and parent == system_cause
+} calls_carry_their_cause_and_traced_ones_a_span
+
+test instances_are_traced_until_their_expiry for traced_until {
+    let world = testing::world()
+    let config = configured(world)
+    var traced = mem::List[journal::TracedInstance].empty(world.alloc)
+    mut traced.push(journal::TracedInstance(moniker: named("tally"), expires: ident::WallTime(utc_ns: NOON_NS + 60_000_000_000, uncertainty_ns: 0)))
+    mut traced.push(journal::TracedInstance(moniker: named("gone"), expires: ident::WallTime(utc_ns: NOON_NS - 1, uncertainty_ns: 0)))
+    let until = traced_until(traced, moniker: named("tally"), config).value_or(0)
+    let expired = traced_until(traced, moniker: named("gone"), config)
+    let unnamed = traced_until(traced, moniker: named("other"), config)
+    let bound = now(config.clock) + 60_000_000_000
+    expect until > 59_000_000_000 and until <= bound
+    expect expired.is_none() and unnamed.is_none()
+} instances_are_traced_until_their_expiry
+
 test instances_serve_calls_in_order_until_stopped for run {
     let world = testing::world()
     let counts = Counts.of(world.alloc)
-    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Seen fails Failure uses wait {
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Seen fails Failure uses wait {
         return try await exercised(core, alloc: world.alloc)
     })
     var totals = Array[u64, 3].filled(0)
@@ -340,7 +435,7 @@ fn restarted(core: Core, alloc: mem::Alloc) -> Array[u64, 2] fails Failure uses 
 test trapped_instances_restart_and_keep_their_intake for run {
     let world = testing::world()
     let counts = Counts.of(world.alloc)
-    let totals = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Array[u64, 2] fails Failure uses wait {
+    let totals = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[u64, 2] fails Failure uses wait {
         return try await restarted(core, alloc: world.alloc)
     })
     let started = counts.started.contents().load()
@@ -388,7 +483,7 @@ fn exhausted(core: Core, alloc: mem::Alloc) -> Array[os::Lifecycle, 2] fails Fai
 test intensity_sends_instances_to_failed for run {
     let world = testing::world()
     let counts = Counts.of(world.alloc)
-    let states = try await run(one_tally(world.alloc, adjust: fragile), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+    let states = try await run(one_tally(world.alloc, adjust: fragile), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
         return try await exhausted(core, alloc: world.alloc)
     })
     let failed = counts.failed.contents().load()
@@ -426,7 +521,7 @@ fn followed(core: Core, exec: task::Executor, alloc: mem::Alloc) -> Array[os::Li
 test changes_are_answered_once_the_lifecycle_differs for run {
     let world = testing::world()
     let counts = Counts.of(world.alloc)
-    let states = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+    let states = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
         return try await followed(core, exec: world.exec, alloc: world.alloc)
     })
     let Some(seen) = states else {
@@ -462,7 +557,7 @@ fn woken(core: Core, alloc: mem::Alloc) -> Array[os::Lifecycle, 2] fails Failure
 test lazy_instances_start_at_their_first_call for run {
     let world = testing::world()
     let counts = Counts.of(world.alloc)
-    let states = try await run(one_tally(world.alloc, adjust: lazy), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
+    let states = try await run(one_tally(world.alloc, adjust: lazy), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails Failure uses wait {
         return try await woken(core, alloc: world.alloc)
     })
     let started = counts.started.contents().load()
@@ -502,7 +597,7 @@ fn slept(core: Core, alloc: mem::Alloc) -> Array[bool, 3] fails Failure uses wai
 test idle_instances_suspend_until_their_next_message for idle {
     let world = testing::world()
     let counts = Counts.of(world.alloc)
-    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Array[bool, 3] fails Failure uses wait {
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[bool, 3] fails Failure uses wait {
         return try await slept(core, alloc: world.alloc)
     })
     let Some(states) = seen else {
@@ -587,7 +682,7 @@ fn tally_and_client(take principal: ident::Principal, alloc: mem::Alloc) -> Know
 test wires_need_a_covering_grant for Directory.world {
     let world = testing::world()
     let alloc = world.alloc
-    let covered = try await run(tally_and_client(system(), alloc), components: Pair(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> os::Lifecycle fails os::ControlError uses wait {
+    let covered = try await run(tally_and_client(system(), alloc), components: Pair(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(named("client"), alloc)
         let Some(minted) = try await core.port(named("client"), credit: os::Credit(messages: 1, calls: 1)) else {
             return started
@@ -603,7 +698,7 @@ test wires_need_a_covering_grant for Directory.world {
         return started
     })
     let stranger = ident::Principal(text: text::Fixed[64].of("agent.stranger"))
-    let uncovered = try await run(tally_and_client(take stranger, alloc), components: Pair(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> os::Lifecycle fails os::ControlError uses wait {
+    let uncovered = try await run(tally_and_client(take stranger, alloc), components: Pair(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> os::Lifecycle fails os::ControlError uses wait {
         return try await core.control.start(named("client"), alloc)
     })
     expect covered == Some(os::Lifecycle.Running)
@@ -636,10 +731,10 @@ fn reserved_call(core: Core, alloc: mem::Alloc) -> os::Lifecycle fails Failure u
 test reserved_instances_need_a_region for Shared.cell {
     let world = testing::world()
     let alloc = world.alloc
-    let held = try await run(one_tally(alloc, adjust: reserved), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> os::Lifecycle fails Failure uses wait {
+    let held = try await run(one_tally(alloc, adjust: reserved), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> os::Lifecycle fails Failure uses wait {
         return try await reserved_call(core, alloc)
     })
-    let missing = try await run(one_tally(alloc, adjust: reserved), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: false), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> os::Lifecycle fails Failure uses wait {
+    let missing = try await run(one_tally(alloc, adjust: reserved), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: false), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> os::Lifecycle fails Failure uses wait {
         return try await reserved_call(core, alloc)
     })
     expect held == Some(os::Lifecycle.Running)
@@ -671,7 +766,7 @@ test revoking_a_grant_takes_its_descendants_and_fails_later_starts for Core.revo
     var known = tally_and_client(system(), alloc)
     discard mut known.grants.insert(1, value: os::Grant(holder: system(), object: os::Object.Instance(prefix: named("tally")), rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 2)))
     let counts = Counts.of(alloc)
-    let seen = try await run(take known, components: Pair(), journal: counts, reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Outcomes fails os::ControlError uses wait {
+    let seen = try await run(take known, components: Pair(), journal: counts, reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Outcomes fails os::ControlError uses wait {
         return try await revoke_root(core, alloc)
     })
     let revoked = counts.revoked.contents().load()
@@ -741,7 +836,7 @@ test grants_expire_at_start_and_once_their_expiry_passes for expire {
     discard mut known.grants.insert(2, value: expiring(system(), parent: 0, seconds: -1, alloc))
     discard mut known.grants.insert(3, value: os::Grant(holder: system(), object: os::Object.Clock, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: Some(2), granted_by: ident::CommitId(number: 3)))
     let counts = Counts.of(alloc)
-    let seen = try await run(take known, components: Pair(), journal: counts, reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails os::ControlError uses wait {
+    let seen = try await run(take known, components: Pair(), journal: counts, reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[os::Lifecycle, 2] fails os::ControlError uses wait {
         return try await outlived(core, clock: world.clock, alloc)
     })
     let revoked = counts.revoked.contents().load()
@@ -811,7 +906,7 @@ fn made(core: Core, exec: task::Executor, alloc: mem::Alloc) -> Made fails Failu
 test created_instances_answer_postponed_requests_until_deleted for Directory.create {
     let world = testing::world()
     let alloc = world.alloc
-    let seen = try await run(Known(specs: mem::Map.empty(alloc), grants: mem::Map.empty(alloc)), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), body: fn(core: Core) -> Made fails Failure uses wait {
+    let seen = try await run(Known(specs: mem::Map.empty(alloc), grants: mem::Map.empty(alloc)), components: Tallies(), journal: Counts.of(alloc), reservations: Spare(alloc: alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Made fails Failure uses wait {
         return try await made(core, exec: world.exec, alloc)
     })
     expect seen == Some(Made(initial: 6, postponed: 6, revoked: true, missing: true))

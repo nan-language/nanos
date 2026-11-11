@@ -16,12 +16,26 @@ pub interface Reservations {
     fn reserve(self, bytes: u64) -> Option[mem::Heap] fails task::Cancelled uses wait
 } Reservations
 
-/// Where the runner records events, each with the slot of its instance, 0 for the core's, and the instance each slot names.
+/// Where the runner records events, each with the slot of its instance, 0 for the core's, and the cause of the work it tells of as a header holds it, 0 for the core's own; where it opens the start causes of incarnations and records the spans of handler calls; and the instance each slot names.
 pub interface Journal {
-    fn record(self, slot: u32, event: Event)
+    fn record(self, slot: u32, cause: u64, event: Event)
+    /// Opens the start cause of the incarnation `incarnation` of the instance `moniker` of slot `slot`, under the cause `parent`, and gives it, each as a header holds it.
+    fn open(self, slot: u32, moniker: ident::Moniker, incarnation: u64, parent: u64) -> u64
+    fn span(self, slot: u32, span: Span)
     /// Notes that the slot `slot` names the instance `moniker`.
     fn name(self, slot: u32, take moniker: ident::Moniker) fails task::Cancelled uses wait
 } Journal
+
+/// A handler call: its cause as a header holds it, the monotonic time it began, its time queued in the instance's intake and running, the slot of the sending instance, 0 for the core, the operation it handled, its name cut to 20 bytes, and the kind of its trap when it trapped.
+pub closed struct Span derives Copy {
+    pub cause: u64
+    pub start_ns: u64
+    pub wait_ns: u64
+    pub run_ns: u64
+    pub sender: u32
+    pub operation: text::Fixed[20]
+    pub trapped: Option[sys::TrapKind]
+} Span
 
 /// An event of an instance's life, or of the core's for `Revoked`: a start names the checkpoint it restored, a failed checkpoint the code of its failure and the bytes of its encoding.
 pub closed enum Event derives Copy, Eq {
@@ -41,7 +55,7 @@ pub closed enum Reason derives Copy, Eq {
     Expiry
 } Reason
 
-/// What the runner draws on: the executor its instances' accounts split from, the allocator their cells split from, its own allocator, the monotonic clock, the wall clock grants expire by, the random source instances holding a `Random` grant draw from, and the executor's class of each CPU class, `latency`, `normal` and `background` in order, then of core work whose timers never wake an idle machine.
+/// What the runner draws on: the executor its instances' accounts split from, the allocator their cells split from, its own allocator, the monotonic clock, the wall clock grants expire by, the random source instances holding a `Random` grant draw from, the executor's class of each CPU class, `latency`, `normal` and `background` in order, then of core work whose timers never wake an idle machine, and the boot's system cause, that of the runner's own work.
 pub closed struct Config derives Copy {
     pub exec: task::Executor
     pub pool: mem::Alloc
@@ -50,7 +64,11 @@ pub closed struct Config derives Copy {
     pub wall: ident::Wall
     pub random: sys::Random
     pub classes: Array[u8, 4]
+    pub system: ident::Cause
 } Config
+
+/// The header of the runner's own work.
+fn Config.work(self) -> os::Header = os::Header.of_work(cause: self.system.bits, slot: 0)
 
 /// The latest UTC the wall time `time` may be, in nanoseconds: its time plus its uncertainty.
 fn latest(time: ident::WallTime) -> i64 = time.utc_ns.saturating_add(i64.saturate(time.uncertainty_ns))
@@ -118,7 +136,7 @@ fn ask(revocations: task::Sender[Revocation], grant: u64, reason: Reason, alloc:
     return revoked
 } ask
 
-/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them: each has a driver carrying out its lifecycle and publishing its record through `postings` and the gauge of its running incarnation through `gauges`, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes.
+/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them, as work of the boot's system cause, `body`'s included: each has a driver carrying out its lifecycle and publishing its record through `postings` and the gauge of its running incarnation through `gauges`, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes. The handler calls of the instances each set `tracings` gives names are traced, each until it expires.
 pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Reservations and Send, T: Send, E: Send](
     take known: Known,
     components: C,
@@ -128,6 +146,7 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Reservations
     postings: task::Sender[os::Posting],
     logs: task::Sender[journal::Logged],
     gauges: Gauges,
+    take tracings: task::Receiver[mem::List[journal::TracedInstance]],
     body: fn(core: Core) -> T fails E uses wait limits stack 16_384,
     ) -> Option[T] fails E uses wait {
     let alloc = config.alloc
@@ -148,38 +167,46 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Reservations
     }
     let expired = mut listed.expire(reached: latest(config.wall.now(config.clock)), alloc)
     for number in expired {
-        journal.record(0, event: Event.Revoked(grant: number, reason: Reason.Expiry))
+        journal.record(0, cause: 0, event: Event.Revoked(grant: number, reason: Reason.Expiry))
     }
     let directory = task::Cown.of(take listed, alloc)
     let reached = directory.share()
     let routes = task::Cown.of(mem::Map[ident::Moniker, task::Sender[Input]].empty(alloc), alloc)
-    let shared = Shared[C, R](components: components, reservations: take reservations, config: config, directory: take directory, orders: orders.split(), withheld: withheld, postings: postings.split(), logs: logs.split(), gauges: gauges.share())
+    let traced = task::Cown.of(mem::List[journal::TracedInstance].empty(alloc), alloc)
+    let shared = Shared[C, R](components: components, reservations: take reservations, config: config, directory: take directory, orders: orders.split(), withheld: withheld, postings: postings.split(), logs: logs.split(), gauges: gauges.share(), traced: traced.share())
     let core = os::MintedControl.of(orders, grant: None, prefix: None, alloc)
     defer take core.close()
     var result: Option[T] = None
-    var waiting = Some(Waiting(drivers: take drivers, ordered: take ordered, revoking: take revoking))
+    var waiting = Some(Waiting(drivers: take drivers, ordered: take ordered, revoking: take revoking, tracing: take tracings))
     defer abandon(take waiting)
-    try await task::scope(config.exec, body: fn[mut result, mut waiting](s: task::Scope) fails E uses wait {
-        let Some(Waiting(drivers: started, ordered: orders_in, revoking: revoking_in)) = mut waiting.extract() else {
-            return
-        }
-        let governed = routes.share()
-        discard s.spawn(fn[take started, take orders_in, take governed]() fails task::Cancelled uses wait limits stack 57_344 {
-            try await shared.govern(take started, orders: take orders_in, routes: governed, journal)
+    try await sys::run_headed(config.work().carried(), body: fn[mut result, mut waiting]() fails E uses wait {
+        try await task::scope(config.exec, body: fn[mut result, mut waiting](s: task::Scope) fails E uses wait {
+            let Some(Waiting(drivers: started, ordered: orders_in, revoking: revoking_in, tracing: tracing_in)) = mut waiting.extract() else {
+                return
+            }
+            let governed = routes.share()
+            discard s.spawn(fn[take started, take orders_in, take governed]() fails task::Cancelled uses wait limits stack 57_344 {
+                try await shared.govern(take started, orders: take orders_in, routes: governed, journal)
+            })
+            let revoked = reached.share()
+            let revoking_routes = routes.share()
+            discard s.spawn(fn[take revoking_in, take revoked, take revoking_routes]() fails task::Cancelled uses wait limits stack 16_384 {
+                try await revoke(take revoking_in, routes: revoking_routes, directory: revoked, journal, alloc)
+            })
+            let tracing_routes = routes.share()
+            let tracing_set = traced.share()
+            discard s.spawn(fn[take tracing_in, take tracing_routes, take tracing_set]() fails task::Cancelled uses wait limits stack 16_384 {
+                try await trace(take tracing_in, routes: tracing_routes, traced: tracing_set, config)
+            })
+            let timed = reached.share()
+            let expiries = revocations.split()
+            discard s.spawn(fn[take timed, take expiries]() fails task::Cancelled uses wait limits stack 16_384 {
+                try await expire_deferred(take expiries, directory: timed, config)
+            })
+            let control = core.mint(os::ControlRights(read: true, lifecycle: true, spawn: true, reserved: 0))
+            result = Some(try await body(Core(control: control, directory: reached.share(), revocations: revocations.split(), alloc: alloc)))
+            s.cancel()
         })
-        let revoked = reached.share()
-        let revoking_routes = routes.share()
-        discard s.spawn(fn[take revoking_in, take revoked, take revoking_routes]() fails task::Cancelled uses wait limits stack 16_384 {
-            try await revoke(take revoking_in, routes: revoking_routes, directory: revoked, journal, alloc)
-        })
-        let timed = reached.share()
-        let expiries = revocations.split()
-        discard s.spawn(fn[take timed, take expiries]() fails task::Cancelled uses wait limits stack 16_384 {
-            try await expire_deferred(take expiries, directory: timed, config)
-        })
-        let control = core.mint(os::ControlRights(read: true, lifecycle: true, spawn: true, reserved: 0))
-        result = Some(try await body(Core(control: control, directory: reached.share(), revocations: revocations.split(), alloc: alloc)))
-        s.cancel()
     })
     return result
 } run
@@ -199,18 +226,19 @@ linear struct Started {
     calls: task::Receiver[os::Call]
 } Started
 
-/// What the runner's scope takes once: the drivers, the orders to carry out, and the revocations.
+/// What the runner's scope takes once: the drivers, the orders to carry out, the revocations, and the instances to trace.
 linear struct Waiting {
     drivers: mem::List[Started]
     ordered: task::Receiver[os::Order]
     revoking: task::Receiver[Revocation]
+    tracing: task::Receiver[mem::List[journal::TracedInstance]]
 } Waiting
 
 /// Releases the drivers that never ran.
 fn abandon(take waiting: Option[Waiting]) {
     match waiting {
         Some(left) => {
-            let Waiting(drivers: drivers, ordered: _, revoking: _) = left
+            let Waiting(drivers: drivers, ordered: _, revoking: _, tracing: _) = left
             for each in take drivers {
                 let Started(driver: driver, inputs: _, taken: _, calls: _) = each
                 take driver.abandon()
@@ -235,12 +263,12 @@ fn revoke[J: Journal](
             return
         }
         let revoked = await when mut directory => mut directory.revoke(grant, alloc)
-        let drivers = await when routes => senders_of(routes, alloc)
+        let drivers = await when routes => routed(routes, alloc)
         if revoked.len() > 0 and drivers.len() > 0 {
             let task::Channel(sender: closed, receiver: acknowledged) = task::Channel[Unit].bounded(drivers.len(), alloc)
             var asked: usize = 0
             for driver in drivers {
-                match attempt await driver.send(Input.Revoke(grants: copy_of(revoked, alloc), done: closed.split())) {
+                match attempt await driver.inputs.send(Input.Revoke(grants: copy_of(revoked, alloc), done: closed.split())) {
                     Ok(_) => {
                         asked += 1
                     }
@@ -255,19 +283,69 @@ fn revoke[J: Journal](
             }
         }
         for number in revoked {
-            journal.record(0, event: Event.Revoked(grant: number, reason: reason))
+            journal.record(0, cause: 0, event: Event.Revoked(grant: number, reason: reason))
         }
         discard attempt await done.send(take revoked)
     }
 } revoke
 
-fn senders_of(routes: mem::Map[ident::Moniker, task::Sender[Input]], alloc: mem::Alloc) -> mem::List[task::Sender[Input]] {
-    var senders = mem::List[task::Sender[Input]].empty(alloc)
-    for route in routes {
-        mut senders.push(route.value().split())
+/// Keeps each set of traced instances in `traced`, for the drivers launched after it, and tells every driver `routes` reaches until when its instance is traced.
+fn trace(take tracings: task::Receiver[mem::List[journal::TracedInstance]], routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]], traced: task::Cown[mem::List[journal::TracedInstance]], config: Config) fails task::Cancelled uses wait {
+    var receiver = tracings
+    loop {
+        let Some(instances) = try await mut receiver.receive() else {
+            return
+        }
+        var given = Some(take instances)
+        await when mut traced {
+            match mut given.extract() {
+                Some(set) => {
+                    traced = set
+                }
+                None => {
+                }
+            }
+        }
+        let drivers = await when routes => routed(routes, alloc: config.alloc)
+        for driver in drivers {
+            let until = await when traced => traced_until(traced, moniker: driver.moniker, config)
+            match attempt await driver.inputs.send(Input.Trace(until_ns: until)) {
+                Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+                else => {
+                }
+            }
+        }
     }
-    return senders
-} senders_of
+} trace
+
+/// The monotonic time until which `traced` traces the instance `moniker`, `None` when it does not or its expiry has passed.
+fn traced_until(traced: mem::List[journal::TracedInstance], moniker: ident::Moniker, config: Config) -> Option[u64] {
+    for instance in traced {
+        if instance.moniker != moniker {
+            continue
+        }
+        let left = instance.expires.utc_ns.saturating_sub(config.wall.now(config.clock).utc_ns)
+        if left <= 0 {
+            return None
+        }
+        return Some(now(config.clock).saturating_add(u64.saturate(left)))
+    }
+    return None
+} traced_until
+
+/// A driver `routes` reaches, and its instance.
+struct Routed {
+    moniker: ident::Moniker
+    inputs: task::Sender[Input]
+} Routed
+
+fn routed(routes: mem::Map[ident::Moniker, task::Sender[Input]], alloc: mem::Alloc) -> mem::List[Routed] {
+    var drivers = mem::List[Routed].empty(alloc)
+    for route in routes {
+        mut drivers.push(Routed(moniker: ident::Moniker(text: route.key().text), inputs: route.value().split()))
+    }
+    return drivers
+} routed
 
 /// Runs `expire` on an account of core work whose timers never wake an idle machine, so that an expiry passing while it idles revokes at its next wake-up.
 fn expire_deferred(take revocations: task::Sender[Revocation], directory: task::Cown[Directory], config: Config) fails task::Cancelled uses wait {
