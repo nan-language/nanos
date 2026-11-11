@@ -10,13 +10,58 @@ pub closed enum Transport derives Copy, Eq, Render, Encode {
     Port
 } Transport
 
-/// A session: its number in the boot, its principal, its transport and when it opened.
+/// A session: its number in the boot, its principal, its transport and when it opened, in wall and monotonic time.
 pub closed struct Session derives Encode {
     pub number: u64
     pub principal: ident::Principal
     pub transport: Transport
     pub opened: ident::WallTime
+    pub opened_ns: u64
 } Session
+
+/// A session's record at `/live/sessions/<id>`: its principal, transport and path, whether it is connected, when it opened and, while detached, when it ends, its taint, its budgets' use, its watches, the session whose `delegate` created its principal, and when it was published.
+pub closed struct LiveSession derives Render, Encode {
+    pub principal: ident::Principal
+    pub transport: Transport
+    /// `link`, its device's driver and, for vsock and TCP, `net`.
+    pub path: mem::List[ident::Moniker]
+    pub connected: bool
+    pub opened: ident::WallTime
+    /// The end of its reattach window while detached.
+    pub expires: Option[ident::WallTime]
+    pub taint: mem::List[ident::OriginLabel]
+    pub budgets: mem::List[BudgetUse]
+    pub watches: u32
+    /// The session whose `delegate` created its principal.
+    pub parent: Option[ident::SessionId]
+    pub as_of: u64
+} LiveSession
+
+pub closed struct BudgetUse derives Render, Encode {
+    pub name: text::String
+    pub used: u64
+    pub limit: Option[u64]
+} BudgetUse
+
+/// The payload of `link.session-opened`, `link.session-detached`, `link.session-resumed` and `link.session-ended`.
+pub closed struct SessionEvent derives Render, Encode {
+    pub session: ident::SessionId
+    pub principal: ident::Principal
+    pub transport: Transport
+} SessionEvent
+
+/// The payload of `link.hello-rejected`.
+pub closed struct HelloRejected derives Render, Encode {
+    pub principal: ident::Principal
+    pub transport: Transport
+    pub code: text::String
+} HelloRejected
+
+/// The summary `link` publishes: the monotonic time of the boot's first ready record, and the sessions open.
+pub closed struct LinkSummary derives Render, Encode {
+    pub ready_ns: u64
+    pub sessions: u32
+} LinkSummary
 
 /// The challenge of a connection's latest `hello`: the principal it answers, its nonce, the connection's binding, and when it expires, in wall and monotonic time.
 pub closed struct Challenge derives Encode {
@@ -137,6 +182,11 @@ fn Linker.hello_step(mut self, take number: u64, take step: HelloStep, mut env: 
         HelloStep.Rejected(code: code) => {
             let block = self.running[at].failed(Failure.of(code.as_str(), subject: principal.text.as_str(), alloc), alloc)
             mut self.respond(at, take block, mut env, mut cx)
+            let events = env.events
+            let rejected = HelloRejected(principal: take principal, transport: Transport.Serial, code: text::String.of(code.as_str(), alloc))
+            mut cx.spawn(key: EMITTING, run: fn[take rejected](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
+                try await events.emit("link.hello-rejected", severity: journal::Severity.Warn, payload: rejected, alloc)
+            })
         }
     }
 } Linker.hello_step
@@ -171,10 +221,26 @@ fn Linker.challenge_block(mut self, at: usize, take principal: ident::Principal,
     return block
 } Linker.challenge_block
 
+/// The boot counter the link read at its start.
+fn Linker.boot(self) -> u64 {
+    return match self.facts {
+        Some(facts) => facts.boot
+        None => 0
+    }
+} Linker.boot
+
+/// Publishes the link's summary: when its first ready record went out, and the sessions open.
+fn Linker.summarize(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[LinkSummary].encode(LinkSummary(ready_ns: self.ready_ns, sessions: u32.saturate(self.sessions.len())), out: mut bytes)
+    discard attempt mut cx.publish(bytes.view())
+} Linker.summarize
+
 /// Opens the session of `principal` on serial for the `hello` numbered `number`, which a keyed task answers with its `session` and `system` records.
 fn Linker.open(mut self, number: u64, take principal: ident::Principal, mut env: Env, mut cx: sys::Cx[Link]) {
     let alloc = env.alloc
-    let session = Session(number: self.next_session, principal: take principal, transport: Transport.Serial, opened: env.wall.now(env.clock))
+    let session = Session(number: self.next_session, principal: take principal, transport: Transport.Serial, opened: env.wall.now(env.clock), opened_ns: now_ns(env.clock))
     self.next_session += 1
     let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
         mut self.sessions.push(take session)
@@ -191,19 +257,26 @@ fn Linker.open(mut self, number: u64, take principal: ident::Principal, mut env:
         None => {
         }
     }
-    let shown = Session(number: session.number, principal: ident::Principal(text: session.principal.text), transport: session.transport, opened: session.opened)
+    let told = Session(number: session.number, principal: ident::Principal(text: session.principal.text), transport: session.transport, opened: session.opened, opened_ns: session.opened_ns)
     mut self.sessions.push(take session)
     let tree = env.tree
+    let live = env.live
+    let events = env.events
+    let boot = self.boot()
     let cut = self.cut(text::String.empty(alloc))
-    mut cx.spawn(key: ANSWERING + number, run: fn[take head, take shown, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
-        let block = try await opened_block(take head, session: shown, mode, generation, tree, alloc)
+    mut self.summarize(mut env, mut cx)
+    mut cx.spawn(key: ANSWERING + number, run: fn[take head, take told, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
+        let path = try await path_of_serial(tree, alloc)
+        let block = try await opened_block(take head, session: told, path, mode, generation, tree, alloc)
         discard attempt await out.responded(number, block: block.text(cut, alloc))
+        let record = LiveSession(principal: ident::Principal(text: told.principal.text), transport: told.transport, path: take path, connected: true, opened: told.opened, expires: None, taint: mem::List.empty(alloc), budgets: mem::List.empty(alloc), watches: 0, parent: None, as_of: told.opened_ns)
+        try await live.publish_below(below: session_text(told.number).as_str(), value: os::published("link::LiveSession", value: record, alloc), alloc)
+        try await events.emit("link.session-opened", severity: journal::Severity.Info, payload: SessionEvent(session: ident::SessionId(boot: boot, number: told.number), principal: ident::Principal(text: told.principal.text), transport: told.transport), alloc)
     })
 } Linker.open
 
-/// `head` with the `session` record of `session`, which opened in the mode `mode` of generation `generation`, and the `system` record of the machine and the instances.
-fn opened_block(take head: Block, session: Session, mode: text::Fixed[16], generation: u64, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
-    var block = head
+/// The path of the serial transport: `link` and the driver of the console role.
+fn path_of_serial(tree: store::service::View, alloc: mem::Alloc) -> mem::List[ident::Moniker] fails task::Cancelled uses wait {
     var path = mem::List[ident::Moniker].empty(alloc)
     mut path.push(ident::Moniker(text: text::Fixed[59].of("link")))
     match try await console_driver(tree, alloc) {
@@ -211,6 +284,12 @@ fn opened_block(take head: Block, session: Session, mode: text::Fixed[16], gener
         None => {
         }
     }
+    return path
+} path_of_serial
+
+/// `head` with the `session` record of `session`, which opened on `path` in the mode `mode` of generation `generation`, and the `system` record of the machine and the instances.
+fn opened_block(take head: Block, session: Session, path: mem::List[ident::Moniker], mode: text::Fixed[16], generation: u64, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+    var block = head
     var record = Record.of("session", alloc)
     mut record.words(session_text(session.number).as_str())
     mut record.field("principal", value: Dyn[Render].view(session.principal))

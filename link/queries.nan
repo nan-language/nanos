@@ -1,0 +1,380 @@
+//! Queries and selectors: the grammars `find` and `watch` take, and the fields, conditions and orders they apply to rows in canonical rendering.
+
+/// A query: the path its rows lie at, its condition, the fields it selects, its order and its limit.
+pub closed struct Query {
+    pub from: text::String
+    pub condition: Option[Condition]
+    pub select: mem::List[text::String]
+    pub order: Option[Order]
+    pub limit: Option[u64]
+} Query
+
+/// A selector: the path whose changes or records it selects, the event kinds and least severity it keeps, and its condition.
+pub closed struct Selector {
+    pub path: text::String
+    pub kinds: mem::List[text::String]
+    pub severity: Option[text::String]
+    pub condition: Option[Condition]
+} Selector
+
+/// An order: the field rows sort by, descending or not.
+pub closed struct Order {
+    pub field: text::String
+    pub descending: bool
+} Order
+
+/// A condition: its comparisons, joined by `and` when `all` holds, else by `or`.
+pub closed struct Condition {
+    pub all: bool
+    pub terms: mem::List[Term]
+} Condition
+
+/// A term: a comparison, or comparisons in parentheses, joined by `and` when `all` holds, else by `or`.
+pub closed enum Term {
+    Compare(Comparison)
+    Group(all: bool, comparisons: mem::List[Comparison])
+} Term
+
+/// A comparison of a field with a literal.
+pub closed struct Comparison {
+    pub field: text::String
+    pub comparator: Comparator
+    pub literal: text::String
+} Comparison
+
+pub closed enum Comparator derives Copy, Eq {
+    Equal
+    Different
+    Less
+    LessOrEqual
+    Greater
+    GreaterOrEqual
+    Prefix
+    Contains
+} Comparator
+
+/// The words of a query or selector: its tokens separated by spaces, with `,` a token of its own and parentheses and text literals kept whole.
+fn tokens_of(text: Str, alloc: mem::Alloc) -> Option[mem::List[text::String]] {
+    var tokens = mem::List[text::String].empty(alloc)
+    var current = text::String.empty(alloc)
+    var depth: u32 = 0
+    var quoted = false
+    var escaped = false
+    for c in text.cursor() {
+        if quoted {
+            mut current.push(c)
+            if escaped {
+                escaped = false
+            } else if c == '\\' {
+                escaped = true
+            } else if c == '"' {
+                quoted = false
+            }
+            continue
+        }
+        if depth == 0 and (c == ' ' or c == ',') {
+            flush(mut tokens, mut current, alloc)
+            if c == ',' {
+                mut tokens.push(text::String.of(",", alloc))
+            }
+            continue
+        }
+        if c == '"' {
+            quoted = true
+        } else if c == '(' {
+            depth += 1
+        } else if c == ')' {
+            if depth == 0 {
+                return None
+            }
+            depth -= 1
+        }
+        mut current.push(c)
+    }
+    if quoted or depth > 0 {
+        return None
+    }
+    flush(mut tokens, mut current, alloc)
+    return Some(take tokens)
+} tokens_of
+
+/// Ends the token being read, when it holds any character.
+fn flush(mut tokens: mem::List[text::String], mut current: text::String, alloc: mem::Alloc) {
+    if current.byte_len() == 0 {
+        return
+    }
+    mut tokens.push(text::String.of(current.as_str(), alloc))
+    mut current.clear()
+} flush
+
+/// The query `text` writes, `None` when the query grammar rejects it.
+pub fn Query.parse(text: Str, alloc: mem::Alloc) -> Option[Query] {
+    let Some(tokens) = tokens_of(text, alloc) else {
+        return None
+    }
+    if tokens.len() < 2 or tokens[0].as_str() != "from" {
+        return None
+    }
+    var query = Query(from: text::String.of(tokens[1].as_str(), alloc), condition: None, select: mem::List.empty(alloc), order: None, limit: None)
+    var at: usize = 2
+    if at < tokens.len() and tokens[at].as_str() == "where" {
+        let Some(read) = Condition.read(tokens, from: at + 1, ends: "select order limit", alloc) else {
+            return None
+        }
+        query.condition = Some(take read.condition)
+        at = read.next
+    }
+    if at < tokens.len() and tokens[at].as_str() == "select" {
+        at += 1
+        loop {
+            if at >= tokens.len() or not is_field(tokens[at].as_str()) {
+                return None
+            }
+            mut query.select.push(text::String.of(tokens[at].as_str(), alloc))
+            at += 1
+            if at >= tokens.len() or tokens[at].as_str() != "," {
+                break
+            }
+            at += 1
+        }
+    }
+    if at < tokens.len() and tokens[at].as_str() == "order" {
+        if at + 1 >= tokens.len() or not is_field(tokens[at + 1].as_str()) {
+            return None
+        }
+        var order = Order(field: text::String.of(tokens[at + 1].as_str(), alloc), descending: false)
+        at += 2
+        if at < tokens.len() and (tokens[at].as_str() == "asc" or tokens[at].as_str() == "desc") {
+            order.descending = tokens[at].as_str() == "desc"
+            at += 1
+        }
+        query.order = Some(take order)
+    }
+    if at < tokens.len() and tokens[at].as_str() == "limit" {
+        if at + 1 >= tokens.len() {
+            return None
+        }
+        let Some(limit) = number_of(tokens[at + 1].as_str()) else {
+            return None
+        }
+        query.limit = Some(limit)
+        at += 2
+    }
+    if at != tokens.len() {
+        return None
+    }
+    return Some(take query)
+} Query.parse
+
+/// The selector `text` writes, `None` when the selector grammar rejects it.
+pub fn Selector.parse(text: Str, alloc: mem::Alloc) -> Option[Selector] {
+    let Some(tokens) = tokens_of(text, alloc) else {
+        return None
+    }
+    if tokens.len() < 1 {
+        return None
+    }
+    var selector = Selector(path: text::String.of(tokens[0].as_str(), alloc), kinds: mem::List.empty(alloc), severity: None, condition: None)
+    var at: usize = 1
+    if at < tokens.len() and tokens[at].as_str() == "kind" {
+        at += 1
+        loop {
+            if at >= tokens.len() {
+                return None
+            }
+            mut selector.kinds.push(text::String.of(tokens[at].as_str(), alloc))
+            at += 1
+            if at >= tokens.len() or tokens[at].as_str() != "," {
+                break
+            }
+            at += 1
+        }
+    }
+    if at < tokens.len() and tokens[at].as_str() == "severity" {
+        if at + 2 >= tokens.len() or tokens[at + 1].as_str() != ">=" or not is_severity(tokens[at + 2].as_str()) {
+            return None
+        }
+        selector.severity = Some(text::String.of(tokens[at + 2].as_str(), alloc))
+        at += 3
+    }
+    if at < tokens.len() and tokens[at].as_str() == "where" {
+        let Some(read) = Condition.read(tokens, from: at + 1, ends: "", alloc) else {
+            return None
+        }
+        selector.condition = Some(take read.condition)
+        at = read.next
+    }
+    if at != tokens.len() {
+        return None
+    }
+    return Some(take selector)
+} Selector.parse
+
+/// A condition read from tokens, and the position of the token after it.
+struct ReadCondition {
+    condition: Condition
+    next: usize
+} ReadCondition
+
+/// The condition starting at `from` among `tokens`, ending before a keyword of `ends` or at the end; `and` and `or` mix only through parentheses.
+fn Condition.read(tokens: mem::List[text::String], from: usize, ends: Str, alloc: mem::Alloc) -> Option[ReadCondition] {
+    var condition = Condition(all: true, terms: mem::List.empty(alloc))
+    var joiner: Option[bool] = None
+    var at = from
+    loop {
+        if at >= tokens.len() {
+            return None
+        }
+        let token = tokens[at].as_str()
+        if token.starts_with("(") {
+            let Some(inner) = token.slice_bytes(1, end: token.byte_len() - 1) else {
+                return None
+            }
+            let Some(group) = group_of(inner, alloc) else {
+                return None
+            }
+            mut condition.terms.push(take group)
+            at += 1
+        } else {
+            if at + 2 >= tokens.len() {
+                return None
+            }
+            let Some(comparator) = comparator_of(tokens[at + 1].as_str()) else {
+                return None
+            }
+            if not is_field(token) {
+                return None
+            }
+            mut condition.terms.push(Term.Compare(Comparison(field: text::String.of(token, alloc), comparator: comparator, literal: text::String.of(tokens[at + 2].as_str(), alloc))))
+            at += 3
+        }
+        if at >= tokens.len() or (ends.byte_len() > 0 and ends.find(tokens[at].as_str()).is_some()) {
+            break
+        }
+        let word = tokens[at].as_str()
+        let all = match word {
+            "and" => true
+            "or" => false
+            else => return None
+        }
+        if joiner.is_some() and joiner != Some(all) {
+            return None
+        }
+        joiner = Some(all)
+        condition.all = all
+        at += 1
+    }
+    return Some(ReadCondition(condition: take condition, next: at))
+} Condition.read
+
+/// The group of comparisons `text` writes inside parentheses, joined by one of `and` and `or`.
+fn group_of(text: Str, alloc: mem::Alloc) -> Option[Term] {
+    let Some(tokens) = tokens_of(text, alloc) else {
+        return None
+    }
+    var comparisons = mem::List[Comparison].empty(alloc)
+    var joiner: Option[bool] = None
+    var at: usize = 0
+    loop {
+        if at + 2 >= tokens.len() or not is_field(tokens[at].as_str()) {
+            return None
+        }
+        let Some(comparator) = comparator_of(tokens[at + 1].as_str()) else {
+            return None
+        }
+        mut comparisons.push(Comparison(field: text::String.of(tokens[at].as_str(), alloc), comparator: comparator, literal: text::String.of(tokens[at + 2].as_str(), alloc)))
+        at += 3
+        if at >= tokens.len() {
+            break
+        }
+        let all = match tokens[at].as_str() {
+            "and" => true
+            "or" => false
+            else => return None
+        }
+        if joiner.is_some() and joiner != Some(all) {
+            return None
+        }
+        joiner = Some(all)
+        at += 1
+    }
+    return Some(Term.Group(all: joiner.value_or(true), comparisons: take comparisons))
+} group_of
+
+fn comparator_of(word: Str) -> Option[Comparator] {
+    return match word {
+        "==" => Some(Comparator.Equal)
+        "!=" => Some(Comparator.Different)
+        "<" => Some(Comparator.Less)
+        "<=" => Some(Comparator.LessOrEqual)
+        ">" => Some(Comparator.Greater)
+        ">=" => Some(Comparator.GreaterOrEqual)
+        "prefix" => Some(Comparator.Prefix)
+        "contains" => Some(Comparator.Contains)
+        else => None
+    }
+} comparator_of
+
+fn is_severity(word: Str) -> bool {
+    return match word {
+        "debug" or "info" or "notice" or "warn" or "error" or "critical" => true
+        else => false
+    }
+} is_severity
+
+/// Whether `word` is a field: names of lower-case letters, digits and `_` joined by `.`.
+fn is_field(word: Str) -> bool {
+    let bytes = word.as_bytes()
+    if bytes.len() == 0 or bytes[0] == b'.' or bytes[bytes.len() - 1] == b'.' {
+        return false
+    }
+    for byte in bytes {
+        if not ((byte >= b'a' and byte <= b'z') or (byte >= b'0' and byte <= b'9') or byte == b'_' or byte == b'.') {
+            return false
+        }
+    }
+    return true
+} is_field
+
+/// The decimal number `word` writes, `None` for any other word.
+fn number_of(word: Str) -> Option[u64] {
+    let bytes = word.as_bytes()
+    if bytes.len() == 0 or bytes.len() > 20 {
+        return None
+    }
+    var value: u64 = 0
+    for byte in bytes {
+        if byte < b'0' or byte > b'9' {
+            return None
+        }
+        let Some(next) = value.checked_mul(10) else {
+            return None
+        }
+        let Some(added) = next.checked_add(u64.widen(byte - b'0')) else {
+            return None
+        }
+        value = added
+    }
+    return Some(value)
+} number_of
+
+test queries_and_selectors_read_their_grammars for Query.parse {
+    let alloc = testing::world().alloc
+    let Some(query) = Query.parse("from /live/accounts where (cpu_ns > 5 or wakeups > 9) and class == Normal select cpu_ns, wakeups order cpu_ns desc limit 5", alloc) else {
+        expect false
+        return
+    }
+    expect query.from.as_str() == "/live/accounts" and query.select.len() == 2 and query.limit == Some(5)
+    let Some(condition) = query.condition else {
+        expect false
+        return
+    }
+    expect condition.all and condition.terms.len() == 2
+    let mixed = Query.parse("from /x where a == 1 and b == 2 or c == 3", alloc)
+    expect mixed.is_none()
+    let Some(selector) = Selector.parse("/journal/events kind instance.*, link.session-opened severity >= warn where payload.restarts > 3", alloc) else {
+        expect false
+        return
+    }
+    expect selector.kinds.len() == 2 and selector.severity.is_some() and selector.condition.is_some()
+} queries_and_selectors_read_their_grammars

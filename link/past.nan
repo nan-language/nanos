@@ -1,0 +1,335 @@
+//! The verbs of the past: `history` of a path or a commit, `diff` between two commits or branches, and `why`, the chain from a subject back to what caused it.
+
+/// The most commits `history` lists, and the most links `why` follows.
+const HISTORY_COMMITS: u32 = 256
+
+const CHAIN_LINKS: usize = 16
+
+/// The most trace records `why` reads back for the causes it follows.
+const TRACED: u64 = 4_096
+
+/// `history <path|commit>`: the commits writing under a path, newest first, or a commit's record and its changes.
+fn history(request: Request, subject: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+    let id = request.id.as_str()
+    let verb = request.verb.as_str()
+    var block = Block.of(Verdict.Ok, id, verb, operand: subject, alloc)
+    match ident::CommitId.parse(subject) {
+        Some(commit) => {
+            let Some(meta) = try await commit_meta(tree, commit, alloc) else {
+                return failed_block(id, verb, operand: subject, failure: Failure.of("store.not-found", subject, alloc), alloc)
+            }
+            mut block.records.push(commit_record(meta, alloc))
+            if commit.number > 1 {
+                for edit in try await edits_of(tree, from: ident::CommitId(number: commit.number - 1), to: commit, path: "/", alloc) {
+                    mut block.records.push(edit_record(edit, kind: "changed", alloc))
+                }
+            }
+            return block
+        }
+        None => {
+        }
+    }
+    let Some(path) = path_of(subject, alloc) else {
+        return failed_block(id, verb, operand: subject, failure: Failure.of("request.invalid-operand", subject, alloc).expecting("a path or a commit", found: subject, alloc), alloc)
+    }
+    let commits = match first attempt await tree.history(take path, before: None, limit: HISTORY_COMMITS, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return failed_block(id, verb, operand: subject, failure: Failure.of(failed.code().as_str(), subject, alloc), alloc)
+    }
+    for meta in commits {
+        mut block.records.push(commit_record(meta, alloc))
+    }
+    return block
+} history
+
+/// `commit #<n>, time, principal, session, plan, cause`, its intent in an envelope.
+fn commit_record(meta: store::CommitMeta, alloc: mem::Alloc) -> Record {
+    var record = Record.of("commit", alloc)
+    mut record.subject(Dyn[Render].view(meta.number))
+    mut record.field("time", value: Dyn[Render].view(meta.time))
+    mut record.field("principal", value: Dyn[Render].view(meta.principal))
+    match meta.session {
+        Some(session) => mut record.field("session", value: Dyn[Render].view(session))
+        None => {
+        }
+    }
+    match meta.plan {
+        Some(plan) => mut record.field("plan", value: Dyn[Render].view(plan))
+        None => {
+        }
+    }
+    mut record.field("cause", value: Dyn[Render].view(meta.cause))
+    match meta.intent {
+        Some(intent) => {
+            var origin = text::String.of("principal.", alloc)
+            mut origin.append(meta.principal.text.as_str())
+            envelope(mut record, field: "intent", origins: origin.as_str(), content: intent.as_str(), alloc)
+        }
+        None => {
+        }
+    }
+    return record
+} commit_record
+
+/// Writes `content` as the envelope of the field `field`: `<field>: envelope <origins> <n>`, then each of its n lines after `| `.
+pub fn envelope(mut record: Record, field: Str, origins: Str, content: Str, alloc: mem::Alloc) {
+    var count: usize = 1
+    for byte in content.as_bytes() {
+        if byte == b'\n' {
+            count += 1
+        }
+    }
+    var head = text::String.of(field, alloc)
+    mut head.append(": envelope ")
+    mut head.append(origins)
+    mut head.push(' ')
+    mut head.write(Dyn[Render].view(count), budget: 24)
+    mut record.line(head.as_str(), alloc)
+    var line = text::String.of("| ", alloc)
+    for c in content.cursor() {
+        if c == '\n' {
+            mut record.line(line.as_str(), alloc)
+            line = text::String.of("| ", alloc)
+            continue
+        }
+        if c < ' ' or c == '\u{7F}' {
+            continue
+        }
+        mut line.push(c)
+    }
+    mut record.line(line.as_str(), alloc)
+} envelope
+
+/// `diff <a> <b> [<path>]`: the nodes added, removed and changed from `a` to `b` under the path, in path order.
+fn diff(request: Request, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+    let id = request.id.as_str()
+    let verb = request.verb.as_str()
+    let operand = first_operand(request, alloc)
+    if request.operands.len() < 2 or request.operands.len() > 3 {
+        return failed_block(id, verb, operand: operand.as_str(), failure: Failure.of("request.invalid-operand", subject: operand.as_str(), alloc).expecting("<a> <b> [<path>]", found: operand.as_str(), alloc), alloc)
+    }
+    let path = match request.operands.get(2) {
+        Some(written) => text::String.of(written.as_str(), alloc)
+        None => text::String.of("/", alloc)
+    }
+    let Some(from) = point_of(request.operands[0].as_str(), alloc) else {
+        return failed_block(id, verb, operand: operand.as_str(), failure: Failure.of("request.invalid-operand", subject: request.operands[0].as_str(), alloc), alloc)
+    }
+    let Some(to) = point_of(request.operands[1].as_str(), alloc) else {
+        return failed_block(id, verb, operand: operand.as_str(), failure: Failure.of("request.invalid-operand", subject: request.operands[1].as_str(), alloc), alloc)
+    }
+    let Some(under) = path_of(path.as_str(), alloc) else {
+        return failed_block(id, verb, operand: operand.as_str(), failure: Failure.of("request.invalid-operand", subject: path.as_str(), alloc), alloc)
+    }
+    let edits = match first attempt await tree.diff(take from, take to, path: take under, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return failed_block(id, verb, operand: operand.as_str(), failure: Failure.of(failed.code().as_str(), subject: path.as_str(), alloc), alloc)
+    }
+    var block = Block.of(Verdict.Ok, id, verb, operand: operand.as_str(), alloc)
+    for edit in edits {
+        let kind = match edit.change {
+            store::Change.Added => "added"
+            store::Change.Removed => "removed"
+            store::Change.Changed => "changed"
+        }
+        mut block.records.push(edit_record(edit, kind, alloc))
+    }
+    return block
+} diff
+
+/// The record of an edit: its path, the hashes it goes from and to, and a `-` and a `+` line naming each field it changes.
+fn edit_record(edit: store::Edit, kind: Str, alloc: mem::Alloc) -> Record {
+    var record = Record.of(kind, alloc)
+    mut record.subject(Dyn[Render].view(edit.path))
+    match edit.from {
+        Some(hash) => mut record.field("from", value: Dyn[Render].view(hash))
+        None => {
+        }
+    }
+    match edit.to {
+        Some(hash) => mut record.field("to", value: Dyn[Render].view(hash))
+        None => {
+        }
+    }
+    for field in edit.fields {
+        if field.from.is_some() {
+            var line = text::String.of("- ", alloc)
+            mut line.append(field.field.as_str())
+            mut record.line(line.as_str(), alloc)
+        }
+        if field.to.is_some() {
+            var line = text::String.of("+ ", alloc)
+            mut line.append(field.field.as_str())
+            mut record.line(line.as_str(), alloc)
+        }
+    }
+    return record
+} edit_record
+
+/// The point a diff operand names: a commit `#<n>` of `main`, or a branch's head.
+fn point_of(text: Str, alloc: mem::Alloc) -> Option[store::Point] {
+    match ident::CommitId.parse(text) {
+        Some(commit) => return Some(store::Point.Commit(branch: text::String.of("main", alloc), commit: commit))
+        None => {
+        }
+    }
+    if text.byte_len() == 0 or text.starts_with("/") {
+        return None
+    }
+    return Some(store::Point.Head(text::String.of(text, alloc)))
+} point_of
+
+/// The edits of `main` from the commit `from` to the commit `to` under `path`.
+fn edits_of(tree: store::service::View, from: ident::CommitId, to: ident::CommitId, path: Str, alloc: mem::Alloc) -> mem::List[store::Edit] fails task::Cancelled uses wait {
+    let start = store::Point.Commit(branch: text::String.of("main", alloc), commit: from)
+    let end = store::Point.Commit(branch: text::String.of("main", alloc), commit: to)
+    return match first attempt await tree.diff(take start, to: take end, path: ident::Path(text: text::String.of(path, alloc)), alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => mem::List.empty(alloc)
+    }
+} edits_of
+
+/// The metadata of the commit `commit`, `None` when the store no longer holds it.
+fn commit_meta(tree: store::service::View, commit: ident::CommitId, alloc: mem::Alloc) -> Option[store::CommitMeta] fails task::Cancelled uses wait {
+    var path = text::String.of("/history/commits/", alloc)
+    mut path.write(Dyn[Render].view(commit.number), budget: 24)
+    return try await Records[store::CommitMeta].at(tree, path: path.as_str(), alloc)
+} commit_meta
+
+/// `why <path|commit|event|cause>`: a `because` record per link from the subject back to the request, start or system work that caused it.
+fn why(request: Request, subject: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+    let id = request.id.as_str()
+    let verb = request.verb.as_str()
+    var block = Block.of(Verdict.Ok, id, verb, operand: subject, alloc)
+    let Some(start) = try await cause_of(subject, tree, mut block, alloc) else {
+        return failed_block(id, verb, operand: subject, failure: Failure.of("request.unknown-name", subject, alloc).expecting("a path, a commit, an event or a cause", found: subject, alloc), alloc)
+    }
+    let causes = try await trace_causes(tree, alloc)
+    var cause = start
+    for _ in 0..<CHAIN_LINKS {
+        let Some(at) = causes.position(fn(each: journal::CauseRecord) => each.cause == cause) else {
+            break
+        }
+        let found = causes[at]
+        var record = Record.of("because", alloc)
+        mut record.words(role_of(found.kind).as_str())
+        mut record.field("subject", value: Dyn[Render].view(Quoted(text: text::String.of(found.subject.as_str(), alloc))))
+        mut record.field("cause", value: Dyn[Render].view(found.cause))
+        mut record.field("principal", value: Dyn[Render].view(found.principal))
+        mut record.field("time", value: Dyn[Render].view(found.time))
+        mut block.records.push(take record)
+        let Some(parent) = found.parent else {
+            break
+        }
+        cause = parent
+    }
+    return block
+} why
+
+/// The cause the subject `subject` names or holds, after adding the `because` record of its own link to `block`.
+fn cause_of(subject: Str, tree: store::service::View, mut block: Block, alloc: mem::Alloc) -> Option[ident::Cause] fails task::Cancelled uses wait {
+    match ident::Cause.parse(subject) {
+        Some(cause) => return Some(cause)
+        None => {
+        }
+    }
+    match ident::Cursor.parse(subject) {
+        Some(cursor) => {
+            let Some(event) = try await event_at(tree, cursor, alloc) else {
+                return None
+            }
+            return Some(event.cause)
+        }
+        None => {
+        }
+    }
+    let commit = match ident::CommitId.parse(subject) {
+        Some(named) => named
+        None => match try await latest_commit(tree, subject, alloc) {
+            Some(latest) => latest
+            None => return None
+        }
+    }
+    let Some(meta) = try await commit_meta(tree, commit, alloc) else {
+        return None
+    }
+    var record = Record.of("because", alloc)
+    mut record.words("written")
+    mut record.field("subject", value: Dyn[Render].view(meta.number))
+    mut record.field("time", value: Dyn[Render].view(meta.time))
+    mut block.records.push(take record)
+    return Some(meta.cause)
+} cause_of
+
+/// The latest commit writing at or below the path `subject`, `None` when `subject` is no path or none did.
+fn latest_commit(tree: store::service::View, subject: Str, alloc: mem::Alloc) -> Option[ident::CommitId] fails task::Cancelled uses wait {
+    let Some(path) = path_of(subject, alloc) else {
+        return None
+    }
+    let latest = match first attempt await tree.history(take path, before: None, limit: 1, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    return match latest.get(0) {
+        Some(meta) => Some(meta.number)
+        None => None
+    }
+} latest_commit
+
+/// The event of `/journal/events` at `cursor`.
+fn event_at(tree: store::service::View, cursor: ident::Cursor, alloc: mem::Alloc) -> Option[journal::Event] fails task::Cancelled uses wait {
+    let read = match first attempt await tree.read_stream(ident::Path(text: text::String.of("/journal/events", alloc)), from: cursor.seq, limit: 1, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(entry) = read.entries.get(0) else {
+        return None
+    }
+    if entry.seq != cursor.seq {
+        return None
+    }
+    return match attempt mem::wire::Codec[journal::Event].decode(Untrusted.of(entry.value.view()), alloc) {
+        Ok(event) => Some(take event)
+        Err(_) => None
+    }
+} event_at
+
+/// The cause records among the latest records of `/journal/traces`.
+fn trace_causes(tree: store::service::View, alloc: mem::Alloc) -> mem::List[journal::CauseRecord] fails task::Cancelled uses wait {
+    var causes = mem::List[journal::CauseRecord].empty(alloc)
+    let path = ident::Path(text: text::String.of("/journal/traces", alloc))
+    let node = match first attempt await tree.get(ident::Path(text: text::String.of("/journal/traces", alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return causes
+    }
+    let read = match first attempt await tree.read_stream(take path, from: node.next.saturating_sub(TRACED), limit: u32.saturate(TRACED), alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return causes
+    }
+    for entry in read.entries {
+        match attempt mem::wire::Codec[journal::TraceRecord].decode(Untrusted.of(entry.value.view()), alloc) {
+            Ok(journal::TraceRecord.Cause(record)) => mut causes.push(take record)
+            else => {
+            }
+        }
+    }
+    return causes
+} trace_causes
+
+/// The role of a link of a cause chain by what opened its cause.
+fn role_of(kind: journal::CauseKind) -> text::Fixed[16] {
+    return text::Fixed[16].of(match kind {
+        journal::CauseKind.Request => "requested"
+        journal::CauseKind.Schedule => "scheduled"
+        journal::CauseKind.Start => "sent"
+        journal::CauseKind.Connection => "requested"
+        journal::CauseKind.System => "scheduled"
+    })
+} role_of

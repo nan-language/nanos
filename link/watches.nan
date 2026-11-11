@@ -1,0 +1,217 @@
+//! Watches: the selectors whose matches the link pushes, through the store's subscriptions, until `cancel` or the end of their session.
+
+/// The keys of the keyed tasks setting a watch up and delivering its matches, plus its number.
+const WATCHING: u64 = 0x2_0000_0000
+
+const DELIVERING: u64 = 0x3_0000_0000
+
+/// The credit of the port the store tells the link's subscriptions through.
+pub const WATCH_CREDIT: u16 = 64
+
+/// A watch: its request id and number, its session, its selector, the store subscription telling it, the cursor of the last event it delivered, whether a delivery is under way or due, and whether it is a wake rule.
+pub closed struct Watch derives Encode {
+    pub id: text::Fixed[32]
+    pub number: u64
+    pub session: u64
+    pub selector: text::String
+    pub subscription: Option[u64]
+    pub cursor: u64
+    pub delivering: bool
+    pub due: bool
+    pub wake: bool
+} Watch
+
+/// What a watch's matches are: events of `/journal/events` or of an instance's subtree, records of another stream, or the commits writing under a path.
+pub closed enum Watched derives Copy, Eq, Encode {
+    Events
+    Rows
+    Commits
+} Watched
+
+/// What a watch selects: its kind and the path of the store it subscribes to.
+pub fn watched_of(selector: Selector, alloc: mem::Alloc) -> Option[Watched] {
+    let path = selector.path.as_str()
+    if path == "/journal/events" or path.starts_with("/live/instances/") {
+        return Some(Watched.Events)
+    }
+    if path.starts_with("/journal/") {
+        return Some(Watched.Rows)
+    }
+    if path.starts_with("/sys") or path.starts_with("/data") or path == "/history/commits" {
+        return Some(Watched.Commits)
+    }
+    return None
+} watched_of
+
+/// The path a watch of `selector` subscribes to.
+pub fn subscribed_path(selector: Selector, watched: Watched, alloc: mem::Alloc) -> text::String {
+    return match watched {
+        Watched.Events => text::String.of("/journal/events", alloc)
+        Watched.Rows => text::String.of(selector.path.as_str(), alloc)
+        Watched.Commits => match selector.path.as_str() {
+            "/history/commits" => text::String.of("/", alloc)
+            else => text::String.of(selector.path.as_str(), alloc)
+        }
+    }
+} subscribed_path
+
+/// Sets a watch up: the cursor it starts after, `--since` or the current end, and the store subscription telling it of new matches; gives the cursor and the subscription.
+pub fn set_up(tree: store::service::View, own: os::PortHandle, take path: text::String, since: Option[u64], watched: Watched, alloc: mem::Alloc) -> WatchStart fails task::Cancelled uses wait {
+    let node = match first attempt await tree.get(ident::Path(text: text::String.of(path.as_str(), alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return WatchStart(cursor: 0, subscription: None, failure: Some(text::Fixed[32].of(failed.code().as_str())))
+    }
+    let head = match try await Records[store::service::LiveStore].at(tree, path: "/live/store", alloc) {
+        Some(live) => live.head
+        None => 0
+    }
+    var cursor = node.next.saturating_sub(1)
+    if watched == Watched.Commits {
+        cursor = head
+    }
+    match since {
+        Some(after) => {
+            cursor = after
+        }
+        None => {
+        }
+    }
+    let subscription = match first attempt await tree.subscribe(ident::Path(text: take path), since: ident::CommitId(number: head), port: own, alloc) {
+        Ok(number) => Some(number)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+    return WatchStart(cursor: cursor, subscription: subscription, failure: None)
+} set_up
+
+/// How a watch started: the cursor it starts after, its subscription, or the code of the failure that stopped it.
+pub closed struct WatchStart derives Encode {
+    pub cursor: u64
+    pub subscription: Option[u64]
+    pub failure: Option[text::Fixed[32]]
+} WatchStart
+
+/// The block of the matches of `selector` after `cursor` in the stream at `path`, at most `backlog` with a `lost` record for the older ones dropped, and the cursor of the last record read.
+pub fn deliver(tree: store::service::View, id: Str, selector: Selector, take path: text::String, cursor: u64, backlog: u32, events: bool, alloc: mem::Alloc) -> Delivered fails task::Cancelled uses wait {
+    var block = Block.of(Verdict.Ok, id, verb: "watch", operand: "", alloc)
+    let read = match first attempt await tree.read_stream(ident::Path(text: take path), from: cursor + 1, limit: backlog, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return Delivered(block: take block, cursor: cursor)
+    }
+    var last = cursor
+    if read.lost > 0 {
+        var lost = Record.of("lost", alloc)
+        mut lost.field("count", value: Dyn[Render].view(read.lost))
+        mut lost.field("since", value: Dyn[Render].view(ident::Cursor(seq: cursor)))
+        mut block.records.push(take lost)
+    }
+    for entry in take read.entries {
+        last = entry.seq
+        let row = stream_row(take entry, events, declared: None, alloc)
+        if matches(row, selector) {
+            mut block.records.push(take row.record)
+        }
+    }
+    return Delivered(block: take block, cursor: last)
+} deliver
+
+/// A delivery's block and the cursor of the last record it read.
+pub closed struct Delivered {
+    pub block: Block
+    pub cursor: u64
+} Delivered
+
+/// Whether the event or record of `row` meets the selector: its source below the instance a `/live/instances` path names, its kind among the kinds, its severity at least the least, and its condition.
+fn matches(row: Row, selector: Selector) -> bool {
+    let value = row.value.as_str()
+    let source_span = field_span(value, path: "source").value_or(Span(start: 0, end: 0))
+    let kind_span = field_span(value, path: "kind").value_or(Span(start: 0, end: 0))
+    let severity_span = field_span(value, path: "severity").value_or(Span(start: 0, end: 0))
+    let Some(source) = value.slice_bytes(source_span.start, end: source_span.end) else {
+        return false
+    }
+    var kind_end = kind_span.start + 1
+    if kind_span.end > kind_end {
+        kind_end = kind_span.end - 1
+    }
+    let Some(kind) = value.slice_bytes(kind_span.start + 1, end: kind_end) else {
+        return false
+    }
+    let Some(severity) = value.slice_bytes(severity_span.start, end: severity_span.end) else {
+        return false
+    }
+    let path = selector.path.as_str()
+    if path.starts_with("/live/instances/") {
+        let Some(moniker) = path.slice_bytes(16, end: path.byte_len()) else {
+            return false
+        }
+        if not below(source, moniker) {
+            return false
+        }
+    }
+    if selector.kinds.len() > 0 and selector.kinds.position(fn(each: text::String) => kind_matches(kind, pattern: each.as_str())).is_none() {
+        return false
+    }
+    match selector.severity {
+        Some(least) => {
+            if severity_rank(severity) < severity_rank(least.as_str()) {
+                return false
+            }
+        }
+        None => {
+        }
+    }
+    return kept(row, condition: selector.condition)
+} matches
+
+/// Whether the moniker `source` is `moniker` or lies below it.
+fn below(source: Str, moniker: Str) -> bool {
+    if source == moniker {
+        return true
+    }
+    return source.starts_with(moniker) and source.byte_len() > moniker.byte_len() and source.as_bytes()[moniker.byte_len()] == b'.'
+} below
+
+/// Whether the kind `kind` matches `pattern`: a kind, or a family followed by `.*`.
+fn kind_matches(kind: Str, pattern: Str) -> bool {
+    if pattern.ends_with(".*") {
+        let Some(family) = pattern.slice_bytes(0, end: pattern.byte_len() - 1) else {
+            return false
+        }
+        return kind.starts_with(family)
+    }
+    return kind == pattern
+} kind_matches
+
+/// The rank of a severity, as its word or its variant writes it.
+fn severity_rank(severity: Str) -> u32 {
+    let start = match severity.find(".") {
+        Some(dot) => dot + 1
+        None => 0
+    }
+    let Some(word) = severity.slice_bytes(start, end: severity.byte_len()) else {
+        return 0
+    }
+    return match word {
+        "debug" or "Debug" => 0
+        "info" or "Info" => 1
+        "notice" or "Notice" => 2
+        "warn" or "Warn" => 3
+        "error" or "Error" => 4
+        "critical" or "Critical" => 5
+        else => 0
+    }
+} severity_rank
+
+/// The `commit` record of a commit a watch of commits selects: its number and the paths it wrote, with the count of those left out.
+pub fn commit_change(commit: ident::CommitId, paths: mem::List[ident::Path], more: u64, alloc: mem::Alloc) -> Record {
+    var record = Record.of("commit", alloc)
+    mut record.subject(Dyn[Render].view(commit))
+    mut record.field("paths", value: Dyn[Render].view(paths))
+    if more > 0 {
+        mut record.field("more", value: Dyn[Render].view(more))
+    }
+    return record
+} commit_change
