@@ -18,13 +18,20 @@ pub closed enum Verdict derives Copy, Eq, Encode {
     Pending
 } Verdict
 
-/// A record: its kind, the rest of its header line, its continuation lines without their indentation, and the origin labels of the untrusted content its envelopes hold.
+/// A record: its kind, the rest of its header line, its continuation lines without their indentation, the origin labels of the untrusted content its envelopes hold, and the hashes its header shows in their short forms.
 pub closed struct Record derives Encode {
     pub kind: text::Fixed[16]
     pub header: text::String
     pub lines: mem::List[text::String]
     pub labels: mem::List[ident::OriginLabel]
+    pub hashes: mem::List[Hashed]
 } Record
+
+/// A hash a record's header shows in its short form, with its full form.
+pub closed struct Hashed derives Copy, Encode {
+    pub short: text::Fixed[18]
+    pub full: text::Fixed[55]
+} Hashed
 
 /// A block: its verdict, the id, verb and first operand of its request, its records, how many records before them its request skipped, and how many after them it never lists, which it elides.
 pub closed struct Block derives Encode {
@@ -44,12 +51,14 @@ struct Shown derives Copy {
     count: u64
 } Shown
 
-/// How a block is cut: the units it holds at most, whether its verdict lines give its size, how many records it skips, and the request without its id or `--skip` that prints what it elides.
+/// How a block is cut and written: the units it holds at most, whether its verdict lines give its size, how many records it skips, the request without its id or `--skip` that prints what it elides, the header fields its records keep, all when empty, and whether it is written as JSON Lines.
 pub closed struct Cut derives Encode {
     pub budget: u32
     pub sized: bool
     pub skip: u64
     pub rest: text::String
+    pub fields: mem::List[text::String]
+    pub json: bool
 } Cut
 
 /// A text written as a text literal.
@@ -64,7 +73,7 @@ fn Quoted.render(self, mut out: core::Renderer) {
 } Quoted.render
 
 pub fn Record.of(kind: Str, alloc: mem::Alloc) -> Record {
-    return Record(kind: text::Fixed[16].of(kind), header: text::String.empty(alloc), lines: mem::List.empty(alloc), labels: mem::List.empty(alloc))
+    return Record(kind: text::Fixed[16].of(kind), header: text::String.empty(alloc), lines: mem::List.empty(alloc), labels: mem::List.empty(alloc), hashes: mem::List.empty(alloc))
 } Record.of
 
 /// Writes the record's subject, which comes before its fields.
@@ -86,6 +95,12 @@ pub fn Record.field(mut self, name: Str, value: Dyn[Render]) {
     mut self.header.append(": ")
     mut self.header.write(value, budget: VALUE_BYTES)
 } Record.field
+
+/// Writes the field `name` with the hash `value` in its short form, noting its full form.
+pub fn Record.hash(mut self, name: Str, value: ident::HashValue) {
+    mut self.field(name, value: Dyn[Render].view(value))
+    mut self.hashes.push(Hashed(short: value.short_form(), full: value.full_form()))
+} Record.hash
 
 /// Writes the field `name` with the text `value` as a text literal.
 pub fn Record.text(mut self, name: Str, value: Str, alloc: mem::Alloc) {
@@ -147,6 +162,125 @@ fn Record.separate(mut self) {
     }
 } Record.separate
 
+/// The record keeping, after its subject, only the header fields `fields` names, its hashes in their full forms when `hash` is among them.
+fn Record.narrowed(self, fields: mem::List[text::String], alloc: mem::Alloc) -> Record {
+    var record = Record.of(self.kind.as_str(), alloc)
+    for item in header_items(self.header.as_str(), alloc) {
+        let keep = match item_name(item.as_str()) {
+            Some(span) => match item.as_str().slice_bytes(span.start, end: span.end) {
+                Some(name) => fields.position(fn(each: text::String) => each.as_str() == name).is_some()
+                None => false
+            }
+            None => true
+        }
+        if keep {
+            mut record.separate()
+            mut record.header.append(item.as_str())
+        }
+    }
+    if fields.position(fn(each: text::String) => each.as_str() == "hash").is_some() {
+        for hashed in self.hashes {
+            record.header = replaced(record.header.as_str(), from: hashed.short.as_str(), to: hashed.full.as_str(), alloc)
+        }
+    }
+    for line in self.lines {
+        mut record.lines.push(text::String.of(line.as_str(), alloc))
+    }
+    for label in self.labels {
+        mut record.labels.push(ident::OriginLabel(text: label.text))
+    }
+    return record
+} Record.narrowed
+
+/// The items of a record's header: its subject, then each field as `name: value`.
+fn header_items(header: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var items = mem::List[text::String].empty(alloc)
+    let bytes = header.as_bytes()
+    var depth: u32 = 0
+    var quoted = false
+    var escaped = false
+    var start: usize = 1
+    for at in 0..<bytes.len() {
+        let byte = bytes[at]
+        if quoted {
+            if escaped {
+                escaped = false
+            } else if byte == b'\\' {
+                escaped = true
+            } else if byte == b'"' {
+                quoted = false
+            }
+            continue
+        }
+        if byte == b'"' {
+            quoted = true
+        } else if byte == b'(' or byte == b'[' or byte == b'{' {
+            depth += 1
+        } else if (byte == b')' or byte == b']' or byte == b'}') and depth > 0 {
+            depth -= 1
+        } else if depth == 0 and byte == b',' and at + 1 < bytes.len() and bytes[at + 1] == b' ' and at > start {
+            match header.slice_bytes(start, end: at) {
+                Some(item) => mut items.push(text::String.of(item, alloc))
+                None => {
+                }
+            }
+            start = at + 2
+        }
+    }
+    if start < bytes.len() {
+        match header.slice_bytes(start, end: bytes.len()) {
+            Some(item) => mut items.push(text::String.of(item, alloc))
+            None => {
+            }
+        }
+    }
+    return items
+} header_items
+
+/// Where the name of the header item `item` lies when it is a field `name: value`, `None` for a subject.
+fn item_name(item: Str) -> Option[Span] {
+    let bytes = item.as_bytes()
+    for at in 0..<bytes.len() {
+        let byte = bytes[at]
+        if byte == b':' {
+            if at > 0 and at + 1 < bytes.len() and bytes[at + 1] == b' ' {
+                return Some(Span(start: 0, end: at))
+            }
+            return None
+        }
+        if not ((byte >= b'a' and byte <= b'z') or (byte >= b'0' and byte <= b'9') or byte == b'_') {
+            return None
+        }
+    }
+    return None
+} item_name
+
+/// `text` with each `from` replaced by `to`.
+fn replaced(text: Str, from: Str, to: Str, alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    var rest_start: usize = 0
+    loop {
+        let Some(rest) = text.slice_bytes(rest_start, end: text.byte_len()) else {
+            return out
+        }
+        let Some(found) = rest.find(from) else {
+            mut out.append(rest)
+            return out
+        }
+        match rest.slice_bytes(0, end: found) {
+            Some(head) => mut out.append(head)
+            None => {
+            }
+        }
+        mut out.append(to)
+        rest_start += found + from.byte_len()
+        if from.byte_len() == 0 {
+            mut out.append(rest)
+            return out
+        }
+    }
+} replaced
+
 /// The bytes of the record's lines.
 fn Record.size(self) -> usize {
     var size = self.kind.byte_len() + self.header.byte_len() + 1
@@ -171,22 +305,23 @@ pub fn Block.of(verdict: Verdict, id: Str, verb: Str, operand: Str, alloc: mem::
     return Block(verdict: verdict, id: text::Fixed[32].of(id), verb: text::Fixed[16].of(verb), operand: cut_operand(operand, alloc), records: mem::List.empty(alloc), skipped: 0, more: 0)
 } Block.of
 
-/// The block's text: the verdict line, the records that show under `cut`, then the elision line when records are left and the verdict line again.
+/// The block's text: the verdict line, the records that show under `cut`, then the elision line when records are left and the verdict line again; as JSON Lines when `cut` says so.
 pub fn Block.text(self, cut: Cut, alloc: mem::Alloc) -> mem::Bytes {
-    let shown = self.shown(cut, alloc)
+    let lines = self.lines(cut, alloc)
+    let shown = self.shown(cut, lines, alloc)
     var body = mem::Bytes.empty(alloc)
     for at in shown.start..<(shown.start + shown.printed) {
-        self.records[at].write(mut body)
+        mut body.append(lines[at].view())
     }
     let after = self.skipped + u64.widen(shown.start + shown.printed)
     if u64.widen(shown.printed) < shown.count {
-        mut body.append(elision_line(shown.count - u64.widen(shown.printed), cut, after, alloc).as_bytes())
+        mut body.append(elision(shown.count - u64.widen(shown.printed), cut, after, alloc).as_bytes())
     }
     var units: Option[u64] = None
     if cut.sized {
-        units = Some(units_of(body.len(), verdict: self.verdict_line(shown.count, units: None, alloc).byte_len()))
+        units = Some(units_of(body.len(), verdict: self.verdict_text(shown.count, units: None, json: cut.json, alloc).byte_len(), json: cut.json))
     }
-    let line = self.verdict_line(shown.count, units, alloc)
+    let line = self.verdict_text(shown.count, units, json: cut.json, alloc)
     var out = mem::Bytes.empty(alloc)
     mut out.append(line.as_bytes())
     mut out.append(body.view())
@@ -196,7 +331,7 @@ pub fn Block.text(self, cut: Cut, alloc: mem::Alloc) -> mem::Bytes {
 
 /// The origin labels of the untrusted content of the records that show under `cut`.
 pub fn Block.labels(self, cut: Cut, alloc: mem::Alloc) -> mem::List[ident::OriginLabel] {
-    let shown = self.shown(cut, alloc)
+    let shown = self.shown(cut, lines: self.lines(cut, alloc), alloc)
     var labels = mem::List[ident::OriginLabel].empty(alloc)
     for at in shown.start..<(shown.start + shown.printed) {
         for label in self.records[at].labels {
@@ -208,8 +343,29 @@ pub fn Block.labels(self, cut: Cut, alloc: mem::Alloc) -> mem::List[ident::Origi
     return labels
 } Block.labels
 
-/// The records that show under `cut`: those after the skipped ones, the most that fit its budget with the verdict lines and the elision line, at least one.
-fn Block.shown(self, cut: Cut, alloc: mem::Alloc) -> Shown {
+/// The lines of each record as `cut` writes them: narrowed to its fields, as text or as a JSON line.
+fn Block.lines(self, cut: Cut, alloc: mem::Alloc) -> mem::List[mem::Bytes] {
+    var lines = mem::List[mem::Bytes].empty(alloc)
+    for record in self.records {
+        var written = mem::Bytes.empty(alloc)
+        if cut.fields.len() == 0 and cut.json {
+            mut written.append(record.json(alloc).as_bytes())
+            mut written.push(b'\n')
+        } else if cut.fields.len() == 0 {
+            record.write(mut written)
+        } else if cut.json {
+            mut written.append(record.narrowed(fields: cut.fields, alloc).json(alloc).as_bytes())
+            mut written.push(b'\n')
+        } else {
+            record.narrowed(fields: cut.fields, alloc).write(mut written)
+        }
+        mut lines.push(take written)
+    }
+    return lines
+} Block.lines
+
+/// The records that show under `cut`, whose lines are `lines`: those after the skipped ones, the most that fit its budget with the verdict lines and the elision line, at least one.
+fn Block.shown(self, cut: Cut, lines: mem::List[mem::Bytes], alloc: mem::Alloc) -> Shown {
     let given = u64.widen(self.records.len())
     let total = self.skipped + given + self.more
     var skip = cut.skip
@@ -225,21 +381,21 @@ fn Block.shown(self, cut: Cut, alloc: mem::Alloc) -> Shown {
         given_skip = skip - self.skipped
     }
     let room = usize.widen(cut.budget).saturating_mul(UNIT_BYTES)
-    var reserved = 2 * self.verdict_line(count, units: None, alloc).byte_len()
+    var reserved = 2 * self.verdict_text(count, units: None, json: cut.json, alloc).byte_len()
     if cut.sized {
         reserved += 2 * (", units ".byte_len() + digits(u64.widen(cut.budget)))
     }
     let start = usize.widen(given_skip)
     var printed: usize = 0
     var used = reserved
-    while start + printed < self.records.len() {
-        let size = self.records[start + printed].size()
+    while start + printed < lines.len() {
+        let size = lines[start + printed].len()
         let left = count - u64.widen(printed) - 1
-        var elision: usize = 0
+        var room_left: usize = 0
         if left > 0 {
-            elision = elision_line(left, cut, after: skip + u64.widen(printed) + 1, alloc).byte_len()
+            room_left = elision(left, cut, after: skip + u64.widen(printed) + 1, alloc).byte_len()
         }
-        if printed > 0 and used + size + elision > room {
+        if printed > 0 and used + size + room_left > room {
             break
         }
         used += size
@@ -247,6 +403,22 @@ fn Block.shown(self, cut: Cut, alloc: mem::Alloc) -> Shown {
     }
     return Shown(start: start, printed: printed, count: count)
 } Block.shown
+
+/// The verdict line of a block of `count` records and of `units` units when given, as text or as JSON.
+fn Block.verdict_text(self, count: u64, units: Option[u64], json: bool, alloc: mem::Alloc) -> text::String {
+    if json {
+        return self.json_verdict(count, units, alloc)
+    }
+    return self.verdict_line(count, units, alloc)
+} Block.verdict_text
+
+/// The elision line of `count` records, `after` records skipped in all, as text or as JSON.
+fn elision(count: u64, cut: Cut, after: u64, alloc: mem::Alloc) -> text::String {
+    if cut.json {
+        return json_elision(count, cut, after, alloc)
+    }
+    return elision_line(count, cut, after, alloc)
+} elision
 
 /// `<word> <id> <verb> <first operand>: records <n>`, then `, units <u>` when given, and a line feed.
 fn Block.verdict_line(self, count: u64, units: Option[u64], alloc: mem::Alloc) -> text::String {
@@ -289,9 +461,12 @@ fn elision_line(count: u64, cut: Cut, after: u64, alloc: mem::Alloc) -> text::St
     return line
 } elision_line
 
-/// The units of a block whose verdict lines without their size take `verdict` bytes each and whose other lines take `body`: the size the units suffix itself takes included.
-fn units_of(body: usize, verdict: usize) -> u64 {
-    let suffix = ", units ".byte_len()
+/// The units of a block whose verdict lines without their size take `verdict` bytes each and whose other lines take `body`: the size the units suffix itself takes, as text or as JSON, included.
+fn units_of(body: usize, verdict: usize, json: bool) -> u64 {
+    var suffix = ", units ".byte_len()
+    if json {
+        suffix = ",\"units\":".byte_len()
+    }
     for width in 1..=20usize {
         let total = body + 2 * (verdict + suffix + width)
         let units = u64.widen((total + UNIT_BYTES - 1) / UNIT_BYTES)
@@ -345,7 +520,7 @@ test blocks_elide_what_their_budget_leaves_out for Block.text {
         mut record.line("Account(cpu_ns: 41000000000)", alloc)
         mut block.records.push(take record)
     }
-    let cut = Cut(budget: 100, sized: false, skip: 0, rest: text::String.of("find from /live/accounts select cpu_ns order cpu_ns desc limit 5 --budget 100", alloc))
+    let cut = Cut(budget: 100, sized: false, skip: 0, rest: text::String.of("find from /live/accounts select cpu_ns order cpu_ns desc limit 5 --budget 100", alloc), fields: mem::List.empty(alloc), json: false)
     let written = block.text(cut, alloc)
     let expected = b"ok 4 find from /live/accounts select cpu_ns order cpu_ns desc limit 5: records 5\nnode /live/accounts/app.indexer0, type: \"Account\"\n    Account(cpu_ns: 41000000000)\nelided 4 records: find from /live/accounts select cpu_ns order cpu_ns desc limit 5 --budget 100 --skip 1\nok 4 find from /live/accounts select cpu_ns order cpu_ns desc limit 5: records 5\n"
     expect written.view() == expected
@@ -357,7 +532,7 @@ test sized_blocks_count_their_units for Block.text {
     var record = Record.of("error", alloc)
     mut record.subject(Dyn[Render].view("plan.stale"))
     mut block.records.push(take record)
-    let written = block.text(Cut(budget: 4_000, sized: true, skip: 0, rest: text::String.of("apply age7pwuq3zqxfkwosw", alloc)), alloc)
+    let written = block.text(Cut(budget: 4_000, sized: true, skip: 0, rest: text::String.of("apply age7pwuq3zqxfkwosw", alloc), fields: mem::List.empty(alloc), json: false), alloc)
     let expected = b"failed 11 apply age7pwuq3zqxfkwosw: records 1, units 33\nerror plan.stale\nfailed 11 apply age7pwuq3zqxfkwosw: records 1, units 33\n"
     expect written.view() == expected
     expect written.len() == 129

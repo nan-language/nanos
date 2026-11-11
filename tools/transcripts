@@ -1,0 +1,105 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo "usage: tools/transcripts [<instance>]" >&2
+    exit 2
+}
+
+[ $# -le 1 ] || usage
+name=${1:-transcripts}
+case $name in
+    "" | *[!A-Za-z0-9_-]*) usage ;;
+esac
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+run=$root/.sandbox/$name.run
+rm -rf "$run"
+mkdir -p "$run"
+mkfifo "$run/in"
+: >"$run/out"
+setsid sh -c 'exec "$0" start "$1" <"$2" >"$3" 2>&1' "$root/tools/sandbox" "$name" "$run/in" "$run/out" &
+group=$!
+exec 3>"$run/in"
+trap 'kill -TERM -- -$group 2>/dev/null || true' EXIT INT TERM
+
+# Waits up to $1 seconds for the command $2... to succeed.
+wait_for() {
+    limit=$1
+    shift
+    waited=0
+    until "$@"; do
+        if [ "$waited" -ge "$((limit * 5))" ]; then
+            return 1
+        fi
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+}
+
+# The lines of the serial output from the ready record on, without the lines of pending blocks.
+blocks() {
+    awk '!started && $0 !~ /^ok 0 link: / { next } { started = 1 } $1 != "pending" { print }' "$run/out"
+}
+
+ready() {
+    grep -q '^ok 0 link: records 1' "$run/out" || ! kill -0 "$group" 2>/dev/null
+}
+
+enough() {
+    [ "$(blocks | wc -l)" -ge "$1" ]
+}
+
+if ! wait_for 900 ready || ! grep -q '^ok 0 link: records 1' "$run/out"; then
+    cat "$run/out" >&2
+    echo "transcripts: the link wrote no ready record" >&2
+    exit 1
+fi
+
+failed=0
+seen=0
+for transcript in "$root"/link/transcripts/*.txt; do
+    title=$(basename "$transcript" .txt)
+    rm -f "$run"/step.*
+    steps=$(awk -v dir="$run" '
+        /^#/ { next }
+        /^> / { if (!asking) { n++; asking = 1 } print substr($0, 3) > (dir "/step." n ".requests"); next }
+        { if (n == 0) n = 1; asking = 0; print > (dir "/step." n ".expected") }
+        END { print n }' "$transcript")
+    : >"$run/expected"
+    : >"$run/actual"
+    step=1
+    while [ "$step" -le "$steps" ]; do
+        if [ -f "$run/step.$step.requests" ]; then
+            while IFS= read -r line; do
+                printf '%s\n' "$line" >&3
+            done <"$run/step.$step.requests"
+        fi
+        wanted=0
+        if [ -f "$run/step.$step.expected" ]; then
+            wanted=$(wc -l <"$run/step.$step.expected")
+            cat "$run/step.$step.expected" >>"$run/expected"
+        fi
+        wait_for 60 enough "$((seen + wanted))" || true
+        blocks | sed -n "$((seen + 1)),$((seen + wanted))p" >>"$run/actual"
+        seen=$((seen + wanted))
+        step=$((step + 1))
+    done
+    if awk '
+        NR == FNR { pattern[FNR] = $0; count = FNR; next }
+        {
+            p = pattern[FNR]
+            gsub(/[][\\.^$+?(){}|\/]/, "\\\\&", p)
+            gsub(/\*/, ".*", p)
+            if ($0 !~ "^" p "$") { bad = 1; exit }
+            matched = FNR
+        }
+        END { exit (bad || matched != count) }' "$run/expected" "$run/actual"; then
+        echo "ok $title"
+    else
+        echo "failed $title"
+        diff "$run/expected" "$run/actual" | sed 's/^/    /' || true
+        failed=$((failed + 1))
+    fi
+done
+[ "$failed" -eq 0 ]

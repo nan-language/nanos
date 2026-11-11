@@ -1,0 +1,428 @@
+//! JSON Lines: blocks as `--json` writes them, each line an object whose members come in byte order of their names, records' values converted from their canonical rendering.
+
+/// The JSON verdict line of a block of `count` records and of `units` units when given.
+fn Block.json_verdict(self, count: u64, units: Option[u64], alloc: mem::Alloc) -> text::String {
+    var line = text::String.of("{\"id\":", alloc)
+    json_string(self.id.as_str(), out: mut line)
+    mut line.append(",\"operand\":")
+    json_string(self.operand.as_str(), out: mut line)
+    mut line.append(",\"record\":\"verdict\",\"summary\":{\"records\":")
+    mut line.write(Dyn[Render].view(count), budget: 24)
+    match units {
+        Some(size) => {
+            mut line.append(",\"units\":")
+            mut line.write(Dyn[Render].view(size), budget: 24)
+        }
+        None => {
+        }
+    }
+    mut line.append("},\"verb\":")
+    json_string(self.verb.as_str(), out: mut line)
+    mut line.append(",\"verdict\":")
+    json_string(match self.verdict {
+        Verdict.Ok => "ok"
+        Verdict.Failed => "failed"
+        Verdict.Pending => "pending"
+    }, out: mut line)
+    mut line.append("}\n")
+    return line
+} Block.json_verdict
+
+/// The JSON elision line of `count` records, `after` records skipped in all.
+fn json_elision(count: u64, cut: Cut, after: u64, alloc: mem::Alloc) -> text::String {
+    var request = text::String.of(cut.rest.as_str(), alloc)
+    mut request.append(" --skip ")
+    mut request.write(Dyn[Render].view(after), budget: 24)
+    var line = text::String.of("{\"count\":", alloc)
+    mut line.write(Dyn[Render].view(count), budget: 24)
+    mut line.append(",\"record\":\"elided\",\"request\":")
+    json_string(request.as_str(), out: mut line)
+    mut line.append("}\n")
+    return line
+} json_elision
+
+/// The record as a JSON object, `{"record": kind, "value": value}`: its value holds its subject, its fields and what its continuation lines say, an envelope standing as `{"envelope": labels, "lines": [...]}` for its field's value.
+fn Record.json(self, alloc: mem::Alloc) -> text::String {
+    var value = text::String.of("{", alloc)
+    var members: u32 = 0
+    for item in header_items(self.header.as_str(), alloc) {
+        match item_name(item.as_str()) {
+            Some(span) => {
+                let name = string_part(item.as_str(), from: span.start, end: span.end, alloc)
+                let rendered = string_part(item.as_str(), from: span.end + 2, end: item.byte_len(), alloc)
+                member(mut value, mut members, name: name.as_str())
+                json_value(rendered.as_str(), out: mut value, alloc)
+            }
+            None => write_subject(mut value, kind: self.kind.as_str(), words: item.as_str(), mut members, alloc)
+        }
+    }
+    write_continued(mut value, kind: self.kind.as_str(), lines: self.lines, mut members, alloc)
+    mut value.push('}')
+    var line = text::String.of("{\"record\":", alloc)
+    json_string(self.kind.as_str(), out: mut line)
+    mut line.append(",\"value\":")
+    mut line.append(value.as_str())
+    mut line.push('}')
+    return line
+} Record.json
+
+/// Writes the subject `words` of a record of kind `kind` as its members: an `error`'s code and subject, else one member named after what the kind's subject is.
+fn write_subject(mut out: text::String, kind: Str, words: Str, mut members: u32, alloc: mem::Alloc) {
+    if kind == "error" {
+        let split = words.find(" ").value_or(words.byte_len())
+        member(mut out, mut members, name: "code")
+        json_string(string_part(words, from: 0, end: split, alloc).as_str(), mut out)
+        if split < words.byte_len() {
+            member(mut out, mut members, name: "subject")
+            json_string(string_part(words, from: split + 1, end: words.byte_len(), alloc).as_str(), mut out)
+        }
+        return
+    }
+    let name = match kind {
+        "node" or "dir" or "stream" or "blob" or "added" or "removed" or "changed" => "path"
+        "entry" or "api" => "name"
+        "piece" => "offset"
+        "event" or "row" or "watch" => "cursor"
+        "commit" => "commit"
+        "session" => "session"
+        "primer" => "part"
+        "code" => "code"
+        "instance" => "moniker"
+        "cancelled" => "target"
+        "because" => "role"
+        "pending" => "state"
+        else => "subject"
+    }
+    member(mut out, mut members, name)
+    json_value(words, mut out, alloc)
+} write_subject
+
+/// Writes what the continuation lines `lines` of a record of kind `kind` say: envelopes as their fields' values, an error's `expected`, `found`, `because` and `fix` lines, the `-` and `+` values of a change, `name: value` lines, and any other line as the record's `value`, or for the primer and the code catalogue its `text`.
+fn write_continued(mut out: text::String, kind: Str, lines: mem::List[text::String], mut members: u32, alloc: mem::Alloc) {
+    var because = mem::List[text::String].empty(alloc)
+    var fixes = mem::List[text::String].empty(alloc)
+    var prose = mem::List[text::String].empty(alloc)
+    var at: usize = 0
+    while at < lines.len() {
+        let line = lines[at].as_str()
+        at += 1
+        match envelope_head(line) {
+            Some(head) => {
+                member(mut out, mut members, name: string_part(line, from: 0, end: head.start, alloc).as_str())
+                mut out.append("{\"envelope\":")
+                json_string(string_part(line, from: head.start + 11, end: head.end, alloc).as_str(), mut out)
+                mut out.append(",\"lines\":[")
+                let count = number_of(string_part(line, from: head.end + 1, end: line.byte_len(), alloc).as_str()).value_or(0)
+                for index in 0..<count {
+                    if at >= lines.len() {
+                        break
+                    }
+                    if index > 0 {
+                        mut out.push(',')
+                    }
+                    json_string(string_part(lines[at].as_str(), from: 2, end: lines[at].byte_len(), alloc).as_str(), mut out)
+                    at += 1
+                }
+                mut out.append("]}")
+                continue
+            }
+            None => {
+            }
+        }
+        if kind == "error" and line.starts_with("because ") {
+            mut because.push(text::String.of(string_part(line, from: 8, end: line.byte_len(), alloc).as_str(), alloc))
+        } else if kind == "error" and line.starts_with("fix ") {
+            let rest = string_part(line, from: 4, end: line.byte_len(), alloc)
+            let space = rest.find(" ").value_or(0)
+            mut fixes.push(string_part(rest.as_str(), from: space + 1, end: rest.byte_len(), alloc))
+        } else if line.starts_with("- ") or line.starts_with("+ ") {
+            member(mut out, mut members, name: match line.starts_with("- ") {
+                true => "old"
+                false => "new"
+            })
+            json_value(string_part(line, from: 2, end: line.byte_len(), alloc).as_str(), mut out, alloc)
+        } else if kind != "primer" and kind != "code" and item_name(line).is_some() {
+            let span = item_name(line).value_or(Span(start: 0, end: 0))
+            member(mut out, mut members, name: string_part(line, from: 0, end: span.end, alloc).as_str())
+            if kind == "error" {
+                json_string(string_part(line, from: span.end + 2, end: line.byte_len(), alloc).as_str(), mut out)
+            } else {
+                json_value(string_part(line, from: span.end + 2, end: line.byte_len(), alloc).as_str(), mut out, alloc)
+            }
+        } else {
+            mut prose.push(text::String.of(line, alloc))
+        }
+    }
+    write_listed(mut out, name: "because", items: because, mut members)
+    write_listed(mut out, name: "fixes", items: fixes, mut members)
+    if prose.len() == 0 {
+        return
+    }
+    if kind == "primer" or kind == "code" or prose.len() > 1 {
+        var joined = text::String.empty(alloc)
+        for index in 0..<prose.len() {
+            if index > 0 {
+                mut joined.push('\n')
+            }
+            mut joined.append(prose[index].as_str())
+        }
+        member(mut out, mut members, name: "text")
+        json_string(joined.as_str(), mut out)
+        return
+    }
+    member(mut out, mut members, name: "value")
+    json_value(prose[0].as_str(), mut out, alloc)
+} write_continued
+
+/// Writes `items` as the member `name`, an array of strings, when it holds any.
+fn write_listed(mut out: text::String, name: Str, items: mem::List[text::String], mut members: u32) {
+    if items.len() == 0 {
+        return
+    }
+    member(mut out, mut members, name)
+    mut out.push('[')
+    for index in 0..<items.len() {
+        if index > 0 {
+            mut out.push(',')
+        }
+        json_string(items[index].as_str(), mut out)
+    }
+    mut out.push(']')
+} write_listed
+
+/// Where the labels of the envelope head `line`, `<field>: envelope <labels> <n>`, lie: from the `: ` before `envelope` to the space before n; `None` for any other line.
+fn envelope_head(line: Str) -> Option[Span] {
+    let Some(at) = line.find(": envelope ") else {
+        return None
+    }
+    let bytes = line.as_bytes()
+    var space = bytes.len()
+    while space > at + 11 {
+        space -= 1
+        if bytes[space] == b' ' {
+            return Some(Span(start: at, end: space))
+        }
+    }
+    return None
+} envelope_head
+
+/// A copy of the bytes of `text` from `from` to `end`, empty when they are no part of it.
+fn string_part(text: Str, from: usize, end: usize, alloc: mem::Alloc) -> text::String {
+    return match text.slice_bytes(from, end) {
+        Some(slice) => text::String.of(slice, alloc)
+        None => text::String.empty(alloc)
+    }
+} string_part
+
+/// Starts the member `name`, after a `,` unless it is the first.
+fn member(mut out: text::String, mut members: u32, name: Str) {
+    if members > 0 {
+        mut out.push(',')
+    }
+    members += 1
+    json_string(name, mut out)
+    mut out.push(':')
+} member
+
+/// Writes `text` as a JSON string.
+fn json_string(text: Str, mut out: text::String) {
+    mut out.push('"')
+    for c in text.cursor() {
+        if c == '"' or c == '\\' {
+            mut out.push('\\')
+            mut out.push(c)
+        } else if c == '\n' {
+            mut out.append("\\n")
+        } else if c < ' ' {
+            mut out.append("\\u00")
+            let bits = char.to_bits(c)
+            mut out.push(hex_digit(bits >> 4))
+            mut out.push(hex_digit(bits & 15))
+        } else {
+            mut out.push(c)
+        }
+    }
+    mut out.push('"')
+} json_string
+
+fn hex_digit(value: u32) -> char {
+    return char.checked_from_bits(match value < 10 {
+        true => 48 + value
+        false => 87 + value
+    }).value_or('0')
+} hex_digit
+
+/// Writes the canonical rendering `text` as JSON: integers and `true` and `false` as themselves, `None` as `null`, `Some(v)` as `v`, text literals as strings, lists as arrays, a construction with fields as an object, a variant with a payload as `{"Variant": payload}` and one without as its name, and any other word as a string.
+fn json_value(text: Str, mut out: text::String, alloc: mem::Alloc) {
+    var open = mem::List[u8].empty(alloc)
+    let bytes = text.as_bytes()
+    var at: usize = 0
+    while at < bytes.len() {
+        let byte = bytes[at]
+        if byte == b'"' {
+            let end = literal_end(text, start: at)
+            mut out.push('"')
+            mut out.append(string_part(text, from: at + 1, end: end - 1, alloc).as_str())
+            mut out.push('"')
+            at = end
+            continue
+        }
+        if byte == b'[' or byte == b']' or byte == b',' {
+            mut out.push(char.checked_from_bits(u32.widen(byte)).value_or(','))
+            if byte == b'[' {
+                mut open.push(b'a')
+            } else if byte == b']' {
+                discard mut open.pop()
+            }
+            at += 1
+            continue
+        }
+        if byte == b')' {
+            match mut open.pop() {
+                Some(b'o') or Some(b'p') => mut out.push('}')
+                Some(b'v') => mut out.append("}}")
+                else => {
+                }
+            }
+            at += 1
+            continue
+        }
+        if byte == b' ' {
+            at += 1
+            continue
+        }
+        let start = at
+        while at < bytes.len() and not ends_word(bytes, at) {
+            at += 1
+        }
+        let owned = string_part(text, from: start, end: at, alloc)
+        let word = owned.as_str()
+        if at < bytes.len() and bytes[at] == b':' {
+            json_string(word, mut out)
+            mut out.push(':')
+            at += 2
+            continue
+        }
+        if at < bytes.len() and bytes[at] == b'(' {
+            at += 1
+            let labeled = item_name(string_part(text, from: at, end: bytes.len(), alloc).as_str()).is_some()
+            if at < bytes.len() and bytes[at] == b')' {
+                mut out.append("{}")
+                at += 1
+                continue
+            }
+            let dot = word.find(".")
+            if word == "Some" {
+                mut open.push(b's')
+            } else if dot.is_some() {
+                mut out.push('{')
+                json_string(string_part(word, from: dot.value_or(0) + 1, end: word.byte_len(), alloc).as_str(), mut out)
+                mut out.push(':')
+                if labeled {
+                    mut out.push('{')
+                    mut open.push(b'v')
+                } else {
+                    mut open.push(b'p')
+                }
+            } else if labeled {
+                mut out.push('{')
+                mut open.push(b'o')
+            } else {
+                mut open.push(b's')
+            }
+            continue
+        }
+        write_word(mut out, word, alloc)
+    }
+} json_value
+
+/// Writes the plain word `word` of a canonical rendering as JSON.
+fn write_word(mut out: text::String, word: Str, alloc: mem::Alloc) {
+    if word == "true" or word == "false" or is_number(word) {
+        mut out.append(word)
+    } else if word == "None" {
+        mut out.append("null")
+    } else if variant_name(word).is_some() {
+        json_string(string_part(word, from: variant_name(word).value_or(0), end: word.byte_len(), alloc).as_str(), mut out)
+    } else {
+        json_string(word, mut out)
+    }
+} write_word
+
+/// Where the variant's name starts in `word` when it names a variant `Type.Variant`, both capitalised.
+fn variant_name(word: Str) -> Option[usize] {
+    let Some(dot) = word.find(".") else {
+        return None
+    }
+    let bytes = word.as_bytes()
+    if dot + 1 >= bytes.len() or bytes[0] < b'A' or bytes[0] > b'Z' or bytes[dot + 1] < b'A' or bytes[dot + 1] > b'Z' {
+        return None
+    }
+    return Some(dot + 1)
+} variant_name
+
+/// Whether `word` writes a number: digits after an optional `-`, with an optional fraction.
+fn is_number(word: Str) -> bool {
+    let bytes = word.as_bytes()
+    var at: usize = 0
+    if at < bytes.len() and bytes[at] == b'-' {
+        at += 1
+    }
+    var seen: usize = 0
+    var dots: usize = 0
+    while at < bytes.len() {
+        let byte = bytes[at]
+        if byte == b'.' {
+            dots += 1
+        } else if byte < b'0' or byte > b'9' {
+            return false
+        } else {
+            seen += 1
+        }
+        at += 1
+    }
+    return seen > 0 and dots <= 1 and not word.ends_with(".")
+} is_number
+
+/// Whether a word of a canonical rendering ends at `at`: before `,`, `(`, `)`, `[`, `]`, a space, or the `: ` after a label.
+fn ends_word(bytes: Slice[u8], at: usize) -> bool {
+    let byte = bytes[at]
+    if byte == b',' or byte == b'(' or byte == b')' or byte == b'[' or byte == b']' or byte == b' ' {
+        return true
+    }
+    return byte == b':' and at + 1 < bytes.len() and bytes[at + 1] == b' '
+} ends_word
+
+/// The position after the text literal starting at `start` in `text`.
+fn literal_end(text: Str, start: usize) -> usize {
+    let bytes = text.as_bytes()
+    var escaped = false
+    var at = start + 1
+    while at < bytes.len() {
+        let byte = bytes[at]
+        at += 1
+        if escaped {
+            escaped = false
+        } else if byte == b'\\' {
+            escaped = true
+        } else if byte == b'"' {
+            return at
+        }
+    }
+    return at
+} literal_end
+
+test json_lines_convert_records_from_their_canonical_rendering for Record.json {
+    let alloc = testing::world().alloc
+    var record = Record.of("event", alloc)
+    mut record.subject(Dyn[Render].view(ident::Cursor(seq: 4410)))
+    mut record.field("time_ns", value: Dyn[Render].view(3_127_000_000u64))
+    mut record.text("kind", value: "instance.failed", alloc)
+    mut record.field("payload", value: Dyn[Render].view("InstanceFailed(code: \"trap.exhausted\", restarts: 5, escalation: Some(app), last: None, at: Severity.Error, list: [1, 2])"))
+    let line = record.json(alloc)
+    expect line.as_str() == "{\"record\":\"event\",\"value\":{\"cursor\":\"e4410\",\"time_ns\":3127000000,\"kind\":\"instance.failed\",\"payload\":{\"code\":\"trap.exhausted\",\"restarts\":5,\"escalation\":\"app\",\"last\":null,\"at\":\"Error\",\"list\":[1,2]}}}"
+    var block = Block.of(Verdict.Ok, id: "5", verb: "watch", operand: "", alloc)
+    mut block.records.push(take record)
+    let written = block.text(Cut(budget: 4_000, sized: false, skip: 0, rest: text::String.of("watch", alloc), fields: mem::List.empty(alloc), json: true), alloc)
+    expect written.view().prefix(80) == Some(b"{\"id\":\"5\",\"operand\":\"\",\"record\":\"verdict\",\"summary\":{\"records\":1},\"verb\":\"watch\"")
+} json_lines_convert_records_from_their_canonical_rendering

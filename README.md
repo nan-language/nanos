@@ -37,3 +37,4 @@ Run from the repository root:
 | `nan build [<scope>]` | Build images into `.nan/images/<target>/` |
 | `tools/sandbox start [<instance>]` | Boot NaN OS under QEMU |
 | `tools/sandbox reset [<instance>]` | Delete a sandbox instance |
+| `tools/transcripts [<instance>]` | Run the link transcripts in a fresh sandbox |

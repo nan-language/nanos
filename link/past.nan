@@ -3,7 +3,7 @@
 /// The most commits `history` lists, and the most links `why` follows.
 const HISTORY_COMMITS: u32 = 256
 
-const CHAIN_LINKS: usize = 16
+const CHAIN_LINKS: usize = 32
 
 /// The most trace records `why` reads back for the causes it follows.
 const TRACED: u64 = 4_096
@@ -29,8 +29,11 @@ fn history(request: Request, subject: Str, tree: store::service::View, reader: i
         None => {
         }
     }
+    if not subject.starts_with("/") {
+        return try await moniker_history(request, subject, tree, alloc)
+    }
     let Some(path) = path_of(subject, alloc) else {
-        return failed_block(id, verb, operand: subject, failure: Failure.of("request.invalid-operand", subject, alloc).expecting("a path or a commit", found: subject, alloc), alloc)
+        return failed_block(id, verb, operand: subject, failure: Failure.of("request.invalid-operand", subject, alloc).expecting("a path, a moniker or a commit", found: subject, alloc), alloc)
     }
     let commits = match first attempt await tree.history(take path, before: None, limit: HISTORY_COMMITS, alloc) {
         Ok(found) => found
@@ -42,6 +45,23 @@ fn history(request: Request, subject: Str, tree: store::service::View, reader: i
     }
     return block
 } history
+
+/// `history <moniker>`: an `input` record per input header of the instance's flight recorder, which holds none until the instance's recorder is armed; a moniker naming no instance fails with the nearest monikers as fixes.
+fn moniker_history(request: Request, subject: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+    let id = request.id.as_str()
+    let verb = request.verb.as_str()
+    let monikers = try await names_below(tree, path: "/sys/instances", alloc)
+    if monikers.position(fn(each: text::String) => each.as_str() == subject).is_some() {
+        return Block.of(Verdict.Ok, id, verb, operand: subject, alloc)
+    }
+    var failure = Failure.of("request.unknown-name", subject, alloc)
+    for candidate in nearest(subject, among: monikers, alloc) {
+        var fix = text::String.of("history ", alloc)
+        mut fix.append(candidate.as_str())
+        mut failure.fixes.push(take fix)
+    }
+    return failed_block(id, verb, operand: subject, take failure, alloc)
+} moniker_history
 
 /// `commit #<n>, time, principal, session, plan, cause`, its intent in an envelope.
 fn commit_record(meta: store::CommitMeta, reader: ident::Principal, alloc: mem::Alloc) -> Record {
@@ -55,7 +75,7 @@ fn commit_record(meta: store::CommitMeta, reader: ident::Principal, alloc: mem::
         }
     }
     match meta.plan {
-        Some(plan) => mut record.field("plan", value: Dyn[Render].view(plan))
+        Some(plan) => mut record.hash("plan", value: plan)
         None => {
         }
     }
@@ -128,12 +148,12 @@ fn edit_record(edit: store::Edit, kind: Str, alloc: mem::Alloc) -> Record {
     var record = Record.of(kind, alloc)
     mut record.subject(Dyn[Render].view(edit.path))
     match edit.from {
-        Some(hash) => mut record.field("from", value: Dyn[Render].view(hash))
+        Some(hash) => mut record.hash("from", value: hash)
         None => {
         }
     }
     match edit.to {
-        Some(hash) => mut record.field("to", value: Dyn[Render].view(hash))
+        Some(hash) => mut record.hash("to", value: hash)
         None => {
         }
     }
@@ -189,7 +209,7 @@ fn why(request: Request, subject: Str, tree: store::service::View, alloc: mem::A
     let verb = request.verb.as_str()
     var block = Block.of(Verdict.Ok, id, verb, operand: subject, alloc)
     let Some(start) = try await cause_of(subject, tree, mut block, alloc) else {
-        return failed_block(id, verb, operand: subject, failure: Failure.of("request.unknown-name", subject, alloc).expecting("a path, a commit, an event or a cause", found: subject, alloc), alloc)
+        return failed_block(id, verb, operand: subject, failure: Failure.of("request.unknown-name", subject, alloc).expecting("a path, a commit, an event, a fault or a cause", found: subject, alloc), alloc)
     }
     let causes = try await trace_causes(tree, alloc)
     var cause = start
@@ -200,9 +220,7 @@ fn why(request: Request, subject: Str, tree: store::service::View, alloc: mem::A
         let found = causes[at]
         var record = Record.of("because", alloc)
         mut record.words(role_of(found.kind).as_str())
-        mut record.field("subject", value: Dyn[Render].view(Quoted(text: text::String.of(found.subject.as_str(), alloc))))
-        mut record.field("cause", value: Dyn[Render].view(found.cause))
-        mut record.field("principal", value: Dyn[Render].view(found.principal))
+        mut record.field("subject", value: Dyn[Render].view(found.cause))
         mut record.field("time", value: Dyn[Render].view(found.time))
         mut block.records.push(take record)
         let Some(parent) = found.parent else {
@@ -226,6 +244,16 @@ fn cause_of(subject: Str, tree: store::service::View, mut block: Block, alloc: m
                 return None
             }
             return Some(event.cause)
+        }
+        None => {
+        }
+    }
+    match fault_number_of(subject) {
+        Some(seq) => {
+            let Some(fault) = try await fault_at(tree, seq, alloc) else {
+                return None
+            }
+            return Some(fault.cause)
         }
         None => {
         }
@@ -282,6 +310,36 @@ fn event_at(tree: store::service::View, cursor: ident::Cursor, alloc: mem::Alloc
         Err(_) => None
     }
 } event_at
+
+/// The sequence number of the fault `text` names as `f<n>`.
+fn fault_number_of(text: Str) -> Option[u64] {
+    if not text.starts_with("f") {
+        return None
+    }
+    let Some(rest) = text.slice_bytes(1, end: text.byte_len()) else {
+        return None
+    }
+    return number_of(rest)
+} fault_number_of
+
+/// The fault record of `/journal/faults` of sequence number `seq`.
+fn fault_at(tree: store::service::View, seq: u64, alloc: mem::Alloc) -> Option[journal::FaultRecord] fails task::Cancelled uses wait {
+    let read = match first attempt await tree.read_stream(ident::Path(text: text::String.of("/journal/faults", alloc)), from: seq, limit: 1, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(entry) = read.entries.get(0) else {
+        return None
+    }
+    if entry.seq != seq {
+        return None
+    }
+    return match attempt mem::wire::Codec[journal::FaultRecord].decode(Untrusted.of(entry.value.view()), alloc) {
+        Ok(fault) => Some(take fault)
+        Err(_) => None
+    }
+} fault_at
 
 /// The cause records among the latest records of `/journal/traces`.
 fn trace_causes(tree: store::service::View, alloc: mem::Alloc) -> mem::List[journal::CauseRecord] fails task::Cancelled uses wait {

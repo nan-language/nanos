@@ -25,6 +25,7 @@ pub fn answer(request: Request, tree: store::service::View, budget: os::SessionB
         "history" => try await history(request, subject: operand.as_str(), tree, reader, alloc)
         "diff" => try await diff(request, tree, alloc)
         "why" => try await why(request, subject: operand.as_str(), tree, alloc)
+        "cancel" => try await cancel_named(request, target: operand.as_str(), tree, alloc)
         else => failed_block(id: request.id.as_str(), verb, operand: operand.as_str(), failure: Failure.of("request.unknown-verb", subject: verb, alloc), alloc)
     }
 } answer
@@ -49,7 +50,7 @@ fn primer(request: Request, part: Str, alloc: mem::Alloc) -> Block {
     return block
 } primer
 
-/// `describe <path|moniker|code>`: a node's type, an instance's specification and status, or a code's section and meaning; an unknown name fails with the nearest codes as fixes.
+/// `describe <path|moniker|code>`: a node's type and writers, an instance's specification and status, or a code's section and meaning; an unknown name fails with the nearest codes and monikers as fixes.
 fn describe(request: Request, subject: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
     let id = request.id.as_str()
     let verb = request.verb.as_str()
@@ -63,7 +64,9 @@ fn describe(request: Request, subject: Str, tree: store::service::View, alloc: m
             Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
             Err(failed) => return failed_block(id, verb, operand: subject, failure: Failure.of(failed.code().as_str(), subject, alloc), alloc)
         }
-        mut block.records.push(node_header(node, alloc))
+        var record = node_header(node, alloc)
+        mut record.field("writers", value: Dyn[Render].view(writers_of(subject, alloc)))
+        mut block.records.push(take record)
         return block
     }
     match code_record(subject, alloc) {
@@ -82,14 +85,96 @@ fn describe(request: Request, subject: Str, tree: store::service::View, alloc: m
         None => {
         }
     }
+    var names = catalogued_codes(alloc)
+    let monikers = try await names_below(tree, path: "/sys/instances", alloc)
+    for moniker in take monikers {
+        mut names.push(take moniker)
+    }
     var failure = Failure.of("request.unknown-name", subject, alloc)
-    for candidate in nearest_codes(subject, alloc) {
+    for candidate in nearest(subject, among: names, alloc) {
         var fix = text::String.of("describe ", alloc)
         mut fix.append(candidate.as_str())
         mut failure.fixes.push(take fix)
     }
     return failed_block(id, verb, operand: subject, take failure, alloc)
 } describe
+
+/// The writers of the node at `path` beside plans, as the tree names them.
+fn writers_of(path: Str, alloc: mem::Alloc) -> mem::List[ident::Moniker] {
+    var names = ""
+    if path_below(path, prefix: "/sys/instances") {
+        names = "kernel devices supervisor"
+    } else if path_below(path, prefix: "/sys/config") {
+        names = "kernel policy supervisor"
+    } else if path_below(path, prefix: "/sys/code") {
+        names = "admission"
+    } else if path_below(path, prefix: "/sys/principals") {
+        names = "keys link"
+    } else if path_below(path, prefix: "/sys/grants") {
+        names = "link keys devices supervisor"
+    } else if path_below(path, prefix: "/sys/approvals") {
+        names = "policy"
+    } else if path_below(path, prefix: "/sys/plans") or path_below(path, prefix: "/sys/outbox") or path_below(path, prefix: "/sys/schedule") or path_below(path, prefix: "/live/sessions") {
+        names = "link"
+    } else if path_below(path, prefix: "/sys/boot") or path_below(path, prefix: "/live/boot") {
+        names = "boot"
+    } else if path_below(path, prefix: "/state") {
+        names = "kernel"
+    } else if path_below(path, prefix: "/journal") {
+        names = "journal"
+    } else if path_below(path, prefix: "/live/store") {
+        names = "store"
+    } else if path_below(path, prefix: "/live/devices") {
+        names = "devices"
+    } else if path_below(path, prefix: "/live") {
+        names = "kernel keys"
+    }
+    var writers = mem::List[ident::Moniker].empty(alloc)
+    if path_below(path, prefix: "/sys") or path_below(path, prefix: "/data") {
+        mut writers.push(ident::Moniker(text: text::Fixed[59].of("plans")))
+    }
+    var start: usize = 0
+    for at in 0..=names.byte_len() {
+        if at < names.byte_len() and names.as_bytes()[at] != b' ' {
+            continue
+        }
+        match names.slice_bytes(start, end: at) {
+            Some(name) => {
+                if name.byte_len() > 0 {
+                    mut writers.push(ident::Moniker(text: text::Fixed[59].of(name)))
+                }
+            }
+            None => {
+            }
+        }
+        start = at + 1
+    }
+    return writers
+} writers_of
+
+/// `cancel <plan|moniker|principal>`: a target naming nothing fails with the nearest names as fixes, and one no cancellable work stands for with `request.not-cancellable`.
+fn cancel_named(request: Request, target: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+    let id = request.id.as_str()
+    let verb = request.verb.as_str()
+    let kind = cancel_target(target)
+    let dir = match kind {
+        Target.Principal => "/sys/principals"
+        Target.Plan => "/sys/plans"
+        else => "/sys/instances"
+    }
+    let names = try await names_below(tree, path: dir, alloc)
+    if names.position(fn(each: text::String) => each.as_str() == target).is_some() {
+        let failure = Failure.of("request.not-cancellable", subject: target, alloc).expecting("a pending request or watch, a plan awaiting approval or scheduled, a job with acknowledgement, or a child's delegation", found: target_word(kind).as_str(), alloc)
+        return failed_block(id, verb, operand: target, take failure, alloc)
+    }
+    var failure = Failure.of("request.unknown-name", subject: target, alloc)
+    for candidate in nearest(target, among: names, alloc) {
+        var fix = text::String.of("cancel ", alloc)
+        mut fix.append(candidate.as_str())
+        mut failure.fixes.push(take fix)
+    }
+    return failed_block(id, verb, operand: target, take failure, alloc)
+} cancel_named
 
 /// The `instance <moniker>` record of the instance `name` names: its specification and, when it has one, its observed record.
 fn instance_record(name: Str, tree: store::service::View, alloc: mem::Alloc) -> Option[Record] fails task::Cancelled uses wait {
@@ -194,7 +279,7 @@ fn node_header(node: store::Node, alloc: mem::Alloc) -> Record {
         mut record.field("commit", value: Dyn[Render].view(node.version))
     }
     match node.hash {
-        Some(hash) => mut record.field("hash", value: Dyn[Render].view(hash))
+        Some(hash) => mut record.hash("hash", value: hash)
         None => {
         }
     }
@@ -242,8 +327,8 @@ fn stream_record(node: store::Node, alloc: mem::Alloc) -> Record {
     mut record.subject(Dyn[Render].view(node.path))
     mut record.field("count", value: Dyn[Render].view(node.size))
     if node.size > 0 {
-        mut record.field("first", value: Dyn[Render].view(ident::Cursor(seq: node.next - node.size)))
-        mut record.field("last", value: Dyn[Render].view(ident::Cursor(seq: node.next - 1)))
+        mut record.field("first", value: Dyn[Render].view(ident::Cursor(seq: node.next.saturating_sub(node.size))))
+        mut record.field("last", value: Dyn[Render].view(ident::Cursor(seq: node.next.saturating_sub(1))))
     }
     return record
 } stream_record
@@ -254,7 +339,7 @@ fn blob_record(node: store::Node, alloc: mem::Alloc) -> Record {
     mut record.subject(Dyn[Render].view(node.path))
     mut record.field("size_bytes", value: Dyn[Render].view(node.size))
     match node.hash {
-        Some(hash) => mut record.field("blake3", value: Dyn[Render].view(hash))
+        Some(hash) => mut record.hash("blake3", value: hash)
         None => {
         }
     }
@@ -306,6 +391,14 @@ validator fn piece_content(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text
     }
 } piece_content
 
+/// `value`, at least `at`.
+fn floored(value: u64, at: u64) -> u64 {
+    if value > at {
+        return value
+    }
+    return at
+} floored
+
 /// `value`, at most `at`.
 fn capped(value: u64, at: u64) -> u64 {
     if value < at {
@@ -350,9 +443,31 @@ fn base64_of(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
     return text
 } base64_of
 
-/// How `request`'s blocks are cut under the session's budget `budget`: its `--budget` and `--skip`.
+/// How `request`'s blocks are cut and written under the session's budget `budget`: its `--budget`, `--skip`, `--fields`, names separated by `,`, and `--json`.
 fn request_cut(request: Request, budget: os::SessionBudget, alloc: mem::Alloc) -> Cut {
-    var cut = Cut(budget: budget.response_units, sized: budget.output_units.is_some(), skip: 0, rest: text::String.empty(alloc))
+    var cut = Cut(budget: budget.response_units, sized: budget.output_units.is_some(), skip: 0, rest: text::String.empty(alloc), fields: mem::List.empty(alloc), json: request.has("json"))
+    match request.flag("fields") {
+        Some(names) => {
+            var start: usize = 0
+            for at in 0..=names.byte_len() {
+                if at < names.byte_len() and names.as_bytes()[at] != b',' {
+                    continue
+                }
+                match names.slice_bytes(start, end: at) {
+                    Some(name) => {
+                        if name.byte_len() > 0 {
+                            mut cut.fields.push(text::String.of(name, alloc))
+                        }
+                    }
+                    None => {
+                    }
+                }
+                start = at + 1
+            }
+        }
+        None => {
+        }
+    }
     match request.flag("budget") {
         Some(units) => {
             cut.budget = u32.saturate(number_of(units).value_or(0))
@@ -396,14 +511,21 @@ fn entries_of(tree: store::service::View, path: ident::Path, alloc: mem::Alloc) 
     }
 } entries_of
 
-/// A row of a query: its subject, its node header or stream cursor, and its value in canonical rendering, the special fields `name`, `path` and `commit` included.
+/// A row of a query: its record, its value in canonical rendering, and the special fields `name`, `path`, `commit` and a stream record's `seq`.
 struct Row {
     record: Record
     value: text::String
     name: text::String
     path: text::String
     commit: text::String
+    seq: text::String
 } Row
+
+/// The sequence numbers a query of a stream reads, from `low` to `high` included, none when `low` passes `high`.
+struct Bounds derives Copy {
+    low: u64
+    high: u64
+} Bounds
 
 /// `find <query>`: the rows of the query's path that its condition keeps, in its order, at most its limit, with its fields.
 fn find(request: Request, query: Str, tree: store::service::View, budget: os::SessionBudget, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
@@ -421,14 +543,26 @@ fn find(request: Request, query: Str, tree: store::service::View, budget: os::Se
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(failed) => return failed_block(id, verb, operand: query, failure: Failure.of(failed.code().as_str(), subject: from, alloc), alloc)
     }
-    if node.size > budget.query_records and node.kind != store::NodeKind.Record {
-        return failed_block(id, verb, operand: query, failure: over_budget(parsed, node, budget, alloc), alloc)
+    let bounds = stream_bounds(parsed, node)
+    var scanned = node.size
+    if node.kind == store::NodeKind.Stream {
+        scanned = 0
+        if bounds.low <= bounds.high {
+            scanned = bounds.high - bounds.low + 1
+        }
     }
-    var rows = match node.kind {
-        store::NodeKind.Stream => try await stream_rows(tree, node, alloc)
-        store::NodeKind.Dir => try await dir_rows(tree, node, alloc)
-        else => mem::List[Row].empty(alloc)
+    if scanned > budget.query_records and node.kind != store::NodeKind.Record {
+        return failed_block(id, verb, operand: query, failure: over_budget(parsed, node, scanned, budget, alloc), alloc)
     }
+    let read = match node.kind {
+        store::NodeKind.Stream => try await stream_rows(tree, node, bounds, most_bytes: budget.query_bytes, alloc)
+        store::NodeKind.Dir => Scanned(rows: try await dir_rows(tree, node, alloc), bytes: 0)
+        else => Scanned(rows: mem::List.empty(alloc), bytes: 0)
+    }
+    if read.bytes > budget.query_bytes {
+        return failed_block(id, verb, operand: query, failure: over_bytes(parsed, bytes: read.bytes, budget, alloc), alloc)
+    }
+    var rows = read.rows
     mut rows.retain(fn(row: Row) => kept(row, condition: parsed.condition))
     match parsed.order {
         Some(order) => mut rows.sort_by(fn(left: Row, right: Row) => ordered(left, right, order))
@@ -449,13 +583,99 @@ fn find(request: Request, query: Str, tree: store::service::View, budget: os::Se
     return block
 } find
 
+/// The `budget.query` failure of a query whose bytes read pass the session's query budget.
+fn over_bytes(query: Query, bytes: u64, budget: os::SessionBudget, alloc: mem::Alloc) -> Failure {
+    var expected = text::String.of("at most ", alloc)
+    mut expected.write(Dyn[Render].view(budget.query_bytes), budget: 24)
+    mut expected.append(" bytes")
+    var found = text::String.empty(alloc)
+    mut found.write(Dyn[Render].view(bytes), budget: 24)
+    mut found.append(" bytes")
+    return Failure.of("budget.query", subject: query.from.as_str(), alloc).expecting(expected.as_str(), found: found.as_str(), alloc)
+} over_bytes
+
+/// The sequence numbers a query of the stream `node` reads: its records, narrowed by the `seq` comparisons among the top-level `and` terms of its condition, and by an `order seq` with a `limit`.
+fn stream_bounds(query: Query, node: store::Node) -> Bounds {
+    if node.kind != store::NodeKind.Stream or node.size == 0 {
+        return Bounds(low: 1, high: 0)
+    }
+    var bounds = Bounds(low: node.next.saturating_sub(node.size), high: node.next.saturating_sub(1))
+    match query.condition {
+        Some(condition) => {
+            if condition.all or condition.terms.len() == 1 {
+                for term in condition.terms {
+                    match term {
+                        Term.Compare(comparison) => {
+                            bounds = bounded(bounds, comparison)
+                        }
+                        Term.Group(all: _, comparisons: _) => {
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+        }
+    }
+    match query.order {
+        Some(order) => match query.limit {
+            Some(limit) => {
+                if order.field.as_str() == "seq" and limit > 0 and bounds.low <= bounds.high and bounds.high - bounds.low >= limit {
+                    if order.descending {
+                        bounds.low = bounds.high - limit + 1
+                    } else {
+                        bounds.high = bounds.low + limit - 1
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        None => {
+        }
+    }
+    return bounds
+} stream_bounds
+
+/// `bounds` narrowed by the comparison `comparison` when it compares `seq` with a number.
+fn bounded(bounds: Bounds, comparison: Comparison) -> Bounds {
+    if comparison.field.as_str() != "seq" {
+        return bounds
+    }
+    let Some(value) = number_of(comparison.literal.as_str()) else {
+        return bounds
+    }
+    var narrowed = bounds
+    match comparison.comparator {
+        Comparator.Greater => {
+            narrowed.low = floored(narrowed.low, at: value.saturating_add(1))
+        }
+        Comparator.GreaterOrEqual => {
+            narrowed.low = floored(narrowed.low, at: value)
+        }
+        Comparator.Less => {
+            narrowed.high = capped(narrowed.high, at: value.saturating_sub(1))
+        }
+        Comparator.LessOrEqual => {
+            narrowed.high = capped(narrowed.high, at: value)
+        }
+        Comparator.Equal => {
+            narrowed.low = floored(narrowed.low, at: value)
+            narrowed.high = capped(narrowed.high, at: value)
+        }
+        else => {
+        }
+    }
+    return narrowed
+} bounded
+
 /// The `budget.query` failure of a query whose rows pass the session's query budget, with the fix narrowing a stream to its latest records.
-fn over_budget(query: Query, node: store::Node, budget: os::SessionBudget, alloc: mem::Alloc) -> Failure {
+fn over_budget(query: Query, node: store::Node, scanned: u64, budget: os::SessionBudget, alloc: mem::Alloc) -> Failure {
     var expected = text::String.of("at most ", alloc)
     mut expected.write(Dyn[Render].view(budget.query_records), budget: 24)
     mut expected.append(" records")
     var found = text::String.empty(alloc)
-    mut found.write(Dyn[Render].view(node.size), budget: 24)
+    mut found.write(Dyn[Render].view(scanned), budget: 24)
     mut found.append(" records")
     var failure = Failure.of("budget.query", subject: query.from.as_str(), alloc).expecting(expected.as_str(), found: found.as_str(), alloc)
     if node.kind == store::NodeKind.Stream {
@@ -468,35 +688,54 @@ fn over_budget(query: Query, node: store::Node, budget: os::SessionBudget, alloc
     return failure
 } over_budget
 
-/// The records of the stream `node`, each an `event` record for `/journal/events` and a `row` otherwise.
-fn stream_rows(tree: store::service::View, node: store::Node, alloc: mem::Alloc) -> mem::List[Row] fails task::Cancelled uses wait {
+/// The records of the stream `node` from `bounds.low` to `bounds.high`, each an `event` record for `/journal/events` and a `row` otherwise, and the bytes their values take, reading stopping once they pass `most_bytes`.
+fn stream_rows(tree: store::service::View, node: store::Node, bounds: Bounds, most_bytes: u64, alloc: mem::Alloc) -> Scanned fails task::Cancelled uses wait {
     var rows = mem::List[Row].empty(alloc)
+    var bytes: u64 = 0
     let events = node.path.text.as_str() == "/journal/events"
-    var from = node.next - node.size
-    loop {
-        let read = match first attempt await tree.read_stream(ident::Path(text: text::String.of(node.path.text.as_str(), alloc)), from, limit: READ_ENTRIES, alloc) {
+    var from = bounds.low
+    while from <= bounds.high and bytes <= most_bytes {
+        let wanted = u32.saturate(capped(u64.widen(READ_ENTRIES), at: bounds.high - from + 1))
+        let read = match first attempt await tree.read_stream(ident::Path(text: text::String.of(node.path.text.as_str(), alloc)), from, limit: wanted, alloc) {
             Ok(found) => found
             Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-            Err(_) => return rows
+            Err(_) => break
         }
         if read.entries.len() == 0 {
-            return rows
+            break
         }
         for entry in take read.entries {
+            if entry.seq > bounds.high {
+                break
+            }
             from = entry.seq + 1
+            bytes = bytes.saturating_add(u64.widen(entry.value.len()))
             mut rows.push(stream_row(take entry, events, declared: node.declared, alloc))
         }
-        if from >= node.next {
-            return rows
-        }
     }
+    return Scanned(rows: take rows, bytes: bytes)
 } stream_rows
 
-/// The row of a stream entry: an `event` record when `events`, else `row <cursor>, time` with its value by the stream's declared type.
+/// The rows a query read and the bytes their values take.
+struct Scanned {
+    rows: mem::List[Row]
+    bytes: u64
+} Scanned
+
+/// The row of a stream entry: an `event` record when `events`, else `row <cursor>, time` with its value by the stream's declared type, a fault's subject being its id `f<n>`.
 fn stream_row(take entry: store::StreamEntry, events: bool, declared: Option[store::TypeRef], alloc: mem::Alloc) -> Row {
     let cursor = ident::Cursor(seq: entry.seq)
     var subject = text::String.empty(alloc)
-    mut subject.write(Dyn[Render].view(cursor), budget: 24)
+    let fault = match declared {
+        Some(type) => type.name.as_str() == "journal::FaultRecord"
+        None => false
+    }
+    if fault {
+        mut subject.push('f')
+        mut subject.write(Dyn[Render].view(entry.seq), budget: 24)
+    } else {
+        mut subject.write(Dyn[Render].view(cursor), budget: 24)
+    }
     if events {
         match attempt mem::wire::Codec[journal::Event].decode(Untrusted.of(entry.value.view()), alloc) {
             Ok(event) => return event_row(cursor, event, alloc)
@@ -505,14 +744,16 @@ fn stream_row(take entry: store::StreamEntry, events: bool, declared: Option[sto
         }
     }
     var record = Record.of("row", alloc)
-    mut record.subject(Dyn[Render].view(cursor))
+    mut record.words(subject.as_str())
     mut record.field("time", value: Dyn[Render].view(entry.time))
     let value = match declared {
         Some(type) => render_value(type.name.as_str(), raw: Untrusted.of(entry.value.view()), alloc)
         None => opaque("-", size: entry.value.len(), alloc)
     }
     mut record.line(value.as_str(), alloc)
-    return Row(record: take record, value: take value, name: take subject, path: text::String.empty(alloc), commit: text::String.empty(alloc))
+    var seq = text::String.empty(alloc)
+    mut seq.write(Dyn[Render].view(entry.seq), budget: 24)
+    return Row(record: take record, value: take value, name: take subject, path: text::String.empty(alloc), commit: text::String.empty(alloc), seq: take seq)
 } stream_row
 
 /// The `event` record of the event of cursor `cursor`, its payload rendered by its type.
@@ -531,7 +772,9 @@ fn event_row(cursor: ident::Cursor, event: journal::Event, alloc: mem::Alloc) ->
     mut value.append(record.header.as_str())
     var name = text::String.empty(alloc)
     mut name.write(Dyn[Render].view(cursor), budget: 24)
-    return Row(record: take record, value: wrapped(value.as_str(), alloc), name: take name, path: text::String.empty(alloc), commit: text::String.empty(alloc))
+    var seq = text::String.empty(alloc)
+    mut seq.write(Dyn[Render].view(cursor.seq), budget: 24)
+    return Row(record: take record, value: wrapped(value.as_str(), alloc), name: take name, path: text::String.empty(alloc), commit: text::String.empty(alloc), seq: take seq)
 } event_row
 
 /// `Name(fields)` from `Name fields`, the header of a record without a subject written as a value.
@@ -573,7 +816,7 @@ fn dir_rows(tree: store::service::View, node: store::Node, alloc: mem::Alloc) ->
         mut record.value(value.as_str(), origins: found.origins, alloc)
         var commit = text::String.empty(alloc)
         mut commit.write(Dyn[Render].view(found.version), budget: 24)
-        mut rows.push(Row(record: take record, value: take value, name: text::String.of(entry.name.as_str(), alloc), path: text::String.of(found.path.text.as_str(), alloc), commit: take commit))
+        mut rows.push(Row(record: take record, value: take value, name: text::String.of(entry.name.as_str(), alloc), path: text::String.of(found.path.text.as_str(), alloc), commit: take commit, seq: text::String.empty(alloc)))
     }
     return rows
 } dir_rows
@@ -612,13 +855,14 @@ fn grouped(row: Row, all: bool, comparisons: mem::List[Comparison]) -> bool {
     return all
 } grouped
 
-/// Whether the field of `comparison` in `row` compares with its literal as it says.
+/// Whether the field of `comparison` in `row` compares with its literal as it says, `name`, `path`, `commit` and `seq` being the row's own.
 fn compared(row: Row, comparison: Comparison) -> bool {
     let field = comparison.field.as_str()
     return match field {
         "name" => holds(row.name.as_str(), comparator: comparison.comparator, literal: comparison.literal.as_str())
         "path" => holds(row.path.as_str(), comparator: comparison.comparator, literal: comparison.literal.as_str())
         "commit" => holds(row.commit.as_str(), comparator: comparison.comparator, literal: comparison.literal.as_str())
+        "seq" => holds(row.seq.as_str(), comparator: comparison.comparator, literal: comparison.literal.as_str())
         else => match field_span(row.value.as_str(), path: field) {
             Some(span) => match row.value.as_str().slice_bytes(span.start, end: span.end) {
                 Some(value) => holds(value, comparator: comparison.comparator, literal: comparison.literal.as_str())
@@ -636,12 +880,14 @@ fn ordered(left: Row, right: Row, order: Order) -> core::Ordering {
         "name" => left.name.as_str()
         "path" => left.path.as_str()
         "commit" => left.commit.as_str()
+        "seq" => left.seq.as_str()
         else => left.value.as_str()
     }
     let right_text = match field {
         "name" => right.name.as_str()
         "path" => right.path.as_str()
         "commit" => right.commit.as_str()
+        "seq" => right.seq.as_str()
         else => right.value.as_str()
     }
     let left_span = row_span(left, field).value_or(Span(start: 0, end: 0))
@@ -669,15 +915,19 @@ fn row_span(row: Row, field: Str) -> Option[Span] {
         "name" => Some(Span(start: 0, end: row.name.byte_len()))
         "path" => Some(Span(start: 0, end: row.path.byte_len()))
         "commit" => Some(Span(start: 0, end: row.commit.byte_len()))
+        "seq" => Some(Span(start: 0, end: row.seq.byte_len()))
         else => field_span(row.value.as_str(), path: field)
     }
 } row_span
 
-/// The record of `row`, its value narrowed to the fields `select` names when it names any, in the envelope it was in.
+/// The record of `row`, its value narrowed to the fields `select` names when it names any, in the envelope it was in, or for an event its header.
 fn row_record(take row: Row, select: mem::List[text::String], alloc: mem::Alloc) -> Record {
     var record = row.record
-    if select.len() == 0 or record.lines.len() == 0 {
+    if select.len() == 0 {
         return record
+    }
+    if record.lines.len() == 0 {
+        return record.narrowed(fields: select, alloc)
     }
     let labels = record.labels
     record.labels = mem::List.empty(alloc)
