@@ -231,7 +231,7 @@ fn declare(tree: store::service::View, retention: Retention, alloc: mem::Alloc) 
     try await commit(tree, take writes, alloc)
 } declare
 
-/// Appends each event the core drains to `/journal/events`, `debug` ones only when `keep_debug`, each ring's lost events as one `journal.lost`, the record of each trap and integrity fault to `/journal/faults` and the system cause a `boot.started` opens to `/journal/traces`, and tells `out` the events it appended.
+/// Appends what the core holds for `journal` as `Gathered.writes` lays it out, and tells `out` the events it appended and those the rings lost.
 fn drain(
     feed: Feed,
     tree: store::service::View,
@@ -243,45 +243,20 @@ fn drain(
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
     loop {
-        let drains = try await feed.next(alloc)
-        var entries = mem::List[mem::Bytes].empty(alloc)
-        var faults = mem::List[mem::Bytes].empty(alloc)
-        var causes = mem::List[mem::Bytes].empty(alloc)
-        var lost: u64 = 0
+        let Fed(drains: drains, logs: logs, logs_lost: logs_lost) = try await feed.next(alloc)
+        var gathered = Gathered.empty(alloc)
         for drained in drains {
-            for record in drained.records {
-                let event = record.event(system, alloc)
-                if event.severity != Severity.Debug or keep_debug {
-                    mut entries.push(wire_of(event, alloc))
-                }
-                match record.fault(system, alloc) {
-                    Some(fault) => mut faults.push(wire_of(fault, alloc))
-                    None => {
-                    }
-                }
-                match record.opened(system, wall, alloc) {
-                    Some(opened) => mut causes.push(wire_of(opened, alloc))
-                    None => {
-                    }
-                }
-            }
-            if drained.lost > 0 {
-                lost = lost.saturating_add(drained.lost)
-                let count = Lost(cpu: Some(drained.cpu), source: None, count: drained.lost)
-                mut entries.push(wire_of(journal_event("journal.lost", severity: Severity.Warn, payload: payload_of(count, alloc), now: now_ns(clock), system, alloc), alloc))
-            }
+            mut gathered.drained(drained, keep_debug, system, wall, now: now_ns(clock), alloc)
         }
-        let appended = u64.widen(entries.len())
-        var writes = mem::List[store::Write].empty(alloc)
-        if entries.len() > 0 {
-            mut writes.push(store::Write.Append(path: Kept.Events.path(alloc), entries: take entries))
+        for logged in take logs {
+            mut gathered.logged(take logged, system, now: now_ns(clock), alloc)
         }
-        if causes.len() > 0 {
-            mut writes.push(store::Write.Append(path: Kept.Traces.path(alloc), entries: take causes))
+        if logs_lost > 0 {
+            mut gathered.lost(Lost(cpu: None, source: None, count: logs_lost), system, now: now_ns(clock), alloc)
         }
-        if faults.len() > 0 {
-            mut writes.push(store::Write.Append(path: Kept.Faults.path(alloc), entries: take faults))
-        }
+        let appended = u64.widen(gathered.events.len())
+        let lost = gathered.ring_lost
+        let writes = take gathered.writes(alloc)
         if writes.len() == 0 {
             continue
         }
@@ -289,6 +264,93 @@ fn drain(
         discard attempt await out.drained(events: appended, lost)
     }
 } drain
+
+/// The entries of one append, by stream, and the events the rings lost among them.
+struct Gathered {
+    events: mem::List[mem::Bytes]
+    logs: mem::List[mem::Bytes]
+    traces: mem::List[mem::Bytes]
+    faults: mem::List[mem::Bytes]
+    ring_lost: u64
+} Gathered
+
+fn Gathered.empty(alloc: mem::Alloc) -> Gathered = Gathered(events: mem::List.empty(alloc), logs: mem::List.empty(alloc), traces: mem::List.empty(alloc), faults: mem::List.empty(alloc), ring_lost: 0)
+
+/// Gathers each event of a drain, `debug` ones only when `keep_debug`, the ring's lost events as one `journal.lost`, the record of each trap and integrity fault, and the system cause a `boot.started` opens.
+fn Gathered.drained(
+    mut self,
+    drained: Drained,
+    keep_debug: bool,
+    system: ident::Cause,
+    wall: ident::Wall,
+    now: u64,
+    alloc: mem::Alloc,
+    ) {
+    for record in drained.records {
+        let event = record.event(system, alloc)
+        if event.severity != Severity.Debug or keep_debug {
+            mut self.events.push(wire_of(event, alloc))
+        }
+        match record.fault(system, alloc) {
+            Some(fault) => mut self.faults.push(wire_of(fault, alloc))
+            None => {
+            }
+        }
+        match record.opened(system, wall, alloc) {
+            Some(opened) => mut self.traces.push(wire_of(opened, alloc))
+            None => {
+            }
+        }
+    }
+    if drained.lost > 0 {
+        self.ring_lost = self.ring_lost.saturating_add(drained.lost)
+        mut self.lost(Lost(cpu: Some(drained.cpu), source: None, count: drained.lost), system, now, alloc)
+    }
+} Gathered.drained
+
+/// Gathers a log record, of the system cause, after a `journal.lost` of the records its instance lost before it.
+fn Gathered.logged(
+    mut self,
+    take logged: Logged,
+    system: ident::Cause,
+    now: u64,
+    alloc: mem::Alloc,
+    ) {
+    if logged.lost > 0 {
+        mut self.lost(Lost(cpu: None, source: Some(ident::Moniker(text: logged.source.text)), count: logged.lost), system, now, alloc)
+    }
+    mut self.logs.push(wire_of(take logged.entry(cause: system), alloc))
+} Gathered.logged
+
+/// Gathers a `journal.lost` of `count`.
+fn Gathered.lost(
+    mut self,
+    count: Lost,
+    system: ident::Cause,
+    now: u64,
+    alloc: mem::Alloc,
+    ) {
+    mut self.events.push(wire_of(journal_event("journal.lost", severity: Severity.Warn, payload: payload_of(count, alloc), now, system, alloc), alloc))
+} Gathered.lost
+
+/// The appends of what was gathered, one per stream holding any.
+fn Gathered.writes(take self, alloc: mem::Alloc) -> mem::List[store::Write] {
+    let Gathered(events: events, logs: logs, traces: traces, faults: faults, ring_lost: _) = self
+    var writes = mem::List[store::Write].empty(alloc)
+    if events.len() > 0 {
+        mut writes.push(store::Write.Append(path: Kept.Events.path(alloc), entries: take events))
+    }
+    if logs.len() > 0 {
+        mut writes.push(store::Write.Append(path: Kept.Log.path(alloc), entries: take logs))
+    }
+    if traces.len() > 0 {
+        mut writes.push(store::Write.Append(path: Kept.Traces.path(alloc), entries: take traces))
+    }
+    if faults.len() > 0 {
+        mut writes.push(store::Write.Append(path: Kept.Faults.path(alloc), entries: take faults))
+    }
+    return writes
+} Gathered.writes
 
 /// An event `journal` records itself at the monotonic time `now`.
 fn journal_event(
