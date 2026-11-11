@@ -1,0 +1,110 @@
+//! The serial transport: the bytes the console UART receives, cut into lines and gathered into requests, and the blocks written to it.
+
+/// The most bytes one read of the UART asks for, and one write gives it.
+const READ_BYTES: u32 = 4_096
+
+const WRITE_BYTES: usize = 4_096
+
+/// What a line received on serial gives: a request's text once it ends, nothing yet, the failure of a request, or a line for the console.
+pub closed enum Received {
+    Request(text::String)
+    Refused(code: text::Fixed[32])
+    Console(text::String)
+} Received
+
+/// The serial input: the bytes of the line being received and the request being gathered.
+pub closed struct Input {
+    pub line: mem::Bytes
+    pub gathered: Gathered
+} Input
+
+pub fn Input.empty(alloc: mem::Alloc) -> Input = Input(line: mem::Bytes.empty(alloc), gathered: Gathered.empty(alloc))
+
+/// Takes `data` from the UART: each line it completes, ending in LF, or in CR or CRLF as a terminal sends it, is a console line when it starts with `console ` outside a request, else goes to the request being gathered. A line growing past the most a request holds ends it with `request.too-large`.
+pub validator fn Input.feed(mut self, data: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::List[Received] {
+    var received = mem::List[Received].empty(alloc)
+    var cr = false
+    for byte in data.inspect() {
+        let ends = byte == b'\n' or byte == b'\r'
+        if byte == b'\n' and cr {
+            cr = false
+            continue
+        }
+        cr = byte == b'\r'
+        if not ends {
+            if self.line.len() <= MOST_REQUEST_BYTES {
+                mut self.line.push(byte)
+            }
+            continue
+        }
+        match mut self.ended_line(alloc) {
+            Some(each) => mut received.push(take each)
+            None => {
+            }
+        }
+    }
+    return received
+} Input.feed
+
+/// What the line just ended gives.
+fn Input.ended_line(mut self, alloc: mem::Alloc) -> Option[Received] {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(self.line.view())
+    mut self.line.truncate(0)
+    if line.len() > MOST_REQUEST_BYTES {
+        return Some(Received.Refused(code: text::Fixed[32].of("request.too-large")))
+    }
+    if self.gathered.text.byte_len() == 0 and line.view().prefix(8) == Some(b"console ") {
+        let Ok(console) = attempt text::String.try_from_utf8(line.view(), alloc) else {
+            return Some(Received.Refused(code: text::Fixed[32].of("request.malformed")))
+        }
+        return Some(Received.Console(take console))
+    }
+    return match mut self.gathered.add(Untrusted.of(line.view()), alloc) {
+        Gathering.Ended(text) => Some(Received.Request(take text))
+        Gathering.Continued => None
+        Gathering.Failed(code: code) => Some(Received.Refused(code: code))
+    }
+} Input.ended_line
+
+/// Reads the console UART for as long as it answers, posting what each read gives.
+pub fn read_serial(console: os::Port[devices::Console], out: sys::Outbox[Link], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var input = Input.empty(alloc)
+    loop {
+        var call = sys::Encoded.empty(alloc)
+        let reply = sys::Wire[devices::Console].read(mut call, max: READ_BYTES)
+        let data = match first attempt await console.call(take call, reply, alloc) {
+            Ok(bytes) => bytes
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return
+        }
+        let received = mut input.feed(data.view(), alloc)
+        for each in take received {
+            discard attempt await out.received(take each)
+        }
+    }
+} read_serial
+
+/// Writes `data` to the console UART in writes of at most 4 KiB, then posts `written`.
+pub fn write_serial(console: os::Port[devices::Console], take data: mem::Bytes, out: sys::Outbox[Link], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var at: usize = 0
+    while at < data.len() {
+        var end = at + WRITE_BYTES
+        if end > data.len() {
+            end = data.len()
+        }
+        var piece = mem::Bytes.empty(alloc)
+        for index in at..<end {
+            mut piece.push(data[index])
+        }
+        var call = sys::Encoded.empty(alloc)
+        let reply = sys::Wire[devices::Console].write(mut call, data: take piece)
+        match first attempt await console.call(take call, reply, alloc) {
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+        at = end
+    }
+    discard attempt await out.written()
+} write_serial

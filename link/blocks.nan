@@ -1,0 +1,283 @@
+//! Blocks: the verdict lines and records of a response or a pushed block, cut to its budget in units with an elision line naming the request that prints the rest.
+
+/// The bytes of an output unit.
+const UNIT_BYTES: usize = 4
+
+/// The most bytes a verdict line's first operand takes, `...` included.
+const OPERAND_BYTES: usize = 64
+
+/// The most bytes a field's value renders to.
+const VALUE_BYTES: usize = 1_048_576
+
+/// The indentation of continuation lines.
+const INDENT: Str = "    "
+
+pub closed enum Verdict derives Copy, Eq {
+    Ok
+    Failed
+    Pending
+} Verdict
+
+/// A record: its kind, the rest of its header line, and its continuation lines without their indentation.
+pub closed struct Record {
+    pub kind: text::Fixed[16]
+    pub header: text::String
+    pub lines: mem::List[text::String]
+} Record
+
+/// A block: its verdict, the id, verb and first operand of its request, and its records.
+pub closed struct Block {
+    pub verdict: Verdict
+    pub id: text::Fixed[32]
+    pub verb: text::Fixed[16]
+    pub operand: text::String
+    pub records: mem::List[Record]
+} Block
+
+/// How a block is cut: the units it holds at most, whether its verdict lines give its size, how many records it skips, and the request without its id or `--skip` that prints what it elides.
+pub closed struct Cut {
+    pub budget: u32
+    pub sized: bool
+    pub skip: u64
+    pub rest: text::String
+} Cut
+
+/// A text written as a text literal.
+struct Quoted {
+    text: text::String
+} Quoted
+
+impl Quoted: Render
+
+fn Quoted.render(self, mut out: core::Renderer) {
+    mut out.write_nested(self.text.as_str())
+} Quoted.render
+
+pub fn Record.of(kind: Str, alloc: mem::Alloc) -> Record {
+    return Record(kind: text::Fixed[16].of(kind), header: text::String.empty(alloc), lines: mem::List.empty(alloc))
+} Record.of
+
+/// Writes the record's subject, which comes before its fields.
+pub fn Record.subject(mut self, value: Dyn[Render]) {
+    mut self.separate()
+    mut self.header.write(value, budget: VALUE_BYTES)
+} Record.subject
+
+/// Writes `text` as the next word of the header, after a space.
+pub fn Record.words(mut self, text: Str) {
+    mut self.header.push(' ')
+    mut self.header.append(text)
+} Record.words
+
+/// Writes the field `name` with its value in canonical rendering, a text value through [Record.text].
+pub fn Record.field(mut self, name: Str, value: Dyn[Render]) {
+    mut self.separate()
+    mut self.header.append(name)
+    mut self.header.append(": ")
+    mut self.header.write(value, budget: VALUE_BYTES)
+} Record.field
+
+/// Writes the field `name` with the text `value` as a text literal.
+pub fn Record.text(mut self, name: Str, value: Str, alloc: mem::Alloc) {
+    let quoted = Quoted(text: text::String.of(value, alloc))
+    mut self.field(name, value: Dyn[Render].view(quoted))
+} Record.text
+
+/// Adds the continuation line `line`.
+pub fn Record.line(mut self, line: Str, alloc: mem::Alloc) {
+    mut self.lines.push(text::String.of(line, alloc))
+} Record.line
+
+/// Starts the next part of the header: a space after the kind, then `, `.
+fn Record.separate(mut self) {
+    if self.header.byte_len() == 0 {
+        mut self.header.push(' ')
+    } else {
+        mut self.header.append(", ")
+    }
+} Record.separate
+
+/// The bytes of the record's lines.
+fn Record.size(self) -> usize {
+    var size = self.kind.byte_len() + self.header.byte_len() + 1
+    for line in self.lines {
+        size += INDENT.byte_len() + line.byte_len() + 1
+    }
+    return size
+} Record.size
+
+fn Record.write(self, mut out: mem::Bytes) {
+    mut out.append(self.kind.as_bytes())
+    mut out.append(self.header.as_bytes())
+    mut out.push(b'\n')
+    for line in self.lines {
+        mut out.append(INDENT.as_bytes())
+        mut out.append(line.as_bytes())
+        mut out.push(b'\n')
+    }
+} Record.write
+
+pub fn Block.of(verdict: Verdict, id: Str, verb: Str, operand: Str, alloc: mem::Alloc) -> Block {
+    return Block(verdict: verdict, id: text::Fixed[32].of(id), verb: text::Fixed[16].of(verb), operand: cut_operand(operand, alloc), records: mem::List.empty(alloc))
+} Block.of
+
+/// The block's text: the verdict line, the records after the skipped ones, the most that fit the budget with the verdict lines and the elision line, at least one, then the elision line when records are left and the verdict line again.
+pub fn Block.text(self, cut: Cut, alloc: mem::Alloc) -> mem::Bytes {
+    var skipped = self.records.len()
+    if cut.skip < u64.widen(skipped) {
+        skipped = usize.widen(cut.skip)
+    }
+    let count = self.records.len() - skipped
+    let room = usize.widen(cut.budget).saturating_mul(UNIT_BYTES)
+    var reserved = 2 * self.verdict_line(count, units: None, alloc).byte_len()
+    if cut.sized {
+        reserved += 2 * (", units ".byte_len() + digits(u64.widen(cut.budget)))
+    }
+    var shown: usize = 0
+    var used = reserved
+    while shown < count {
+        let size = self.records[skipped + shown].size()
+        let left = count - shown - 1
+        var elision: usize = 0
+        if left > 0 {
+            elision = elision_line(left, cut, after: skipped + shown + 1, alloc).byte_len()
+        }
+        if shown > 0 and used + size + elision > room {
+            break
+        }
+        used += size
+        shown += 1
+    }
+    var body = mem::Bytes.empty(alloc)
+    for at in skipped..<(skipped + shown) {
+        self.records[at].write(mut body)
+    }
+    if shown < count {
+        mut body.append(elision_line(count - shown, cut, after: skipped + shown, alloc).as_bytes())
+    }
+    var units: Option[u64] = None
+    if cut.sized {
+        units = Some(units_of(body.len(), verdict: self.verdict_line(count, units: None, alloc).byte_len()))
+    }
+    let line = self.verdict_line(count, units, alloc)
+    var out = mem::Bytes.empty(alloc)
+    mut out.append(line.as_bytes())
+    mut out.append(body.view())
+    mut out.append(line.as_bytes())
+    return out
+} Block.text
+
+/// `<word> <id> <verb> <first operand>: records <n>`, then `, units <u>` when given, and a line feed.
+fn Block.verdict_line(self, count: usize, units: Option[u64], alloc: mem::Alloc) -> text::String {
+    var line = text::String.empty(alloc)
+    mut line.append(match self.verdict {
+        Verdict.Ok => "ok "
+        Verdict.Failed => "failed "
+        Verdict.Pending => "pending "
+    })
+    mut line.append(self.id.as_str())
+    mut line.push(' ')
+    mut line.append(self.verb.as_str())
+    if self.operand.byte_len() > 0 {
+        mut line.push(' ')
+        mut line.append(self.operand.as_str())
+    }
+    mut line.append(": records ")
+    mut line.write(Dyn[Render].view(count), budget: 24)
+    match units {
+        Some(size) => {
+            mut line.append(", units ")
+            mut line.write(Dyn[Render].view(size), budget: 24)
+        }
+        None => {
+        }
+    }
+    mut line.push('\n')
+    return line
+} Block.verdict_line
+
+/// `elided <n> records: <request> --skip <k>`, k being `after` skipped records in all.
+fn elision_line(count: usize, cut: Cut, after: usize, alloc: mem::Alloc) -> text::String {
+    var line = text::String.of("elided ", alloc)
+    mut line.write(Dyn[Render].view(count), budget: 24)
+    mut line.append(" records: ")
+    mut line.append(cut.rest.as_str())
+    mut line.append(" --skip ")
+    mut line.write(Dyn[Render].view(after), budget: 24)
+    mut line.push('\n')
+    return line
+} elision_line
+
+/// The units of a block whose verdict lines without their size take `verdict` bytes each and whose other lines take `body`: the size the units suffix itself takes included.
+fn units_of(body: usize, verdict: usize) -> u64 {
+    let suffix = ", units ".byte_len()
+    for width in 1..=20usize {
+        let total = body + 2 * (verdict + suffix + width)
+        let units = u64.widen((total + UNIT_BYTES - 1) / UNIT_BYTES)
+        if digits(units) == width {
+            return units
+        }
+    }
+    return u64.widen((body + 2 * verdict) / UNIT_BYTES)
+} units_of
+
+/// The decimal digits of `value`.
+fn digits(value: u64) -> usize {
+    var count: usize = 1
+    var rest = value / 10
+    for _ in 0..<20usize {
+        if rest == 0 {
+            break
+        }
+        count += 1
+        rest = rest / 10
+    }
+    return count
+} digits
+
+/// `operand`, cut to 64 bytes ending in `...` when longer.
+fn cut_operand(operand: Str, alloc: mem::Alloc) -> text::String {
+    if operand.byte_len() <= OPERAND_BYTES {
+        return text::String.of(operand, alloc)
+    }
+    var end = OPERAND_BYTES - 3
+    while end > 0 and not operand.is_char_boundary(end) {
+        end -= 1
+    }
+    let Some(head) = operand.slice_bytes(0, end) else {
+        return text::String.of("...", alloc)
+    }
+    var cut = text::String.of(head, alloc)
+    mut cut.append("...")
+    return cut
+} cut_operand
+
+test blocks_elide_what_their_budget_leaves_out for Block.text {
+    let alloc = testing::world().alloc
+    var block = Block.of(Verdict.Ok, id: "4", verb: "find", operand: "from /live/accounts select cpu_ns order cpu_ns desc limit 5", alloc)
+    for at in 0..<5u64 {
+        var path = text::String.of("/live/accounts/app.indexer", alloc)
+        mut path.write(Dyn[Render].view(at), budget: 4)
+        var record = Record.of("node", alloc)
+        mut record.subject(Dyn[Render].view(path.as_str()))
+        mut record.text("type", value: "Account", alloc)
+        mut record.line("Account(cpu_ns: 41000000000)", alloc)
+        mut block.records.push(take record)
+    }
+    let cut = Cut(budget: 100, sized: false, skip: 0, rest: text::String.of("find from /live/accounts select cpu_ns order cpu_ns desc limit 5 --budget 100", alloc))
+    let written = block.text(cut, alloc)
+    let expected = b"ok 4 find from /live/accounts select cpu_ns order cpu_ns desc limit 5: records 5\nnode /live/accounts/app.indexer0, type: \"Account\"\n    Account(cpu_ns: 41000000000)\nelided 4 records: find from /live/accounts select cpu_ns order cpu_ns desc limit 5 --budget 100 --skip 1\nok 4 find from /live/accounts select cpu_ns order cpu_ns desc limit 5: records 5\n"
+    expect written.view() == expected
+} blocks_elide_what_their_budget_leaves_out
+
+test sized_blocks_count_their_units for Block.text {
+    let alloc = testing::world().alloc
+    var block = Block.of(Verdict.Failed, id: "11", verb: "apply", operand: "age7pwuq3zqxfkwosw", alloc)
+    var record = Record.of("error", alloc)
+    mut record.subject(Dyn[Render].view("plan.stale"))
+    mut block.records.push(take record)
+    let written = block.text(Cut(budget: 4_000, sized: true, skip: 0, rest: text::String.of("apply age7pwuq3zqxfkwosw", alloc)), alloc)
+    let expected = b"failed 11 apply age7pwuq3zqxfkwosw: records 1, units 33\nerror plan.stale\nfailed 11 apply age7pwuq3zqxfkwosw: records 1, units 33\n"
+    expect written.view() == expected
+    expect written.len() == 129
+} sized_blocks_count_their_units

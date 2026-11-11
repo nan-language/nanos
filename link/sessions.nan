@@ -1,0 +1,336 @@
+//! Sessions: a principal's authenticated presence on a connection, opened by `hello`.
+
+/// The connection number of the serial transport's one connection.
+const SERIAL_CONNECTION: u64 = 1
+
+pub closed enum Transport derives Copy, Eq, Render, Encode {
+    Serial
+    Vsock
+    Tcp
+    Port
+} Transport
+
+/// A session: its number in the boot, its principal, its transport and when it opened.
+pub closed struct Session derives Encode {
+    pub number: u64
+    pub principal: ident::Principal
+    pub transport: Transport
+    pub opened: ident::WallTime
+} Session
+
+/// The challenge of a connection's latest `hello`: the principal it answers, its nonce, the connection's binding, and when it expires, in wall and monotonic time.
+pub closed struct Challenge derives Encode {
+    pub principal: ident::Principal
+    pub nonce: Array[u8, 32]
+    pub binding: ident::HashValue
+    pub expires: ident::WallTime
+    pub expires_ns: u64
+} Challenge
+
+/// What a principal signs to open a session: the challenge's nonce and the connection's binding.
+pub closed struct HelloProof derives Encode {
+    pub principal: ident::Principal
+    pub nonce: Array[u8, 32]
+    pub binding: ident::HashValue
+} HelloProof
+
+/// How a `hello` waiting on its keyed task went on: the principal has a key and the nonce drawn for its challenge, it has none, its signature verified, or it was refused with a code.
+pub closed enum HelloStep derives Encode {
+    Known(nonce: Array[u8, 32])
+    Unknown
+    Verified
+    Rejected(code: text::Fixed[32])
+} HelloStep
+
+/// `hello <principal> [<signature>]`: opens the owner's session at once in `dev` mode, else answers a challenge, or checks the signature answering it.
+fn Linker.hello(mut self, request: Request, number: u64, mut env: Env, mut cx: sys::Cx[Link]) -> Option[Block] {
+    let alloc = env.alloc
+    let Some(named) = request.operands.get(0) else {
+        return Some(refusal(request, failure: Failure.of("request.invalid-operand", subject: "-", alloc).expecting("a principal", found: "nothing", alloc), alloc))
+    }
+    let Some(principal) = principal_of(named.as_str()) else {
+        return Some(refusal(request, failure: Failure.of("request.invalid-operand", subject: named.as_str(), alloc).expecting("a principal", found: named.as_str(), alloc), alloc))
+    }
+    if request.has("claim") or request.has("resume") {
+        return Some(refusal(request, failure: Failure.of("request.invalid-flag", subject: "-", alloc), alloc))
+    }
+    match self.running.position(fn(each: Running) => each.number == number) {
+        Some(at) => {
+            self.running[at].principal = Some(ident::Principal(text: principal.text))
+        }
+        None => {
+        }
+    }
+    let dev = match self.facts {
+        Some(facts) => facts.ready.mode.as_str() == "dev"
+        None => false
+    }
+    match request.operands.len() {
+        1 => {
+            if dev and principal.text.as_str() == "owner" {
+                mut self.open(number, take principal, mut env, mut cx)
+                return None
+            }
+            let tree = env.tree
+            let random = env.random
+            mut cx.spawn(key: ANSWERING + number, run: fn[take principal](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
+                let step = try await challenge_step(tree, principal, random, alloc)
+                discard attempt await out.hello_step(number, take step)
+            })
+            return None
+        }
+        2 => return mut self.verify(request, take principal, number, mut env, mut cx)
+        else => return Some(refusal(request, failure: Failure.of("request.invalid-operand", subject: named.as_str(), alloc), alloc))
+    }
+} Linker.hello
+
+/// Has a keyed task verify the signature of `hello <principal> <signature>` against the connection's challenge.
+fn Linker.verify(mut self, request: Request, take principal: ident::Principal, number: u64, mut env: Env, mut cx: sys::Cx[Link]) -> Option[Block] {
+    let alloc = env.alloc
+    let Some(written) = request.operands.get(1) else {
+        return Some(refusal(request, failure: Failure.of("request.invalid-operand", subject: "-", alloc), alloc))
+    }
+    let Some(signature) = ident::Signature.parse(written.as_str()) else {
+        return Some(refusal(request, failure: Failure.of("request.invalid-operand", subject: written.as_str(), alloc).expecting("a signature in checksummed base32", found: written.as_str(), alloc), alloc))
+    }
+    let now = now_ns(env.clock)
+    let Some(challenge) = self.challenge else {
+        return Some(refusal(request, failure: Failure.of("link.challenge-expired", subject: principal.text.as_str(), alloc), alloc))
+    }
+    if challenge.principal != principal or now >= challenge.expires_ns {
+        return Some(refusal(request, failure: Failure.of("link.challenge-expired", subject: principal.text.as_str(), alloc), alloc))
+    }
+    var proof = mem::Bytes.empty(alloc)
+    mem::wire::Codec[HelloProof].encode(HelloProof(principal: ident::Principal(text: principal.text), nonce: challenge.nonce, binding: challenge.binding), out: mut proof)
+    let subject = ident::HashValue.of_object(ident::Kind.Handshake, bytes: proof.view())
+    let keys = env.keys
+    mut cx.spawn(key: ANSWERING + number, run: fn[take principal](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
+        let step = try await verified_step(keys, principal, subject, signature, alloc)
+        discard attempt await out.hello_step(number, take step)
+    })
+    return None
+} Linker.verify
+
+/// Goes on with the `hello` numbered `number`.
+fn Linker.hello_step(mut self, take number: u64, take step: HelloStep, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    let Some(named) = self.running[at].principal else {
+        return
+    }
+    let principal = ident::Principal(text: named.text)
+    match step {
+        HelloStep.Known(nonce: nonce) => {
+            let block = mut self.challenge_block(at, take principal, nonce, mut env)
+            mut self.respond(at, take block, mut env, mut cx)
+        }
+        HelloStep.Unknown => {
+            let block = self.running[at].failed(Failure.of("link.principal-unknown", subject: principal.text.as_str(), alloc), alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+        }
+        HelloStep.Verified => {
+            self.challenge = None
+            mut self.open(number, take principal, mut env, mut cx)
+        }
+        HelloStep.Rejected(code: code) => {
+            let block = self.running[at].failed(Failure.of(code.as_str(), subject: principal.text.as_str(), alloc), alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+        }
+    }
+} Linker.hello_step
+
+/// Issues the connection's challenge to `principal`, replacing any earlier one, and gives its `challenge` block.
+fn Linker.challenge_block(mut self, at: usize, take principal: ident::Principal, nonce: Array[u8, 32], mut env: Env) -> Block {
+    let alloc = env.alloc
+    let boot = match self.facts {
+        Some(facts) => facts.boot
+        None => 0
+    }
+    let key = match self.facts {
+        Some(facts) => facts.ready.key
+        None => ident::HashValue.of_content(b"")
+    }
+    var bound = text::String.of("serial ", alloc)
+    mut bound.write(Dyn[Render].view(boot), budget: 24)
+    mut bound.push(' ')
+    mut bound.write(Dyn[Render].view(SERIAL_CONNECTION), budget: 24)
+    mut bound.push(' ')
+    mut bound.append(key.full_form().as_str())
+    let binding = ident::HashValue.of_object(ident::Kind.Handshake, bytes: bound.as_bytes())
+    let expires_ns = now_ns(env.clock).saturating_add(u64.widen(self.config.challenge_s) * 1_000_000_000)
+    let expires = env.wall.at_ns(expires_ns)
+    self.challenge = Some(Challenge(principal: take principal, nonce: nonce, binding: binding, expires: expires, expires_ns: expires_ns))
+    var record = Record.of("challenge", alloc)
+    mut record.field("nonce", value: Dyn[Render].view(ident::key_text(nonce).as_str()))
+    mut record.field("binding", value: Dyn[Render].view(binding.full_form().as_str()))
+    mut record.field("expires", value: Dyn[Render].view(expires))
+    var block = self.running[at].block(Verdict.Ok, alloc)
+    mut block.records.push(take record)
+    return block
+} Linker.challenge_block
+
+/// Opens the session of `principal` on serial for the `hello` numbered `number`, which a keyed task answers with its `session` and `system` records.
+fn Linker.open(mut self, number: u64, take principal: ident::Principal, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    let session = Session(number: self.next_session, principal: take principal, transport: Transport.Serial, opened: env.wall.now(env.clock))
+    self.next_session += 1
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        mut self.sessions.push(take session)
+        return
+    }
+    let head = self.running[at].block(Verdict.Ok, alloc)
+    var mode = text::Fixed[16].empty()
+    var generation: u64 = 0
+    match self.facts {
+        Some(facts) => {
+            mode = text::Fixed[16].of(facts.ready.mode.as_str())
+            generation = facts.ready.generation
+        }
+        None => {
+        }
+    }
+    let shown = Session(number: session.number, principal: ident::Principal(text: session.principal.text), transport: session.transport, opened: session.opened)
+    mut self.sessions.push(take session)
+    let tree = env.tree
+    let cut = self.cut(text::String.empty(alloc))
+    mut cx.spawn(key: ANSWERING + number, run: fn[take head, take shown, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
+        let block = try await opened_block(take head, session: shown, mode, generation, tree, alloc)
+        discard attempt await out.responded(number, block: block.text(cut, alloc))
+    })
+} Linker.open
+
+/// `head` with the `session` record of `session`, which opened in the mode `mode` of generation `generation`, and the `system` record of the machine and the instances.
+fn opened_block(take head: Block, session: Session, mode: text::Fixed[16], generation: u64, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+    var block = head
+    var path = mem::List[ident::Moniker].empty(alloc)
+    mut path.push(ident::Moniker(text: text::Fixed[59].of("link")))
+    match try await console_driver(tree, alloc) {
+        Some(driver) => mut path.push(take driver)
+        None => {
+        }
+    }
+    var record = Record.of("session", alloc)
+    mut record.words(session_text(session.number).as_str())
+    mut record.field("principal", value: Dyn[Render].view(session.principal))
+    mut record.field("transport", value: Dyn[Render].view(session.transport))
+    mut record.field("path", value: Dyn[Render].view(path))
+    mut record.text("mode", value: mode.as_str(), alloc)
+    mut record.field("generation", value: Dyn[Render].view(generation))
+    mut block.records.push(take record)
+    mut block.records.push(try await system_record(tree, alloc))
+    return block
+} opened_block
+
+/// The `system` record: the CPUs and memory of `/live/machine`, and the instances, those converged, the approvals pending and the event cursor of `/live/status`.
+fn system_record(tree: store::service::View, alloc: mem::Alloc) -> Record fails task::Cancelled uses wait {
+    var record = Record.of("system", alloc)
+    match try await Records[os::Machine].at(tree, path: "/live/machine", alloc) {
+        Some(machine) => {
+            mut record.field("cpus", value: Dyn[Render].view(machine.cpus))
+            mut record.field("memory_bytes", value: Dyn[Render].view(machine.ram_bytes))
+        }
+        None => {
+        }
+    }
+    match try await Records[os::LiveStatus].at(tree, path: "/live/status", alloc) {
+        Some(status) => {
+            let counts = status.instances
+            mut record.field("instances", value: Dyn[Render].view(counts.running + counts.converging + counts.failed))
+            mut record.field("converged", value: Dyn[Render].view(counts.running))
+            mut record.field("approvals", value: Dyn[Render].view(status.approvals))
+        }
+        None => {
+        }
+    }
+    mut record.field("cursor", value: Dyn[Render].view(try await event_cursor(tree, alloc)))
+    return record
+} system_record
+
+/// The driver holding the `console` role, as `/live/devices` names it, each bus there taking a dir of its devices.
+fn console_driver(tree: store::service::View, alloc: mem::Alloc) -> Option[ident::Moniker] fails task::Cancelled uses wait {
+    for bus in try await names_below(tree, path: "/live/devices", alloc) {
+        var dir = text::String.of("/live/devices/", alloc)
+        mut dir.append(bus.as_str())
+        for name in try await names_below(tree, path: dir.as_str(), alloc) {
+            var path = text::String.of(dir.as_str(), alloc)
+            mut path.push('/')
+            mut path.append(name.as_str())
+            let Some(device) = try await Records[devices::LiveDevice].at(tree, path: path.as_str(), alloc) else {
+                continue
+            }
+            if device.role == Some(os::Role.Console) {
+                return device.driver
+            }
+        }
+    }
+    return None
+} console_driver
+
+/// The names of the children of the dir at `path`, none when it is no dir.
+fn names_below(tree: store::service::View, path: Str, alloc: mem::Alloc) -> mem::List[text::String] fails task::Cancelled uses wait {
+    var names = mem::List[text::String].empty(alloc)
+    let listing = match first attempt await tree.list(ident::Path(text: text::String.of(path, alloc)), after: None, limit: 256, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return names
+    }
+    for entry in take listing.entries {
+        mut names.push(take entry.name)
+    }
+    return names
+} names_below
+
+/// Whether `principal` has a key to answer a challenge with, and the nonce drawn for its challenge.
+fn challenge_step(tree: store::service::View, principal: ident::Principal, random: sys::Random, alloc: mem::Alloc) -> HelloStep fails task::Cancelled uses wait {
+    var path = text::String.of("/sys/principals/", alloc)
+    mut path.append(principal.text.as_str())
+    let Some(record) = try await Records[os::PrincipalRecord].at(tree, path: path.as_str(), alloc) else {
+        return HelloStep.Unknown
+    }
+    if record.key.is_none() {
+        return HelloStep.Unknown
+    }
+    var nonce = Array[u8, 32].filled(0)
+    discard attempt random.fill(mut nonce.view_mut())
+    return HelloStep.Known(nonce: nonce)
+} challenge_step
+
+/// Whether `keys` verifies `signature` as `principal`'s for the purpose `handshake` over `subject`.
+fn verified_step(keys: os::Port[keys::Keys], principal: ident::Principal, subject: ident::HashValue, signature: ident::Signature, alloc: mem::Alloc) -> HelloStep fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[keys::Keys].verify(mut call, principal: ident::Principal(text: principal.text), kind: text::String.of("handshake", alloc), subject, signature, former: false)
+    return match first attempt await keys.call(take call, reply, alloc) {
+        Ok(_) => HelloStep.Verified
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => HelloStep.Rejected(code: text::Fixed[32].of("link.signature-invalid"))
+    }
+} verified_step
+
+/// The principal `text` names, `None` when it names none.
+fn principal_of(text: Str) -> Option[ident::Principal] {
+    if text.byte_len() > 64 {
+        return None
+    }
+    let fixed = text::Fixed[64].of(text)
+    if not ident::is_principal(fixed) {
+        return None
+    }
+    return Some(ident::Principal(text: fixed))
+} principal_of
+
+/// `s<n>`, the text of the session numbered `number` in this boot.
+pub fn session_text(number: u64) -> text::Fixed[24] {
+    var text = text::Fixed[24].of("s")
+    mut text.write(Dyn[Render].view(number), budget: 22)
+    return text
+} session_text
+
+/// The monotonic time in nanoseconds, 0 through a revoked clock.
+fn now_ns(clock: sys::Clock) -> u64 {
+    return match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} now_ns

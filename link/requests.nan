@@ -1,0 +1,398 @@
+//! Requests: the lines a client sends, gathered into requests and cut into the words and flags of chapter 18's request grammar.
+
+/// The most bytes a request holds.
+pub const MOST_REQUEST_BYTES: usize = 1_048_576
+
+/// The most delimiters a request holds open at once.
+const MOST_DEPTH: usize = 64
+
+/// A request: its id, its verb, its operands and its flags, each operand and flag value a word as written.
+pub closed struct Request {
+    pub id: text::Fixed[32]
+    pub verb: text::Fixed[16]
+    pub operands: mem::List[text::String]
+    pub flags: mem::List[Flag]
+} Request
+
+/// A flag and the word it takes, if any.
+pub closed struct Flag {
+    pub name: text::Fixed[16]
+    pub value: Option[text::String]
+} Flag
+
+/// What reading a request gives: the request, or the failure of a text that is none, with the id and verb it names when it names them, `-` otherwise.
+pub closed enum Read {
+    Request(Request)
+    Refused(id: text::Fixed[32], verb: text::Fixed[16], failure: Failure)
+} Read
+
+/// An `error` record: its code, the subject at fault, what was expected and found, the causes, and the requests without their id that fix it.
+pub closed struct Failure {
+    pub code: text::Fixed[32]
+    pub subject: text::String
+    pub expected: Option[text::String]
+    pub found: Option[text::String]
+    pub because: mem::List[text::String]
+    pub fixes: mem::List[text::String]
+} Failure
+
+/// The lines of a request gathered so far, joined by spaces, and how many delimiters they leave open.
+pub closed struct Gathered derives Encode {
+    pub text: text::String
+    pub depth: u32
+} Gathered
+
+/// What a line gives the request being gathered: the request's text once it ends, nothing yet, or its failure.
+pub closed enum Gathering derives Eq {
+    Ended(text::String)
+    Continued
+    Failed(code: text::Fixed[32])
+} Gathering
+
+pub fn Failure.of(code: Str, subject: Str, alloc: mem::Alloc) -> Failure {
+    return Failure(code: text::Fixed[32].of(code), subject: text::String.of(subject, alloc), expected: None, found: None, because: mem::List.empty(alloc), fixes: mem::List.empty(alloc))
+} Failure.of
+
+/// This failure with its `expected: ` and `found: ` lines.
+pub fn Failure.expecting(take self, expected: Str, found: Str, alloc: mem::Alloc) -> Failure {
+    var failure = self
+    failure.expected = Some(text::String.of(expected, alloc))
+    failure.found = Some(text::String.of(found, alloc))
+    return failure
+} Failure.expecting
+
+pub fn Gathered.empty(alloc: mem::Alloc) -> Gathered = Gathered(text: text::String.empty(alloc), depth: 0)
+
+/// Adds the line `line`, without its line end, to the request being gathered. The request ends with a line that leaves no delimiter open and does not end with `,`; an empty line while a delimiter is open ends it with `request.unbalanced`, and a line that is not UTF-8 or holds a control character with `request.malformed`.
+pub validator fn Gathered.add(mut self, line: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Gathering {
+    let bytes = line.inspect()
+    if self.depth > 0 and bytes.len() == 0 {
+        return mut self.refuse("request.unbalanced", alloc)
+    }
+    if self.text.byte_len() + bytes.len() + 1 > MOST_REQUEST_BYTES {
+        return mut self.refuse("request.too-large", alloc)
+    }
+    let Ok(added) = attempt text::String.try_from_utf8(bytes, alloc) else {
+        return mut self.refuse("request.malformed", alloc)
+    }
+    let piece = added.as_str()
+    for byte in piece.as_bytes() {
+        if byte < 0x20 or byte == 0x7F {
+            return mut self.refuse("request.malformed", alloc)
+        }
+    }
+    if self.text.byte_len() > 0 {
+        mut self.text.push(' ')
+        let Some(rest) = piece.slice_bytes(leading_spaces(piece), end: piece.byte_len()) else {
+            return mut self.refuse("request.malformed", alloc)
+        }
+        mut self.text.append(rest)
+    } else {
+        mut self.text.append(piece)
+    }
+    let Some(depth) = depth_after(piece, from: self.depth) else {
+        return mut self.refuse("request.malformed", alloc)
+    }
+    self.depth = depth
+    if depth > 0 or piece.ends_with(",") {
+        return Gathering.Continued
+    }
+    var ended = text::String.empty(alloc)
+    mut ended.append(self.text.as_str())
+    mut self.text.clear()
+    return Gathering.Ended(take ended)
+} Gathered.add
+
+/// Clears the request being gathered, which ends with `code`.
+fn Gathered.refuse(mut self, code: Str, alloc: mem::Alloc) -> Gathering {
+    mut self.text.clear()
+    self.depth = 0
+    return Gathering.Failed(code: text::Fixed[32].of(code))
+} Gathered.refuse
+
+/// The delimiters open after `line`, `from` being open before it; `None` when it closes more than are open.
+fn depth_after(line: Str, from: u32) -> Option[u32] {
+    var depth = from
+    var quoted = false
+    var escaped = false
+    for byte in line.as_bytes() {
+        if quoted {
+            if escaped {
+                escaped = false
+            } else if byte == b'\\' {
+                escaped = true
+            } else if byte == b'"' {
+                quoted = false
+            }
+            continue
+        }
+        if byte == b'"' {
+            quoted = true
+        } else if byte == b'(' or byte == b'[' or byte == b'{' {
+            depth = depth.saturating_add(1)
+        } else if byte == b')' or byte == b']' or byte == b'}' {
+            if depth == 0 {
+                return None
+            }
+            depth -= 1
+        }
+    }
+    return Some(depth)
+} depth_after
+
+/// How many spaces `text` starts with.
+fn leading_spaces(text: Str) -> usize {
+    var count: usize = 0
+    for byte in text.as_bytes() {
+        if byte != b' ' {
+            break
+        }
+        count += 1
+    }
+    return count
+} leading_spaces
+
+/// The request `text` writes: `request.malformed` for text the grammar rejects, `request.unknown-verb` for an unknown verb and `request.invalid-flag` for an unknown flag or a flag without its word.
+pub fn Request.read(text: Str, alloc: mem::Alloc) -> Read {
+    let Some(words) = words_of(text, alloc) else {
+        return refused(id: "-", verb: "-", failure: Failure.of("request.malformed", subject: "-", alloc))
+    }
+    if words.len() < 2 or not is_request_id(words[0].as_str()) {
+        return refused(id: "-", verb: "-", failure: Failure.of("request.malformed", subject: "-", alloc))
+    }
+    let id = words[0].as_str()
+    let verb = words[1].as_str()
+    if not is_verb(verb) {
+        return refused(id, verb, failure: Failure.of("request.unknown-verb", subject: verb, alloc))
+    }
+    var operands = mem::List[text::String].empty(alloc)
+    var flags = mem::List[Flag].empty(alloc)
+    var at: usize = 2
+    while at < words.len() {
+        let word = words[at].as_str()
+        at += 1
+        let Some(name) = flag_name(word) else {
+            mut operands.push(text::String.of(word, alloc))
+            continue
+        }
+        let Some(valued) = takes_word(name.as_str()) else {
+            return refused(id, verb, failure: Failure.of("request.invalid-flag", subject: word, alloc))
+        }
+        if not valued {
+            mut flags.push(Flag(name: name, value: None))
+            continue
+        }
+        if at >= words.len() {
+            return refused(id, verb, failure: Failure.of("request.invalid-flag", subject: word, alloc))
+        }
+        mut flags.push(Flag(name: name, value: Some(text::String.of(words[at].as_str(), alloc))))
+        at += 1
+    }
+    return Read.Request(Request(id: text::Fixed[32].of(id), verb: text::Fixed[16].of(verb), operands: take operands, flags: take flags))
+} Request.read
+
+fn refused(id: Str, verb: Str, take failure: Failure) -> Read {
+    return Read.Refused(id: text::Fixed[32].of(id), verb: text::Fixed[16].of(verb), failure: take failure)
+} refused
+
+/// The words of `text`: its runs between single spaces outside text literals and forms, `None` when a space starts or ends it or follows another, a delimiter closes another kind or none, or a text literal or delimiter stays open.
+fn words_of(text: Str, alloc: mem::Alloc) -> Option[mem::List[text::String]] {
+    var words = mem::List[text::String].empty(alloc)
+    var open = mem::List[u8].empty(alloc)
+    var quoted = false
+    var escaped = false
+    var start: usize = 0
+    let bytes = text.as_bytes()
+    for at in 0..<bytes.len() {
+        let byte = bytes[at]
+        if quoted {
+            if escaped {
+                escaped = false
+            } else if byte == b'\\' {
+                escaped = true
+            } else if byte == b'"' {
+                quoted = false
+            }
+            continue
+        }
+        if byte == b' ' and open.len() == 0 {
+            if at == start {
+                return None
+            }
+            let Some(word) = text.slice_bytes(start, end: at) else {
+                return None
+            }
+            mut words.push(text::String.of(word, alloc))
+            start = at + 1
+            continue
+        }
+        if not mut track(mut open, byte, quoted: mut quoted) {
+            return None
+        }
+    }
+    if quoted or open.len() > 0 or start >= bytes.len() {
+        return None
+    }
+    let Some(word) = text.slice_bytes(start, end: bytes.len()) else {
+        return None
+    }
+    mut words.push(text::String.of(word, alloc))
+    return Some(take words)
+} words_of
+
+/// Follows `byte` outside a text literal: a quote opens one, an opening delimiter goes on `open` and a closing one takes its own kind off; false when it closes another kind or none, or too many are open.
+fn track(mut open: mem::List[u8], byte: u8, mut quoted: bool) -> bool {
+    if byte == b'"' {
+        quoted = true
+        return true
+    }
+    if byte == b'(' or byte == b'[' or byte == b'{' {
+        if open.len() >= MOST_DEPTH {
+            return false
+        }
+        mut open.push(byte)
+        return true
+    }
+    let opener = match byte {
+        b')' => b'('
+        b']' => b'['
+        b'}' => b'{'
+        else => return true
+    }
+    let Some(last) = mut open.pop() else {
+        return false
+    }
+    return last == opener
+} track
+
+/// The name of the flag `word` writes, `--` and a lower-case word with hyphens, `None` for any other word.
+fn flag_name(word: Str) -> Option[text::Fixed[16]] {
+    let bytes = word.as_bytes()
+    if bytes.len() < 3 or bytes.len() > 18 or bytes[0] != b'-' or bytes[1] != b'-' {
+        return None
+    }
+    var name = text::Fixed[16].empty()
+    for at in 2..<bytes.len() {
+        let byte = bytes[at]
+        if not ((byte >= b'a' and byte <= b'z') or byte == b'-') {
+            return None
+        }
+        mut name.push(char.checked_from_bits(u32.widen(byte)).value_or('-'))
+    }
+    return Some(name)
+} flag_name
+
+fn is_request_id(text: Str) -> bool {
+    let bytes = text.as_bytes()
+    if bytes.len() == 0 or bytes.len() > 32 {
+        return false
+    }
+    for byte in bytes {
+        let plain = (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') or byte == b'_' or byte == b'-'
+        if not plain {
+            return false
+        }
+    }
+    return true
+} is_request_id
+
+/// Whether `word` is a verb of chapter 18 or `status`.
+fn is_verb(word: Str) -> bool {
+    return match word {
+        "hello" or "primer" or "delegate" or "describe" or "get" or "find" or "diff" or "history" or "why" or "watch" or "call" or "plan" or "apply" or "undo" or "confirm" or "cancel" or "put" or "extract" or "approve" or "freeze" or "status" => true
+        else => false
+    }
+} is_verb
+
+/// Whether the flag `name` takes a word, `None` for an unknown flag.
+fn takes_word(name: Str) -> Option[bool] {
+    return match name {
+        "session" or "key" or "budget" or "skip" or "fields" or "at" or "since" or "claim" or "resume" or "replay" or "bundle" or "when" or "by" => Some(true)
+        "json" or "json-in" or "wake" or "encrypt" or "with-head" => Some(false)
+        else => None
+    }
+} takes_word
+
+/// The value of the flag `name`, the word it takes; `None` when the request has no such flag or it takes no word.
+pub proj fn Request.flag(self, name: Str) -> Option[Str] {
+    for flag in self.flags {
+        if flag.name.as_str() == name {
+            return match flag.value {
+                Some(value) => Some(value.as_str())
+                None => None
+            }
+        }
+    }
+    return None
+} Request.flag
+
+/// Whether the request has the flag `name`.
+pub fn Request.has(self, name: Str) -> bool {
+    for flag in self.flags {
+        if flag.name.as_str() == name {
+            return true
+        }
+    }
+    return false
+} Request.has
+
+/// The text of the request's operands, joined by spaces.
+pub fn Request.operand_text(self, alloc: mem::Alloc) -> text::String {
+    var joined = text::String.empty(alloc)
+    for operand in self.operands {
+        if joined.byte_len() > 0 {
+            mut joined.push(' ')
+        }
+        mut joined.append(operand.as_str())
+    }
+    return joined
+} Request.operand_text
+
+test requests_read_into_words_and_flags for Request.read {
+    let alloc = testing::world().alloc
+    let Read.Request(request) = Request.read("4 find from /live/accounts where (cpu_ns > 5 or wakeups > 9) limit 5 --budget 100", alloc) else {
+        expect false
+        return
+    }
+    expect request.id.as_str() == "4"
+    expect request.operands.len() == 6
+    expect request.operands[3].as_str() == "(cpu_ns > 5 or wakeups > 9)"
+    expect request.flag("budget") == Some("100")
+    let Read.Request(quoted) = Request.read("x get /data/\"notes 2026.txt\"", alloc) else {
+        expect false
+        return
+    }
+    expect quoted.operands[0].as_str() == "/data/\"notes 2026.txt\""
+    let Read.Refused(id: _, verb: _, failure: doubled) = Request.read("1  get /", alloc) else {
+        expect false
+        return
+    }
+    expect doubled.code.as_str() == "request.malformed"
+    let Read.Refused(id: id, verb: _, failure: unknown) = Request.read("7 fetch /", alloc) else {
+        expect false
+        return
+    }
+    expect id.as_str() == "7" and unknown.code.as_str() == "request.unknown-verb"
+    let Read.Refused(id: _, verb: _, failure: flagged) = Request.read("8 get / --colour", alloc) else {
+        expect false
+        return
+    }
+    expect flagged.code.as_str() == "request.invalid-flag"
+} requests_read_into_words_and_flags
+
+test lines_gather_while_delimiters_are_open for Gathered.add {
+    let alloc = testing::world().alloc
+    var gathered = Gathered.empty(alloc)
+    let started = mut gathered.add(Untrusted.of(b"5 find from /live/instances select state,"), alloc)
+    expect started == Gathering.Continued
+    let second = mut gathered.add(Untrusted.of(b"    restarts"), alloc)
+    let Gathering.Ended(text) = second else {
+        expect false
+        return
+    }
+    expect text.as_str() == "5 find from /live/instances select state, restarts"
+    let opened = mut gathered.add(Untrusted.of(b"6 plan [write /sys/x 1"), alloc)
+    expect opened == Gathering.Continued
+    let ended = mut gathered.add(Untrusted.of(b""), alloc)
+    expect ended == Gathering.Failed(code: text::Fixed[32].of("request.unbalanced"))
+} lines_gather_while_delimiters_are_open

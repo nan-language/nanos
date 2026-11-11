@@ -1,0 +1,454 @@
+//! The `link` instance: the protocol through which agents and humans reach the system, served on the serial transport.
+
+/// The keys of the keyed tasks: the serial transport's reader and writer, the one reading the ready record's facts, and those answering requests, plus their number.
+const READING: u64 = 1
+
+const WRITING: u64 = 2
+
+const OPENING: u64 = 3
+
+const ANSWERING: u64 = 0x1_0000_0000
+
+/// What `link` serves: the messages of the store's subscriptions, and those of its own keyed tasks and timers.
+pub protocol Link {
+    /// A commit changed nodes below a subscription's prefix.
+    pub fn changed(subscription: u64, commit: ident::CommitId, paths: mem::List[ident::Path], more: u64) limits traceless
+    /// An append to a stream below a subscription's prefix.
+    pub fn appended(subscription: u64, path: ident::Path, seq: u64) limits traceless
+    /// Commits a subscription could not be told of.
+    pub fn lost(subscription: u64, commits: u64) limits traceless
+    /// What a line received on serial gives.
+    fn received(received: Received) limits traceless
+    /// The serial transport wrote what it was given.
+    fn written() limits traceless
+    /// The facts of the ready record and the boot counter, read once the store answers.
+    fn opened(ready: LinkReady, boot: u64) limits traceless
+    /// The request numbered `number` ended with the block `block`.
+    fn responded(number: u64, block: mem::Bytes) limits traceless
+    /// The `hello` numbered `number` goes on.
+    fn hello_step(number: u64, step: HelloStep) limits traceless
+    /// The request numbered `number` has run for `LinkConfig.pending_ms`.
+    fn due(number: u64) limits traceless
+} Link
+
+/// The ready record.
+pub closed struct LinkReady derives Encode {
+    pub version: u32
+    pub mode: text::String
+    pub generation: u64
+    pub claimed: bool
+    /// The cursor of the `events` stream.
+    pub cursor: ident::Cursor
+    /// The hash of the link's Ed25519 identity public key.
+    pub key: ident::HashValue
+} LinkReady
+
+/// The facts the link read at its start: the ready record and the boot counter.
+pub closed struct Facts derives Encode {
+    pub ready: LinkReady
+    pub boot: u64
+} Facts
+
+/// The Env of `link`: the console UART, its View of the tree, its port to `keys`, the kernel's entropy, the clocks, its configuration and its cell.
+pub open struct Env derives Send {
+    console: os::Port[devices::Console]
+    tree: store::service::View
+    keys: os::Port[keys::Keys]
+    random: sys::Random
+    clock: sys::Clock
+    wall: ident::Wall
+    config: LinkConfig
+    alloc: mem::Alloc
+} Env
+
+/// A request running: its number, id, verb and first operand, whether its `pending` block went out, and for `hello` the principal it names.
+pub closed struct Running derives Encode {
+    pub number: u64
+    pub id: text::Fixed[32]
+    pub verb: text::Fixed[16]
+    pub operand: text::String
+    pub pending: bool
+    pub principal: Option[ident::Principal]
+} Running
+
+/// The state of `link`: its configuration, the facts read at its start, the blocks waiting for the serial transport and whether one is being written, the requests running and the number of the next, the sessions open and the number of the next, and the serial connection's challenge.
+pub closed struct Linker derives Encode {
+    pub config: LinkConfig
+    pub facts: Option[Facts]
+    pub output: mem::List[mem::Bytes]
+    pub writing: bool
+    pub running: mem::List[Running]
+    pub next: u64
+    pub sessions: mem::List[Session]
+    pub next_session: u64
+    pub challenge: Option[Challenge]
+} Linker
+
+impl Linker: sys::Component[Env, Link]
+
+impl Linker: sys::Resume[Env, Link]
+
+pub fn Env.of(
+    console: os::Port[devices::Console],
+    tree: store::service::View,
+    keys: os::Port[keys::Keys],
+    random: sys::Random,
+    clock: sys::Clock,
+    wall: ident::Wall,
+    config: LinkConfig,
+    alloc: mem::Alloc,
+    ) -> Env {
+    return Env(console: console, tree: tree, keys: keys, random: random, clock: clock, wall: wall, config: config, alloc: alloc)
+} Env.of
+
+pub fn Linker.start(mut env: Env) -> Linker {
+    return Linker(config: env.config, facts: None, output: mem::List.empty(env.alloc), writing: false, running: mem::List.empty(env.alloc), next: 1, sessions: mem::List.empty(env.alloc), next_session: 1, challenge: None)
+} Linker.start
+
+/// Listens on serial, and reads the ready record's facts.
+pub fn Linker.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Link]) {
+    let console = env.console
+    let tree = env.tree
+    let alloc = env.alloc
+    mut cx.spawn(key: READING, run: fn(out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
+        try await read_serial(console, out, alloc)
+    })
+    mut cx.spawn(key: OPENING, run: fn(out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
+        let facts = try await facts_of(tree, alloc)
+        let Facts(ready: ready, boot: boot) = facts
+        discard attempt await out.opened(take ready, boot)
+    })
+} Linker.resume
+
+/// Writes the ready record, before any block.
+fn Linker.opened(mut self, take ready: LinkReady, take boot: u64, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    var block = Block.of(Verdict.Ok, id: "0", verb: "link", operand: "", alloc)
+    var record = Record.of("link", alloc)
+    mut record.field("version", value: Dyn[Render].view(ready.version))
+    mut record.text("mode", value: ready.mode.as_str(), alloc)
+    mut record.field("generation", value: Dyn[Render].view(ready.generation))
+    mut record.field("claimed", value: Dyn[Render].view(ready.claimed))
+    mut record.field("cursor", value: Dyn[Render].view(ready.cursor))
+    mut record.field("key", value: Dyn[Render].view(ready.key))
+    mut block.records.push(take record)
+    mut self.output.insert(0, value: block.text(self.cut(text::String.empty(alloc)), alloc))
+    self.facts = Some(Facts(ready: take ready, boot: boot))
+    mut self.write(mut env, mut cx)
+} Linker.opened
+
+fn Linker.received(mut self, take received: Received, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    match received {
+        Received.Request(text) => mut self.request(text.as_str(), mut env, mut cx)
+        Received.Refused(code: code) => mut self.answer(failed_block(id: "-", verb: "-", operand: "", failure: Failure.of(code.as_str(), subject: "-", alloc), alloc), mut env, mut cx)
+        Received.Console(_) => {
+        }
+    }
+} Linker.received
+
+fn Linker.written(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
+    self.writing = false
+    mut self.write(mut env, mut cx)
+} Linker.written
+
+fn Linker.responded(mut self, take number: u64, take block: mem::Bytes, mut env: Env, mut cx: sys::Cx[Link]) {
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    discard mut self.running.remove(at)
+    mut self.output.push(take block)
+    mut self.write(mut env, mut cx)
+} Linker.responded
+
+/// Answers `pending` for a request still running.
+fn Linker.due(mut self, take number: u64, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    var block = self.running[at].block(Verdict.Pending, alloc)
+    var record = Record.of("pending", alloc)
+    mut record.words("running")
+    mut block.records.push(take record)
+    self.running[at].pending = true
+    mut self.answer(take block, mut env, mut cx)
+} Linker.due
+
+pub fn Linker.changed(
+    mut self,
+    take subscription: u64,
+    take commit: ident::CommitId,
+    take paths: mem::List[ident::Path],
+    take more: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Link],
+    ) {
+} Linker.changed
+
+pub fn Linker.appended(mut self, take subscription: u64, take path: ident::Path, take seq: u64, mut env: Env, mut cx: sys::Cx[Link]) {
+} Linker.appended
+
+pub fn Linker.lost(mut self, take subscription: u64, take commits: u64, mut env: Env, mut cx: sys::Cx[Link]) {
+} Linker.lost
+
+/// Reads the request `text` and runs it.
+fn Linker.request(mut self, text: Str, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    match Request.read(text, alloc) {
+        Read.Refused(id: id, verb: verb, failure: failure) => mut self.answer(failed_block(id: id.as_str(), verb: verb.as_str(), operand: "", take failure, alloc), mut env, mut cx)
+        Read.Request(request) => mut self.run(take request, mut env, mut cx)
+    }
+} Linker.request
+
+/// Runs `request`: refuses it when the session rules do, else answers it, at once or from a keyed task, which answers `pending` past `pending_ms`.
+fn Linker.run(mut self, take request: Request, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    match self.refused(request, alloc) {
+        Some(failure) => {
+            mut self.answer(refusal(request, take failure, alloc), mut env, mut cx)
+            return
+        }
+        None => {
+        }
+    }
+    let number = self.next
+    self.next += 1
+    mut self.running.push(Running(number: number, id: request.id, verb: request.verb, operand: first_operand(request, alloc), pending: false, principal: None))
+    if request.verb.as_str() == "hello" {
+        match mut self.hello(request, number, mut env, mut cx) {
+            Some(block) => mut self.respond(self.running.len() - 1, take block, mut env, mut cx)
+            None => mut cx.after(ms: u64.widen(self.config.pending_ms), send: Link.due(number: number))
+        }
+        return
+    }
+    let tree = env.tree
+    let cut = self.cut(rest_of(request, alloc))
+    mut cx.spawn(key: ANSWERING + number, run: fn[take request, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
+        let block = try await answer(request, tree, alloc)
+        discard attempt await out.responded(number, block: block.text(cut, alloc))
+    })
+    mut cx.after(ms: u64.widen(self.config.pending_ms), send: Link.due(number: number))
+} Linker.run
+
+/// The failure of a request the session rules refuse: an id pending, a request needing a session before one opens, and a session missing, unknown or required among several.
+fn Linker.refused(self, request: Request, alloc: mem::Alloc) -> Option[Failure] {
+    if self.running.position(fn(each: Running) => each.id == request.id).is_some() {
+        return Some(Failure.of("request.duplicate-id", subject: request.id.as_str(), alloc))
+    }
+    let verb = request.verb.as_str()
+    let open = verb == "hello" or verb == "status" or verb == "primer"
+    match request.flag("session") {
+        Some(named) => {
+            if self.sessions.position(fn(each: Session) => session_text(each.number).as_str() == named).is_none() {
+                return Some(Failure.of("link.session-unknown", subject: named, alloc))
+            }
+        }
+        None => {
+            if self.sessions.len() == 0 and not open {
+                return Some(Failure.of("link.no-session", subject: "-", alloc))
+            }
+            if self.sessions.len() > 1 and not open {
+                return Some(Failure.of("link.session-required", subject: "-", alloc))
+            }
+        }
+    }
+    return None
+} Linker.refused
+
+/// Answers the request running at `at` with `block`.
+fn Linker.respond(mut self, at: usize, take block: Block, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    discard mut self.running.remove(at)
+    mut self.output.push(block.text(self.cut(text::String.empty(alloc)), alloc))
+    mut self.write(mut env, mut cx)
+} Linker.respond
+
+/// Queues `block` behind the blocks waiting.
+fn Linker.answer(mut self, take block: Block, mut env: Env, mut cx: sys::Cx[Link]) {
+    let alloc = env.alloc
+    mut self.output.push(block.text(self.cut(text::String.empty(alloc)), alloc))
+    mut self.write(mut env, mut cx)
+} Linker.answer
+
+/// How the blocks of a request are cut, `rest` being the request that prints what they elide.
+fn Linker.cut(self, take rest: text::String) -> Cut {
+    return Cut(budget: self.config.budget.response_units, sized: self.config.budget.output_units.is_some(), skip: 0, rest: take rest)
+} Linker.cut
+
+/// Has a keyed task write the next block waiting, once the ready record went out and no write is under way.
+fn Linker.write(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
+    if self.writing or self.facts.is_none() or self.output.len() == 0 {
+        return
+    }
+    let data = mut self.output.remove(0)
+    self.writing = true
+    let console = env.console
+    let alloc = env.alloc
+    mut cx.spawn(key: WRITING, run: fn[take data](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
+        try await write_serial(console, take data, out, alloc)
+    })
+} Linker.write
+
+/// A block of the request's verdict, id, verb and first operand.
+fn Running.block(self, verdict: Verdict, alloc: mem::Alloc) -> Block {
+    return Block.of(verdict, id: self.id.as_str(), verb: self.verb.as_str(), operand: self.operand.as_str(), alloc)
+} Running.block
+
+/// The `failed` block of the request with `failure`.
+fn Running.failed(self, take failure: Failure, alloc: mem::Alloc) -> Block {
+    var block = self.block(Verdict.Failed, alloc)
+    mut block.records.push(failure.record(alloc))
+    return block
+} Running.failed
+
+/// The `failed` block refusing `request` with `failure`.
+fn refusal(request: Request, take failure: Failure, alloc: mem::Alloc) -> Block {
+    let operand = first_operand(request, alloc)
+    return failed_block(id: request.id.as_str(), verb: request.verb.as_str(), operand: operand.as_str(), take failure, alloc)
+} refusal
+
+/// The first operand of `request` as its verdict line names it: the whole query of `find` and `watch`, else its first word.
+fn first_operand(request: Request, alloc: mem::Alloc) -> text::String {
+    let verb = request.verb.as_str()
+    if verb == "find" or verb == "watch" {
+        return request.operand_text(alloc)
+    }
+    return match request.operands.get(0) {
+        Some(word) => text::String.of(word.as_str(), alloc)
+        None => text::String.empty(alloc)
+    }
+} first_operand
+
+/// The request without its id or `--skip`: what an elision line repeats.
+fn rest_of(request: Request, alloc: mem::Alloc) -> text::String {
+    var rest = text::String.of(request.verb.as_str(), alloc)
+    for operand in request.operands {
+        mut rest.push(' ')
+        mut rest.append(operand.as_str())
+    }
+    for flag in request.flags {
+        if flag.name.as_str() == "skip" {
+            continue
+        }
+        mut rest.append(" --")
+        mut rest.append(flag.name.as_str())
+        match flag.value {
+            Some(value) => {
+                mut rest.push(' ')
+                mut rest.append(value.as_str())
+            }
+            None => {
+            }
+        }
+    }
+    return rest
+} rest_of
+
+/// The `failed` block of `failure`.
+pub fn failed_block(id: Str, verb: Str, operand: Str, take failure: Failure, alloc: mem::Alloc) -> Block {
+    var block = Block.of(Verdict.Failed, id, verb, operand, alloc)
+    mut block.records.push(failure.record(alloc))
+    return block
+} failed_block
+
+/// The `error` record of this failure.
+pub fn Failure.record(self, alloc: mem::Alloc) -> Record {
+    var record = Record.of("error", alloc)
+    mut record.words(self.code.as_str())
+    mut record.words(self.subject.as_str())
+    match self.expected {
+        Some(expected) => mut record.line(lined("expected: ", text: expected.as_str(), alloc).as_str(), alloc)
+        None => {
+        }
+    }
+    match self.found {
+        Some(found) => mut record.line(lined("found: ", text: found.as_str(), alloc).as_str(), alloc)
+        None => {
+        }
+    }
+    for because in self.because {
+        mut record.line(lined("because ", text: because.as_str(), alloc).as_str(), alloc)
+    }
+    var number: u32 = 1
+    for fix in self.fixes {
+        var line = text::String.of("fix ", alloc)
+        mut line.write(Dyn[Render].view(number), budget: 12)
+        mut line.push(' ')
+        mut line.append(fix.as_str())
+        mut record.line(line.as_str(), alloc)
+        number += 1
+    }
+    return record
+} Failure.record
+
+/// `head` followed by `text`.
+fn lined(head: Str, text: Str, alloc: mem::Alloc) -> text::String {
+    var line = text::String.of(head, alloc)
+    mut line.append(text)
+    return line
+} lined
+
+/// The facts of the ready record, from `/live/status`, the events stream and `/live/security`, and the boot counter of `/live/boot`.
+fn facts_of(tree: store::service::View, alloc: mem::Alloc) -> Facts fails task::Cancelled uses wait {
+    var ready = LinkReady(version: 1, mode: text::String.of("normal", alloc), generation: 0, claimed: false, cursor: try await event_cursor(tree, alloc), key: ident::HashValue.of_content(b""))
+    match try await Records[os::LiveStatus].at(tree, path: "/live/status", alloc) {
+        Some(status) => {
+            ready.mode = text::String.of(mode_name(status.mode).as_str(), alloc)
+            ready.generation = status.generation
+            ready.claimed = status.claimed
+        }
+        None => {
+        }
+    }
+    match try await Records[os::LiveSecurity].at(tree, path: "/live/security", alloc) {
+        Some(security) => {
+            ready.key = ident::HashValue.of_content(security.link_keys.ed25519.view())
+        }
+        None => {
+        }
+    }
+    let boot = match try await Records[os::LiveBoot].at(tree, path: "/live/boot", alloc) {
+        Some(booted) => booted.boot_counter
+        None => 0
+    }
+    return Facts(ready: take ready, boot: boot)
+} facts_of
+
+/// The cursor of the latest event of `/journal/events`, `e0` before any.
+fn event_cursor(tree: store::service::View, alloc: mem::Alloc) -> ident::Cursor fails task::Cancelled uses wait {
+    return match first attempt await tree.get(ident::Path(text: text::String.of("/journal/events", alloc)), at: None, alloc) {
+        Ok(node) => ident::Cursor(seq: node.next.saturating_sub(1))
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => ident::Cursor(seq: 0)
+    }
+} event_cursor
+
+/// Reads records of type T.
+pub open struct Records[T: Encode] {
+} Records
+
+/// The record of type T at `path`, `None` when it is missing or does not decode as one.
+pub fn Records.at(tree: store::service::View, path: Str, alloc: mem::Alloc) -> Option[T] fails task::Cancelled uses wait {
+    let node = match first attempt await tree.get(ident::Path(text: text::String.of(path, alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(value) = node.value else {
+        return None
+    }
+    return match attempt mem::wire::Codec[T].decode(value.view(), alloc) {
+        Ok(decoded) => Some(take decoded)
+        Err(_) => None
+    }
+} Records.at
+
+pub fn mode_name(mode: os::BootMode) -> text::Fixed[8] {
+    return text::Fixed[8].of(match mode {
+        os::BootMode.Normal => "normal"
+        os::BootMode.Trial => "trial"
+        os::BootMode.Recovery => "recovery"
+        os::BootMode.Dev => "dev"
+    })
+} mode_name
