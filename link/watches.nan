@@ -1,4 +1,4 @@
-//! Watches: the selectors whose matches the link pushes, through the store's subscriptions, until `cancel` or the end of their session.
+//! Watches: the selectors whose matches the link pushes, through the store's subscriptions, until `cancel` or the end of their session, and `cancel` itself.
 
 /// The keys of the keyed tasks setting a watch up and delivering its matches, plus the watch's slot.
 const WATCHING: u64 = 0x2_0000_0000
@@ -11,7 +11,7 @@ const MOST_WATCHES: u64 = 64
 /// The credit of the port the store tells the link's subscriptions through.
 pub const WATCH_CREDIT: u16 = 64
 
-/// A watch: its request id and number, the slot its keyed tasks' keys name, its session, its selector, the store subscription telling it, the cursor of the last event it delivered, whether a delivery is under way or due, and whether it is a wake rule.
+/// A watch: its request id and number, the slot its keyed tasks' keys name, its session, its selector, the store subscription telling it, the cursor of the last match it read, whether a delivery is under way or due, whether it is a wake rule, and the blocks of matches it holds until a wake rule wakes its session, with how many matches they hold.
 pub closed struct Watch derives Encode {
     pub id: text::Fixed[32]
     pub number: u64
@@ -23,6 +23,8 @@ pub closed struct Watch derives Encode {
     pub delivering: bool
     pub due: bool
     pub wake: bool
+    pub held: mem::List[Block]
+    pub matches: u64
 } Watch
 
 /// What a watch's matches are: events of `/journal/events` or of an instance's subtree, records of another stream, or the commits writing under a path.
@@ -64,7 +66,7 @@ pub fn set_up(tree: store::service::View, own: os::PortHandle, take path: text::
     let node = match first attempt await tree.get(ident::Path(text: text::String.of(path.as_str(), alloc)), at: None, alloc) {
         Ok(found) => found
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-        Err(failed) => return WatchStart(cursor: 0, subscription: None, failure: Some(text::Fixed[32].of(failed.code().as_str())))
+        Err(failed) => return WatchStart(cursor: 0, subscription: None, since: false, failure: Some(text::Fixed[32].of(failed.code().as_str())))
     }
     let head = match try await Records[store::service::LiveStore].at(tree, path: "/live/store", alloc) {
         Some(live) => live.head
@@ -86,24 +88,26 @@ pub fn set_up(tree: store::service::View, own: os::PortHandle, take path: text::
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(_) => None
     }
-    return WatchStart(cursor: cursor, subscription: subscription, failure: None)
+    return WatchStart(cursor: cursor, subscription: subscription, since: since.is_some(), failure: None)
 } set_up
 
-/// How a watch started: the cursor it starts after, its subscription, or the code of the failure that stopped it.
+/// How a watch started: the cursor it starts after, its subscription, whether `--since` gave the cursor, or the code of the failure that stopped it.
 pub closed struct WatchStart derives Encode {
     pub cursor: u64
     pub subscription: Option[u64]
+    pub since: bool
     pub failure: Option[text::Fixed[32]]
 } WatchStart
 
-/// The block of the matches of `selector` after `cursor` in the stream at `path`, at most `backlog` with a `lost` record for the older ones dropped, and the cursor of the last record read.
+/// The block of the matches of `selector` after `cursor` in the stream at `path`, at most `backlog` with a `lost` record for the older ones dropped, repeats of one kind from one source coalesced into one record with their count, the cursor of the last record read, and whether the read stopped at the backlog.
 pub fn deliver(tree: store::service::View, id: Str, selector: Selector, take path: text::String, cursor: u64, backlog: u32, events: bool, alloc: mem::Alloc) -> Delivered fails task::Cancelled uses wait {
     var block = Block.of(Verdict.Ok, id, verb: "watch", operand: "", alloc)
     let read = match first attempt await tree.read_stream(ident::Path(text: take path), from: cursor + 1, limit: backlog, alloc) {
         Ok(found) => found
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => return Delivered(block: take block, cursor: cursor)
+        Err(_) => return Delivered(block: take block, cursor: cursor, full: false)
     }
+    let full = read.entries.len() >= usize.widen(backlog)
     var last = cursor
     if read.lost > 0 {
         var lost = Record.of("lost", alloc)
@@ -111,20 +115,57 @@ pub fn deliver(tree: store::service::View, id: Str, selector: Selector, take pat
         mut lost.field("since", value: Dyn[Render].view(ident::Cursor(seq: cursor)))
         mut block.records.push(take lost)
     }
+    var repeats = mem::List[Repeat].empty(alloc)
     for entry in take read.entries {
         last = entry.seq
         let row = stream_row(take entry, events, declared: None, alloc)
-        if matches(row, selector) {
-            mut block.records.push(take row.record)
+        if not matches(row, selector) {
+            continue
+        }
+        let source = field_text(row.value.as_str(), field: "source", alloc)
+        let kind = field_text(row.value.as_str(), field: "kind", alloc)
+        match repeats.position(fn(each: Repeat) => events and each.source == source and each.kind == kind) {
+            Some(seen) => {
+                repeats[seen].count += 1
+            }
+            None => {
+                mut repeats.push(Repeat(source: take source, kind: take kind, record: block.records.len(), count: 1))
+                mut block.records.push(take row.record)
+            }
         }
     }
-    return Delivered(block: take block, cursor: last)
+    for repeat in repeats {
+        if repeat.count > 1 {
+            mut block.records[repeat.record].field("count", value: Dyn[Render].view(repeat.count))
+        }
+    }
+    return Delivered(block: take block, cursor: last, full: full)
 } deliver
 
-/// A delivery's block and the cursor of the last record it read.
+/// A kind of event from one source in a watch's block: the record holding it and how many of its events matched.
+struct Repeat {
+    source: text::String
+    kind: text::String
+    record: usize
+    count: u64
+} Repeat
+
+/// The text of the field `field` of the construction text `value`, empty when it has none.
+fn field_text(value: Str, field: Str, alloc: mem::Alloc) -> text::String {
+    let Some(span) = field_span(value, path: field) else {
+        return text::String.empty(alloc)
+    }
+    return match value.slice_bytes(span.start, end: span.end) {
+        Some(text) => text::String.of(text, alloc)
+        None => text::String.empty(alloc)
+    }
+} field_text
+
+/// A delivery's block, the cursor of the last record it read, and whether its read stopped at the backlog.
 pub closed struct Delivered {
     pub block: Block
     pub cursor: u64
+    pub full: bool
 } Delivered
 
 /// Whether the event or record of `row` meets the selector: its source below the instance a `/live/instances` path names, its kind among the kinds, its severity at least the least, and its condition.
@@ -219,3 +260,361 @@ pub fn commit_change(commit: ident::CommitId, paths: mem::List[ident::Path], mor
     }
     return record
 } commit_change
+
+pub fn Linker.changed(
+    mut self,
+    take subscription: u64,
+    take commit: ident::CommitId,
+    take paths: mem::List[ident::Path],
+    take more: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let alloc = env.alloc
+    if self.authority_subscription(subscription) {
+        mut self.regrant(mut env, mut cx)
+        return
+    }
+    let Some(at) = self.watches.position(fn(each: Watch) => each.subscription == Some(subscription)) else {
+        return
+    }
+    let Some(selector) = Selector.parse(self.watches[at].selector.as_str(), alloc) else {
+        return
+    }
+    if watched_of(selector, alloc) == Some(Watched.Commits) {
+        var block = Block.of(Verdict.Ok, id: self.watches[at].id.as_str(), verb: "watch", operand: "", alloc)
+        mut block.records.push(commit_change(commit, paths, more, alloc))
+        self.watches[at].cursor = commit.number
+        mut self.push_watch(at, take block, full: false, mut env, mut cx)
+        return
+    }
+    mut self.fall_due(at, mut env, mut cx)
+} Linker.changed
+
+pub fn Linker.appended(mut self, take subscription: u64, take path: ident::Path, take seq: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let Some(at) = self.watches.position(fn(each: Watch) => each.subscription == Some(subscription)) else {
+        return
+    }
+    mut self.fall_due(at, mut env, mut cx)
+} Linker.appended
+
+/// Pushes a `lost` record to the watch the subscription tells, or reads the grants again for those of the link's authority.
+pub fn Linker.lost(mut self, take subscription: u64, take commits: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    if self.authority_subscription(subscription) {
+        mut self.regrant(mut env, mut cx)
+        return
+    }
+    let Some(at) = self.watches.position(fn(each: Watch) => each.subscription == Some(subscription)) else {
+        return
+    }
+    var block = Block.of(Verdict.Ok, id: self.watches[at].id.as_str(), verb: "watch", operand: "", alloc)
+    var record = Record.of("lost", alloc)
+    mut record.field("count", value: Dyn[Render].view(commits))
+    mut record.field("since", value: Dyn[Render].view(ident::CommitId(number: self.watches[at].cursor)))
+    mut block.records.push(take record)
+    mut self.push_watch(at, take block, full: false, mut env, mut cx)
+} Linker.lost
+
+/// Whether `subscription` tells the link of changes to `/sys/grants` or `/sys/principals`.
+fn Linker.authority_subscription(self, subscription: u64) -> bool {
+    return match self.facts {
+        Some(facts) => facts.grants == Some(subscription) or facts.principals == Some(subscription)
+        None => false
+    }
+} Linker.authority_subscription
+
+/// Marks the watch at `at` due, a delivery following within `push_ms` unless one is under way.
+fn Linker.fall_due(mut self, at: usize, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    if self.watches[at].due {
+        return
+    }
+    self.watches[at].due = true
+    if not self.watches[at].delivering {
+        mut cx.after(ms: u64.widen(self.config.push_ms), send: LinkSession.push_due(number: self.watches[at].number))
+    }
+} Linker.fall_due
+
+/// Has a keyed task deliver the matches of the watch numbered `number`.
+fn Linker.push_due(mut self, take number: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    let Some(at) = self.watches.position(fn(each: Watch) => each.number == number) else {
+        return
+    }
+    if self.watches[at].delivering {
+        return
+    }
+    let Some(selector) = Selector.parse(self.watches[at].selector.as_str(), alloc) else {
+        return
+    }
+    let Some(watched) = watched_of(selector, alloc) else {
+        return
+    }
+    self.watches[at].due = false
+    self.watches[at].delivering = true
+    let tree = env.tree
+    let id = self.watches[at].id
+    let cursor = self.watches[at].cursor
+    let backlog = self.config.backlog
+    let path = subscribed_path(selector, watched, alloc)
+    let events = watched == Watched.Events
+    let slot = self.watches[at].slot
+    mut cx.spawn(key: DELIVERING + slot, run: fn[take selector, take path](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 65_536 {
+        let Delivered(block: block, cursor: reached, full: full) = try await deliver(tree, id: id.as_str(), selector, take path, cursor, backlog, events, alloc)
+        discard attempt await out.delivered(number, take block, cursor: reached, full: full)
+    })
+} Linker.push_due
+
+/// Pushes what a delivery matched, and delivers again when the watch fell due meanwhile.
+fn Linker.delivered(mut self, take number: u64, take block: Block, take cursor: u64, take full: bool, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let Some(at) = self.watches.position(fn(each: Watch) => each.number == number) else {
+        return
+    }
+    self.watches[at].delivering = false
+    self.watches[at].cursor = cursor
+    if block.records.len() > 0 {
+        mut self.push_watch(at, take block, full, mut env, mut cx)
+    }
+    let Some(again) = self.watches.position(fn(each: Watch) => each.number == number) else {
+        return
+    }
+    if self.watches[again].due or full {
+        mut cx.after(ms: u64.widen(self.config.push_ms), send: LinkSession.push_due(number: number))
+    }
+} Linker.delivered
+
+/// Pushes `block` of the watch at `at` to its session, under its wake rules: a session holding a wake rule receives the blocks of its watches only when a wake rule matches or a watch holds `backlog` matches, then all of them; a session whose output budget is spent loses them.
+fn Linker.push_watch(mut self, at: usize, take block: Block, full: bool, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let session = self.watches[at].session
+    if self.attention_spent(session) {
+        return
+    }
+    let asleep = self.watches.position(fn(each: Watch) => each.session == session and each.wake).is_some()
+    self.watches[at].matches = self.watches[at].matches.saturating_add(u64.widen(block.records.len()))
+    mut self.watches[at].held.push(take block)
+    if asleep and not self.watches[at].wake and not full and self.watches[at].matches < u64.widen(self.config.backlog) {
+        return
+    }
+    let alloc = env.alloc
+    let cut = self.cut(budget: self.budget_of(session), rest: text::String.empty(alloc))
+    for index in 0..<self.watches.len() {
+        if self.watches[index].session != session {
+            continue
+        }
+        self.watches[index].matches = 0
+        while self.watches[index].held.len() > 0 {
+            let held = mut self.watches[index].held.remove(0)
+            mut self.deliver(connection: 0, session, block: take held, cut, mut env, mut cx)
+        }
+    }
+} Linker.push_watch
+
+/// Answers the watch numbered `number` once it started: `watch <cursor>` with the cursor it starts after, or its failure.
+fn Linker.watching(mut self, take number: u64, take start: WatchStart, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    let Some(at) = self.watches.position(fn(each: Watch) => each.number == number) else {
+        return
+    }
+    let Some(running) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    match start.failure {
+        Some(code) => {
+            discard mut self.watches.remove(at)
+            let block = self.running[running].failed(Failure.of(code.as_str(), subject: self.running[running].operand.as_str(), alloc), alloc)
+            mut self.respond(running, take block, mut env, mut cx)
+            return
+        }
+        None => {
+        }
+    }
+    self.watches[at].subscription = start.subscription
+    self.watches[at].cursor = start.cursor
+    var block = self.running[running].block(Verdict.Ok, alloc)
+    var record = Record.of("watch", alloc)
+    match Selector.parse(self.watches[at].selector.as_str(), alloc) {
+        Some(selector) => {
+            if watched_of(selector, alloc) == Some(Watched.Commits) {
+                mut record.subject(Dyn[Render].view(ident::CommitId(number: start.cursor)))
+            } else {
+                mut record.subject(Dyn[Render].view(ident::Cursor(seq: start.cursor)))
+            }
+        }
+        None => {
+        }
+    }
+    mut block.records.push(take record)
+    mut self.respond(running, take block, mut env, mut cx)
+    let session = self.watches[at].session
+    mut self.tell_session(session, kind: "", mut env, mut cx)
+    if start.since {
+        mut self.fall_due(at, mut env, mut cx)
+    }
+} Linker.watching
+
+/// `watch <selector> [--since <cursor>] [--wake]`: a watch of the session, which a keyed task subscribes and answers with the cursor it starts after.
+fn Linker.watch(mut self, take request: Request, number: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    let at = self.running.len() - 1
+    let text = request.operand_text(alloc)
+    let Some(selector) = Selector.parse(text.as_str(), alloc) else {
+        let block = self.running[at].failed(Failure.of("request.malformed", subject: text.as_str(), alloc).expecting("<path> [kind <kinds>] [severity >= <severity>] [where <condition>]", found: text.as_str(), alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    let Some(watched) = watched_of(selector, alloc) else {
+        let block = self.running[at].failed(Failure.of("request.invalid-operand", subject: selector.path.as_str(), alloc).expecting("/journal/<stream>, /live/instances/<moniker>, /sys, /data or /history/commits", found: selector.path.as_str(), alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    var since: Option[u64] = None
+    match request.flag("since") {
+        Some(written) => match since_of(written) {
+            Some(after) => {
+                since = Some(after)
+            }
+            None => {
+                let block = self.running[at].failed(Failure.of("request.invalid-flag", subject: "--since", alloc).expecting("a cursor e<n> or a commit #<n>", found: written, alloc), alloc)
+                mut self.respond(at, take block, mut env, mut cx)
+                return
+            }
+        }
+        None => {
+        }
+    }
+    let Some(slot) = self.free_watch_slot() else {
+        let block = self.running[at].failed(Failure.of("budget.exhausted", subject: "watches", alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    mut self.watches.push(Watch(id: request.id, number: number, slot: slot, session: self.running[at].session, selector: take text, subscription: None, cursor: 0, delivering: false, due: false, wake: request.has("wake"), held: mem::List.empty(alloc), matches: 0))
+    let tree = env.tree
+    let own = env.own
+    let path = subscribed_path(selector, watched, alloc)
+    mut cx.spawn(key: WATCHING + slot, run: fn[take path](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let start = try await set_up(tree, own, take path, since, watched, alloc)
+        discard attempt await out.watching(number, take start)
+    })
+} Linker.watch
+
+/// Ends the watch numbered `number`: its subscription goes and its tasks stop.
+fn Linker.drop_watch(mut self, number: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let Some(at) = self.watches.position(fn(each: Watch) => each.number == number) else {
+        return
+    }
+    let ended = mut self.watches.remove(at)
+    let tree = env.tree
+    let alloc = env.alloc
+    match ended.subscription {
+        Some(subscription) => mut cx.spawn(key: WATCHING + ended.slot, run: fn(out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 16_384 {
+            discard attempt await tree.unsubscribe(subscription, alloc)
+        })
+        None => mut cx.cancel(key: WATCHING + ended.slot)
+    }
+    mut cx.cancel(key: DELIVERING + ended.slot)
+} Linker.drop_watch
+
+/// `cancel <target>`: ends a watch of the session or a request of the session still running; a plan, a moniker's job or a principal's delegation is a target no cancellable work stands for.
+fn Linker.cancel(mut self, take request: Request, number: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    let at = self.running.len() - 1
+    let Some(target) = request.operands.get(0) else {
+        let block = self.running[at].failed(Failure.of("request.invalid-operand", subject: "-", alloc).expecting("a request id, a plan, a moniker or a principal", found: "nothing", alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    let named = text::String.of(target.as_str(), alloc)
+    let session = self.running[at].session
+    if cancel_target(named.as_str()) != Target.Request {
+        let block = self.running[at].failed(Failure.of("request.not-cancellable", subject: named.as_str(), alloc).expecting("a pending request or watch, a plan awaiting approval or scheduled, a job with acknowledgement, or a child's delegation", found: target_word(cancel_target(named.as_str())).as_str(), alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    var cancelled = false
+    match self.watches.position(fn(each: Watch) => each.id.as_str() == named.as_str() and each.session == session) {
+        Some(watch) => {
+            let watch_number = self.watches[watch].number
+            mut self.drop_watch(watch_number, mut env, mut cx)
+            mut self.tell_session(session, kind: "", mut env, mut cx)
+            cancelled = true
+        }
+        None => {
+        }
+    }
+    match self.running.position(fn(each: Running) => each.id.as_str() == named.as_str() and each.number != number and each.session == session) {
+        Some(other) => {
+            mut cx.cancel(key: ANSWERING + self.running[other].slot)
+            discard mut self.running.remove(other)
+            cancelled = true
+        }
+        None => {
+        }
+    }
+    let Some(own) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    if not cancelled {
+        let block = self.running[own].failed(Failure.of("request.unknown-name", subject: named.as_str(), alloc).expecting("a pending request or watch of the session", found: named.as_str(), alloc), alloc)
+        mut self.respond(own, take block, mut env, mut cx)
+        return
+    }
+    var block = self.running[own].block(Verdict.Ok, alloc)
+    var record = Record.of("cancelled", alloc)
+    mut record.words(named.as_str())
+    mut block.records.push(take record)
+    mut self.respond(own, take block, mut env, mut cx)
+} Linker.cancel
+
+/// What `cancel` classifies its operand as: a principal, a plan, a moniker, or a request id.
+pub closed enum Target derives Copy, Eq {
+    Principal
+    Plan
+    Moniker
+    Request
+} Target
+
+/// The class of the operand `text` of `cancel`: a principal starting with `inst.`, `agent.` or `human.`; else a hash form, a plan; else, holding a `.`, a moniker; else a request id.
+fn cancel_target(text: Str) -> Target {
+    if text.starts_with("inst.") or text.starts_with("agent.") or text.starts_with("human.") {
+        return Target.Principal
+    }
+    if ident::HashText.parse(text).is_some() {
+        return Target.Plan
+    }
+    if text.find(".").is_some() {
+        return Target.Moniker
+    }
+    return Target.Request
+} cancel_target
+
+fn target_word(target: Target) -> text::Fixed[64] {
+    return text::Fixed[64].of(match target {
+        Target.Principal => "a principal without a delegation to cancel"
+        Target.Plan => "a plan neither awaiting approval nor scheduled"
+        Target.Moniker => "an instance without a job to cancel"
+        Target.Request => "a request id"
+    })
+} target_word
+
+/// The lowest slot no watch holds, `None` when `MOST_WATCHES` are kept.
+fn Linker.free_watch_slot(self) -> Option[u64] {
+    for slot in 0..<MOST_WATCHES {
+        if self.watches.position(fn(each: Watch) => each.slot == slot).is_none() {
+            return Some(slot)
+        }
+    }
+    return None
+} Linker.free_watch_slot
+
+/// The sequence number or commit number a `--since` names: a cursor `e<n>` or a commit `#<n>`.
+fn since_of(text: Str) -> Option[u64] {
+    match ident::Cursor.parse(text) {
+        Some(cursor) => return Some(cursor.seq)
+        None => {
+        }
+    }
+    return match ident::CommitId.parse(text) {
+        Some(commit) => Some(commit.number)
+        None => None
+    }
+} since_of

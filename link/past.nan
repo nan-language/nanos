@@ -9,7 +9,7 @@ const CHAIN_LINKS: usize = 16
 const TRACED: u64 = 4_096
 
 /// `history <path|commit>`: the commits writing under a path, newest first, or a commit's record and its changes.
-fn history(request: Request, subject: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+fn history(request: Request, subject: Str, tree: store::service::View, reader: ident::Principal, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
     let id = request.id.as_str()
     let verb = request.verb.as_str()
     var block = Block.of(Verdict.Ok, id, verb, operand: subject, alloc)
@@ -18,7 +18,7 @@ fn history(request: Request, subject: Str, tree: store::service::View, alloc: me
             let Some(meta) = try await commit_meta(tree, commit, alloc) else {
                 return failed_block(id, verb, operand: subject, failure: Failure.of("store.not-found", subject, alloc), alloc)
             }
-            mut block.records.push(commit_record(meta, alloc))
+            mut block.records.push(commit_record(meta, reader, alloc))
             if commit.number > 1 {
                 for edit in try await edits_of(tree, from: ident::CommitId(number: commit.number - 1), to: commit, path: "/", alloc) {
                     mut block.records.push(edit_record(edit, kind: "changed", alloc))
@@ -38,13 +38,13 @@ fn history(request: Request, subject: Str, tree: store::service::View, alloc: me
         Err(failed) => return failed_block(id, verb, operand: subject, failure: Failure.of(failed.code().as_str(), subject, alloc), alloc)
     }
     for meta in commits {
-        mut block.records.push(commit_record(meta, alloc))
+        mut block.records.push(commit_record(meta, reader, alloc))
     }
     return block
 } history
 
 /// `commit #<n>, time, principal, session, plan, cause`, its intent in an envelope.
-fn commit_record(meta: store::CommitMeta, alloc: mem::Alloc) -> Record {
+fn commit_record(meta: store::CommitMeta, reader: ident::Principal, alloc: mem::Alloc) -> Record {
     var record = Record.of("commit", alloc)
     mut record.subject(Dyn[Render].view(meta.number))
     mut record.field("time", value: Dyn[Render].view(meta.time))
@@ -61,45 +61,29 @@ fn commit_record(meta: store::CommitMeta, alloc: mem::Alloc) -> Record {
     }
     mut record.field("cause", value: Dyn[Render].view(meta.cause))
     match meta.intent {
-        Some(intent) => {
-            var origin = text::String.of("principal.", alloc)
-            mut origin.append(meta.principal.text.as_str())
-            envelope(mut record, field: "intent", origins: origin.as_str(), content: intent.as_str(), alloc)
-        }
+        Some(intent) => mut record.envelope("intent", labels: untrusted_labels(meta.origins, author: meta.principal, reader, alloc), content: intent.as_str(), alloc)
         None => {
         }
     }
     return record
 } commit_record
 
-/// Writes `content` as the envelope of the field `field`: `<field>: envelope <origins> <n>`, then each of its n lines after `| `.
-pub fn envelope(mut record: Record, field: Str, origins: Str, content: Str, alloc: mem::Alloc) {
-    var count: usize = 1
-    for byte in content.as_bytes() {
-        if byte == b'\n' {
-            count += 1
-        }
+/// The origin labels of a value of the origin set `origins` that `author` wrote, as `reader` reads it: the set, with `principal.<author>` unless the author is `system` or the reader.
+pub fn untrusted_labels(origins: mem::List[ident::OriginLabel], author: ident::Principal, reader: ident::Principal, alloc: mem::Alloc) -> mem::List[ident::OriginLabel] {
+    var labels = mem::List[ident::OriginLabel].empty(alloc)
+    for label in origins {
+        mut labels.push(ident::OriginLabel(text: label.text))
     }
-    var head = text::String.of(field, alloc)
-    mut head.append(": envelope ")
-    mut head.append(origins)
-    mut head.push(' ')
-    mut head.write(Dyn[Render].view(count), budget: 24)
-    mut record.line(head.as_str(), alloc)
-    var line = text::String.of("| ", alloc)
-    for c in content.cursor() {
-        if c == '\n' {
-            mut record.line(line.as_str(), alloc)
-            line = text::String.of("| ", alloc)
-            continue
-        }
-        if c < ' ' or c == '\u{7F}' {
-            continue
-        }
-        mut line.push(c)
+    if author.text.as_str() == "system" or author == reader {
+        return labels
     }
-    mut record.line(line.as_str(), alloc)
-} envelope
+    var text = text::Fixed[260].of("principal.")
+    mut text.append(author.text.as_str())
+    if ident::is_origin_label(text) {
+        mut labels.push(ident::OriginLabel(text: text))
+    }
+    return labels
+} untrusted_labels
 
 /// `diff <a> <b> [<path>]`: the nodes added, removed and changed from `a` to `b` under the path, in path order.
 fn diff(request: Request, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {

@@ -1,0 +1,375 @@
+//! Authority: the grants of the principals holding sessions, which open their sessions, give their budgets and let their requests read the tree, and what their sessions spend and gain together.
+
+/// The most grants one read of `/sys/grants` gives.
+const GRANTS_READ: u32 = 256
+
+/// A grant and its number.
+pub closed struct Held derives Encode {
+    pub number: u64
+    pub grant: os::Grant
+} Held
+
+/// What a principal holds: its grants, and whether its record holds a key.
+pub closed struct Holding derives Encode {
+    pub principal: ident::Principal
+    pub grants: mem::List[Held]
+    pub keyed: bool
+} Holding
+
+/// What `principal` holds, read from `/sys/grants` and `/sys/principals`.
+pub fn holding_of(tree: store::service::View, take principal: ident::Principal, alloc: mem::Alloc) -> Holding fails task::Cancelled uses wait {
+    var principals = mem::List[ident::Principal].empty(alloc)
+    mut principals.push(ident::Principal(text: principal.text))
+    var holdings = try await holdings_of(tree, principals, alloc)
+    return match holdings.len() {
+        0 => Holding(principal: take principal, grants: mem::List.empty(alloc), keyed: false)
+        else => mut holdings.remove(0)
+    }
+} holding_of
+
+/// What each of `principals` holds, in their order.
+pub fn holdings_of(tree: store::service::View, principals: mem::List[ident::Principal], alloc: mem::Alloc) -> mem::List[Holding] fails task::Cancelled uses wait {
+    var holdings = mem::List[Holding].empty(alloc)
+    for principal in principals {
+        var path = text::String.of("/sys/principals/", alloc)
+        mut path.append(principal.text.as_str())
+        let keyed = match try await Records[os::PrincipalRecord].at(tree, path: path.as_str(), alloc) {
+            Some(record) => record.key.is_some()
+            None => false
+        }
+        mut holdings.push(Holding(principal: ident::Principal(text: principal.text), grants: mem::List.empty(alloc), keyed: keyed))
+    }
+    var from = text::String.empty(alloc)
+    loop {
+        let nodes = match first attempt await tree.scan(ident::Path(text: text::String.of("/sys/grants", alloc)), from: text::String.of(from.as_str(), alloc), to: text::String.empty(alloc), limit: GRANTS_READ, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return holdings
+        }
+        var read: u32 = 0
+        for node in take nodes {
+            let path = node.path.text.as_str()
+            var cut: usize = 0
+            for at in 0..<path.byte_len() {
+                if path.as_bytes()[at] == b'/' {
+                    cut = at + 1
+                }
+            }
+            let Some(name) = path.slice_bytes(cut, end: path.byte_len()) else {
+                continue
+            }
+            if name == from.as_str() {
+                continue
+            }
+            read += 1
+            from = text::String.of(name, alloc)
+            let Some(number) = grant_number_of(name) else {
+                continue
+            }
+            let Some(value) = node.value else {
+                continue
+            }
+            let Ok(grant) = attempt mem::wire::Codec[os::Grant].decode(value.view(), alloc) else {
+                continue
+            }
+            let Some(at) = holdings.position(fn(each: Holding) => each.principal == grant.holder) else {
+                continue
+            }
+            mut holdings[at].grants.push(Held(number: number, grant: take grant))
+        }
+        if read == 0 {
+            return holdings
+        }
+    }
+} holdings_of
+
+/// The number of the grant `g<n>` names.
+fn grant_number_of(name: Str) -> Option[u64] {
+    if not name.starts_with("g") {
+        return None
+    }
+    let Some(rest) = name.slice_bytes(1, end: name.byte_len()) else {
+        return None
+    }
+    return number_of(rest)
+} grant_number_of
+
+/// Whether the grant is live at the UTC time `now_utc`.
+fn Held.live(self, now_utc: i64) -> bool {
+    return match self.grant.caveats.expires_utc_ns {
+        Some(at) => at > now_utc
+        None => true
+    }
+} Held.live
+
+/// Whether the grant opens sessions: a `Session` or a `Machine` grant.
+fn Held.opens(self) -> bool {
+    return match self.grant.object {
+        os::Object.Session(share: _, budget: _) or os::Object.Machine => true
+        else => false
+    }
+} Held.opens
+
+/// Whether the holding opens sessions at the UTC time `now_utc`: it holds a live `Session` or `Machine` grant.
+pub fn Holding.opens(self, now_utc: i64) -> bool {
+    return self.grants.position(fn(each: Held) => each.opens() and each.live(now_utc)).is_some()
+} Holding.opens
+
+/// When the grant the holding's sessions open under expires, `None` when it never does or none opens them.
+pub fn Holding.expiry(self, now_utc: i64) -> Option[i64] {
+    var latest: Option[i64] = None
+    for held in self.grants {
+        if not held.opens() or not held.live(now_utc) {
+            continue
+        }
+        let Some(at) = held.grant.caveats.expires_utc_ns else {
+            return None
+        }
+        latest = match latest {
+            Some(known) => match known > at {
+                true => Some(known)
+                false => Some(at)
+            }
+            None => Some(at)
+        }
+    }
+    return latest
+} Holding.expiry
+
+/// The budget of the holding's sessions: its `Session` grant's, else `fallback`, `LinkConfig.budget`.
+pub fn Holding.budget(self, fallback: os::SessionBudget) -> os::SessionBudget {
+    for held in self.grants {
+        match held.grant.object {
+            os::Object.Session(share: _, budget: budget) => return budget
+            else => {
+            }
+        }
+    }
+    return fallback
+} Holding.budget
+
+/// Whether the holding's grants let its sessions read `path` at the UTC time `now_utc`: a `Machine` grant, a `Tree` grant of `main` with `read` whose prefix holds it, outside `/state/keys`, or an `Instance` grant with `read` whose prefix holds the instance whose specification, configuration, state or `/live` record it is.
+pub fn Holding.reads(self, path: Str, now_utc: i64) -> bool {
+    for held in self.grants {
+        if not held.live(now_utc) {
+            continue
+        }
+        let may_read = held.grant.rights.contains(os::Right.Read)
+        let covered = match held.grant.object {
+            os::Object.Machine => true
+            os::Object.Tree(prefix: prefix, branch: branch) => may_read and (branch.as_str() == "main" or branch.as_str() == "*") and path_below(path, prefix: prefix.text.as_str()) and not path_below(path, prefix: "/state/keys")
+            os::Object.Instance(prefix: prefix) => may_read and instance_node(path, prefix)
+            else => false
+        }
+        if covered {
+            return true
+        }
+    }
+    return false
+} Holding.reads
+
+/// Whether the path `path` is `prefix` or lies below it.
+fn path_below(path: Str, prefix: Str) -> bool {
+    if prefix == "/" or path == prefix {
+        return true
+    }
+    return path.starts_with(prefix) and path.byte_len() > prefix.byte_len() and path.as_bytes()[prefix.byte_len()] == b'/'
+} path_below
+
+/// Whether `path` is the specification, configuration, state or `/live` record of an instance `prefix` names or one below it.
+fn instance_node(path: Str, prefix: ident::Moniker) -> bool {
+    for index in 0..<4u32 {
+        let dir = match index {
+            0 => "/sys/instances/"
+            1 => "/sys/config/"
+            2 => "/state/"
+            else => "/live/instances/"
+        }
+        if not path.starts_with(dir) {
+            continue
+        }
+        let Some(rest) = path.slice_bytes(dir.byte_len(), end: path.byte_len()) else {
+            return false
+        }
+        let end = rest.find("/").value_or(rest.byte_len())
+        let Some(name) = rest.slice_bytes(0, end: end) else {
+            return false
+        }
+        if name.byte_len() > 59 {
+            return false
+        }
+        return os::is_under(ident::Moniker(text: text::Fixed[59].of(name)), prefix)
+    }
+    return false
+} instance_node
+
+/// The paths `request` reads: its path, its query's or selector's, the instance nodes of a moniker, and the journal for the other subjects of `why`.
+pub fn read_paths(request: Request, alloc: mem::Alloc) -> mem::List[text::String] {
+    var paths = mem::List[text::String].empty(alloc)
+    let verb = request.verb.as_str()
+    let operand = first_operand(request, alloc)
+    let text = operand.as_str()
+    match verb {
+        "status" => mut paths.push(text::String.of("/live/status", alloc))
+        "get" or "history" or "describe" or "why" => {
+            if text.starts_with("/") {
+                mut paths.push(text::String.of(text, alloc))
+            } else if verb == "why" {
+                mut paths.push(text::String.of("/journal/events", alloc))
+            } else if verb == "history" and text.starts_with("#") {
+                mut paths.push(text::String.of("/", alloc))
+            }
+        }
+        "find" => match Query.parse(text, alloc) {
+            Some(query) => mut paths.push(text::String.of(query.from.as_str(), alloc))
+            None => {
+            }
+        }
+        "watch" => match Selector.parse(text, alloc) {
+            Some(selector) => mut paths.push(text::String.of(selector.path.as_str(), alloc))
+            None => {
+            }
+        }
+        "diff" => match request.operands.get(2) {
+            Some(path) => mut paths.push(text::String.of(path.as_str(), alloc))
+            None => mut paths.push(text::String.of("/", alloc))
+        }
+        else => {
+        }
+    }
+    return paths
+} read_paths
+
+/// Notes what `holding` holds, replacing what its principal held.
+fn Linker.hold(mut self, take holding: Holding) {
+    mut self.holdings.retain(fn(each: Holding) => each.principal != holding.principal)
+    mut self.holdings.push(take holding)
+} Linker.hold
+
+/// The budget of the session numbered `session`, `LinkConfig.budget` for none.
+fn Linker.budget_of(self, session: u64) -> os::SessionBudget {
+    let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return self.config.budget
+    }
+    return match self.holdings.position(fn(each: Holding) => each.principal == self.sessions[at].principal) {
+        Some(holding) => self.holdings[holding].budget(fallback: self.config.budget)
+        None => self.config.budget
+    }
+} Linker.budget_of
+
+/// Whether the session numbered `session` may read `path` at the UTC time `now_utc`.
+fn Linker.reads(self, session: u64, path: Str, now_utc: i64) -> bool {
+    let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return false
+    }
+    return match self.holdings.position(fn(each: Holding) => each.principal == self.sessions[at].principal) {
+        Some(holding) => self.holdings[holding].reads(path, now_utc)
+        None => false
+    }
+} Linker.reads
+
+/// Whether the sessions of the principal of the session numbered `session` spent their output budget.
+fn Linker.attention_spent(self, session: u64) -> bool {
+    let Some(limit) = self.budget_of(session).output_units else {
+        return false
+    }
+    let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return false
+    }
+    return match self.tallies.position(fn(each: Tally) => each.principal == self.sessions[at].principal) {
+        Some(tally) => self.tallies[tally].units >= limit
+        None => false
+    }
+} Linker.attention_spent
+
+/// The tally of the principal of the session at `at`, made when it has none.
+fn Linker.tally_of(mut self, at: usize, alloc: mem::Alloc) -> usize {
+    match self.tallies.position(fn(each: Tally) => each.principal == self.sessions[at].principal) {
+        Some(tally) => return tally
+        None => {
+        }
+    }
+    mut self.tallies.push(Tally(principal: ident::Principal(text: self.sessions[at].principal.text), units: 0, taint: mem::List.empty(alloc)))
+    return self.tallies.len() - 1
+} Linker.tally_of
+
+/// Counts `units` of output against the principal of the session numbered `session`.
+fn Linker.spend(mut self, session: u64, units: u64, alloc: mem::Alloc) {
+    let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return
+    }
+    let tally = mut self.tally_of(at, alloc)
+    self.tallies[tally].units = self.tallies[tally].units.saturating_add(units)
+} Linker.spend
+
+/// Grows the taint of the principal of the session numbered `session` by `origins`, giving the `taint` record of the labels the session gained since its previous block, if any.
+fn Linker.taint(mut self, session: u64, origins: mem::List[ident::OriginLabel], alloc: mem::Alloc) -> Option[Record] {
+    let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return None
+    }
+    let tally = mut self.tally_of(at, alloc)
+    for label in origins {
+        if self.tallies[tally].taint.position(fn(each: ident::OriginLabel) => each == label).is_none() {
+            mut self.tallies[tally].taint.push(ident::OriginLabel(text: label.text))
+        }
+    }
+    let before = self.sessions[at].told
+    let known = self.tallies[tally].taint.len()
+    if before >= known {
+        return None
+    }
+    var added = mem::List[ident::OriginLabel].empty(alloc)
+    for index in before..<known {
+        mut added.push(ident::OriginLabel(text: self.tallies[tally].taint[index].text))
+    }
+    self.sessions[at].told = known
+    var record = Record.of("taint", alloc)
+    mut record.field("added", value: Dyn[Render].view(added))
+    return Some(take record)
+} Linker.taint
+
+/// Has a keyed task read again what the principals holding sessions hold, once no reading is under way.
+fn Linker.regrant(mut self, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    if self.granting {
+        self.stale = true
+        return
+    }
+    let alloc = env.alloc
+    var principals = mem::List[ident::Principal].empty(alloc)
+    for session in self.sessions {
+        if principals.position(fn(each: ident::Principal) => each == session.principal).is_none() {
+            mut principals.push(ident::Principal(text: session.principal.text))
+        }
+    }
+    if principals.len() == 0 {
+        return
+    }
+    self.granting = true
+    self.stale = false
+    let tree = env.tree
+    mut cx.spawn(key: GRANTING, run: fn[take principals](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let holdings = try await holdings_of(tree, principals, alloc)
+        discard attempt await out.granted(take holdings)
+    })
+} Linker.regrant
+
+/// Takes what the principals holding sessions hold now, ending each session they no longer let go on.
+fn Linker.granted(mut self, take holdings: mem::List[Holding], mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    self.granting = false
+    for holding in take holdings {
+        mut self.hold(take holding)
+    }
+    let now_utc = now_utc_ns(env.wall, clock: env.clock)
+    var ending = mem::List[u64].empty(env.alloc)
+    for at in 0..<self.sessions.len() {
+        if not self.standing(at, now_utc) {
+            mut ending.push(self.sessions[at].number)
+        }
+    }
+    for session in ending {
+        mut self.end(session, mut env, mut cx)
+    }
+    if self.stale {
+        mut self.regrant(mut env, mut cx)
+    }
+} Linker.granted

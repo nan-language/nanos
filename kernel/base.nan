@@ -69,7 +69,7 @@ const LOG_ROOM: usize = 256
 /// How long after the core's start `store`, `keys`, `journal` and `policy` may take to run.
 const BASE_DEADLINE_NS: u64 = 30_000_000_000
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, the switch of the machine's power, and where `link` publishes `/live/sessions`.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, the switch of the machine's power, and where `link` publishes `/live/sessions` and learns the instances calling it.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
@@ -87,6 +87,7 @@ struct Base derives Copy {
     machine: os::Machine
     switch: power::Switch
     sessions_live: os::Live
+    callers: os::Callers
 } Base
 
 impl Base: runner::Components
@@ -147,7 +148,7 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
         return Some(os::Protocols(own: sys::Wire[power::Power].hash(), serves: None))
     }
     if component == LINKER {
-        return Some(os::Protocols(own: sys::Wire[link::Link].hash(), serves: Some(sys::Wire[store::service::Watcher].hash())))
+        return Some(os::Protocols(own: sys::Wire[link::LinkSession].hash(), serves: Some(sys::Wire[store::service::Watcher].hash())))
     }
     if component == DESK {
         return Some(os::Protocols(own: sys::Wire[console::Console].hash(), serves: None))
@@ -586,10 +587,10 @@ fn Base.serve_link(self, take world: nanos::World, take serving: runner::Serving
     let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
         return runner::Ended.EnvIncomplete
     }
-    let env = link::Env.of(console, tree, keys: keyring, attendant, own, events, live: self.sessions_live, random: world.random, clock: world.clock, wall: self.wall, config, alloc)
+    let env = link::Env.of(console, tree, keys: keyring, attendant, own, events, live: self.sessions_live, callers: self.callers, random: world.random, clock: world.clock, wall: self.wall, config, alloc)
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
     mut peers.push(sys::Wire[store::service::Watcher].schema(alloc))
-    return try await runner::Driven[link::Linker, link::Env, link::Link].run(take env, exec: world.exec, alloc, take serving, take peers, release: fn(take ended: link::Env) limits stack 512 {
+    return try await runner::Driven[link::Linker, link::Env, link::LinkSession].run(take env, exec: world.exec, alloc, take serving, take peers, release: fn(take ended: link::Env) limits stack 4_096 {
     })
 } Base.serve_link
 
@@ -912,7 +913,7 @@ fn run_base(
     let reporting = store::service::MintedReporter.of(reported, alloc: config.alloc)
     defer take reporting.close()
     let task::Channel(sender: posted, receiver: postings) = task::Channel[os::Posting].bounded(16, alloc: config.alloc)
-    let lives = LiveRoots.of(posted, alloc: config.alloc)
+    let lives = Roots.of(posted, monikers: rings.monikers(), alloc: config.alloc)
     defer take lives.close()
     let task::Channel(sender: tracings, receiver: traced) = task::Channel[mem::List[journal::TracedInstance]].bounded(1, alloc: config.alloc)
     let backlog = journal::Backlog.of(tracings, principals: rings.principals(), alloc: config.alloc)
@@ -922,7 +923,7 @@ fn run_base(
     let switching = power::MintedSwitch.of(switched, alloc: config.alloc)
     defer take switching.close()
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: switching.mint(), sessions_live: lives.sessions.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: switching.mint(), sessions_live: lives.sessions.mint(), callers: lives.callers.mint())
     var requested = incoming
     var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced))
     defer abandon_given(take given)
@@ -980,28 +981,30 @@ fn run_base(
     })
 } run_base
 
-/// The root entries of the `/live` records base instances publish: the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`.
-linear struct LiveRoots {
+/// The root entries of what base instances reach of the core's records: the `/live` records they publish, the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`, and the monikers of the instances calling them.
+linear struct Roots {
     store: os::MintedLive
     devices: os::MintedLive
     keys: os::MintedLive
     boot: os::MintedLive
     sessions: os::MintedLive
-} LiveRoots
+    callers: os::MintedCallers
+} Roots
 
-fn LiveRoots.of(posted: task::Sender[os::Posting], alloc: mem::Alloc) -> LiveRoots {
-    return LiveRoots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc))
-} LiveRoots.of
+fn Roots.of(posted: task::Sender[os::Posting], take monikers: task::Cown[mem::Map[u32, ident::Moniker]], alloc: mem::Alloc) -> Roots {
+    return Roots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), callers: os::MintedCallers.of(take monikers, alloc))
+} Roots.of
 
-/// Revokes the records' root entries.
-fn LiveRoots.close(take self) {
-    let LiveRoots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked) = self
+/// Revokes the root entries.
+fn Roots.close(take self) {
+    let Roots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, callers: calling) = self
     take stored.close()
     take managed.close()
     take keyed.close()
     take booted.close()
     take linked.close()
-} LiveRoots.close
+    take calling.close()
+} Roots.close
 
 /// Halts the kernel with `fault.base-not-running` and the first of `store`, `keys`, `journal` and `policy` that is not running 30 s after the core's start.
 fn watch_base(control: os::Control, clock: sys::Clock, alloc: mem::Alloc) fails task::Cancelled uses wait {
@@ -1196,7 +1199,9 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unswitched
     let switching = power::MintedSwitch.of(switched, alloc)
     defer take switching.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint())
+    let naming = os::MintedCallers.of(rings.monikers(), alloc)
+    defer take naming.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), callers: naming.mint())
     let task::Channel(sender: logs, receiver: unlogged) = task::Channel[journal::Logged].bounded(1, alloc)
     discard unlogged
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, logs, gauges: runner::Gauges.empty(alloc), tracings: take untraced, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {

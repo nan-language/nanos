@@ -1,0 +1,122 @@
+//! The facts the link reads of the system: the ready record's, the records of `/live`, and the subscriptions telling it of the principals' grants and keys.
+
+/// The facts of the ready record, from `/live/status`, the events stream and `/live/security`, the boot counter of `/live/boot`, the console role's driver, and the subscriptions of `/sys/grants` and `/sys/principals` telling `own`.
+fn facts_of(tree: store::service::View, own: os::PortHandle, alloc: mem::Alloc) -> Facts fails task::Cancelled uses wait {
+    var ready = LinkReady(version: 1, mode: text::String.of("normal", alloc), generation: 0, claimed: false, cursor: try await event_cursor(tree, alloc), key: ident::HashValue.of_content(b""))
+    match try await Records[os::LiveStatus].at(tree, path: "/live/status", alloc) {
+        Some(status) => {
+            ready.mode = text::String.of(mode_name(status.mode).as_str(), alloc)
+            ready.generation = status.generation
+            ready.claimed = status.claimed
+        }
+        None => {
+        }
+    }
+    match try await Records[os::LiveSecurity].at(tree, path: "/live/security", alloc) {
+        Some(security) => {
+            ready.key = ident::HashValue.of_content(security.link_keys.ed25519.view())
+        }
+        None => {
+        }
+    }
+    let boot = match try await Records[os::LiveBoot].at(tree, path: "/live/boot", alloc) {
+        Some(booted) => booted.boot_counter
+        None => 0
+    }
+    let grants = try await subscribed(tree, own, path: "/sys/grants", alloc)
+    let principals = try await subscribed(tree, own, path: "/sys/principals", alloc)
+    return Facts(ready: take ready, boot: boot, console: try await console_driver(tree, alloc), grants: grants, principals: principals)
+} facts_of
+
+/// The subscription of the changes below `path` from now on, telling `own`, `None` when the store refuses it.
+fn subscribed(tree: store::service::View, own: os::PortHandle, path: Str, alloc: mem::Alloc) -> Option[u64] fails task::Cancelled uses wait {
+    let head = match try await Records[store::service::LiveStore].at(tree, path: "/live/store", alloc) {
+        Some(live) => live.head
+        None => 0
+    }
+    return match first attempt await tree.subscribe(ident::Path(text: text::String.of(path, alloc)), since: ident::CommitId(number: head), port: own, alloc) {
+        Ok(number) => Some(number)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} subscribed
+
+/// The driver holding the `console` role, as `/live/devices` names it, each bus there taking a dir of its devices.
+fn console_driver(tree: store::service::View, alloc: mem::Alloc) -> Option[ident::Moniker] fails task::Cancelled uses wait {
+    for bus in try await names_below(tree, path: "/live/devices", alloc) {
+        var dir = text::String.of("/live/devices/", alloc)
+        mut dir.append(bus.as_str())
+        for name in try await names_below(tree, path: dir.as_str(), alloc) {
+            var path = text::String.of(dir.as_str(), alloc)
+            mut path.push('/')
+            mut path.append(name.as_str())
+            let Some(device) = try await Records[devices::LiveDevice].at(tree, path: path.as_str(), alloc) else {
+                continue
+            }
+            if device.role == Some(os::Role.Console) {
+                return device.driver
+            }
+        }
+    }
+    return None
+} console_driver
+
+/// The names of the children of the dir at `path`, none when it is no dir.
+fn names_below(tree: store::service::View, path: Str, alloc: mem::Alloc) -> mem::List[text::String] fails task::Cancelled uses wait {
+    var names = mem::List[text::String].empty(alloc)
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await tree.list(ident::Path(text: text::String.of(path, alloc)), after: take after, limit: 256, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return names
+        }
+        if listing.entries.len() == 0 {
+            return names
+        }
+        var last = text::String.empty(alloc)
+        for entry in take listing.entries {
+            last = text::String.of(entry.name.as_str(), alloc)
+            mut names.push(take entry.name)
+        }
+        after = Some(take last)
+    }
+} names_below
+
+/// The cursor of the latest event of `/journal/events`, `e0` before any.
+fn event_cursor(tree: store::service::View, alloc: mem::Alloc) -> ident::Cursor fails task::Cancelled uses wait {
+    return match first attempt await tree.get(ident::Path(text: text::String.of("/journal/events", alloc)), at: None, alloc) {
+        Ok(node) => ident::Cursor(seq: node.next.saturating_sub(1))
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => ident::Cursor(seq: 0)
+    }
+} event_cursor
+
+/// Reads records of type T.
+pub open struct Records[T: Encode] {
+} Records
+
+/// The record of type T at `path`, `None` when it is missing or does not decode as one.
+pub fn Records.at(tree: store::service::View, path: Str, alloc: mem::Alloc) -> Option[T] fails task::Cancelled uses wait {
+    let node = match first attempt await tree.get(ident::Path(text: text::String.of(path, alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(value) = node.value else {
+        return None
+    }
+    return match attempt mem::wire::Codec[T].decode(value.view(), alloc) {
+        Ok(decoded) => Some(take decoded)
+        Err(_) => None
+    }
+} Records.at
+
+pub fn mode_name(mode: os::BootMode) -> text::Fixed[8] {
+    return text::Fixed[8].of(match mode {
+        os::BootMode.Normal => "normal"
+        os::BootMode.Trial => "trial"
+        os::BootMode.Recovery => "recovery"
+        os::BootMode.Dev => "dev"
+    })
+} mode_name

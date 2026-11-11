@@ -1,21 +1,29 @@
-//! The `link` instance: the protocol through which agents and humans reach the system, served on the serial transport.
+//! The `link` instance: the protocol through which agents and humans reach the system, served on the serial and port transports.
 
-/// The keys of the keyed tasks: the serial transport's reader and writer, the one reading the ready record's facts, the one handing lines to `console`, and those answering requests, plus the slot of each.
+/// The keys of the keyed tasks: the serial transport's reader, the one reading the facts of the ready record, the one handing lines to `console`, the one reading the principals' grants, the one telling the journal and `/live` of sessions, and those answering requests and writing to each connection, plus the slot of each.
 const READING: u64 = 1
-
-const WRITING: u64 = 2
 
 const OPENING: u64 = 3
 
 const CONSOLING: u64 = 4
 
+const GRANTING: u64 = 5
+
+const NOTIFYING: u64 = 6
+
 const ANSWERING: u64 = 0x1_0000_0000
+
+const WRITING: u64 = 0x4_0000_0000
 
 /// The most requests running at once, each keeping the slot its keyed task's key names.
 const MOST_RUNNING: u64 = 256
 
-/// What `link` serves: the messages of the store's subscriptions, and those of its own keyed tasks and timers.
-pub protocol Link {
+/// What `link` serves: the connections of resident agents, the messages of the store's subscriptions, and those of its own keyed tasks and timers.
+pub protocol LinkSession {
+    /// Opens a connection whose blocks go to `client`, a port of `LinkClient`, for the calling instance, whose earlier connection is lost.
+    pub fn open(client: os::PortHandle) -> u64 fails Refusal limits traceless
+    /// Takes one request line on the calling instance's connection.
+    pub fn send(line: text::String) limits irreversible(emit, actuate, erase, spend)
     /// A commit changed nodes below a subscription's prefix.
     pub fn changed(subscription: u64, commit: ident::CommitId, paths: mem::List[ident::Path], more: u64) limits traceless
     /// An append to a stream below a subscription's prefix.
@@ -24,25 +32,43 @@ pub protocol Link {
     pub fn lost(subscription: u64, commits: u64) limits traceless
     /// What a line received on serial gives.
     fn received(received: Received) limits traceless
-    /// The serial transport wrote what it was given.
-    fn written() limits traceless
+    /// The connection numbered `connection` took the block it was given, or is lost.
+    fn written(connection: u64, lost: bool) limits traceless
     /// `console` took the line it was handed.
     fn handed() limits traceless
-    /// The facts of the ready record and the boot counter, read once the store answers.
-    fn opened(ready: LinkReady, boot: u64) limits traceless
+    /// The facts the link reads at its start.
+    fn opened(facts: Facts) limits traceless
     /// The request numbered `number` ended with the block `block`.
-    fn responded(number: u64, block: mem::Bytes) limits traceless
+    fn responded(number: u64, block: Block) limits traceless
     /// The `hello` numbered `number` goes on.
     fn hello_step(number: u64, step: HelloStep) limits traceless
     /// The request numbered `number` has run for `LinkConfig.pending_ms`.
     fn due(number: u64) limits traceless
     /// The watch numbered `number` started as `start` says.
     fn watching(number: u64, start: WatchStart) limits traceless
-    /// The matches of the watch numbered `number` up to the cursor `cursor`, as the block `block`, empty when none matched.
-    fn delivered(number: u64, block: mem::Bytes, matched: bool, cursor: u64) limits traceless
+    /// The matches of the watch numbered `number` up to the cursor `cursor`, as the block `block`, and whether the read stopped at the backlog.
+    fn delivered(number: u64, block: Block, cursor: u64, full: bool) limits traceless
     /// The watch numbered `number` has matches to deliver.
     fn push_due(number: u64) limits traceless
-} Link
+    /// What the principals holding sessions hold, read after `/sys/grants` or `/sys/principals` changed.
+    fn granted(holdings: mem::List[Holding]) limits traceless
+    /// The session numbered `session` may have reached its end.
+    fn session_due(session: u64) limits traceless
+    /// The journal and `/live` took the notice at the head of the queue.
+    fn notified() limits traceless
+} LinkSession
+
+/// What a resident agent serves for the blocks of its connection.
+pub protocol LinkClient {
+    /// One block, its lines ending in LF.
+    pub fn block(text: text::String) limits traceless
+} LinkClient
+
+/// Why `LinkSession.open` refuses a connection: the link holds its most connections, or the client is no port of `LinkClient`.
+pub closed enum Refusal derives Copy, Eq, Render, Encode {
+    SessionLimit
+    InvalidClient
+} Refusal
 
 /// The ready record.
 pub closed struct LinkReady derives Encode {
@@ -56,13 +82,16 @@ pub closed struct LinkReady derives Encode {
     pub key: ident::HashValue
 } LinkReady
 
-/// The facts the link read at its start: the ready record and the boot counter.
+/// The facts the link read at its start: the ready record, the boot counter, the console role's driver, and the subscriptions telling it of changes to `/sys/grants` and `/sys/principals`.
 pub closed struct Facts derives Encode {
     pub ready: LinkReady
     pub boot: u64
+    pub console: Option[ident::Moniker]
+    pub grants: Option[u64]
+    pub principals: Option[u64]
 } Facts
 
-/// The Env of `link`: the console UART, its View of the tree, its ports to `keys` and to `console`, the port the store tells its subscriptions through, its source of events, where it publishes `/live/sessions`, the kernel's entropy, the clocks, its configuration and its cell.
+/// The Env of `link`: the console UART, its View of the tree, its ports to `keys` and to `console`, the port the store tells its subscriptions through, its source of events, where it publishes `/live/sessions`, the names of the instances calling it, the kernel's entropy, the clocks, its configuration, the clients of its port connections and its cell.
 pub open struct Env derives Send {
     console: os::Port[devices::Console]
     tree: store::service::View
@@ -71,44 +100,55 @@ pub open struct Env derives Send {
     own: os::PortHandle
     events: journal::Source
     live: os::Live
+    callers: os::Callers
     random: sys::Random
     clock: sys::Clock
     wall: ident::Wall
     config: LinkConfig
+    clients: mem::List[Client]
     alloc: mem::Alloc
 } Env
 
-/// A request running: its number, the slot its keyed task's key names, its id, verb and first operand, whether its `pending` block went out, and for `hello` the principal it names.
+/// A request running: its number, the slot its keyed task's key names, its connection and its session, 0 for none, its id, verb and first operand, how its blocks are cut, whether its `pending` block went out, and for `hello` the principal it names and the session it resumes.
 pub closed struct Running derives Encode {
     pub number: u64
     pub slot: u64
+    pub connection: u64
+    pub session: u64
     pub id: text::Fixed[32]
     pub verb: text::Fixed[16]
     pub operand: text::String
+    pub cut: Cut
     pub pending: bool
     pub principal: Option[ident::Principal]
+    pub resume: Option[u64]
 } Running
 
-/// The state of `link`: its configuration, the facts read at its start, the blocks waiting for the serial transport and whether one is being written, the requests running and the number of the next, the sessions open and the number of the next, the serial connection's challenge, the watches, when the ready record went out, and the console lines waiting for `console` and whether one is being handed over.
+/// The state of `link`: its configuration, the facts read at its start, its connections and the number of the next, the requests running and the number of the next, the sessions open and the number of the next, what the principals holding them hold and what their sessions spent and gained, whether their grants are being read and whether they changed meanwhile, the watches, when the ready record went out, the console lines waiting for `console` and whether one is being handed over, and the notices waiting for the journal and `/live` and whether one is being told.
 pub closed struct Linker derives Encode {
     pub config: LinkConfig
     pub facts: Option[Facts]
-    pub output: mem::List[mem::Bytes]
-    pub writing: bool
+    pub connections: mem::List[Connection]
+    pub next_connection: u64
     pub running: mem::List[Running]
     pub next: u64
     pub sessions: mem::List[Session]
     pub next_session: u64
-    pub challenge: Option[Challenge]
+    pub holdings: mem::List[Holding]
+    pub tallies: mem::List[Tally]
+    pub granting: bool
+    pub stale: bool
     pub watches: mem::List[Watch]
     pub ready_ns: u64
     pub lines: mem::List[text::String]
     pub consoling: bool
+    pub notices: mem::List[Notice]
+    pub notifying: bool
 } Linker
 
-impl Linker: sys::Component[Env, Link]
+impl Linker: sys::Component[Env, LinkSession]
 
-impl Linker: sys::Resume[Env, Link]
+impl Linker: sys::Resume[Env, LinkSession]
 
 pub fn Env.of(
     console: os::Port[devices::Console],
@@ -118,38 +158,59 @@ pub fn Env.of(
     own: os::PortHandle,
     events: journal::Source,
     live: os::Live,
+    callers: os::Callers,
     random: sys::Random,
     clock: sys::Clock,
     wall: ident::Wall,
     config: LinkConfig,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(console: console, tree: tree, keys: keys, attendant: attendant, own: own, events: events, live: live, random: random, clock: clock, wall: wall, config: config, alloc: alloc)
+    return Env(console: console, tree: tree, keys: keys, attendant: attendant, own: own, events: events, live: live, callers: callers, random: random, clock: clock, wall: wall, config: config, clients: mem::List.empty(alloc), alloc: alloc)
 } Env.of
 
 pub fn Linker.start(mut env: Env) -> Linker {
-    return Linker(config: env.config, facts: None, output: mem::List.empty(env.alloc), writing: false, running: mem::List.empty(env.alloc), next: 1, sessions: mem::List.empty(env.alloc), next_session: 1, challenge: None, watches: mem::List.empty(env.alloc), ready_ns: 0, lines: mem::List.empty(env.alloc), consoling: false)
+    let alloc = env.alloc
+    var connections = mem::List[Connection].empty(alloc)
+    mut connections.push(Connection.of(SERIAL_CONNECTION, transport: Transport.Serial, opener: 0, slot: 0, alloc))
+    return Linker(config: env.config, facts: None, connections: take connections, next_connection: SERIAL_CONNECTION + 1, running: mem::List.empty(alloc), next: 1, sessions: mem::List.empty(alloc), next_session: 1, holdings: mem::List.empty(alloc), tallies: mem::List.empty(alloc), granting: false, stale: false, watches: mem::List.empty(alloc), ready_ns: 0, lines: mem::List.empty(alloc), consoling: false, notices: mem::List.empty(alloc), notifying: false)
 } Linker.start
 
-/// Listens on serial, and reads the ready record's facts.
-pub fn Linker.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Link]) {
+/// Listens on serial, reads the facts of the ready record and subscribes to the grants and principals.
+pub fn Linker.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[LinkSession]) {
     let console = env.console
     let tree = env.tree
+    let own = env.own
     let alloc = env.alloc
-    mut cx.spawn(key: READING, run: fn(out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
+    mut cx.spawn(key: READING, run: fn(out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
         try await read_serial(console, out, alloc)
     })
-    mut cx.spawn(key: OPENING, run: fn(out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
-        let facts = try await facts_of(tree, alloc)
-        let Facts(ready: ready, boot: boot) = facts
-        discard attempt await out.opened(take ready, boot)
+    mut cx.spawn(key: OPENING, run: fn(out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let facts = try await facts_of(tree, own, alloc)
+        discard attempt await out.opened(take facts)
     })
 } Linker.resume
 
-/// Writes the ready record, before any block.
-fn Linker.opened(mut self, take ready: LinkReady, take boot: u64, mut env: Env, mut cx: sys::Cx[Link]) {
-    let alloc = env.alloc
+/// Writes the ready record to each connection, ahead of any block.
+fn Linker.opened(mut self, take facts: Facts, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    self.facts = Some(take facts)
+    self.ready_ns = now_ns(env.clock)
+    for at in 0..<self.connections.len() {
+        let block = self.ready_block(env.alloc)
+        mut self.connections[at].output.insert(0, value: take block)
+    }
+    mut self.summarize(mut env, mut cx)
+    for at in 0..<self.connections.len() {
+        mut self.write(self.connections[at].number, mut env, mut cx)
+    }
+} Linker.opened
+
+/// The ready record's block.
+fn Linker.ready_block(self, alloc: mem::Alloc) -> mem::Bytes {
     var block = Block.of(Verdict.Ok, id: "0", verb: "link", operand: "", alloc)
+    let Some(facts) = self.facts else {
+        return block.text(self.cut(budget: self.config.budget, rest: text::String.empty(alloc)), alloc)
+    }
+    let ready = facts.ready
     var record = Record.of("link", alloc)
     mut record.field("version", value: Dyn[Render].view(ready.version))
     mut record.text("mode", value: ready.mode.as_str(), alloc)
@@ -158,75 +219,19 @@ fn Linker.opened(mut self, take ready: LinkReady, take boot: u64, mut env: Env, 
     mut record.field("cursor", value: Dyn[Render].view(ready.cursor))
     mut record.field("key", value: Dyn[Render].view(ready.key))
     mut block.records.push(take record)
-    mut self.output.insert(0, value: block.text(self.cut(text::String.empty(alloc)), alloc))
-    self.facts = Some(Facts(ready: take ready, boot: boot))
-    self.ready_ns = now_ns(env.clock)
-    mut self.summarize(mut env, mut cx)
-    mut self.write(mut env, mut cx)
-} Linker.opened
+    return block.text(self.cut(budget: self.config.budget, rest: text::String.empty(alloc)), alloc)
+} Linker.ready_block
 
-fn Linker.received(mut self, take received: Received, mut env: Env, mut cx: sys::Cx[Link]) {
-    let alloc = env.alloc
-    match received {
-        Received.Request(text) => mut self.request(text.as_str(), mut env, mut cx)
-        Received.Refused(code: code) => mut self.answer(failed_block(id: "-", verb: "-", operand: "", failure: Failure.of(code.as_str(), subject: "-", alloc), alloc), mut env, mut cx)
-        Received.Console(text) => {
-            mut self.lines.push(take text)
-            mut self.hand(mut env, mut cx)
-        }
-    }
-} Linker.received
-
-/// Hands `console` the console line `line`, without its leading `console `.
-fn hand_over(attendant: os::Port[console::Console], line: Str, alloc: mem::Alloc) fails task::Cancelled uses wait {
-    let Some(rest) = line.slice_bytes(8, end: line.byte_len()) else {
-        return
-    }
-    var call = sys::Encoded.empty(alloc)
-    sys::Wire[console::Console].line(mut call, text: text::String.of(rest, alloc))
-    match attempt await attendant.post(take call) {
-        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
-        else => {
-        }
-    }
-} hand_over
-
-/// Has a keyed task hand the next console line waiting to `console`, once none is being handed over.
-fn Linker.hand(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
-    if self.consoling or self.lines.len() == 0 {
-        return
-    }
-    let text = mut self.lines.remove(0)
-    self.consoling = true
-    let attendant = env.attendant
-    let alloc = env.alloc
-    mut cx.spawn(key: CONSOLING, run: fn[take text](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
-        try await hand_over(attendant, line: text.as_str(), alloc)
-        discard attempt await out.handed()
-    })
-} Linker.hand
-
-fn Linker.handed(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
-    self.consoling = false
-    mut self.hand(mut env, mut cx)
-} Linker.handed
-
-fn Linker.written(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
-    self.writing = false
-    mut self.write(mut env, mut cx)
-} Linker.written
-
-fn Linker.responded(mut self, take number: u64, take block: mem::Bytes, mut env: Env, mut cx: sys::Cx[Link]) {
+fn Linker.responded(mut self, take number: u64, take block: Block, mut env: Env, mut cx: sys::Cx[LinkSession]) {
     let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
         return
     }
-    discard mut self.running.remove(at)
-    mut self.output.push(take block)
-    mut self.write(mut env, mut cx)
+    let done = mut self.running.remove(at)
+    mut self.deliver(connection: done.connection, session: done.session, take block, cut: done.cut, mut env, mut cx)
 } Linker.responded
 
 /// Answers `pending` for a request still running.
-fn Linker.due(mut self, take number: u64, mut env: Env, mut cx: sys::Cx[Link]) {
+fn Linker.due(mut self, take number: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
     let alloc = env.alloc
     let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
         return
@@ -236,210 +241,112 @@ fn Linker.due(mut self, take number: u64, mut env: Env, mut cx: sys::Cx[Link]) {
     mut record.words("running")
     mut block.records.push(take record)
     self.running[at].pending = true
-    mut self.answer(take block, mut env, mut cx)
+    let connection = self.running[at].connection
+    let session = self.running[at].session
+    mut self.answer(connection, session, take block, mut env, mut cx)
 } Linker.due
 
-pub fn Linker.changed(
-    mut self,
-    take subscription: u64,
-    take commit: ident::CommitId,
-    take paths: mem::List[ident::Path],
-    take more: u64,
-    mut env: Env,
-    mut cx: sys::Cx[Link],
-    ) {
-    let alloc = env.alloc
-    let Some(at) = self.watches.position(fn(each: Watch) => each.subscription == Some(subscription)) else {
-        return
-    }
-    let Some(selector) = Selector.parse(self.watches[at].selector.as_str(), alloc) else {
-        return
-    }
-    if watched_of(selector, alloc) == Some(Watched.Commits) {
-        var block = Block.of(Verdict.Ok, id: self.watches[at].id.as_str(), verb: "watch", operand: "", alloc)
-        mut block.records.push(commit_change(commit, paths, more, alloc))
-        self.watches[at].cursor = commit.number
-        mut self.answer(take block, mut env, mut cx)
-        return
-    }
-    mut self.fall_due(at, mut env, mut cx)
-} Linker.changed
-
-pub fn Linker.appended(mut self, take subscription: u64, take path: ident::Path, take seq: u64, mut env: Env, mut cx: sys::Cx[Link]) {
-    let Some(at) = self.watches.position(fn(each: Watch) => each.subscription == Some(subscription)) else {
-        return
-    }
-    mut self.fall_due(at, mut env, mut cx)
-} Linker.appended
-
-/// Pushes a `lost` record to the watch the subscription tells.
-pub fn Linker.lost(mut self, take subscription: u64, take commits: u64, mut env: Env, mut cx: sys::Cx[Link]) {
-    let alloc = env.alloc
-    let Some(at) = self.watches.position(fn(each: Watch) => each.subscription == Some(subscription)) else {
-        return
-    }
-    var block = Block.of(Verdict.Ok, id: self.watches[at].id.as_str(), verb: "watch", operand: "", alloc)
-    var record = Record.of("lost", alloc)
-    mut record.field("count", value: Dyn[Render].view(commits))
-    mut record.field("since", value: Dyn[Render].view(ident::CommitId(number: self.watches[at].cursor)))
-    mut block.records.push(take record)
-    mut self.answer(take block, mut env, mut cx)
-} Linker.lost
-
-/// Marks the watch at `at` due, a delivery following within `push_ms` unless one is under way.
-fn Linker.fall_due(mut self, at: usize, mut env: Env, mut cx: sys::Cx[Link]) {
-    if self.watches[at].due {
-        return
-    }
-    self.watches[at].due = true
-    if not self.watches[at].delivering {
-        mut cx.after(ms: u64.widen(self.config.push_ms), send: Link.push_due(number: self.watches[at].number))
-    }
-} Linker.fall_due
-
-/// Has a keyed task deliver the matches of the watch numbered `number`.
-fn Linker.push_due(mut self, take number: u64, mut env: Env, mut cx: sys::Cx[Link]) {
-    let alloc = env.alloc
-    let Some(at) = self.watches.position(fn(each: Watch) => each.number == number) else {
-        return
-    }
-    if self.watches[at].delivering {
-        return
-    }
-    let Some(selector) = Selector.parse(self.watches[at].selector.as_str(), alloc) else {
-        return
-    }
-    let Some(watched) = watched_of(selector, alloc) else {
-        return
-    }
-    self.watches[at].due = false
-    self.watches[at].delivering = true
-    let tree = env.tree
-    let id = self.watches[at].id
-    let cursor = self.watches[at].cursor
-    let backlog = self.config.backlog
-    let path = subscribed_path(selector, watched, alloc)
-    let events = watched == Watched.Events
-    let cut = self.cut(text::String.empty(alloc))
-    let slot = self.watches[at].slot
-    mut cx.spawn(key: DELIVERING + slot, run: fn[take selector, take path, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
-        let Delivered(block: block, cursor: reached) = try await deliver(tree, id: id.as_str(), selector, take path, cursor, backlog, events, alloc)
-        let matched = block.records.len() > 0
-        discard attempt await out.delivered(number, block: block.text(cut, alloc), matched, cursor: reached)
-    })
-} Linker.push_due
-
-/// Pushes what a delivery matched, and delivers again when the watch fell due meanwhile.
-fn Linker.delivered(mut self, take number: u64, take block: mem::Bytes, take matched: bool, take cursor: u64, mut env: Env, mut cx: sys::Cx[Link]) {
-    let Some(at) = self.watches.position(fn(each: Watch) => each.number == number) else {
-        return
-    }
-    self.watches[at].delivering = false
-    self.watches[at].cursor = cursor
-    if matched {
-        mut self.output.push(take block)
-        mut self.write(mut env, mut cx)
-    }
-    if self.watches[at].due {
-        mut cx.after(ms: u64.widen(self.config.push_ms), send: Link.push_due(number: number))
-    }
-} Linker.delivered
-
-/// Answers the watch numbered `number` once it started: `watch <cursor>` with the cursor it starts after, or its failure.
-fn Linker.watching(mut self, take number: u64, take start: WatchStart, mut env: Env, mut cx: sys::Cx[Link]) {
-    let alloc = env.alloc
-    let Some(at) = self.watches.position(fn(each: Watch) => each.number == number) else {
-        return
-    }
-    let Some(running) = self.running.position(fn(each: Running) => each.number == number) else {
-        return
-    }
-    match start.failure {
-        Some(code) => {
-            discard mut self.watches.remove(at)
-            let block = self.running[running].failed(Failure.of(code.as_str(), subject: self.running[running].operand.as_str(), alloc), alloc)
-            mut self.respond(running, take block, mut env, mut cx)
-            return
-        }
-        None => {
-        }
-    }
-    self.watches[at].subscription = start.subscription
-    self.watches[at].cursor = start.cursor
-    var block = self.running[running].block(Verdict.Ok, alloc)
-    var record = Record.of("watch", alloc)
-    match Selector.parse(self.watches[at].selector.as_str(), alloc) {
-        Some(selector) => {
-            if watched_of(selector, alloc) == Some(Watched.Commits) {
-                mut record.subject(Dyn[Render].view(ident::CommitId(number: start.cursor)))
-            } else {
-                mut record.subject(Dyn[Render].view(ident::Cursor(seq: start.cursor)))
-            }
-        }
-        None => {
-        }
-    }
-    mut block.records.push(take record)
-    mut self.respond(running, take block, mut env, mut cx)
-} Linker.watching
-
-/// Reads the request `text` and runs it.
-fn Linker.request(mut self, text: Str, mut env: Env, mut cx: sys::Cx[Link]) {
+/// Reads the request `text` received on the connection numbered `connection` and runs it.
+fn Linker.request(mut self, connection: u64, text: Str, mut env: Env, mut cx: sys::Cx[LinkSession]) {
     let alloc = env.alloc
     match Request.read(text, alloc) {
-        Read.Refused(id: id, verb: verb, failure: failure) => mut self.answer(failed_block(id: id.as_str(), verb: verb.as_str(), operand: "", take failure, alloc), mut env, mut cx)
-        Read.Request(request) => mut self.run(take request, mut env, mut cx)
+        Read.Refused(id: id, verb: verb, failure: failure) => mut self.answer(connection, session: 0, block: failed_block(id: id.as_str(), verb: verb.as_str(), operand: "", take failure, alloc), mut env, mut cx)
+        Read.Request(request) => mut self.run(connection, take request, mut env, mut cx)
     }
 } Linker.request
 
-/// Runs `request`: refuses it when the session rules do, else answers it, at once or from a keyed task, which answers `pending` past `pending_ms`.
-fn Linker.run(mut self, take request: Request, mut env: Env, mut cx: sys::Cx[Link]) {
+/// Runs `request` of the connection numbered `connection`: refuses it when the session rules, the session's budget or its authority do, else answers it, at once or from a keyed task, which answers `pending` past `pending_ms`.
+fn Linker.run(mut self, connection: u64, take request: Request, mut env: Env, mut cx: sys::Cx[LinkSession]) {
     let alloc = env.alloc
-    match self.refused(request, alloc) {
+    let session = match self.session_for(connection, request, alloc) {
+        Ok(number) => number
+        Err(failure) => {
+            mut self.answer(connection, session: 0, block: refusal(request, take failure, alloc), mut env, mut cx)
+            return
+        }
+    }
+    match self.refused(connection, session, request, now_utc: now_utc_ns(env.wall, clock: env.clock), alloc) {
         Some(failure) => {
-            mut self.answer(refusal(request, take failure, alloc), mut env, mut cx)
+            mut self.answer(connection, session, block: refusal(request, take failure, alloc), mut env, mut cx)
             return
         }
         None => {
         }
     }
     let Some(slot) = self.free_slot() else {
-        mut self.answer(refusal(request, failure: Failure.of("budget.exhausted", subject: "requests", alloc), alloc), mut env, mut cx)
+        mut self.answer(connection, session, block: refusal(request, failure: Failure.of("budget.exhausted", subject: "requests", alloc), alloc), mut env, mut cx)
         return
     }
     let number = self.next
     self.next += 1
-    mut self.running.push(Running(number: number, slot: slot, id: request.id, verb: request.verb, operand: first_operand(request, alloc), pending: false, principal: None))
-    if request.verb.as_str() == "watch" {
-        mut self.watch(take request, number, mut env, mut cx)
-        return
+    let cut = self.cut_for(request, budget: self.budget_of(session), alloc)
+    mut self.running.push(Running(number: number, slot: slot, connection: connection, session: session, id: request.id, verb: request.verb, operand: first_operand(request, alloc), cut: take cut, pending: false, principal: None, resume: None))
+    match request.verb.as_str() {
+        "watch" => mut self.watch(take request, number, mut env, mut cx)
+        "cancel" => mut self.cancel(take request, number, mut env, mut cx)
+        "hello" => mut self.hello(request, number, mut env, mut cx)
+        else => mut self.spawn_answer(take request, number, slot, session, mut env, mut cx)
     }
-    if request.verb.as_str() == "cancel" {
-        mut self.cancel(take request, number, mut env, mut cx)
-        return
-    }
-    if request.verb.as_str() == "hello" {
-        match mut self.hello(request, number, mut env, mut cx) {
-            Some(block) => mut self.respond(self.running.len() - 1, take block, mut env, mut cx)
-            None => mut cx.after(ms: u64.widen(self.config.pending_ms), send: Link.due(number: number))
-        }
-        return
-    }
-    let tree = env.tree
-    let budget = self.config.budget
-    let cut = self.cut_for(request, alloc)
-    mut cx.spawn(key: ANSWERING + slot, run: fn[take request, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
-        let block = try await answer(request, tree, budget, alloc)
-        discard attempt await out.responded(number, block: block.text(cut, alloc))
-    })
-    mut cx.after(ms: u64.widen(self.config.pending_ms), send: Link.due(number: number))
 } Linker.run
 
-/// The failure of a request the session rules refuse: an id pending, a request needing a session before one opens, and a session missing, unknown or required among several.
-fn Linker.refused(self, request: Request, alloc: mem::Alloc) -> Option[Failure] {
-    if self.running.position(fn(each: Running) => each.id == request.id).is_some() or self.watches.position(fn(each: Watch) => each.id == request.id).is_some() {
+/// Has a keyed task answer the request numbered `number` through the link's View, within the budget of its session.
+fn Linker.spawn_answer(mut self, take request: Request, number: u64, slot: u64, session: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    let tree = env.tree
+    let budget = self.budget_of(session)
+    let reader = self.principal_of_session(session)
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take request, take reader](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 65_536 {
+        let block = try await answer(request, tree, budget, reader, alloc)
+        discard attempt await out.responded(number, take block)
+    })
+    mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
+} Linker.spawn_answer
+
+/// The failure of a request the rules refuse once its session is known: an id pending on its connection, a flag of the wrong form, a session's spent output budget, or a path its authority does not let it read.
+fn Linker.refused(self, connection: u64, session: u64, request: Request, now_utc: i64, alloc: mem::Alloc) -> Option[Failure] {
+    if self.running.position(fn(each: Running) => each.connection == connection and each.id == request.id).is_some() or self.watching_id(connection, id: request.id.as_str()) {
         return Some(Failure.of("request.duplicate-id", subject: request.id.as_str(), alloc))
     }
+    match flag_failure(request, alloc) {
+        Some(failure) => return Some(take failure)
+        None => {
+        }
+    }
+    if session == 0 or request.verb.as_str() == "hello" {
+        return None
+    }
+    if self.attention_spent(session) {
+        return Some(Failure.of("budget.attention", subject: session_text(session).as_str(), alloc))
+    }
+    for path in read_paths(request, alloc) {
+        if not self.reads(session, path: path.as_str(), now_utc) {
+            return Some(Failure.of("auth.denied", subject: path.as_str(), alloc).expecting("tree.read", found: "no grant covering the path", alloc))
+        }
+    }
+    return None
+} Linker.refused
+
+/// Whether a watch of a session on the connection numbered `connection` has the id `id`.
+fn Linker.watching_id(self, connection: u64, id: Str) -> bool {
+    for watch in self.watches {
+        if watch.id.as_str() != id {
+            continue
+        }
+        match self.sessions.position(fn(each: Session) => each.number == watch.session) {
+            Some(at) => {
+                if self.sessions[at].connection == Some(connection) {
+                    return true
+                }
+            }
+            None => {
+            }
+        }
+    }
+    return false
+} Linker.watching_id
+
+/// The failure of a `--budget` or `--skip` of the wrong form.
+fn flag_failure(request: Request, alloc: mem::Alloc) -> Option[Failure] {
     match request.flag("budget") {
         Some(units) => {
             if number_of(units).value_or(0) < 100 {
@@ -458,132 +365,8 @@ fn Linker.refused(self, request: Request, alloc: mem::Alloc) -> Option[Failure] 
         None => {
         }
     }
-    let verb = request.verb.as_str()
-    let open = verb == "hello" or verb == "status" or verb == "primer"
-    match request.flag("session") {
-        Some(named) => {
-            if self.sessions.position(fn(each: Session) => session_text(each.number).as_str() == named).is_none() {
-                return Some(Failure.of("link.session-unknown", subject: named, alloc))
-            }
-        }
-        None => {
-            if self.sessions.len() == 0 and not open {
-                return Some(Failure.of("link.no-session", subject: "-", alloc))
-            }
-            if self.sessions.len() > 1 and not open {
-                return Some(Failure.of("link.session-required", subject: "-", alloc))
-            }
-        }
-    }
     return None
-} Linker.refused
-
-/// `watch <selector> [--since <cursor>] [--wake]`: a watch of the session, which a keyed task subscribes and answers with the cursor it starts after.
-fn Linker.watch(mut self, take request: Request, number: u64, mut env: Env, mut cx: sys::Cx[Link]) {
-    let alloc = env.alloc
-    let at = self.running.len() - 1
-    let text = request.operand_text(alloc)
-    let Some(selector) = Selector.parse(text.as_str(), alloc) else {
-        let block = self.running[at].failed(Failure.of("request.malformed", subject: text.as_str(), alloc).expecting("<path> [kind <kinds>] [severity >= <severity>] [where <condition>]", found: text.as_str(), alloc), alloc)
-        mut self.respond(at, take block, mut env, mut cx)
-        return
-    }
-    let Some(watched) = watched_of(selector, alloc) else {
-        let block = self.running[at].failed(Failure.of("request.invalid-operand", subject: selector.path.as_str(), alloc).expecting("/journal/<stream>, /live/instances/<moniker>, /sys, /data or /history/commits", found: selector.path.as_str(), alloc), alloc)
-        mut self.respond(at, take block, mut env, mut cx)
-        return
-    }
-    var since: Option[u64] = None
-    match request.flag("since") {
-        Some(written) => match since_of(written) {
-            Some(after) => {
-                since = Some(after)
-            }
-            None => {
-                let block = self.running[at].failed(Failure.of("request.invalid-flag", subject: "--since", alloc).expecting("a cursor e<n> or a commit #<n>", found: written, alloc), alloc)
-                mut self.respond(at, take block, mut env, mut cx)
-                return
-            }
-        }
-        None => {
-        }
-    }
-    let session = self.session_of(request)
-    let Some(slot) = self.free_watch_slot() else {
-        let block = self.running[at].failed(Failure.of("budget.exhausted", subject: "watches", alloc), alloc)
-        mut self.respond(at, take block, mut env, mut cx)
-        return
-    }
-    mut self.watches.push(Watch(id: request.id, number: number, slot: slot, session: session, selector: take text, subscription: None, cursor: 0, delivering: false, due: false, wake: request.has("wake")))
-    let tree = env.tree
-    let own = env.own
-    let path = subscribed_path(selector, watched, alloc)
-    mut cx.spawn(key: WATCHING + slot, run: fn[take path](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
-        let start = try await set_up(tree, own, take path, since, watched, alloc)
-        discard attempt await out.watching(number, take start)
-    })
-} Linker.watch
-
-/// `cancel <watch id|request id>`: ends a watch of the session, or a request still running.
-fn Linker.cancel(mut self, take request: Request, number: u64, mut env: Env, mut cx: sys::Cx[Link]) {
-    let alloc = env.alloc
-    let at = self.running.len() - 1
-    let Some(target) = request.operands.get(0) else {
-        let block = self.running[at].failed(Failure.of("request.invalid-operand", subject: "-", alloc).expecting("a request id, a plan, a moniker or a principal", found: "nothing", alloc), alloc)
-        mut self.respond(at, take block, mut env, mut cx)
-        return
-    }
-    let named = target.as_str()
-    var cancelled = false
-    match self.watches.position(fn(each: Watch) => each.id.as_str() == named) {
-        Some(watch) => {
-            let ended = mut self.watches.remove(watch)
-            let tree = env.tree
-            match ended.subscription {
-                Some(subscription) => mut cx.spawn(key: WATCHING + ended.slot, run: fn(out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
-                    discard attempt await tree.unsubscribe(subscription, alloc)
-                })
-                None => mut cx.cancel(key: WATCHING + ended.slot)
-            }
-            mut cx.cancel(key: DELIVERING + ended.slot)
-            cancelled = true
-        }
-        None => {
-        }
-    }
-    match self.running.position(fn(each: Running) => each.id.as_str() == named and each.number != number) {
-        Some(other) => {
-            mut cx.cancel(key: ANSWERING + self.running[other].slot)
-            discard mut self.running.remove(other)
-            cancelled = true
-        }
-        None => {
-        }
-    }
-    let Some(own) = self.running.position(fn(each: Running) => each.number == number) else {
-        return
-    }
-    if not cancelled {
-        let block = self.running[own].failed(Failure.of("request.unknown-name", subject: named, alloc), alloc)
-        mut self.respond(own, take block, mut env, mut cx)
-        return
-    }
-    var block = self.running[own].block(Verdict.Ok, alloc)
-    var record = Record.of("cancelled", alloc)
-    mut record.words(named)
-    mut block.records.push(take record)
-    mut self.respond(own, take block, mut env, mut cx)
-} Linker.cancel
-
-/// The lowest slot no watch holds, `None` when `MOST_WATCHES` are kept.
-fn Linker.free_watch_slot(self) -> Option[u64] {
-    for slot in 0..<MOST_WATCHES {
-        if self.watches.position(fn(each: Watch) => each.slot == slot).is_none() {
-            return Some(slot)
-        }
-    }
-    return None
-} Linker.free_watch_slot
+} flag_failure
 
 /// The lowest slot no request running holds, `None` when `MOST_RUNNING` run.
 fn Linker.free_slot(self) -> Option[u64] {
@@ -595,6 +378,14 @@ fn Linker.free_slot(self) -> Option[u64] {
     return None
 } Linker.free_slot
 
+/// The principal of the session numbered `session`, `system` for none.
+fn Linker.principal_of_session(self, session: u64) -> ident::Principal {
+    return match self.sessions.position(fn(each: Session) => each.number == session) {
+        Some(at) => ident::Principal(text: self.sessions[at].principal.text)
+        None => ident::Principal(text: text::Fixed[64].of("system"))
+    }
+} Linker.principal_of_session
+
 /// The key of the keyed task answering the request numbered `number`.
 fn Linker.key_of(self, number: u64) -> u64 {
     return match self.running.position(fn(each: Running) => each.number == number) {
@@ -603,59 +394,27 @@ fn Linker.key_of(self, number: u64) -> u64 {
     }
 } Linker.key_of
 
-/// The number of the session `request` runs in: the one `--session` names, else the connection's first.
-fn Linker.session_of(self, request: Request) -> u64 {
-    match request.flag("session") {
-        Some(named) => match self.sessions.position(fn(each: Session) => session_text(each.number).as_str() == named) {
-            Some(at) => return self.sessions[at].number
-            None => {
-            }
-        }
-        None => {
-        }
-    }
-    return match self.sessions.get(0) {
-        Some(session) => session.number
-        None => 0
-    }
-} Linker.session_of
-
-/// The sequence number or commit number a `--since` names: a cursor `e<n>` or a commit `#<n>`.
-fn since_of(text: Str) -> Option[u64] {
-    match ident::Cursor.parse(text) {
-        Some(cursor) => return Some(cursor.seq)
-        None => {
-        }
-    }
-    return match ident::CommitId.parse(text) {
-        Some(commit) => Some(commit.number)
-        None => None
-    }
-} since_of
-
 /// Answers the request running at `at` with `block`.
-fn Linker.respond(mut self, at: usize, take block: Block, mut env: Env, mut cx: sys::Cx[Link]) {
-    let alloc = env.alloc
-    discard mut self.running.remove(at)
-    mut self.output.push(block.text(self.cut(text::String.empty(alloc)), alloc))
-    mut self.write(mut env, mut cx)
+fn Linker.respond(mut self, at: usize, take block: Block, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let done = mut self.running.remove(at)
+    mut self.deliver(connection: done.connection, session: done.session, take block, cut: done.cut, mut env, mut cx)
 } Linker.respond
 
-/// Queues `block` behind the blocks waiting.
-fn Linker.answer(mut self, take block: Block, mut env: Env, mut cx: sys::Cx[Link]) {
+/// Sends `block` to the connection numbered `connection`, cut to the budget of the session numbered `session`.
+fn Linker.answer(mut self, connection: u64, session: u64, take block: Block, mut env: Env, mut cx: sys::Cx[LinkSession]) {
     let alloc = env.alloc
-    mut self.output.push(block.text(self.cut(text::String.empty(alloc)), alloc))
-    mut self.write(mut env, mut cx)
+    let cut = self.cut(budget: self.budget_of(session), rest: text::String.empty(alloc))
+    mut self.deliver(connection, session, take block, cut, mut env, mut cx)
 } Linker.answer
 
-/// How the blocks of a request are cut, `rest` being the request that prints what they elide.
-fn Linker.cut(self, take rest: text::String) -> Cut {
-    return Cut(budget: self.config.budget.response_units, sized: self.config.budget.output_units.is_some(), skip: 0, rest: take rest)
+/// How the blocks of a request are cut under `budget`, `rest` being the request that prints what they elide.
+fn Linker.cut(self, budget: os::SessionBudget, take rest: text::String) -> Cut {
+    return Cut(budget: budget.response_units, sized: budget.output_units.is_some(), skip: 0, rest: take rest)
 } Linker.cut
 
-/// How the blocks of `request` are cut: its `--budget` and `--skip`, the session's budget otherwise.
-fn Linker.cut_for(self, request: Request, alloc: mem::Alloc) -> Cut {
-    var cut = self.cut(rest_of(request, alloc))
+/// How the blocks of `request` are cut: its `--budget` and `--skip`, the session's budget `budget` otherwise.
+fn Linker.cut_for(self, request: Request, budget: os::SessionBudget, alloc: mem::Alloc) -> Cut {
+    var cut = self.cut(budget, rest: rest_of(request, alloc))
     match request.flag("budget") {
         Some(units) => {
             cut.budget = u32.saturate(number_of(units).value_or(0))
@@ -672,180 +431,3 @@ fn Linker.cut_for(self, request: Request, alloc: mem::Alloc) -> Cut {
     }
     return cut
 } Linker.cut_for
-
-/// Has a keyed task write the next block waiting, once the ready record went out and no write is under way.
-fn Linker.write(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
-    if self.writing or self.facts.is_none() or self.output.len() == 0 {
-        return
-    }
-    let data = mut self.output.remove(0)
-    self.writing = true
-    let console = env.console
-    let alloc = env.alloc
-    mut cx.spawn(key: WRITING, run: fn[take data](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
-        try await write_serial(console, take data, out, alloc)
-    })
-} Linker.write
-
-/// A block of the request's verdict, id, verb and first operand.
-fn Running.block(self, verdict: Verdict, alloc: mem::Alloc) -> Block {
-    return Block.of(verdict, id: self.id.as_str(), verb: self.verb.as_str(), operand: self.operand.as_str(), alloc)
-} Running.block
-
-/// The `failed` block of the request with `failure`.
-fn Running.failed(self, take failure: Failure, alloc: mem::Alloc) -> Block {
-    var block = self.block(Verdict.Failed, alloc)
-    mut block.records.push(failure.record(alloc))
-    return block
-} Running.failed
-
-/// The `failed` block refusing `request` with `failure`.
-fn refusal(request: Request, take failure: Failure, alloc: mem::Alloc) -> Block {
-    let operand = first_operand(request, alloc)
-    return failed_block(id: request.id.as_str(), verb: request.verb.as_str(), operand: operand.as_str(), take failure, alloc)
-} refusal
-
-/// The first operand of `request` as its verdict line names it: the whole query of `find` and `watch`, else its first word.
-fn first_operand(request: Request, alloc: mem::Alloc) -> text::String {
-    let verb = request.verb.as_str()
-    if verb == "find" or verb == "watch" {
-        return request.operand_text(alloc)
-    }
-    return match request.operands.get(0) {
-        Some(word) => text::String.of(word.as_str(), alloc)
-        None => text::String.empty(alloc)
-    }
-} first_operand
-
-/// The request without its id or `--skip`: what an elision line repeats.
-fn rest_of(request: Request, alloc: mem::Alloc) -> text::String {
-    var rest = text::String.of(request.verb.as_str(), alloc)
-    for operand in request.operands {
-        mut rest.push(' ')
-        mut rest.append(operand.as_str())
-    }
-    for flag in request.flags {
-        if flag.name.as_str() == "skip" {
-            continue
-        }
-        mut rest.append(" --")
-        mut rest.append(flag.name.as_str())
-        match flag.value {
-            Some(value) => {
-                mut rest.push(' ')
-                mut rest.append(value.as_str())
-            }
-            None => {
-            }
-        }
-    }
-    return rest
-} rest_of
-
-/// The `failed` block of `failure`.
-pub fn failed_block(id: Str, verb: Str, operand: Str, take failure: Failure, alloc: mem::Alloc) -> Block {
-    var block = Block.of(Verdict.Failed, id, verb, operand, alloc)
-    mut block.records.push(failure.record(alloc))
-    return block
-} failed_block
-
-/// The `error` record of this failure.
-pub fn Failure.record(self, alloc: mem::Alloc) -> Record {
-    var record = Record.of("error", alloc)
-    mut record.words(self.code.as_str())
-    mut record.words(self.subject.as_str())
-    match self.expected {
-        Some(expected) => mut record.line(lined("expected: ", text: expected.as_str(), alloc).as_str(), alloc)
-        None => {
-        }
-    }
-    match self.found {
-        Some(found) => mut record.line(lined("found: ", text: found.as_str(), alloc).as_str(), alloc)
-        None => {
-        }
-    }
-    for because in self.because {
-        mut record.line(lined("because ", text: because.as_str(), alloc).as_str(), alloc)
-    }
-    var number: u32 = 1
-    for fix in self.fixes {
-        var line = text::String.of("fix ", alloc)
-        mut line.write(Dyn[Render].view(number), budget: 12)
-        mut line.push(' ')
-        mut line.append(fix.as_str())
-        mut record.line(line.as_str(), alloc)
-        number += 1
-    }
-    return record
-} Failure.record
-
-/// `head` followed by `text`.
-fn lined(head: Str, text: Str, alloc: mem::Alloc) -> text::String {
-    var line = text::String.of(head, alloc)
-    mut line.append(text)
-    return line
-} lined
-
-/// The facts of the ready record, from `/live/status`, the events stream and `/live/security`, and the boot counter of `/live/boot`.
-fn facts_of(tree: store::service::View, alloc: mem::Alloc) -> Facts fails task::Cancelled uses wait {
-    var ready = LinkReady(version: 1, mode: text::String.of("normal", alloc), generation: 0, claimed: false, cursor: try await event_cursor(tree, alloc), key: ident::HashValue.of_content(b""))
-    match try await Records[os::LiveStatus].at(tree, path: "/live/status", alloc) {
-        Some(status) => {
-            ready.mode = text::String.of(mode_name(status.mode).as_str(), alloc)
-            ready.generation = status.generation
-            ready.claimed = status.claimed
-        }
-        None => {
-        }
-    }
-    match try await Records[os::LiveSecurity].at(tree, path: "/live/security", alloc) {
-        Some(security) => {
-            ready.key = ident::HashValue.of_content(security.link_keys.ed25519.view())
-        }
-        None => {
-        }
-    }
-    let boot = match try await Records[os::LiveBoot].at(tree, path: "/live/boot", alloc) {
-        Some(booted) => booted.boot_counter
-        None => 0
-    }
-    return Facts(ready: take ready, boot: boot)
-} facts_of
-
-/// The cursor of the latest event of `/journal/events`, `e0` before any.
-fn event_cursor(tree: store::service::View, alloc: mem::Alloc) -> ident::Cursor fails task::Cancelled uses wait {
-    return match first attempt await tree.get(ident::Path(text: text::String.of("/journal/events", alloc)), at: None, alloc) {
-        Ok(node) => ident::Cursor(seq: node.next.saturating_sub(1))
-        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => ident::Cursor(seq: 0)
-    }
-} event_cursor
-
-/// Reads records of type T.
-pub open struct Records[T: Encode] {
-} Records
-
-/// The record of type T at `path`, `None` when it is missing or does not decode as one.
-pub fn Records.at(tree: store::service::View, path: Str, alloc: mem::Alloc) -> Option[T] fails task::Cancelled uses wait {
-    let node = match first attempt await tree.get(ident::Path(text: text::String.of(path, alloc)), at: None, alloc) {
-        Ok(found) => found
-        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => return None
-    }
-    let Some(value) = node.value else {
-        return None
-    }
-    return match attempt mem::wire::Codec[T].decode(value.view(), alloc) {
-        Ok(decoded) => Some(take decoded)
-        Err(_) => None
-    }
-} Records.at
-
-pub fn mode_name(mode: os::BootMode) -> text::Fixed[8] {
-    return text::Fixed[8].of(match mode {
-        os::BootMode.Normal => "normal"
-        os::BootMode.Trial => "trial"
-        os::BootMode.Recovery => "recovery"
-        os::BootMode.Dev => "dev"
-    })
-} mode_name

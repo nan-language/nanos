@@ -12,30 +12,40 @@ const VALUE_BYTES: usize = 1_048_576
 /// The indentation of continuation lines.
 const INDENT: Str = "    "
 
-pub closed enum Verdict derives Copy, Eq {
+pub closed enum Verdict derives Copy, Eq, Encode {
     Ok
     Failed
     Pending
 } Verdict
 
-/// A record: its kind, the rest of its header line, and its continuation lines without their indentation.
-pub closed struct Record {
+/// A record: its kind, the rest of its header line, its continuation lines without their indentation, and the origin labels of the untrusted content its envelopes hold.
+pub closed struct Record derives Encode {
     pub kind: text::Fixed[16]
     pub header: text::String
     pub lines: mem::List[text::String]
+    pub labels: mem::List[ident::OriginLabel]
 } Record
 
-/// A block: its verdict, the id, verb and first operand of its request, and its records.
-pub closed struct Block {
+/// A block: its verdict, the id, verb and first operand of its request, its records, how many records before them its request skipped, and how many after them it never lists, which it elides.
+pub closed struct Block derives Encode {
     pub verdict: Verdict
     pub id: text::Fixed[32]
     pub verb: text::Fixed[16]
     pub operand: text::String
     pub records: mem::List[Record]
+    pub skipped: u64
+    pub more: u64
 } Block
 
+/// The records of a block that print: the position of the earliest among its records, how many, and how many records it counts, printed or elided.
+struct Shown derives Copy {
+    start: usize
+    printed: usize
+    count: u64
+} Shown
+
 /// How a block is cut: the units it holds at most, whether its verdict lines give its size, how many records it skips, and the request without its id or `--skip` that prints what it elides.
-pub closed struct Cut {
+pub closed struct Cut derives Encode {
     pub budget: u32
     pub sized: bool
     pub skip: u64
@@ -54,7 +64,7 @@ fn Quoted.render(self, mut out: core::Renderer) {
 } Quoted.render
 
 pub fn Record.of(kind: Str, alloc: mem::Alloc) -> Record {
-    return Record(kind: text::Fixed[16].of(kind), header: text::String.empty(alloc), lines: mem::List.empty(alloc))
+    return Record(kind: text::Fixed[16].of(kind), header: text::String.empty(alloc), lines: mem::List.empty(alloc), labels: mem::List.empty(alloc))
 } Record.of
 
 /// Writes the record's subject, which comes before its fields.
@@ -88,6 +98,46 @@ pub fn Record.line(mut self, line: Str, alloc: mem::Alloc) {
     mut self.lines.push(text::String.of(line, alloc))
 } Record.line
 
+/// Writes `content`, untrusted content of the origin labels `labels`, as the envelope of the field `field`: `<field>: envelope <labels> <n>`, the labels joined by `,` or `-` for none, then each of its n lines after `| `.
+pub fn Record.envelope(mut self, field: Str, labels: mem::List[ident::OriginLabel], content: Str, alloc: mem::Alloc) {
+    var count: usize = 1
+    for byte in content.as_bytes() {
+        if byte == b'\n' {
+            count += 1
+        }
+    }
+    var head = text::String.of(field, alloc)
+    mut head.append(": envelope ")
+    if labels.len() == 0 {
+        mut head.push('-')
+    }
+    for at in 0..<labels.len() {
+        if at > 0 {
+            mut head.push(',')
+        }
+        mut head.write(Dyn[Render].view(labels[at]), budget: 256)
+        if self.labels.position(fn(each: ident::OriginLabel) => each == labels[at]).is_none() {
+            mut self.labels.push(ident::OriginLabel(text: labels[at].text))
+        }
+    }
+    mut head.push(' ')
+    mut head.write(Dyn[Render].view(count), budget: 24)
+    mut self.line(head.as_str(), alloc)
+    var line = text::String.of("| ", alloc)
+    for c in content.cursor() {
+        if c == '\n' {
+            mut self.line(line.as_str(), alloc)
+            line = text::String.of("| ", alloc)
+            continue
+        }
+        if c < ' ' or c == '\u{7F}' {
+            continue
+        }
+        mut line.push(c)
+    }
+    mut self.line(line.as_str(), alloc)
+} Record.envelope
+
 /// Starts the next part of the header: a space after the kind, then `, `.
 fn Record.separate(mut self) {
     if self.header.byte_len() == 0 {
@@ -118,48 +168,25 @@ fn Record.write(self, mut out: mem::Bytes) {
 } Record.write
 
 pub fn Block.of(verdict: Verdict, id: Str, verb: Str, operand: Str, alloc: mem::Alloc) -> Block {
-    return Block(verdict: verdict, id: text::Fixed[32].of(id), verb: text::Fixed[16].of(verb), operand: cut_operand(operand, alloc), records: mem::List.empty(alloc))
+    return Block(verdict: verdict, id: text::Fixed[32].of(id), verb: text::Fixed[16].of(verb), operand: cut_operand(operand, alloc), records: mem::List.empty(alloc), skipped: 0, more: 0)
 } Block.of
 
-/// The block's text: the verdict line, the records after the skipped ones, the most that fit the budget with the verdict lines and the elision line, at least one, then the elision line when records are left and the verdict line again.
+/// The block's text: the verdict line, the records that show under `cut`, then the elision line when records are left and the verdict line again.
 pub fn Block.text(self, cut: Cut, alloc: mem::Alloc) -> mem::Bytes {
-    var skipped = self.records.len()
-    if cut.skip < u64.widen(skipped) {
-        skipped = usize.widen(cut.skip)
-    }
-    let count = self.records.len() - skipped
-    let room = usize.widen(cut.budget).saturating_mul(UNIT_BYTES)
-    var reserved = 2 * self.verdict_line(count, units: None, alloc).byte_len()
-    if cut.sized {
-        reserved += 2 * (", units ".byte_len() + digits(u64.widen(cut.budget)))
-    }
-    var printed: usize = 0
-    var used = reserved
-    while printed < count {
-        let size = self.records[skipped + printed].size()
-        let left = count - printed - 1
-        var elision: usize = 0
-        if left > 0 {
-            elision = elision_line(left, cut, after: skipped + printed + 1, alloc).byte_len()
-        }
-        if printed > 0 and used + size + elision > room {
-            break
-        }
-        used += size
-        printed += 1
-    }
+    let shown = self.shown(cut, alloc)
     var body = mem::Bytes.empty(alloc)
-    for at in skipped..<(skipped + printed) {
+    for at in shown.start..<(shown.start + shown.printed) {
         self.records[at].write(mut body)
     }
-    if printed < count {
-        mut body.append(elision_line(count - printed, cut, after: skipped + printed, alloc).as_bytes())
+    let after = self.skipped + u64.widen(shown.start + shown.printed)
+    if u64.widen(shown.printed) < shown.count {
+        mut body.append(elision_line(shown.count - u64.widen(shown.printed), cut, after, alloc).as_bytes())
     }
     var units: Option[u64] = None
     if cut.sized {
-        units = Some(units_of(body.len(), verdict: self.verdict_line(count, units: None, alloc).byte_len()))
+        units = Some(units_of(body.len(), verdict: self.verdict_line(shown.count, units: None, alloc).byte_len()))
     }
-    let line = self.verdict_line(count, units, alloc)
+    let line = self.verdict_line(shown.count, units, alloc)
     var out = mem::Bytes.empty(alloc)
     mut out.append(line.as_bytes())
     mut out.append(body.view())
@@ -167,8 +194,62 @@ pub fn Block.text(self, cut: Cut, alloc: mem::Alloc) -> mem::Bytes {
     return out
 } Block.text
 
+/// The origin labels of the untrusted content of the records that show under `cut`.
+pub fn Block.labels(self, cut: Cut, alloc: mem::Alloc) -> mem::List[ident::OriginLabel] {
+    let shown = self.shown(cut, alloc)
+    var labels = mem::List[ident::OriginLabel].empty(alloc)
+    for at in shown.start..<(shown.start + shown.printed) {
+        for label in self.records[at].labels {
+            if labels.position(fn(each: ident::OriginLabel) => each == label).is_none() {
+                mut labels.push(ident::OriginLabel(text: label.text))
+            }
+        }
+    }
+    return labels
+} Block.labels
+
+/// The records that show under `cut`: those after the skipped ones, the most that fit its budget with the verdict lines and the elision line, at least one.
+fn Block.shown(self, cut: Cut, alloc: mem::Alloc) -> Shown {
+    let given = u64.widen(self.records.len())
+    let total = self.skipped + given + self.more
+    var skip = cut.skip
+    if skip < self.skipped {
+        skip = self.skipped
+    }
+    if skip > total {
+        skip = total
+    }
+    let count = total - skip
+    var given_skip = given
+    if skip - self.skipped < given {
+        given_skip = skip - self.skipped
+    }
+    let room = usize.widen(cut.budget).saturating_mul(UNIT_BYTES)
+    var reserved = 2 * self.verdict_line(count, units: None, alloc).byte_len()
+    if cut.sized {
+        reserved += 2 * (", units ".byte_len() + digits(u64.widen(cut.budget)))
+    }
+    let start = usize.widen(given_skip)
+    var printed: usize = 0
+    var used = reserved
+    while start + printed < self.records.len() {
+        let size = self.records[start + printed].size()
+        let left = count - u64.widen(printed) - 1
+        var elision: usize = 0
+        if left > 0 {
+            elision = elision_line(left, cut, after: skip + u64.widen(printed) + 1, alloc).byte_len()
+        }
+        if printed > 0 and used + size + elision > room {
+            break
+        }
+        used += size
+        printed += 1
+    }
+    return Shown(start: start, printed: printed, count: count)
+} Block.shown
+
 /// `<word> <id> <verb> <first operand>: records <n>`, then `, units <u>` when given, and a line feed.
-fn Block.verdict_line(self, count: usize, units: Option[u64], alloc: mem::Alloc) -> text::String {
+fn Block.verdict_line(self, count: u64, units: Option[u64], alloc: mem::Alloc) -> text::String {
     var line = text::String.empty(alloc)
     mut line.append(match self.verdict {
         Verdict.Ok => "ok "
@@ -197,7 +278,7 @@ fn Block.verdict_line(self, count: usize, units: Option[u64], alloc: mem::Alloc)
 } Block.verdict_line
 
 /// `elided <n> records: <request> --skip <k>`, k being `after` skipped records in all.
-fn elision_line(count: usize, cut: Cut, after: usize, alloc: mem::Alloc) -> text::String {
+fn elision_line(count: u64, cut: Cut, after: u64, alloc: mem::Alloc) -> text::String {
     var line = text::String.of("elided ", alloc)
     mut line.write(Dyn[Render].view(count), budget: 24)
     mut line.append(" records: ")

@@ -6,17 +6,23 @@ const LISTED: u32 = 4_096
 /// The most entries of a stream one read gives.
 const READ_ENTRIES: u32 = 4_096
 
-/// The block answering `request`, read through `tree` within the session's budget `budget`.
-pub fn answer(request: Request, tree: store::service::View, budget: SessionBudget, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+/// The bytes of a blob's `piece`.
+const PIECE_BYTES: u64 = 4_096
+
+/// The alphabet of base64, RFC 4648 §4.
+const BASE64: Str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+/// The block answering `request`, read through `tree` within the session's budget `budget` for the principal `reader`.
+pub fn answer(request: Request, tree: store::service::View, budget: os::SessionBudget, reader: ident::Principal, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
     let verb = request.verb.as_str()
     let operand = first_operand(request, alloc)
     return match verb {
         "primer" => primer(request, part: operand.as_str(), alloc)
-        "status" => try await get(request, path: "/live/status", operand: "", tree, alloc)
-        "get" => try await get(request, path: operand.as_str(), operand: operand.as_str(), tree, alloc)
+        "status" => try await get(request, path: "/live/status", operand: "", tree, budget, alloc)
+        "get" => try await get(request, path: operand.as_str(), operand: operand.as_str(), tree, budget, alloc)
         "find" => try await find(request, query: operand.as_str(), tree, budget, alloc)
         "describe" => try await describe(request, subject: operand.as_str(), tree, alloc)
-        "history" => try await history(request, subject: operand.as_str(), tree, alloc)
+        "history" => try await history(request, subject: operand.as_str(), tree, reader, alloc)
         "diff" => try await diff(request, tree, alloc)
         "why" => try await why(request, subject: operand.as_str(), tree, alloc)
         else => failed_block(id: request.id.as_str(), verb, operand: operand.as_str(), failure: Failure.of("request.unknown-verb", subject: verb, alloc), alloc)
@@ -118,7 +124,7 @@ fn instance_record(name: Str, tree: store::service::View, alloc: mem::Alloc) -> 
 } instance_record
 
 /// `get <path> [--at <commit>]`: the node at `path`, as a `node`, `dir`, `stream` or `blob` record, the verdict line naming `operand`.
-fn get(request: Request, path: Str, operand: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+fn get(request: Request, path: Str, operand: Str, tree: store::service::View, budget: os::SessionBudget, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
     let id = request.id.as_str()
     let verb = request.verb.as_str()
     let Some(named) = path_of(path, alloc) else {
@@ -140,7 +146,7 @@ fn get(request: Request, path: Str, operand: Str, tree: store::service::View, al
     match node.kind {
         store::NodeKind.Record => mut block.records.push(node_record(node, alloc))
         store::NodeKind.Stream => mut block.records.push(stream_record(node, alloc))
-        store::NodeKind.Blob => mut block.records.push(blob_record(node, alloc))
+        store::NodeKind.Blob => try await blob_pieces(mut block, node, tree, at, cut: request_cut(request, budget, alloc), alloc)
         store::NodeKind.Dir => {
             mut block.records.push(dir_record(node, alloc))
             for entry in try await entries_of(tree, path: node.path, alloc) {
@@ -151,16 +157,29 @@ fn get(request: Request, path: Str, operand: Str, tree: store::service::View, al
     return block
 } get
 
-/// The `node` record of `node`: its path, type, commit and hash, with its value on a continuation line.
+/// The `node` record of `node`: its path, type, commit and hash, with its value on a continuation line, in an envelope when its origin set is not empty.
 fn node_record(node: store::Node, alloc: mem::Alloc) -> Record {
     var record = node_header(node, alloc)
     match value_text(node, alloc) {
-        Some(value) => mut record.line(value.as_str(), alloc)
+        Some(value) => mut record.value(value.as_str(), origins: node.origins, alloc)
         None => {
         }
     }
     return record
 } node_record
+
+/// Writes the value `value` of a node of the origin set `origins` on a continuation line, in an envelope when the set is not empty.
+fn Record.value(mut self, value: Str, origins: mem::List[ident::OriginLabel], alloc: mem::Alloc) {
+    if origins.len() == 0 {
+        mut self.line(value, alloc)
+        return
+    }
+    var labels = mem::List[ident::OriginLabel].empty(alloc)
+    for label in origins {
+        mut labels.push(ident::OriginLabel(text: label.text))
+    }
+    mut self.envelope("value", labels: labels, content: value, alloc)
+} Record.value
 
 /// The header of the `node` record of `node`.
 fn node_header(node: store::Node, alloc: mem::Alloc) -> Record {
@@ -245,6 +264,112 @@ fn blob_record(node: store::Node, alloc: mem::Alloc) -> Record {
     return record
 } blob_record
 
+/// The `blob` record of the blob `node` and its `piece` records, read as of `at`: a piece for each 4 KiB from its offset, in an envelope of the blob's origins, as text when UTF-8 and else as base64; only the pieces the cut `cut` may show are read, the others counted as elided.
+fn blob_pieces(mut block: Block, node: store::Node, tree: store::service::View, at: Option[ident::CommitId], cut: Cut, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let pieces = (node.size + PIECE_BYTES - 1) / PIECE_BYTES
+    var from: u64 = 0
+    if cut.skip > 0 {
+        from = capped(cut.skip - 1, at: pieces)
+        block.skipped = from + 1
+    } else {
+        mut block.records.push(blob_record(node, alloc))
+    }
+    let last = capped(from + u64.widen(cut.budget) * 4 / PIECE_BYTES + 2, at: pieces)
+    for piece in from..<last {
+        let offset = piece * PIECE_BYTES
+        let length = u32.saturate(capped(node.size - offset, at: PIECE_BYTES))
+        let read = match first attempt await tree.read(ident::Path(text: text::String.of(node.path.text.as_str(), alloc)), at, offset, length, alloc) {
+            Ok(bytes) => bytes
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => break
+        }
+        var record = Record.of("piece", alloc)
+        mut record.subject(Dyn[Render].view(offset))
+        mut record.field("size_bytes", value: Dyn[Render].view(length))
+        var labels = mem::List[ident::OriginLabel].empty(alloc)
+        for label in node.origins {
+            mut labels.push(ident::OriginLabel(text: label.text))
+        }
+        let content = piece_content(read.view(), alloc)
+        mut record.envelope("content", labels, content: content.as_str(), alloc)
+        mut block.records.push(take record)
+    }
+    block.more = pieces - capped(last, at: pieces)
+} blob_pieces
+
+/// The text of a blob's piece `raw`: itself when UTF-8, else its base64.
+validator fn piece_content(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text::String {
+    let bytes = raw.inspect()
+    return match attempt text::String.try_from_utf8(bytes, alloc) {
+        Ok(text) => text
+        Err(_) => base64_of(bytes, alloc)
+    }
+} piece_content
+
+/// `value`, at most `at`.
+fn capped(value: u64, at: u64) -> u64 {
+    if value < at {
+        return value
+    }
+    return at
+} capped
+
+/// The base64 text of `bytes`, RFC 4648 §4.
+fn base64_of(bytes: Slice[u8], alloc: mem::Alloc) -> text::String {
+    var text = text::String.empty(alloc)
+    let alphabet = BASE64.as_bytes()
+    var at: usize = 0
+    while at < bytes.len() {
+        let left = bytes.len() - at
+        let b0 = u32.widen(bytes[at])
+        var b1: u32 = 0
+        var b2: u32 = 0
+        if left > 1 {
+            b1 = u32.widen(bytes[at + 1])
+        }
+        if left > 2 {
+            b2 = u32.widen(bytes[at + 2])
+        }
+        let group = (b0 << 16) | (b1 << 8) | b2
+        for index in 0..<4usize {
+            if index > left {
+                mut text.push('=')
+                continue
+            }
+            let shift: u32 = match index {
+                0 => 18
+                1 => 12
+                2 => 6
+                else => 0
+            }
+            let sextet = usize.widen((group >> shift) & 63)
+            mut text.push(char.checked_from_bits(u32.widen(alphabet[sextet])).value_or('?'))
+        }
+        at += 3
+    }
+    return text
+} base64_of
+
+/// How `request`'s blocks are cut under the session's budget `budget`: its `--budget` and `--skip`.
+fn request_cut(request: Request, budget: os::SessionBudget, alloc: mem::Alloc) -> Cut {
+    var cut = Cut(budget: budget.response_units, sized: budget.output_units.is_some(), skip: 0, rest: text::String.empty(alloc))
+    match request.flag("budget") {
+        Some(units) => {
+            cut.budget = u32.saturate(number_of(units).value_or(0))
+        }
+        None => {
+        }
+    }
+    match request.flag("skip") {
+        Some(count) => {
+            cut.skip = number_of(count).value_or(0)
+        }
+        None => {
+        }
+    }
+    return cut
+} request_cut
+
 /// The children of the dir at `path`, at most `LISTED`.
 fn entries_of(tree: store::service::View, path: ident::Path, alloc: mem::Alloc) -> mem::List[store::Entry] fails task::Cancelled uses wait {
     var entries = mem::List[store::Entry].empty(alloc)
@@ -281,7 +406,7 @@ struct Row {
 } Row
 
 /// `find <query>`: the rows of the query's path that its condition keeps, in its order, at most its limit, with its fields.
-fn find(request: Request, query: Str, tree: store::service::View, budget: SessionBudget, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+fn find(request: Request, query: Str, tree: store::service::View, budget: os::SessionBudget, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
     let id = request.id.as_str()
     let verb = request.verb.as_str()
     let Some(parsed) = Query.parse(query, alloc) else {
@@ -325,7 +450,7 @@ fn find(request: Request, query: Str, tree: store::service::View, budget: Sessio
 } find
 
 /// The `budget.query` failure of a query whose rows pass the session's query budget, with the fix narrowing a stream to its latest records.
-fn over_budget(query: Query, node: store::Node, budget: SessionBudget, alloc: mem::Alloc) -> Failure {
+fn over_budget(query: Query, node: store::Node, budget: os::SessionBudget, alloc: mem::Alloc) -> Failure {
     var expected = text::String.of("at most ", alloc)
     mut expected.write(Dyn[Render].view(budget.query_records), budget: 24)
     mut expected.append(" records")
@@ -445,7 +570,7 @@ fn dir_rows(tree: store::service::View, node: store::Node, alloc: mem::Alloc) ->
             None => text::String.empty(alloc)
         }
         var record = node_header(found, alloc)
-        mut record.line(value.as_str(), alloc)
+        mut record.value(value.as_str(), origins: found.origins, alloc)
         var commit = text::String.empty(alloc)
         mut commit.write(Dyn[Render].view(found.version), budget: 24)
         mut rows.push(Row(record: take record, value: take value, name: text::String.of(entry.name.as_str(), alloc), path: text::String.of(found.path.text.as_str(), alloc), commit: take commit))
@@ -548,14 +673,21 @@ fn row_span(row: Row, field: Str) -> Option[Span] {
     }
 } row_span
 
-/// The record of `row`, its value narrowed to the fields `select` names when it names any.
+/// The record of `row`, its value narrowed to the fields `select` names when it names any, in the envelope it was in.
 fn row_record(take row: Row, select: mem::List[text::String], alloc: mem::Alloc) -> Record {
     var record = row.record
     if select.len() == 0 or record.lines.len() == 0 {
         return record
     }
+    let labels = record.labels
+    record.labels = mem::List.empty(alloc)
     mut record.lines.truncate(0)
-    mut record.line(projected(row.value.as_str(), fields: select, alloc).as_str(), alloc)
+    let narrowed = projected(row.value.as_str(), fields: select, alloc)
+    if labels.len() == 0 {
+        mut record.line(narrowed.as_str(), alloc)
+    } else {
+        mut record.envelope("value", labels, content: narrowed.as_str(), alloc)
+    }
     return record
 } row_record
 
