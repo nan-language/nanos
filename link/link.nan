@@ -1,15 +1,18 @@
 //! The `link` instance: the protocol through which agents and humans reach the system, served on the serial transport.
 
-/// The keys of the keyed tasks: the serial transport's reader and writer, the one reading the ready record's facts, and those answering requests, plus their number.
+/// The keys of the keyed tasks: the serial transport's reader and writer, the one reading the ready record's facts, the one handing lines to `console`, and those answering requests, plus the slot of each.
 const READING: u64 = 1
 
 const WRITING: u64 = 2
 
 const OPENING: u64 = 3
 
-const EMITTING: u64 = 4
+const CONSOLING: u64 = 4
 
 const ANSWERING: u64 = 0x1_0000_0000
+
+/// The most requests running at once, each keeping the slot its keyed task's key names.
+const MOST_RUNNING: u64 = 256
 
 /// What `link` serves: the messages of the store's subscriptions, and those of its own keyed tasks and timers.
 pub protocol Link {
@@ -23,6 +26,8 @@ pub protocol Link {
     fn received(received: Received) limits traceless
     /// The serial transport wrote what it was given.
     fn written() limits traceless
+    /// `console` took the line it was handed.
+    fn handed() limits traceless
     /// The facts of the ready record and the boot counter, read once the store answers.
     fn opened(ready: LinkReady, boot: u64) limits traceless
     /// The request numbered `number` ended with the block `block`.
@@ -57,11 +62,12 @@ pub closed struct Facts derives Encode {
     pub boot: u64
 } Facts
 
-/// The Env of `link`: the console UART, its View of the tree, its port to `keys`, the port the store tells its subscriptions through, its source of events, where it publishes `/live/sessions`, the kernel's entropy, the clocks, its configuration and its cell.
+/// The Env of `link`: the console UART, its View of the tree, its ports to `keys` and to `console`, the port the store tells its subscriptions through, its source of events, where it publishes `/live/sessions`, the kernel's entropy, the clocks, its configuration and its cell.
 pub open struct Env derives Send {
     console: os::Port[devices::Console]
     tree: store::service::View
     keys: os::Port[keys::Keys]
+    attendant: os::Port[console::Console]
     own: os::PortHandle
     events: journal::Source
     live: os::Live
@@ -72,9 +78,10 @@ pub open struct Env derives Send {
     alloc: mem::Alloc
 } Env
 
-/// A request running: its number, id, verb and first operand, whether its `pending` block went out, and for `hello` the principal it names.
+/// A request running: its number, the slot its keyed task's key names, its id, verb and first operand, whether its `pending` block went out, and for `hello` the principal it names.
 pub closed struct Running derives Encode {
     pub number: u64
+    pub slot: u64
     pub id: text::Fixed[32]
     pub verb: text::Fixed[16]
     pub operand: text::String
@@ -82,7 +89,7 @@ pub closed struct Running derives Encode {
     pub principal: Option[ident::Principal]
 } Running
 
-/// The state of `link`: its configuration, the facts read at its start, the blocks waiting for the serial transport and whether one is being written, the requests running and the number of the next, the sessions open and the number of the next, the serial connection's challenge, the watches, and when the ready record went out.
+/// The state of `link`: its configuration, the facts read at its start, the blocks waiting for the serial transport and whether one is being written, the requests running and the number of the next, the sessions open and the number of the next, the serial connection's challenge, the watches, when the ready record went out, and the console lines waiting for `console` and whether one is being handed over.
 pub closed struct Linker derives Encode {
     pub config: LinkConfig
     pub facts: Option[Facts]
@@ -95,6 +102,8 @@ pub closed struct Linker derives Encode {
     pub challenge: Option[Challenge]
     pub watches: mem::List[Watch]
     pub ready_ns: u64
+    pub lines: mem::List[text::String]
+    pub consoling: bool
 } Linker
 
 impl Linker: sys::Component[Env, Link]
@@ -105,6 +114,7 @@ pub fn Env.of(
     console: os::Port[devices::Console],
     tree: store::service::View,
     keys: os::Port[keys::Keys],
+    attendant: os::Port[console::Console],
     own: os::PortHandle,
     events: journal::Source,
     live: os::Live,
@@ -114,11 +124,11 @@ pub fn Env.of(
     config: LinkConfig,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(console: console, tree: tree, keys: keys, own: own, events: events, live: live, random: random, clock: clock, wall: wall, config: config, alloc: alloc)
+    return Env(console: console, tree: tree, keys: keys, attendant: attendant, own: own, events: events, live: live, random: random, clock: clock, wall: wall, config: config, alloc: alloc)
 } Env.of
 
 pub fn Linker.start(mut env: Env) -> Linker {
-    return Linker(config: env.config, facts: None, output: mem::List.empty(env.alloc), writing: false, running: mem::List.empty(env.alloc), next: 1, sessions: mem::List.empty(env.alloc), next_session: 1, challenge: None, watches: mem::List.empty(env.alloc), ready_ns: 0)
+    return Linker(config: env.config, facts: None, output: mem::List.empty(env.alloc), writing: false, running: mem::List.empty(env.alloc), next: 1, sessions: mem::List.empty(env.alloc), next_session: 1, challenge: None, watches: mem::List.empty(env.alloc), ready_ns: 0, lines: mem::List.empty(env.alloc), consoling: false)
 } Linker.start
 
 /// Listens on serial, and reads the ready record's facts.
@@ -160,10 +170,46 @@ fn Linker.received(mut self, take received: Received, mut env: Env, mut cx: sys:
     match received {
         Received.Request(text) => mut self.request(text.as_str(), mut env, mut cx)
         Received.Refused(code: code) => mut self.answer(failed_block(id: "-", verb: "-", operand: "", failure: Failure.of(code.as_str(), subject: "-", alloc), alloc), mut env, mut cx)
-        Received.Console(_) => {
+        Received.Console(text) => {
+            mut self.lines.push(take text)
+            mut self.hand(mut env, mut cx)
         }
     }
 } Linker.received
+
+/// Hands `console` the console line `line`, without its leading `console `.
+fn hand_over(attendant: os::Port[console::Console], line: Str, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(rest) = line.slice_bytes(8, end: line.byte_len()) else {
+        return
+    }
+    var call = sys::Encoded.empty(alloc)
+    sys::Wire[console::Console].line(mut call, text: text::String.of(rest, alloc))
+    match attempt await attendant.post(take call) {
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} hand_over
+
+/// Has a keyed task hand the next console line waiting to `console`, once none is being handed over.
+fn Linker.hand(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
+    if self.consoling or self.lines.len() == 0 {
+        return
+    }
+    let text = mut self.lines.remove(0)
+    self.consoling = true
+    let attendant = env.attendant
+    let alloc = env.alloc
+    mut cx.spawn(key: CONSOLING, run: fn[take text](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
+        try await hand_over(attendant, line: text.as_str(), alloc)
+        discard attempt await out.handed()
+    })
+} Linker.hand
+
+fn Linker.handed(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
+    self.consoling = false
+    mut self.hand(mut env, mut cx)
+} Linker.handed
 
 fn Linker.written(mut self, mut env: Env, mut cx: sys::Cx[Link]) {
     self.writing = false
@@ -275,7 +321,8 @@ fn Linker.push_due(mut self, take number: u64, mut env: Env, mut cx: sys::Cx[Lin
     let path = subscribed_path(selector, watched, alloc)
     let events = watched == Watched.Events
     let cut = self.cut(text::String.empty(alloc))
-    mut cx.spawn(key: DELIVERING + number, run: fn[take selector, take path, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
+    let slot = self.watches[at].slot
+    mut cx.spawn(key: DELIVERING + slot, run: fn[take selector, take path, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
         let Delivered(block: block, cursor: reached) = try await deliver(tree, id: id.as_str(), selector, take path, cursor, backlog, events, alloc)
         let matched = block.records.len() > 0
         discard attempt await out.delivered(number, block: block.text(cut, alloc), matched, cursor: reached)
@@ -356,9 +403,13 @@ fn Linker.run(mut self, take request: Request, mut env: Env, mut cx: sys::Cx[Lin
         None => {
         }
     }
+    let Some(slot) = self.free_slot() else {
+        mut self.answer(refusal(request, failure: Failure.of("budget.exhausted", subject: "requests", alloc), alloc), mut env, mut cx)
+        return
+    }
     let number = self.next
     self.next += 1
-    mut self.running.push(Running(number: number, id: request.id, verb: request.verb, operand: first_operand(request, alloc), pending: false, principal: None))
+    mut self.running.push(Running(number: number, slot: slot, id: request.id, verb: request.verb, operand: first_operand(request, alloc), pending: false, principal: None))
     if request.verb.as_str() == "watch" {
         mut self.watch(take request, number, mut env, mut cx)
         return
@@ -377,7 +428,7 @@ fn Linker.run(mut self, take request: Request, mut env: Env, mut cx: sys::Cx[Lin
     let tree = env.tree
     let budget = self.config.budget
     let cut = self.cut_for(request, alloc)
-    mut cx.spawn(key: ANSWERING + number, run: fn[take request, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take request, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
         let block = try await answer(request, tree, budget, alloc)
         discard attempt await out.responded(number, block: block.text(cut, alloc))
     })
@@ -458,11 +509,16 @@ fn Linker.watch(mut self, take request: Request, number: u64, mut env: Env, mut 
         }
     }
     let session = self.session_of(request)
-    mut self.watches.push(Watch(id: request.id, number: number, session: session, selector: take text, subscription: None, cursor: 0, delivering: false, due: false, wake: request.has("wake")))
+    let Some(slot) = self.free_watch_slot() else {
+        let block = self.running[at].failed(Failure.of("budget.exhausted", subject: "watches", alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    mut self.watches.push(Watch(id: request.id, number: number, slot: slot, session: session, selector: take text, subscription: None, cursor: 0, delivering: false, due: false, wake: request.has("wake")))
     let tree = env.tree
     let own = env.own
     let path = subscribed_path(selector, watched, alloc)
-    mut cx.spawn(key: WATCHING + number, run: fn[take path](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
+    mut cx.spawn(key: WATCHING + slot, run: fn[take path](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
         let start = try await set_up(tree, own, take path, since, watched, alloc)
         discard attempt await out.watching(number, take start)
     })
@@ -484,12 +540,12 @@ fn Linker.cancel(mut self, take request: Request, number: u64, mut env: Env, mut
             let ended = mut self.watches.remove(watch)
             let tree = env.tree
             match ended.subscription {
-                Some(subscription) => mut cx.spawn(key: WATCHING + ended.number, run: fn(out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
+                Some(subscription) => mut cx.spawn(key: WATCHING + ended.slot, run: fn(out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
                     discard attempt await tree.unsubscribe(subscription, alloc)
                 })
-                None => mut cx.cancel(key: WATCHING + ended.number)
+                None => mut cx.cancel(key: WATCHING + ended.slot)
             }
-            mut cx.cancel(key: DELIVERING + ended.number)
+            mut cx.cancel(key: DELIVERING + ended.slot)
             cancelled = true
         }
         None => {
@@ -497,7 +553,7 @@ fn Linker.cancel(mut self, take request: Request, number: u64, mut env: Env, mut
     }
     match self.running.position(fn(each: Running) => each.id.as_str() == named and each.number != number) {
         Some(other) => {
-            mut cx.cancel(key: ANSWERING + self.running[other].number)
+            mut cx.cancel(key: ANSWERING + self.running[other].slot)
             discard mut self.running.remove(other)
             cancelled = true
         }
@@ -518,6 +574,34 @@ fn Linker.cancel(mut self, take request: Request, number: u64, mut env: Env, mut
     mut block.records.push(take record)
     mut self.respond(own, take block, mut env, mut cx)
 } Linker.cancel
+
+/// The lowest slot no watch holds, `None` when `MOST_WATCHES` are kept.
+fn Linker.free_watch_slot(self) -> Option[u64] {
+    for slot in 0..<MOST_WATCHES {
+        if self.watches.position(fn(each: Watch) => each.slot == slot).is_none() {
+            return Some(slot)
+        }
+    }
+    return None
+} Linker.free_watch_slot
+
+/// The lowest slot no request running holds, `None` when `MOST_RUNNING` run.
+fn Linker.free_slot(self) -> Option[u64] {
+    for slot in 0..<MOST_RUNNING {
+        if self.running.position(fn(each: Running) => each.slot == slot).is_none() {
+            return Some(slot)
+        }
+    }
+    return None
+} Linker.free_slot
+
+/// The key of the keyed task answering the request numbered `number`.
+fn Linker.key_of(self, number: u64) -> u64 {
+    return match self.running.position(fn(each: Running) => each.number == number) {
+        Some(at) => ANSWERING + self.running[at].slot
+        None => ANSWERING + MOST_RUNNING
+    }
+} Linker.key_of
 
 /// The number of the session `request` runs in: the one `--session` names, else the connection's first.
 fn Linker.session_of(self, request: Request) -> u64 {

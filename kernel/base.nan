@@ -39,6 +39,8 @@ const POWER: Str = "power::Powering"
 
 const LINKER: Str = "link::Linker"
 
+const DESK: Str = "console::Desk"
+
 /// The canonical paths of the record types genesis writes besides specifications.
 const GRANT_TYPE: Str = "os::Grant"
 
@@ -147,6 +149,9 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == LINKER {
         return Some(os::Protocols(own: sys::Wire[link::Link].hash(), serves: Some(sys::Wire[store::service::Watcher].hash())))
     }
+    if component == DESK {
+        return Some(os::Protocols(own: sys::Wire[console::Console].hash(), serves: None))
+    }
     return None
 } Base.protocols
 
@@ -216,6 +221,9 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     }
     if component == LINKER {
         return try await self.serve_link(take world, take serving)
+    }
+    if component == DESK {
+        return try await self.serve_console(take world, take serving)
     }
     let exec = world.exec
     let alloc = world.alloc
@@ -541,7 +549,7 @@ fn Base.serve_power(self, take world: nanos::World, take serving: runner::Servin
     })
 } Base.serve_power
 
-/// Serves `link` on its ports to the console UART, to `keys` and to itself, its View of the tree, the kernel's entropy and the clocks, with its configuration record, the configuration by default when it has none.
+/// Serves `link` on its ports to the console UART, to `keys`, to `console` and to itself, its View of the tree, the kernel's entropy and the clocks, with its configuration record, the configuration by default when it has none.
 fn Base.serve_link(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     let alloc = world.alloc
     let Ok(consoling) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "console") else {
@@ -559,6 +567,12 @@ fn Base.serve_link(self, take world: nanos::World, take serving: runner::Serving
     let Some(keyring) = os::Port[keys::Keys].of(keying) else {
         return runner::Ended.EnvIncomplete
     }
+    let Ok(attending) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "attendant") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Some(attendant) = os::Port[console::Console].of(attending) else {
+        return runner::Ended.EnvIncomplete
+    }
     let Ok(own) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "own") else {
         return runner::Ended.EnvIncomplete
     }
@@ -572,12 +586,28 @@ fn Base.serve_link(self, take world: nanos::World, take serving: runner::Serving
     let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
         return runner::Ended.EnvIncomplete
     }
-    let env = link::Env.of(console, tree, keys: keyring, own, events, live: self.sessions_live, random: world.random, clock: world.clock, wall: self.wall, config, alloc)
+    let env = link::Env.of(console, tree, keys: keyring, attendant, own, events, live: self.sessions_live, random: world.random, clock: world.clock, wall: self.wall, config, alloc)
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
     mut peers.push(sys::Wire[store::service::Watcher].schema(alloc))
     return try await runner::Driven[link::Linker, link::Env, link::Link].run(take env, exec: world.exec, alloc, take serving, take peers, release: fn(take ended: link::Env) limits stack 512 {
     })
 } Base.serve_link
+
+/// Serves `console` on the reserved lane of the console UART and its View of `/live`.
+fn Base.serve_console(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Ok(handle) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "uart") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Some(uart) = os::Port[devices::Console].of(handle) else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(live) = attempt nanos::Cap[store::service::View].get(world.caps, key: "live") else {
+        return runner::Ended.EnvIncomplete
+    }
+    return try await runner::Driven[console::Desk, console::Env, console::Console].run(console::Env.of(uart, live, alloc), exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: console::Env) limits stack 512 {
+    })
+} Base.serve_console
 
 /// The schemas a block driver or view serves the calls of: `Block`'s.
 fn schema_of_block(alloc: mem::Alloc) -> mem::List[sys::ProtocolSchema] {
@@ -696,10 +726,21 @@ fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem
     mut building.grant(mut powering, holder: "power", field: "configuring", object: tree_of("/sys/config/power", alloc), granted: tree_rights(alloc), alloc)
     mut building.grant(mut powering, holder: "power", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
     discard mut building.specs.insert(moniker("power"), value: take powering)
+    mut building.add_link(bundle, alloc)
+    if owner_of(handoff, alloc).is_some() {
+        let number = u64.widen(building.grants.len())
+        discard mut building.grants.insert(number, value: os::Grant(holder: principal("owner"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
+    }
+    let Building(specs: specs, grants: grants) = building
+    return runner::Known(specs: take specs, grants: take grants)
+} image_genesis
+
+/// Adds the specifications and grants of `link` and `console`, running `bundle`.
+fn Building.add_link(mut self, bundle: ident::HashValue, alloc: mem::Alloc) {
     var linking = os::InstanceSpec.of(principal: principal("system"), bundle, component: LINKER, alloc)
-    mut building.grant(mut linking, holder: "link", field: "tree", object: tree_of("/", alloc), granted: read_rights(alloc), alloc)
-    mut building.grant(mut linking, holder: "link", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
-    mut building.grant(mut linking, holder: "link", field: "random", object: os::Object.Random, granted: mem::Set.empty(alloc), alloc)
+    mut self.grant(mut linking, holder: "link", field: "tree", object: tree_of("/", alloc), granted: read_rights(alloc), alloc)
+    mut self.grant(mut linking, holder: "link", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
+    mut self.grant(mut linking, holder: "link", field: "random", object: os::Object.Random, granted: mem::Set.empty(alloc), alloc)
     var verifying = mem::List[text::String].empty(alloc)
     mut verifying.push(text::String.of("verify", alloc))
     discard mut linking.wiring.insert(text::String.of("keys", alloc), value: os::Wire(target: os::Target.Instance(moniker("keys")), operations: Some(take verifying), credit: os::Credit(messages: 4, calls: 4)))
@@ -708,14 +749,18 @@ fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem
     mut consoling.push(text::String.of("write", alloc))
     mut consoling.push(text::String.of("read", alloc))
     discard mut linking.wiring.insert(text::String.of("console", alloc), value: os::Wire(target: os::Target.Role(os::Role.Console), operations: Some(take consoling), credit: os::Credit(messages: 4, calls: 4)))
-    discard mut building.specs.insert(moniker("link"), value: take linking)
-    if owner_of(handoff, alloc).is_some() {
-        let number = u64.widen(building.grants.len())
-        discard mut building.grants.insert(number, value: os::Grant(holder: principal("owner"), object: os::Object.Machine, rights: rights(every: true, alloc), caveats: os::Caveats.none(), parent: Some(0), granted_by: ident::CommitId(number: 1)))
-    }
-    let Building(specs: specs, grants: grants) = building
-    return runner::Known(specs: take specs, grants: take grants)
-} image_genesis
+    var attending = mem::List[text::String].empty(alloc)
+    mut attending.push(text::String.of("line", alloc))
+    discard mut linking.wiring.insert(text::String.of("attendant", alloc), value: os::Wire(target: os::Target.Instance(moniker("console")), operations: Some(take attending), credit: os::Credit(messages: 16, calls: 1)))
+    discard mut self.specs.insert(moniker("link"), value: take linking)
+    var desking = os::InstanceSpec.of(principal: principal("system"), bundle, component: DESK, alloc)
+    mut self.grant(mut desking, holder: "console", field: "live", object: tree_of("/live", alloc), granted: read_rights(alloc), alloc)
+    var reserved = mem::List[text::String].empty(alloc)
+    mut reserved.push(text::String.of("write_reserved", alloc))
+    mut reserved.push(text::String.of("read_reserved", alloc))
+    discard mut desking.wiring.insert(text::String.of("uart", alloc), value: os::Wire(target: os::Target.Role(os::Role.Console), operations: Some(take reserved), credit: os::Credit(messages: 4, calls: 4)))
+    discard mut self.specs.insert(moniker("console"), value: take desking)
+} Building.add_link
 
 /// The specifications and grants of the image's genesis record as they are built.
 struct Building {

@@ -118,8 +118,9 @@ fn Linker.hello(mut self, request: Request, number: u64, mut env: Env, mut cx: s
             }
             let tree = env.tree
             let random = env.random
-            mut cx.spawn(key: ANSWERING + number, run: fn[take principal](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
-                let step = try await challenge_step(tree, principal, random, alloc)
+            let events = env.events
+            mut cx.spawn(key: self.key_of(number), run: fn[take principal](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
+                let step = try await challenge_step(tree, principal, random, events, alloc)
                 discard attempt await out.hello_step(number, take step)
             })
             return None
@@ -149,8 +150,9 @@ fn Linker.verify(mut self, request: Request, take principal: ident::Principal, n
     mem::wire::Codec[HelloProof].encode(HelloProof(principal: ident::Principal(text: principal.text), nonce: challenge.nonce, binding: challenge.binding), out: mut proof)
     let subject = ident::HashValue.of_object(ident::Kind.Handshake, bytes: proof.view())
     let keys = env.keys
-    mut cx.spawn(key: ANSWERING + number, run: fn[take principal](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
-        let step = try await verified_step(keys, principal, subject, signature, alloc)
+    let events = env.events
+    mut cx.spawn(key: self.key_of(number), run: fn[take principal](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 32_768 {
+        let step = try await verified_step(keys, principal, subject, signature, events, alloc)
         discard attempt await out.hello_step(number, take step)
     })
     return None
@@ -182,11 +184,6 @@ fn Linker.hello_step(mut self, take number: u64, take step: HelloStep, mut env: 
         HelloStep.Rejected(code: code) => {
             let block = self.running[at].failed(Failure.of(code.as_str(), subject: principal.text.as_str(), alloc), alloc)
             mut self.respond(at, take block, mut env, mut cx)
-            let events = env.events
-            let rejected = HelloRejected(principal: take principal, transport: Transport.Serial, code: text::String.of(code.as_str(), alloc))
-            mut cx.spawn(key: EMITTING, run: fn[take rejected](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 16_384 {
-                try await events.emit("link.hello-rejected", severity: journal::Severity.Warn, payload: rejected, alloc)
-            })
         }
     }
 } Linker.hello_step
@@ -265,7 +262,7 @@ fn Linker.open(mut self, number: u64, take principal: ident::Principal, mut env:
     let boot = self.boot()
     let cut = self.cut(text::String.empty(alloc))
     mut self.summarize(mut env, mut cx)
-    mut cx.spawn(key: ANSWERING + number, run: fn[take head, take told, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
+    mut cx.spawn(key: self.key_of(number), run: fn[take head, take told, take cut](out: sys::Outbox[Link]) fails task::Cancelled uses wait limits stack 65_536 {
         let path = try await path_of_serial(tree, alloc)
         let block = try await opened_block(take head, session: told, path, mode, generation, tree, alloc)
         discard attempt await out.responded(number, block: block.text(cut, alloc))
@@ -361,14 +358,16 @@ fn names_below(tree: store::service::View, path: Str, alloc: mem::Alloc) -> mem:
     return names
 } names_below
 
-/// Whether `principal` has a key to answer a challenge with, and the nonce drawn for its challenge.
-fn challenge_step(tree: store::service::View, principal: ident::Principal, random: sys::Random, alloc: mem::Alloc) -> HelloStep fails task::Cancelled uses wait {
+/// Whether `principal` has a key to answer a challenge with, and the nonce drawn for its challenge; `link.hello-rejected` when it has none.
+fn challenge_step(tree: store::service::View, principal: ident::Principal, random: sys::Random, events: journal::Source, alloc: mem::Alloc) -> HelloStep fails task::Cancelled uses wait {
     var path = text::String.of("/sys/principals/", alloc)
     mut path.append(principal.text.as_str())
-    let Some(record) = try await Records[os::PrincipalRecord].at(tree, path: path.as_str(), alloc) else {
-        return HelloStep.Unknown
+    let known = match try await Records[os::PrincipalRecord].at(tree, path: path.as_str(), alloc) {
+        Some(record) => record.key.is_some()
+        None => false
     }
-    if record.key.is_none() {
+    if not known {
+        try await rejected(events, principal, code: "link.principal-unknown", alloc)
         return HelloStep.Unknown
     }
     var nonce = Array[u8, 32].filled(0)
@@ -376,16 +375,26 @@ fn challenge_step(tree: store::service::View, principal: ident::Principal, rando
     return HelloStep.Known(nonce: nonce)
 } challenge_step
 
-/// Whether `keys` verifies `signature` as `principal`'s for the purpose `handshake` over `subject`.
-fn verified_step(keys: os::Port[keys::Keys], principal: ident::Principal, subject: ident::HashValue, signature: ident::Signature, alloc: mem::Alloc) -> HelloStep fails task::Cancelled uses wait {
+/// Whether `keys` verifies `signature` as `principal`'s for the purpose `handshake` over `subject`; `link.hello-rejected` when it does not.
+fn verified_step(keys: os::Port[keys::Keys], principal: ident::Principal, subject: ident::HashValue, signature: ident::Signature, events: journal::Source, alloc: mem::Alloc) -> HelloStep fails task::Cancelled uses wait {
     var call = sys::Encoded.empty(alloc)
     let reply = sys::Wire[keys::Keys].verify(mut call, principal: ident::Principal(text: principal.text), kind: text::String.of("handshake", alloc), subject, signature, former: false)
-    return match first attempt await keys.call(take call, reply, alloc) {
-        Ok(_) => HelloStep.Verified
+    let verified = match first attempt await keys.call(take call, reply, alloc) {
+        Ok(_) => true
         Err(os::PortError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => HelloStep.Rejected(code: text::Fixed[32].of("link.signature-invalid"))
+        Err(_) => false
     }
+    if verified {
+        return HelloStep.Verified
+    }
+    try await rejected(events, principal, code: "link.signature-invalid", alloc)
+    return HelloStep.Rejected(code: text::Fixed[32].of("link.signature-invalid"))
 } verified_step
+
+/// Emits `link.hello-rejected` for a `hello` of `principal` on serial refused with `code`.
+fn rejected(events: journal::Source, principal: ident::Principal, code: Str, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    try await events.emit("link.hello-rejected", severity: journal::Severity.Warn, payload: HelloRejected(principal: ident::Principal(text: principal.text), transport: Transport.Serial, code: text::String.of(code, alloc)), alloc)
+} rejected
 
 /// The principal `text` names, `None` when it names none.
 fn principal_of(text: Str) -> Option[ident::Principal] {

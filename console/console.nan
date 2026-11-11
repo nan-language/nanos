@@ -1,0 +1,153 @@
+//! The `console` instance: the human's console at the machine, sharing the console UART with the link, which hands it every line starting `console `; it answers on the UART's reserved lane with blocks of the id `console`.
+
+/// The keys of the keyed tasks writing to the reserved lane and answering a line.
+const WRITING: u64 = 1
+
+const ANSWERING: u64 = 2
+
+/// What `console` serves.
+pub protocol Console {
+    /// A line typed at the console after `console `.
+    pub fn line(text: text::String) limits traceless
+    /// The block answering the line being answered.
+    fn answered(block: mem::Bytes) limits traceless
+    /// The reserved lane took what it was given.
+    fn written() limits traceless
+} Console
+
+/// The Env of `console`: the reserved lane of the console UART, its View of `/live`, and its cell.
+pub open struct Env derives Send {
+    uart: os::Port[devices::Console]
+    live: store::service::View
+    alloc: mem::Alloc
+} Env
+
+/// The state of `console`: the blocks waiting for the reserved lane and whether one is being written, and the lines waiting for their answer and whether one is being answered.
+pub closed struct Desk derives Encode {
+    pub output: mem::List[mem::Bytes]
+    pub writing: bool
+    pub lines: mem::List[text::String]
+    pub answering: bool
+} Desk
+
+impl Desk: sys::Component[Env, Console]
+
+pub fn Env.of(uart: os::Port[devices::Console], live: store::service::View, alloc: mem::Alloc) -> Env = Env(uart: uart, live: live, alloc: alloc)
+
+pub fn Desk.start(mut env: Env) -> Desk = Desk(output: mem::List.empty(env.alloc), writing: false, lines: mem::List.empty(env.alloc), answering: false)
+
+/// Answers each console line in turn from a keyed task: `status` prints `/live/status` and `/live/security`; any other line fails with `request.unknown-verb`.
+pub fn Desk.line(mut self, take text: text::String, mut env: Env, mut cx: sys::Cx[Console]) {
+    mut self.lines.push(take text)
+    mut self.answer(mut env, mut cx)
+} Desk.line
+
+fn Desk.answered(mut self, take block: mem::Bytes, mut env: Env, mut cx: sys::Cx[Console]) {
+    self.answering = false
+    mut self.output.push(take block)
+    mut self.write(mut env, mut cx)
+    mut self.answer(mut env, mut cx)
+} Desk.answered
+
+/// Has a keyed task answer the next line waiting, once none is being answered.
+fn Desk.answer(mut self, mut env: Env, mut cx: sys::Cx[Console]) {
+    if self.answering or self.lines.len() == 0 {
+        return
+    }
+    let text = mut self.lines.remove(0)
+    self.answering = true
+    let live = env.live
+    let alloc = env.alloc
+    mut cx.spawn(key: ANSWERING, run: fn[take text](out: sys::Outbox[Console]) fails task::Cancelled uses wait limits stack 65_536 {
+        let block = try await answer(text.as_str(), live, alloc)
+        discard attempt await out.answered(block: take block)
+    })
+} Desk.answer
+
+fn Desk.written(mut self, mut env: Env, mut cx: sys::Cx[Console]) {
+    self.writing = false
+    mut self.write(mut env, mut cx)
+} Desk.written
+
+/// Has a keyed task write the next block waiting to the reserved lane, once no write is under way.
+fn Desk.write(mut self, mut env: Env, mut cx: sys::Cx[Console]) {
+    if self.writing or self.output.len() == 0 {
+        return
+    }
+    let data = mut self.output.remove(0)
+    self.writing = true
+    let uart = env.uart
+    let alloc = env.alloc
+    mut cx.spawn(key: WRITING, run: fn[take data](out: sys::Outbox[Console]) fails task::Cancelled uses wait limits stack 16_384 {
+        var call = sys::Encoded.empty(alloc)
+        let reply = sys::Wire[devices::Console].write_reserved(mut call, data: take data)
+        match first attempt await uart.call(take call, reply, alloc) {
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+        discard attempt await out.written()
+    })
+} Desk.write
+
+/// The block answering the console line `text`, of the id `console`.
+fn answer(text: Str, live: store::service::View, alloc: mem::Alloc) -> mem::Bytes fails task::Cancelled uses wait {
+    var records = mem::List[text::String].empty(alloc)
+    var word = "failed"
+    if text == "status" {
+        word = "ok"
+        mut records.push(try await record_line(live, name: "status", type: "os::LiveStatus", alloc))
+        mut records.push(try await record_line(live, name: "security", type: "os::LiveSecurity", alloc))
+    } else {
+        var error = text::String.of("error request.unknown-verb ", alloc)
+        mut error.append(text)
+        mut records.push(take error)
+    }
+    var verdict = text::String.of(word, alloc)
+    mut verdict.append(" console ")
+    mut verdict.append(text)
+    mut verdict.append(": records ")
+    mut verdict.write(Dyn[Render].view(records.len()), budget: 24)
+    mut verdict.push('\n')
+    var block = mem::Bytes.empty(alloc)
+    mut block.append(verdict.as_bytes())
+    for record in records {
+        mut block.append(record.as_bytes())
+        mut block.push(b'\n')
+    }
+    mut block.append(verdict.as_bytes())
+    return block
+} answer
+
+/// The `node` record of the record `/live/<name>`, read through the View of `/live`, its value rendered on a continuation line.
+fn record_line(live: store::service::View, name: Str, type: Str, alloc: mem::Alloc) -> text::String fails task::Cancelled uses wait {
+    var path = text::String.of("/", alloc)
+    mut path.append(name)
+    var line = text::String.of("node /live/", alloc)
+    mut line.append(name)
+    mut line.append(", type: \"")
+    mut line.append(type)
+    mut line.append("\"\n    ")
+    let node = match first attempt await live.get(ident::Path(text: take path), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return line
+    }
+    let Some(value) = node.value else {
+        return line
+    }
+    if type == "os::LiveStatus" {
+        match attempt mem::wire::Codec[os::LiveStatus].decode(value.view(), alloc) {
+            Ok(status) => mut line.write(Dyn[Render].view(status), budget: 65_536)
+            Err(_) => {
+            }
+        }
+    } else {
+        match attempt mem::wire::Codec[os::LiveSecurity].decode(value.view(), alloc) {
+            Ok(security) => mut line.write(Dyn[Render].view(security), budget: 65_536)
+            Err(_) => {
+            }
+        }
+    }
+    return line
+} record_line
