@@ -6,6 +6,9 @@ const HELD_RECORDS: usize = 2_048
 /// The most log records the core holds for `journal`: a record past them is counted lost.
 const HELD_LOGS: usize = 1_024
 
+/// The most metric samples the core holds for `journal`: the samples of a second past them are dropped.
+const HELD_METRICS: usize = 4_096
+
 /// A capability taking the records the core drained.
 pub open struct Feed {
 } Feed
@@ -24,13 +27,15 @@ struct Held {
     records: usize
     logs: mem::List[Logged]
     logs_lost: u64
+    metrics: mem::List[MetricSample]
 } Held
 
-/// What `journal` takes from the core at once: the drains, the log records, and the log records the core had no room for.
+/// What `journal` takes from the core at once: the drains, the log records, the log records the core had no room for, and the metric samples of each second, oldest first.
 pub closed struct Fed {
     pub drains: mem::List[Drained]
     pub logs: mem::List[Logged]
     pub logs_lost: u64
+    pub metrics: mem::List[MetricSample]
 } Fed
 
 /// What the core drained of one ring: its records, and how many events found it full or found the backlog full since its previous drain.
@@ -46,7 +51,7 @@ pub open linear struct MintedFeed derives Send {
 } MintedFeed
 
 pub fn Backlog.empty(alloc: mem::Alloc) -> Backlog {
-    return Backlog(held: task::Cown.of(Held(drains: mem::List.empty(alloc), records: 0, logs: mem::List.empty(alloc), logs_lost: 0), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
+    return Backlog(held: task::Cown.of(Held(drains: mem::List.empty(alloc), records: 0, logs: mem::List.empty(alloc), logs_lost: 0, metrics: mem::List.empty(alloc)), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
 } Backlog.empty
 
 pub fn Backlog.share(self) -> Backlog {
@@ -96,6 +101,26 @@ pub fn Backlog.hold_logged(self, take logged: Logged) fails task::Cancelled uses
     self.wake()
 } Backlog.hold_logged
 
+/// Holds the samples `samples` of one second for `journal`, dropping them when the backlog holds its most samples, and signals it.
+pub fn Backlog.hold_metrics(self, take samples: mem::List[MetricSample]) fails task::Cancelled uses wait {
+    let held = self.held.share()
+    var given = Some(take samples)
+    await when mut held {
+        match mut given.extract() {
+            Some(second) => {
+                if held.metrics.len() + second.len() <= HELD_METRICS {
+                    for sample in take second {
+                        mut held.metrics.push(take sample)
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    self.wake()
+} Backlog.hold_metrics
+
 fn Backlog.wake(self) {
     let signal = self.signal.share()
     hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
@@ -120,7 +145,7 @@ pub fn MintedFeed.close(take self) {
 
 /// What the core holds, oldest first, waiting until it holds a drain or a log record or has counted one lost; nothing once the feed is stale.
 pub fn Feed.next(self, alloc: mem::Alloc) -> Fed fails task::Cancelled uses wait {
-    var fed = Fed(drains: mem::List.empty(alloc), logs: mem::List.empty(alloc), logs_lost: 0)
+    var fed = Fed(drains: mem::List.empty(alloc), logs: mem::List.empty(alloc), logs_lost: 0, metrics: mem::List.empty(alloc))
     let Some(backlog) = sys::reach(self, body: fn(state: Backlog, record: u8) => state.share()) else {
         return fed
     }
@@ -136,8 +161,11 @@ pub fn Feed.next(self, alloc: mem::Alloc) -> Fed fails task::Cancelled uses wait
             }
             fed.logs_lost = held.logs_lost
             held.logs_lost = 0
+            while held.metrics.len() > 0 {
+                mut fed.metrics.push(mut held.metrics.remove(0))
+            }
         }
-        if fed.drains.len() > 0 or fed.logs.len() > 0 or fed.logs_lost > 0 {
+        if fed.drains.len() > 0 or fed.logs.len() > 0 or fed.logs_lost > 0 or fed.metrics.len() > 0 {
             return fed
         }
         try await backlog.signal.contents().wait()

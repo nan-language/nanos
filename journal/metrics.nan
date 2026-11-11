@@ -1,0 +1,102 @@
+//! Metrics: the samples of the instances that `journal` keeps by resolution, and their merges into samples of 60 and 3,600 seconds.
+
+const SECOND_NS: i64 = 1_000_000_000
+
+/// What an instance used over an interval: its CPU time, handler calls, deepest intake, cell charge at the end and highest, estimated energy, abandonments, restarts and handler run times, in the 32 buckets of `os::Gauge`.
+pub closed struct MetricSample derives Encode {
+    pub source: ident::Moniker
+    pub time: ident::WallTime
+    pub interval_s: u32
+    pub bundle: ident::HashValue
+    pub cpu_ns: u64
+    pub messages: u64
+    pub intake_max: u32
+    pub memory_bytes: u64
+    pub memory_peak_bytes: u64
+    pub energy_mj: u64
+    pub traps: u64
+    pub restarts: u64
+    pub latency: Array[u64, 32]
+} MetricSample
+
+/// The samples merged so far into the current interval of `seconds`: those of each instance and bundle.
+pub closed struct Merging {
+    pub seconds: u32
+    pub start: i64
+    pub instances: mem::List[MetricSample]
+} Merging
+
+pub fn Merging.empty(seconds: u32, alloc: mem::Alloc) -> Merging = Merging(seconds: seconds, start: 0, instances: mem::List.empty(alloc))
+
+/// Merges `sample` into the current interval, first giving the merged samples of the interval before when `sample` falls past it.
+pub fn Merging.merge(mut self, take sample: MetricSample, alloc: mem::Alloc) -> mem::List[MetricSample] {
+    let span = i64.widen(self.seconds) * SECOND_NS
+    let start = sample.time.utc_ns.div_floor(span) * span
+    var done = mem::List[MetricSample].empty(alloc)
+    if start != self.start {
+        while self.instances.len() > 0 {
+            mut done.push(mut self.instances.remove(0))
+        }
+        self.start = start
+    }
+    mut self.merge_instance(take sample)
+    return done
+} Merging.merge
+
+/// Adds counters and histograms, keeps the last cell charge and the greatest peak and intake, keeping each instance's bundles apart.
+fn Merging.merge_instance(mut self, take sample: MetricSample) {
+    for at in 0..<self.instances.len() {
+        if self.instances[at].source == sample.source and self.instances[at].bundle == sample.bundle {
+            var held = mut self.instances.remove(at)
+            held.cpu_ns = held.cpu_ns.saturating_add(sample.cpu_ns)
+            held.messages = held.messages.saturating_add(sample.messages)
+            held.energy_mj = held.energy_mj.saturating_add(sample.energy_mj)
+            held.traps = held.traps.saturating_add(sample.traps)
+            held.restarts = held.restarts.saturating_add(sample.restarts)
+            for bucket in 0..<32usize {
+                held.latency[bucket] = held.latency[bucket].saturating_add(sample.latency[bucket])
+            }
+            held.memory_bytes = sample.memory_bytes
+            if sample.memory_peak_bytes > held.memory_peak_bytes {
+                held.memory_peak_bytes = sample.memory_peak_bytes
+            }
+            if sample.intake_max > held.intake_max {
+                held.intake_max = sample.intake_max
+            }
+            mut self.instances.insert(at, value: take held)
+            return
+        }
+    }
+    let uncertainty = sample.time.uncertainty_ns
+    var opened = sample
+    opened.time = ident::WallTime(utc_ns: self.start, uncertainty_ns: uncertainty)
+    opened.interval_s = self.seconds
+    mut self.instances.push(take opened)
+} Merging.merge_instance
+
+/// A sample of `fat` running `bundle` from second `second`, charged `cpu_ns`, its cell at `memory` and its peak at `peak`.
+fn fat_sample(
+    second: i64,
+    bundle: u8,
+    cpu_ns: u64,
+    memory: u64,
+    peak: u64,
+    ) -> MetricSample {
+    var latency = Array[u64, 32].filled(0)
+    latency[3] = 2
+    return MetricSample(source: ident::Moniker(text: text::Fixed[59].of("fat")), time: ident::WallTime(utc_ns: second * SECOND_NS, uncertainty_ns: 0), interval_s: 1, bundle: ident::HashValue(bytes: Array[u8, 33].filled(bundle)), cpu_ns: cpu_ns, messages: 1, intake_max: u32.truncate(cpu_ns), memory_bytes: memory, memory_peak_bytes: peak, energy_mj: 1, traps: 0, restarts: 0, latency: latency)
+} fat_sample
+
+test samples_merge_by_interval_keeping_bundles_apart for Merging.merge {
+    let alloc = testing::world().alloc
+    var minutes = Merging.empty(seconds: 60, alloc)
+    discard mut minutes.merge(fat_sample(61, bundle: 1, cpu_ns: 10, memory: 100, peak: 150), alloc)
+    discard mut minutes.merge(fat_sample(62, bundle: 1, cpu_ns: 5, memory: 80, peak: 200), alloc)
+    discard mut minutes.merge(fat_sample(63, bundle: 2, cpu_ns: 7, memory: 90, peak: 90), alloc)
+    let done = mut minutes.merge(fat_sample(125, bundle: 1, cpu_ns: 1, memory: 1, peak: 1), alloc)
+    expect done.len() == 2
+    let merged = done[0]
+    expect merged.interval_s == 60 and merged.time.utc_ns == 60 * SECOND_NS and merged.cpu_ns == 15 and merged.messages == 2 and merged.memory_bytes == 80 and merged.memory_peak_bytes == 200 and merged.intake_max == 10 and merged.latency[3] == 4
+    let apart = done[1]
+    expect apart.bundle.bytes[0] == 2 and apart.cpu_ns == 7
+} samples_merge_by_interval_keeping_bundles_apart

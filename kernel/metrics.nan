@@ -1,0 +1,96 @@
+//! The core's metrics: each second, a sample of each instance charged anything in that second, held for `journal`.
+
+const SECOND_NS: u64 = 1_000_000_000
+
+/// What the core last read of an instance: its incarnation, its CPU time and handler calls with their buckets in that incarnation, and the abandonments of its incarnations.
+struct Seen derives Copy {
+    incarnation: u64
+    cpu_ns: u64
+    messages: u64
+    latency: Array[u64, 32]
+    traps: u64
+} Seen
+
+/// Samples each second the instances `gauges` reads, an instance's energy estimated at `busy_mw` while it runs, and holds the samples in `backlog`.
+fn sample_metrics(
+    gauges: runner::Gauges,
+    backlog: journal::Backlog,
+    clock: sys::Clock,
+    wall: ident::Wall,
+    busy_mw: u64,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var seen = mem::Map[text::String, Seen].empty(alloc)
+    loop {
+        try await clock.sleep_ns(SECOND_NS)
+        let time = wall.at_ns(rings::elapsed(clock).saturating_sub(SECOND_NS))
+        var samples = mem::List[journal::MetricSample].empty(alloc)
+        for name in try await gauges.instances(alloc) {
+            let Some(gauge) = try await gauges.read(name.as_str(), alloc) else {
+                continue
+            }
+            let before = seen.get(name)
+            discard mut seen.insert(text::String.of(name.as_str(), alloc), value: Seen(incarnation: gauge.incarnation, cpu_ns: gauge.cpu_ns, messages: gauge.messages, latency: gauge.latency, traps: gauge.traps))
+            let Some(measured) = sampled(gauge, before, source: name.as_str(), time, busy_mw) else {
+                continue
+            }
+            mut samples.push(take measured)
+        }
+        if samples.len() > 0 {
+            try await backlog.hold_metrics(take samples)
+        }
+    }
+} sample_metrics
+
+/// The sample of the instance `source` over the second from `time`, as `gauge` reads it against what the core read before, `before`; `None` when it was charged nothing.
+fn sampled(
+    gauge: os::Gauge,
+    before: Option[Seen],
+    source: Str,
+    time: ident::WallTime,
+    busy_mw: u64,
+    ) -> Option[journal::MetricSample] {
+    var base = Seen(incarnation: gauge.incarnation, cpu_ns: 0, messages: 0, latency: Array[u64, 32].filled(0), traps: gauge.traps)
+    var restarts: u64 = 0
+    match before {
+        Some(held) => {
+            base.traps = held.traps
+            if held.incarnation == gauge.incarnation {
+                base = held
+            } else {
+                restarts = gauge.incarnation.saturating_sub(held.incarnation)
+            }
+        }
+        None => {
+        }
+    }
+    let cpu_ns = gauge.cpu_ns.saturating_sub(base.cpu_ns)
+    let messages = gauge.messages.saturating_sub(base.messages)
+    if cpu_ns == 0 and messages == 0 {
+        return None
+    }
+    var latency = Array[u64, 32].filled(0)
+    for bucket in 0..<32usize {
+        latency[bucket] = gauge.latency[bucket].saturating_sub(base.latency[bucket])
+    }
+    return Some(journal::MetricSample(source: ident::Moniker(text: text::Fixed[59].of(source)), time: time, interval_s: 1, bundle: gauge.bundle, cpu_ns: cpu_ns, messages: messages, intake_max: gauge.intake, memory_bytes: gauge.memory.charged, memory_peak_bytes: gauge.memory.peak, energy_mj: cpu_ns.saturating_mul(busy_mw) / SECOND_NS, traps: gauge.traps.saturating_sub(base.traps), restarts: restarts, latency: latency))
+} sampled
+
+test instances_charged_nothing_yield_no_sample for sampled {
+    var latency = Array[u64, 32].filled(0)
+    latency[2] = 5
+    let gauge = os::Gauge(intake: 3, memory: os::Usage(charged: 4_096, limit: 65_536, peak: 8_192), cpu_ns: 2_000_000, class: os::CpuClass.Normal, bundle: ident::HashValue(bytes: Array[u8, 33].filled(1)), incarnation: 2, messages: 7, latency: latency, traps: 1)
+    let held = Seen(incarnation: 2, cpu_ns: 500_000, messages: 4, latency: Array[u64, 32].filled(0), traps: 1)
+    let idle = sampled(gauge, before: Some(Seen(incarnation: 2, cpu_ns: 2_000_000, messages: 7, latency: latency, traps: 1)), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0), busy_mw: 2_000)
+    let Some(busy) = sampled(gauge, before: Some(held), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0), busy_mw: 2_000) else {
+        expect false
+        return
+    }
+    let Some(restarted) = sampled(gauge, before: Some(Seen(incarnation: 1, cpu_ns: 9_000_000, messages: 90, latency: latency, traps: 0)), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0), busy_mw: 2_000) else {
+        expect false
+        return
+    }
+    expect idle.is_none()
+    expect busy.cpu_ns == 1_500_000 and busy.messages == 3 and busy.latency[2] == 5 and busy.energy_mj == 3 and busy.restarts == 0 and busy.traps == 0
+    expect restarted.cpu_ns == 2_000_000 and restarted.messages == 7 and restarted.restarts == 1 and restarted.traps == 1
+} instances_charged_nothing_yield_no_sample
