@@ -1,4 +1,4 @@
-//! Fields of values in canonical rendering: the text of a field, a projection onto fields, and comparisons of fields with literals.
+//! Fields of values in canonical rendering and in JSON: the text of a field, a projection onto fields, comparisons of fields with literals, and a field's value replaced.
 
 /// A range of bytes of a text.
 pub closed struct Span derives Copy, Eq {
@@ -262,3 +262,144 @@ test fields_of_renderings_compare_and_project for field_span {
     expect narrowed.as_str() == "Event(kind: \"instance.failed\", time_ns: 3127000000)"
     expect compare_values("41000000000", right: "9") == core::Ordering.Greater
 } fields_of_renderings_compare_and_project
+
+/// The value of the member `path`, names joined by `.`, of the JSON object `json`, `None` when it has none.
+pub fn json_field_span(json: Str, path: Str) -> Option[Span] {
+    var span = Span(start: 0, end: json.byte_len())
+    var start: usize = 0
+    let names = path.as_bytes()
+    for at in 0..=names.len() {
+        if at < names.len() and names[at] != b'.' {
+            continue
+        }
+        let Some(name) = path.slice_bytes(start, end: at) else {
+            return None
+        }
+        let Some(inner) = json_member(json, within: span, name) else {
+            return None
+        }
+        span = inner
+        start = at + 1
+    }
+    return Some(span)
+} json_field_span
+
+/// The value of the member `name` of the JSON object lying at `within` in `json`.
+fn json_member(json: Str, within: Span, name: Str) -> Option[Span] {
+    let bytes = json.as_bytes()
+    var at = json_blank(bytes, from: within.start, end: within.end)
+    if at >= within.end or bytes[at] != b'{' {
+        return None
+    }
+    at += 1
+    while at < within.end {
+        at = json_blank(bytes, from: at, end: within.end)
+        if at >= within.end or bytes[at] != b'"' {
+            return None
+        }
+        let key_end = json_value_end(bytes, from: at, end: within.end)
+        let Some(key) = json.slice_bytes(at + 1, end: key_end.saturating_sub(1)) else {
+            return None
+        }
+        at = json_blank(bytes, from: key_end, end: within.end)
+        if at >= within.end or bytes[at] != b':' {
+            return None
+        }
+        let value_start = json_blank(bytes, from: at + 1, end: within.end)
+        let value_end = json_value_end(bytes, from: value_start, end: within.end)
+        if key == name {
+            return Some(Span(start: value_start, end: value_end))
+        }
+        at = json_blank(bytes, from: value_end, end: within.end)
+        if at >= within.end or bytes[at] != b',' {
+            return None
+        }
+        at += 1
+    }
+    return None
+} json_member
+
+/// The first byte from `from` on that is no JSON whitespace.
+fn json_blank(bytes: Slice[u8], from: usize, end: usize) -> usize {
+    var at = from
+    while at < end and (bytes[at] == b' ' or bytes[at] == b'\n' or bytes[at] == b'\r' or bytes[at] == b'\t') {
+        at += 1
+    }
+    return at
+} json_blank
+
+/// The end of the JSON value starting at `from`: past its closing quote, bracket or brace, or before the delimiter ending a scalar.
+fn json_value_end(bytes: Slice[u8], from: usize, end: usize) -> usize {
+    var depth: u32 = 0
+    var quoted = false
+    var escaped = false
+    var at = from
+    while at < end {
+        let byte = bytes[at]
+        if quoted {
+            if escaped {
+                escaped = false
+            } else if byte == b'\\' {
+                escaped = true
+            } else if byte == b'"' {
+                quoted = false
+                if depth == 0 {
+                    return at + 1
+                }
+            }
+            at += 1
+            continue
+        }
+        if byte == b'"' {
+            quoted = true
+        } else if byte == b'{' or byte == b'[' {
+            depth += 1
+        } else if byte == b'}' or byte == b']' {
+            if depth == 0 {
+                return at
+            }
+            depth -= 1
+            if depth == 0 {
+                return at + 1
+            }
+        } else if depth == 0 and byte == b',' {
+            return at
+        }
+        at += 1
+    }
+    return at
+} json_value_end
+
+/// `json` with the value of its member `path` replaced by `value`, `None` when it has no such member.
+pub fn json_spliced(json: Str, path: Str, value: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(span) = json_field_span(json, path) else {
+        return None
+    }
+    let Some(head) = json.slice_bytes(0, end: span.start) else {
+        return None
+    }
+    let Some(tail) = json.slice_bytes(span.end, end: json.byte_len()) else {
+        return None
+    }
+    var spliced = text::String.of(head, alloc)
+    mut spliced.append(value)
+    mut spliced.append(tail)
+    return Some(take spliced)
+} json_spliced
+
+test json_members_are_found_and_replaced for json_spliced {
+    let alloc = testing::world().alloc
+    let json = "{\"budget\":{\"limit\":3,\"names\":[\"a,b\",\"c\"]},\"stopped\":false, \"plans\": {\"health_s\": 30}}"
+    let stopped = json_spliced(json, path: "stopped", value: "true", alloc)
+    let health = json_spliced(json, path: "plans.health_s", value: "0", alloc)
+    let missing = json_spliced(json, path: "plans.keep_s", value: "0", alloc)
+    let spliced_stop = match stopped {
+        Some(text) => text.as_str() == "{\"budget\":{\"limit\":3,\"names\":[\"a,b\",\"c\"]},\"stopped\":true, \"plans\": {\"health_s\": 30}}"
+        None => false
+    }
+    let nested = match health {
+        Some(text) => text.as_str().ends_with("{\"health_s\": 0}}")
+        None => false
+    }
+    expect spliced_stop and nested and missing.is_none()
+} json_members_are_found_and_replaced

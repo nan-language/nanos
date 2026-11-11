@@ -1,0 +1,470 @@
+//! Steps: the step lists of `plan` cut into the steps of chapter 14, with their operands and their `--expect`, and the options of plans.
+
+/// The most steps one plan holds.
+const MOST_STEPS: usize = 256
+
+/// A step as its request writes it, its operands checked for their form.
+pub closed enum Step derives Encode {
+    /// `write <path> <value>`, or `write <path>.<field> <value>`, whose path and field the preview splits at the base.
+    Write(target: text::String, value: text::String)
+    Delete(path: ident::Path)
+    Start(moniker: ident::Moniker)
+    Stop(moniker: ident::Moniker)
+    /// `grant <spec>`, a construction literal of a grant without its generated fields.
+    Grant(spec: text::String)
+    Revoke(grant: u64)
+    Call(moniker: ident::Moniker, operation: text::String, arguments: text::String)
+    Revert(commit: ident::CommitId)
+    Redeliver(moniker: ident::Moniker, seq: u64)
+    RestoreCheckpoint(moniker: ident::Moniker, number: u64)
+} Step
+
+/// A step of a plan: the step, the commit or hash its `--expect` names, and its canonical text.
+pub closed struct Written derives Encode {
+    pub step: Step
+    pub expected: Option[store::Version]
+    pub text: text::String
+} Written
+
+/// The options of a plan: its intent, its confirmation window, the length of its spans' health windows, and the branch it commits to.
+pub closed struct Options derives Encode {
+    pub intent: Option[text::String]
+    pub confirm_within_s: Option[u32]
+    pub health_s: u32
+    pub branch: text::String
+} Options
+
+/// The steps the step list `list` writes, `[` and its items separated by `,` then `]`: the failure of the first item that is no step, or of a list without one.
+pub fn steps_of(list: Str, alloc: mem::Alloc) -> Result[mem::List[Written], Failure] {
+    let bytes = list.as_bytes()
+    if bytes.len() < 2 or bytes[0] != b'[' or bytes[bytes.len() - 1] != b']' {
+        return Err(Failure.of("request.invalid-operand", subject: list, alloc).expecting("a step list [<step>, ...]", found: list, alloc))
+    }
+    let Some(inside) = list.slice_bytes(1, end: bytes.len() - 1) else {
+        return Err(Failure.of("request.invalid-operand", subject: list, alloc))
+    }
+    var steps = mem::List[Written].empty(alloc)
+    for item in split_outside(inside, separator: b',', alloc) {
+        if item.byte_len() == 0 {
+            continue
+        }
+        if steps.len() >= MOST_STEPS {
+            return Err(Failure.of("request.too-large", subject: list, alloc).expecting("at most 256 steps", found: "more", alloc))
+        }
+        match step_of(item.as_str(), alloc) {
+            Ok(written) => mut steps.push(take written)
+            Err(failure) => return Err(take failure)
+        }
+    }
+    if steps.len() == 0 {
+        return Err(Failure.of("request.invalid-operand", subject: list, alloc).expecting("at least one step", found: "[]", alloc))
+    }
+    return Ok(take steps)
+} steps_of
+
+/// The step the item `item` writes, its words separated by spaces outside forms and text literals.
+pub fn step_of(item: Str, alloc: mem::Alloc) -> Result[Written, Failure] {
+    let words = split_outside(item, separator: b' ', alloc)
+    var operands = mem::List[text::String].empty(alloc)
+    var expected: Option[store::Version] = None
+    var at: usize = 0
+    while at < words.len() {
+        let word = words[at].as_str()
+        at += 1
+        if word.byte_len() == 0 {
+            continue
+        }
+        if not word.starts_with("--") {
+            mut operands.push(text::String.of(word, alloc))
+            continue
+        }
+        if word != "--expect" or at >= words.len() {
+            return Err(Failure.of("request.invalid-flag", subject: word, alloc).expecting("--expect <commit or hash>", found: word, alloc))
+        }
+        let named = words[at].as_str()
+        at += 1
+        let Some(version) = version_of(named) else {
+            return Err(Failure.of("request.invalid-flag", subject: named, alloc).expecting("a commit #<n> or a full hash", found: named, alloc))
+        }
+        expected = Some(take version)
+    }
+    if operands.len() == 0 {
+        return Err(Failure.of("request.invalid-operand", subject: item, alloc).expecting("a step", found: item, alloc))
+    }
+    let kind = operands[0].as_str()
+    let step = match step_from(kind, operands, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    match step {
+        Step.Write(target: _, value: _) or Step.Delete(path: _) => {
+        }
+        else => {
+            if expected.is_some() {
+                return Err(Failure.of("request.invalid-flag", subject: "--expect", alloc).expecting("--expect on a write or a delete", found: kind, alloc))
+            }
+        }
+    }
+    var text = text::String.empty(alloc)
+    for operand in operands {
+        if text.byte_len() > 0 {
+            mut text.push(' ')
+        }
+        mut text.append(operand.as_str())
+    }
+    mut text.append(expect_suffix(expected, alloc).as_str())
+    return Ok(Written(step: take step, expected: take expected, text: take text))
+} step_of
+
+/// How many steps the step list `list` holds.
+pub fn step_count(list: Str, alloc: mem::Alloc) -> usize {
+    let Some(inside) = list.slice_bytes(1, end: list.byte_len().saturating_sub(1)) else {
+        return 0
+    }
+    var count: usize = 0
+    for item in split_outside(inside, separator: b',', alloc) {
+        if item.byte_len() > 0 {
+            count += 1
+        }
+    }
+    return count
+} step_count
+
+/// The step of kind `kind` whose words, the kind first, are `operands`.
+fn step_from(kind: Str, operands: mem::List[text::String], alloc: mem::Alloc) -> Result[Step, Failure] {
+    return match kind {
+        "write" or "delete" or "grant" => tree_step(kind, operands, alloc)
+        "start" or "stop" or "redeliver" or "restore-checkpoint" => instance_step(kind, operands, alloc)
+        "call" or "revoke" or "revert" => named_step(kind, operands, alloc)
+        else => Err(Failure.of("request.invalid-operand", subject: kind, alloc).expecting("a step among write, delete, start, stop, grant, revoke, call, revert, redeliver and restore-checkpoint", found: kind, alloc))
+    }
+} step_from
+
+/// A `write`, `delete` or `grant` step.
+fn tree_step(kind: Str, operands: mem::List[text::String], alloc: mem::Alloc) -> Result[Step, Failure] {
+    let count = operands.len()
+    if kind == "delete" {
+        if count != 2 {
+            return Err(step_failure(kind, expected: "delete <path>", alloc))
+        }
+        let Some(path) = path_of(operands[1].as_str(), alloc) else {
+            return Err(operand_failure(operands[1].as_str(), expected: "a path", alloc))
+        }
+        return Ok(Step.Delete(path: take path))
+    }
+    let first_value: usize = match kind == "write" {
+        true => 2
+        false => 1
+    }
+    if count <= first_value or (kind == "write" and not operands[1].as_str().starts_with("/")) {
+        return Err(step_failure(kind, expected: "write <path> <value> or grant <grant>", alloc))
+    }
+    var value = text::String.empty(alloc)
+    for at in first_value..<count {
+        if at > first_value {
+            mut value.push(' ')
+        }
+        mut value.append(operands[at].as_str())
+    }
+    if kind == "grant" {
+        return Ok(Step.Grant(spec: take value))
+    }
+    return Ok(Step.Write(target: text::String.of(operands[1].as_str(), alloc), value: take value))
+} tree_step
+
+/// A `start`, `stop`, `redeliver` or `restore-checkpoint` step.
+fn instance_step(kind: Str, operands: mem::List[text::String], alloc: mem::Alloc) -> Result[Step, Failure] {
+    let numbered = kind == "redeliver" or kind == "restore-checkpoint"
+    let words: usize = match numbered {
+        true => 3
+        false => 2
+    }
+    if operands.len() != words {
+        return Err(step_failure(kind, expected: "start <moniker>, stop <moniker>, redeliver <moniker> <seq> or restore-checkpoint <moniker> <n>", alloc))
+    }
+    let Some(moniker) = moniker_of(operands[1].as_str()) else {
+        return Err(operand_failure(operands[1].as_str(), expected: "a moniker", alloc))
+    }
+    if kind == "start" {
+        return Ok(Step.Start(moniker: take moniker))
+    }
+    if kind == "stop" {
+        return Ok(Step.Stop(moniker: take moniker))
+    }
+    let Some(number) = number_of(operands[2].as_str()) else {
+        return Err(operand_failure(operands[2].as_str(), expected: "a number", alloc))
+    }
+    if kind == "redeliver" {
+        return Ok(Step.Redeliver(moniker: take moniker, seq: number))
+    }
+    return Ok(Step.RestoreCheckpoint(moniker: take moniker, number: number))
+} instance_step
+
+/// A `call`, `revoke` or `revert` step.
+fn named_step(kind: Str, operands: mem::List[text::String], alloc: mem::Alloc) -> Result[Step, Failure] {
+    let count = operands.len()
+    if kind == "call" {
+        if count != 3 {
+            return Err(step_failure(kind, expected: "call <moniker> <op>(<args>)", alloc))
+        }
+        let Some(moniker) = moniker_of(operands[1].as_str()) else {
+            return Err(operand_failure(operands[1].as_str(), expected: "a moniker", alloc))
+        }
+        let Some(called) = operation_of(operands[2].as_str(), alloc) else {
+            return Err(operand_failure(operands[2].as_str(), expected: "an operation call <op>(<args>)", alloc))
+        }
+        let Called(operation: operation, arguments: arguments) = called
+        return Ok(Step.Call(moniker: take moniker, operation: take operation, arguments: take arguments))
+    }
+    if count != 2 {
+        return Err(step_failure(kind, expected: "revoke g<n> or revert #<n>", alloc))
+    }
+    if kind == "revoke" {
+        let Some(number) = grant_number_of(operands[1].as_str()) else {
+            return Err(operand_failure(operands[1].as_str(), expected: "a grant g<n>", alloc))
+        }
+        return Ok(Step.Revoke(grant: number))
+    }
+    let Some(commit) = ident::CommitId.parse(operands[1].as_str()) else {
+        return Err(operand_failure(operands[1].as_str(), expected: "a commit #<n>", alloc))
+    }
+    return Ok(Step.Revert(commit: commit))
+} named_step
+
+/// The failure of a step of kind `kind` whose words do not take the form `expected`.
+fn step_failure(kind: Str, expected: Str, alloc: mem::Alloc) -> Failure {
+    return Failure.of("request.invalid-operand", subject: kind, alloc).expecting(expected, found: kind, alloc)
+} step_failure
+
+/// The failure of the operand `word`, which is not `expected`.
+fn operand_failure(word: Str, expected: Str, alloc: mem::Alloc) -> Failure {
+    return Failure.of("request.invalid-operand", subject: word, alloc).expecting(expected, found: word, alloc)
+} operand_failure
+
+/// An operation call: the operation's name and the text of its arguments between the parentheses.
+pub closed struct Called derives Encode {
+    pub operation: text::String
+    pub arguments: text::String
+} Called
+
+/// The operation call `word` writes, `<op>(<args>)`, its name a NaN function name.
+pub fn operation_of(word: Str, alloc: mem::Alloc) -> Option[Called] {
+    let Some(open) = word.find("(") else {
+        return None
+    }
+    if open == 0 or not word.ends_with(")") {
+        return None
+    }
+    let Some(name) = word.slice_bytes(0, end: open) else {
+        return None
+    }
+    for byte in name.as_bytes() {
+        if not ((byte >= b'a' and byte <= b'z') or (byte >= b'0' and byte <= b'9') or byte == b'_') {
+            return None
+        }
+    }
+    let Some(arguments) = word.slice_bytes(open + 1, end: word.byte_len() - 1) else {
+        return None
+    }
+    return Some(Called(operation: text::String.of(name, alloc), arguments: text::String.of(arguments, alloc)))
+} operation_of
+
+/// The moniker `word` writes.
+pub fn moniker_of(word: Str) -> Option[ident::Moniker] {
+    if word.byte_len() == 0 or word.byte_len() > 59 {
+        return None
+    }
+    let name = text::Fixed[59].of(word)
+    if not ident::is_moniker(name) {
+        return None
+    }
+    return Some(ident::Moniker(text: name))
+} moniker_of
+
+/// The version an `--expect` names: a commit `#<n>`, or a full hash.
+fn version_of(word: Str) -> Option[store::Version] {
+    match ident::CommitId.parse(word) {
+        Some(commit) => return Some(store::Version.Commit(commit))
+        None => {
+        }
+    }
+    return match ident::HashText.parse(word) {
+        Some(ident::HashText.Full(hash)) => Some(store::Version.Hash(hash))
+        else => None
+    }
+} version_of
+
+/// ` --expect <version>` for a step expecting `expected`, else nothing.
+fn expect_suffix(expected: Option[store::Version], alloc: mem::Alloc) -> text::String {
+    let Some(version) = expected else {
+        return text::String.empty(alloc)
+    }
+    var suffix = text::String.of(" --expect ", alloc)
+    mut suffix.append(version_text(version, alloc).as_str())
+    return suffix
+} expect_suffix
+
+/// The text of a version an `--expect` names.
+fn version_text(version: store::Version, alloc: mem::Alloc) -> text::String {
+    var text = text::String.empty(alloc)
+    match version {
+        store::Version.Commit(commit) => mut text.write(Dyn[Render].view(commit), budget: 32)
+        store::Version.Hash(hash) => mut text.append(hash.full_form().as_str())
+        store::Version.Absent => mut text.append("absent")
+    }
+    return text
+} version_text
+
+/// The parts of `text` between the bytes `separator` lying outside forms and text literals, each without the spaces around it.
+fn split_outside(text: Str, separator: u8, alloc: mem::Alloc) -> mem::List[text::String] {
+    var found = mem::List[text::String].empty(alloc)
+    let bytes = text.as_bytes()
+    var depth: u32 = 0
+    var quoted = false
+    var escaped = false
+    var start: usize = 0
+    for at in 0..=bytes.len() {
+        if at < bytes.len() {
+            let byte = bytes[at]
+            if quoted {
+                if escaped {
+                    escaped = false
+                } else if byte == b'\\' {
+                    escaped = true
+                } else if byte == b'"' {
+                    quoted = false
+                }
+                continue
+            }
+            if byte == b'"' {
+                quoted = true
+                continue
+            }
+            if byte == b'(' or byte == b'[' or byte == b'{' {
+                depth += 1
+                continue
+            }
+            if (byte == b')' or byte == b']' or byte == b'}') and depth > 0 {
+                depth -= 1
+                continue
+            }
+            if depth > 0 or byte != separator {
+                continue
+            }
+        }
+        match text.slice_bytes(start, end: at) {
+            Some(piece) => mut found.push(trimmed(piece, alloc))
+            None => {
+            }
+        }
+        start = at + 1
+    }
+    return found
+} split_outside
+
+/// `text` without the spaces around it.
+fn trimmed(text: Str, alloc: mem::Alloc) -> text::String {
+    let bytes = text.as_bytes()
+    var start: usize = 0
+    var end = bytes.len()
+    while start < end and bytes[start] == b' ' {
+        start += 1
+    }
+    while end > start and bytes[end - 1] == b' ' {
+        end -= 1
+    }
+    return match text.slice_bytes(start, end) {
+        Some(inner) => text::String.of(inner, alloc)
+        None => text::String.empty(alloc)
+    }
+} trimmed
+
+/// The options `request` gives a plan, with the configuration's health window by default: `--intent "<text>"`, `--confirm-within <s>`, `--health <s>` and `--at <branch>`.
+pub fn options_of(request: Request, plans: PlanConfig, alloc: mem::Alloc) -> Result[Options, Failure] {
+    var options = Options(intent: None, confirm_within_s: None, health_s: plans.health_s, branch: text::String.of("main", alloc))
+    match request.flag("intent") {
+        Some(written) => {
+            let bytes = written.as_bytes()
+            if bytes.len() < 2 or bytes[0] != b'"' or bytes[bytes.len() - 1] != b'"' or written.byte_len() > 1_026 {
+                return Err(Failure.of("request.invalid-flag", subject: "--intent", alloc).expecting("a text literal of at most 1 KiB", found: written, alloc))
+            }
+            options.intent = Some(literal_text(written, from: 1, end: bytes.len() - 1, alloc))
+        }
+        None => {
+        }
+    }
+    match request.flag("confirm-within") {
+        Some(written) => {
+            let Some(seconds) = number_of(written) else {
+                return Err(Failure.of("request.invalid-flag", subject: "--confirm-within", alloc).expecting("a number of seconds", found: written, alloc))
+            }
+            if seconds > 0 {
+                options.confirm_within_s = Some(u32.saturate(seconds))
+            }
+        }
+        None => {
+        }
+    }
+    match request.flag("health") {
+        Some(written) => {
+            let Some(seconds) = number_of(written) else {
+                return Err(Failure.of("request.invalid-flag", subject: "--health", alloc).expecting("a number of seconds", found: written, alloc))
+            }
+            options.health_s = u32.saturate(seconds)
+        }
+        None => {
+        }
+    }
+    match request.flag("at") {
+        Some(branch) => {
+            if branch != "main" {
+                return Err(Failure.of("plan.step-misplaced", subject: branch, alloc).expecting("the running branch main", found: branch, alloc))
+            }
+        }
+        None => {
+        }
+    }
+    return Ok(take options)
+} options_of
+
+test step_lists_cut_into_steps_with_their_expectations for steps_of {
+    let alloc = testing::world().alloc
+    let Ok(steps) = steps_of("[write /sys/config/app.feeds.batch 32, call app.feeds refresh(), delete /data/a --expect #12,]", alloc) else {
+        expect false
+        return
+    }
+    expect steps.len() == 3
+    expect steps[0].text.as_str() == "write /sys/config/app.feeds.batch 32"
+    expect steps[1].text.as_str() == "call app.feeds refresh()"
+    expect steps[2].text.as_str() == "delete /data/a --expect #12"
+    expect steps[2].expected == Some(store::Version.Commit(ident::CommitId(number: 12)))
+    let Ok(spaced) = steps_of("[write /data/notes Note(text: \"a, b\", tags: [1, 2])]", alloc) else {
+        expect false
+        return
+    }
+    expect spaced.len() == 1 and spaced[0].text.as_str() == "write /data/notes Note(text: \"a, b\", tags: [1, 2])"
+    let Ok(called) = step_of("call app.feeds refresh(limit: 3)", alloc) else {
+        expect false
+        return
+    }
+    let Written(step: step, expected: _, text: _) = called
+    let Step.Call(moniker: moniker, operation: operation, arguments: arguments) = step else {
+        expect false
+        return
+    }
+    expect moniker.text.as_str() == "app.feeds" and operation.as_str() == "refresh" and arguments.as_str() == "limit: 3"
+    let Err(unknown) = steps_of("[install /data/b.bundle]", alloc) else {
+        expect false
+        return
+    }
+    let Err(empty) = steps_of("[]", alloc) else {
+        expect false
+        return
+    }
+    let Err(misflagged) = steps_of("[stop app --expect #3]", alloc) else {
+        expect false
+        return
+    }
+    expect unknown.code.as_str() == "request.invalid-operand" and empty.code.as_str() == "request.invalid-operand"
+    expect misflagged.code.as_str() == "request.invalid-flag"
+} step_lists_cut_into_steps_with_their_expectations
