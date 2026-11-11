@@ -1,6 +1,6 @@
 # 0028. Devices with storm containment
 
-Status: accepted
+Status: superseded by 0062
 
 ## Context
 
