@@ -20,13 +20,13 @@ fn segments_below(path: ident::Path, top: Slice[u8], alloc: mem::Alloc) -> Optio
     return Some(take segments)
 } segments_below
 
-/// What the store stamps on a commit made through the View: its principal and instance, the cause of the request, the typedness of its writes, no session or origins yet.
+/// What the store stamps on a commit made through the View: its principal, its instance or session, the cause of the request, the typedness of its writes, no origins yet.
 fn Scoped.stamp(self, typed: bool, alloc: mem::Alloc) -> store::Stamp {
     let instance = match self.instance {
         Some(moniker) => Some(ident::Moniker(text: moniker.text))
         None => None
     }
-    return store::Stamp(principal: ident::Principal(text: self.principal.text), session: None, instance: take instance, cause: self.cause, origins: mem::List.empty(alloc), typed: typed)
+    return store::Stamp(principal: ident::Principal(text: self.principal.text), session: self.session, instance: take instance, cause: self.cause, origins: mem::List.empty(alloc), typed: typed)
 } Scoped.stamp
 
 /// Fails `store.denied` unless the View holds what `need` asks.
@@ -149,7 +149,7 @@ fn Scoped.before(self, before: Option[ident::CommitId]) -> Option[ident::CommitI
     }
 } Scoped.before
 
-/// Runs a request other than a commit, a mapping, or the creation or deletion of a branch, and gives its reply's encoding.
+/// Runs a request other than a commit, a mapping, the creation or deletion of a branch or an acting View, and gives its reply's encoding.
 fn Sequencer.run(mut self, take scope: Scoped, take job: Job, world: Surroundings) -> mem::Bytes fails task::Cancelled uses wait {
     let alloc = world.alloc
     return match job {
@@ -161,7 +161,7 @@ fn Sequencer.run(mut self, take scope: Scoped, take job: Job, world: Surrounding
         Job.Draft => encoded(mut self.draft(scope, world), alloc)
         Job.DraftAppend(draft: draft, bytes: bytes) => encoded(try await mut self.draft_append(scope, draft, bytes, world), alloc)
         Job.DraftClose(draft: draft, expected: expected) => encoded(try await mut self.draft_close(scope, draft, expected, world), alloc)
-        Job.Commit(transaction: _, typed: _) or Job.Map(path: _, at: _, offset: _, length: _) or Job.Branch(name: _, at: _) or Job.DeleteBranch(name: _) => encoded(Err[Unit, Failure](Failure.Kind), alloc)
+        Job.Commit(transaction: _, typed: _) or Job.Map(path: _, at: _, offset: _, length: _) or Job.Branch(name: _, at: _) or Job.Preview or Job.Acting(principal: _, session: _) or Job.DeleteBranch(name: _) => encoded(Err[Unit, Failure](Failure.Kind), alloc)
         Job.Append(path: path, entries: entries) => encoded(try await mut self.append(scope, path, take entries, world), alloc)
         Job.ReadStream(path: path, from: from, limit: limit) => encoded(try await mut self.read_stream(scope, path, from, limit, world), alloc)
         Job.Subscribe(subscription: subscription, prefix: prefix, since: since, port: port) => encoded(try await mut self.subscribe(scope, subscription, prefix, since, port, world), alloc)
@@ -528,6 +528,29 @@ fn Sequencer.branch(
     return branched_reply(take made, view, alloc)
 } Sequencer.branch
 
+/// Creates the branch `preview/<n>` at the head of the View's branch: the reply holds its record and the handle of a View of it, which `roots` holds the root entry of.
+fn Sequencer.preview(mut self, scope: Scoped, mut roots: BranchRoots, world: Surroundings) -> sys::Encoded fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    if (attempt scope.check(need: Need.Admin)).is_err() {
+        return plain(encoded(Err[BranchedReply, Failure](Failure.Denied), alloc), alloc)
+    }
+    let made = match try settled(attempt await mut self.engine.preview(self.volume, from: scope.branch.as_str(), by: scope.principal, now: world.now(), alloc)) {
+        Ok(branch) => branch
+        Err(failure) => return plain(encoded(Err[BranchedReply, Failure](take failure), alloc), alloc)
+    }
+    let view = mut roots.mint(scope, name: made.name.as_str(), alloc)
+    return branched_reply(take made, view, alloc)
+} Sequencer.preview
+
+/// A View acting for `principal` in `session` with the subtree, branch and rights of a View that owns the nodes their owning operations write, `store.denied` for any other View.
+fn Sequencer.acting(scope: Scoped, take principal: ident::Principal, session: ident::SessionId, mut roots: BranchRoots, alloc: mem::Alloc) -> sys::Encoded {
+    if not Rights.from_bits(scope.rights).own {
+        return plain(encoded(Err[ActingReply, Failure](Failure.Denied), alloc), alloc)
+    }
+    let view = mut roots.acting(scope, take principal, session, alloc)
+    return acting_reply(view, alloc)
+} Sequencer.acting
+
 /// Deletes the branch `name`, revoking the Views of it `roots` holds the root entries of.
 fn Sequencer.delete_branch(
     mut self,
@@ -568,6 +591,7 @@ fn Sequencer.erase(mut self, scope: Scoped, path: ident::Path, world: Surroundin
     return try settled(attempt await mut self.engine.erase(self.volume, branch: scope.branch.as_str(), path: ident::Path(text: text::String.of(resolved.text.as_str(), alloc)), stamp: scope.stamp(typed: true, alloc), now: world.now(), alloc))
 } Sequencer.erase
 
+/// Reverts the commit `commit`, or gives the writes reverting it when `dry_run`, and tells the subscriptions of the revert's commit.
 fn Sequencer.revert(
     mut self,
     scope: Scoped,
@@ -575,10 +599,27 @@ fn Sequencer.revert(
     dry_run: bool,
     world: Surroundings,
     ) -> Result[store::Reverted, Failure] fails task::Cancelled uses wait {
+    let alloc = world.alloc
     if (attempt scope.check(need: Need.Write)).is_err() {
         return Err(Failure.Denied)
     }
-    return try settled(attempt await mut self.engine.revert(self.volume, branch: scope.branch.as_str(), commit, dry_run, stamp: scope.stamp(typed: true, alloc: world.alloc), now: world.now(), alloc: world.alloc))
+    let planned = try settled(attempt await mut self.engine.revert(self.volume, branch: scope.branch.as_str(), commit, dry_run: true, stamp: scope.stamp(typed: true, alloc), now: world.now(), alloc))
+    let writes = match planned {
+        Ok(store::Reverted.Writes(found)) => found
+        else => return planned
+    }
+    if dry_run {
+        return Ok(store::Reverted.Writes(take writes))
+    }
+    let reverted = try settled(attempt await mut self.engine.revert(self.volume, branch: scope.branch.as_str(), commit, dry_run: false, stamp: scope.stamp(typed: true, alloc), now: world.now(), alloc))
+    match reverted {
+        Ok(store::Reverted.Committed(done)) => {
+            try await mut self.tell(branch: scope.branch.as_str(), commit: done.number, paths: written_paths(writes, alloc), alloc)
+            return Ok(store::Reverted.Committed(take done))
+        }
+        Ok(store::Reverted.Writes(left)) => return Ok(store::Reverted.Writes(take left))
+        Err(failure) => return Err(take failure)
+    }
 } Sequencer.revert
 
 fn Sequencer.pin(

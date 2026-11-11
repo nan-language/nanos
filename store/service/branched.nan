@@ -1,4 +1,4 @@
-//! The Views of branches: the store mints a View of each branch a request creates, holding its root entry until the branch is deleted.
+//! The Views of branches and of sessions: the store mints a View of each branch a request creates, holding its root entry until the branch is deleted, and Views acting for the principals of sessions, holding the root entries of the latest.
 
 /// A branch a request created, and a View of it with the requesting View's subtree and rights.
 pub closed struct Branched {
@@ -12,11 +12,32 @@ struct BranchedReply derives Render, Encode {
     view: u64
 } BranchedReply
 
-/// A branch's name and the root entry of its Views.
+/// A View acting for a session's principal.
+pub closed struct Acting {
+    pub view: View
+} Acting
+
+/// The encoding of an `Acting` reply, its View written as the index of its handle.
+struct ActingReply derives Render, Encode {
+    view: u64
+} ActingReply
+
+/// The most root entries of Views acting for sessions the store holds; the least recently used gives way.
+const MOST_ACTING: usize = 64
+
+/// A branch's name and the root entry of its Views, and for Views acting for a session's principal, their subtree, that principal and that session.
 linear struct BranchRoot {
     name: text::String
     root: MintedView
+    acting: Option[ActingFor]
 } BranchRoot
+
+/// The subtree, principal and session the Views of a root entry act for.
+struct ActingFor derives Eq {
+    prefix: ident::Path
+    principal: ident::Principal
+    session: ident::SessionId
+} ActingFor
 
 /// The root entries of the Views of the branches requests created.
 linear struct BranchRoots {
@@ -30,28 +51,73 @@ fn branched_reply(take made: store::Branch, view: View, alloc: mem::Alloc) -> sy
     return reply
 } branched_reply
 
+/// The reply giving `view`, its encoding naming its handle by its index.
+fn acting_reply(view: View, alloc: mem::Alloc) -> sys::Encoded {
+    var reply = plain(encoded(Ok[ActingReply, Failure](ActingReply(view: 0)), alloc), alloc)
+    mut reply.handles.push(sys::Handle.of(view))
+    return reply
+} acting_reply
+
 fn BranchRoots.empty(alloc: mem::Alloc) -> BranchRoots {
     return BranchRoots(roots: mem::List.empty(alloc))
 } BranchRoots.empty
 
-/// A View of the branch `name` with the subtree, rights, principal and instance of `scope`.
+/// A View of the branch `name` with the subtree, rights, principal, instance and session of `scope`.
 fn BranchRoots.mint(mut self, scope: Scoped, name: Str, alloc: mem::Alloc) -> View {
     let instance = match scope.instance {
         Some(moniker) => Some(ident::Moniker(text: moniker.text))
         None => None
     }
-    let root = MintedView.of(store: scope.store, prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), branch: name, principal: ident::Principal(text: scope.principal.text), take instance, alloc)
+    let root = MintedView.of_writer(store: scope.store, prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), branch: name, principal: ident::Principal(text: scope.principal.text), take instance, session: scope.session, alloc)
     let view = root.mint(Rights.from_bits(scope.rights))
-    mut self.roots.push(BranchRoot(name: text::String.of(name, alloc), root: take root))
+    mut self.roots.push(BranchRoot(name: text::String.of(name, alloc), root: take root, acting: None))
     return view
 } BranchRoots.mint
+
+/// A View of the subtree, branch and rights of `scope` acting for `principal` in `session`, from the root entry held for them, made when none is, the least recently used acting root entry giving way beyond `MOST_ACTING`.
+fn BranchRoots.acting(mut self, scope: Scoped, take principal: ident::Principal, session: ident::SessionId, alloc: mem::Alloc) -> View {
+    let wanted = ActingFor(prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), principal: take principal, session: session)
+    let rights = Rights.from_bits(scope.rights)
+    var held: usize = 0
+    var oldest: Option[usize] = None
+    for at in 0..<self.roots.len() {
+        match self.roots[at].acting {
+            Some(acting) => {
+                if acting == wanted and self.roots[at].name == scope.branch {
+                    let kept = mut self.roots.remove(at)
+                    let view = kept.root.mint(rights)
+                    mut self.roots.push(take kept)
+                    return view
+                }
+                held += 1
+                if oldest.is_none() {
+                    oldest = Some(at)
+                }
+            }
+            None => {
+            }
+        }
+    }
+    match first oldest {
+        Some(at) if held >= MOST_ACTING => {
+            let BranchRoot(name: _, root: gone, acting: _) = mut self.roots.remove(at)
+            take gone.close()
+        }
+        else => {
+        }
+    }
+    let root = MintedView.of_writer(store: scope.store, prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), branch: scope.branch.as_str(), principal: ident::Principal(text: wanted.principal.text), instance: None, session: Some(session), alloc)
+    let view = root.mint(rights)
+    mut self.roots.push(BranchRoot(name: text::String.of(scope.branch.as_str(), alloc), root: take root, acting: Some(take wanted)))
+    return view
+} BranchRoots.acting
 
 /// Revokes the Views of the branch `name`.
 fn BranchRoots.revoke(mut self, name: Str) {
     var at: usize = 0
     while at < self.roots.len() {
         if self.roots[at].name.as_str() == name {
-            let BranchRoot(name: _, root: root) = mut self.roots.remove(at)
+            let BranchRoot(name: _, root: root, acting: _) = mut self.roots.remove(at)
             take root.close()
         } else {
             at += 1
@@ -63,7 +129,7 @@ fn BranchRoots.revoke(mut self, name: Str) {
 fn BranchRoots.close(take self) {
     let BranchRoots(roots: roots) = self
     for held in take roots {
-        let BranchRoot(name: _, root: root) = held
+        let BranchRoot(name: _, root: root, acting: _) = held
         take root.close()
     }
 } BranchRoots.close
@@ -88,3 +154,39 @@ test branch_replies_decode_as_the_protocol_reads_them for branched_reply {
     expect branched.branch.fork == ident::CommitId(number: 4) and branched.branch.name.as_str() == "feature"
     expect scope.branch.as_str() == "feature" and scope.prefix.text.as_str() == "/data"
 } branch_replies_decode_as_the_protocol_reads_them
+
+test acting_views_stamp_their_session_and_the_oldest_gives_way for BranchRoots.acting {
+    let alloc = testing::world().alloc
+    var views = TestViews.of(branch: "main", alloc)
+    defer take views.close()
+    var roots = BranchRoots.empty(alloc)
+    defer take roots.close()
+    let Some(scope) = views.root.mint(Rights.all()).scoped(alloc) else {
+        expect false
+        return
+    }
+    let session = ident::SessionId(boot: 2, number: 7)
+    let earliest = mut roots.acting(scope, principal: ident::Principal(text: text::Fixed[64].of("agent.ops")), session, alloc)
+    let again = mut roots.acting(scope, principal: ident::Principal(text: text::Fixed[64].of("agent.ops")), session, alloc)
+    let reply = acting_reply(earliest, alloc)
+    var call = sys::Encoded.empty(alloc)
+    let reading = sys::Wire[Store].acting(mut call, view: earliest, principal: ident::Principal(text: text::Fixed[64].of("agent.ops")), session)
+    let Ok(acting) = attempt reading.decode(Untrusted.of(reply.bytes.view()), handles: reply.handles.view(), alloc) else {
+        expect false
+        return
+    }
+    let Some(acted) = acting.view.scoped(alloc) else {
+        expect false
+        return
+    }
+    let stamp = acted.stamp(typed: true, alloc)
+    expect stamp.principal.text.as_str() == "agent.ops" and stamp.session == Some(session) and stamp.instance.is_none()
+    expect acted.branch.as_str() == "main" and acted.prefix.text.as_str() == "/data" and Rights.from_bits(acted.rights).write
+    let reused = again.scoped(alloc).is_some()
+    expect roots.roots.len() == 1 and reused
+    for number in 0..<64u64 {
+        discard mut roots.acting(scope, principal: ident::Principal(text: text::Fixed[64].of("owner")), session: ident::SessionId(boot: 2, number: 100 + number), alloc)
+    }
+    let evicted = earliest.scoped(alloc).is_none()
+    expect roots.roots.len() == MOST_ACTING and evicted
+} acting_views_stamp_their_session_and_the_oldest_gives_way
