@@ -17,13 +17,14 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `ident/` | The `ident` package: the names, identifiers, hashes and times of NaN OS records |
 | `bootfmt/` | The `bootfmt` package: the boot record, the handoff record and the kernel image |
 | `acpi/` | The `acpi` package: the ACPI tables NaN OS reads |
+| `crypto/` | The `crypto` package: XChaCha20-Poly1305 sealing and BLAKE3 key derivation on secret values |
 | `os/` | The `os` package: the records instances and the core share, and the capability kinds `Port`, `Control` and `Live` |
 | `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints and dead letters |
 | `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |
 | `devices/` | The `devices` package: the device protocols and `fat`'s, the `drivers` registry, the AML evaluator, partition tables, volume views and the device manager |
 | `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries |
 | `fat/` | The `fat` package: the boot volume's file system |
-| `store/` | The `store` package: the store's engine, its log, index trees, item table and blob cache, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol, Views and mappings |
+| `store/` | The `store` package: the store's engine, its log, index trees, item table, blob cache and keyring, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol, Views and mappings |
 | `journal/` | The `journal` package: events and the kernel image's kind table, the streams of `/journal`, sources, log capabilities, and the `journal` instance |
 | `keys/` | The `keys` package: the `keys` instance, the machine's keys and the principals' |
 | `policy/` | The `policy` package: the policy's records, presets, patterns and evaluation, and the `policy` instance |

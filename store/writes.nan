@@ -4,12 +4,13 @@
 const INLINE_BYTES: usize = 1_024
 
 /// Applies one write.
-pkg fn Store.apply_write[D: disk::Device](
+pkg fn Store.apply_write[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     write: Write,
     writing: Writing,
     mut staged: Staged,
+    secrets: K,
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
     let segments = write.path().segments(alloc)
@@ -21,10 +22,10 @@ pkg fn Store.apply_write[D: disk::Device](
         fail StoreError.Denied
     }
     match write {
-        Write.Put(path: _, value: value) => try await mut self.put_value(device, segments: segments.view(), value, writing, mut staged, alloc)
+        Write.Put(path: _, value: value) => try await mut self.put_value(device, segments: segments.view(), value, writing, mut staged, secrets, alloc)
         Write.Make(path: _, declaration: declaration) => try await mut self.make_node(device, segments: segments.view(), declaration, writing, mut staged, alloc)
         Write.Delete(path: _) => try await mut self.delete_node(device, segments: segments.view(), writing, mut staged, alloc)
-        Write.Add(path: _, value: value) => try await mut self.add_child(device, segments: segments.view(), value, writing, mut staged, alloc)
+        Write.Add(path: _, value: value) => try await mut self.add_child(device, segments: segments.view(), value, writing, mut staged, secrets, alloc)
         Write.Append(path: _, entries: entries) => try await mut self.append_entries(device, segments: segments.view(), entries: entries.view(), writing, mut staged, alloc)
         Write.Expire(path: _, at: at) => try await mut self.expire_node(device, segments: segments.view(), at, writing, mut staged, alloc)
         Write.Hold(path: _, on: on) => try await mut self.hold_node(device, segments: segments.view(), on, writing, mut staged, alloc)
@@ -33,13 +34,14 @@ pkg fn Store.apply_write[D: disk::Device](
 } Store.apply_write
 
 /// Creates or replaces a record or blob.
-fn Store.put_value[D: disk::Device](
+fn Store.put_value[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     segments: Slice[mem::Bytes],
     value: Value,
     writing: Writing,
     mut staged: Staged,
+    secrets: K,
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
     if segments.len() < 2 {
@@ -58,7 +60,7 @@ fn Store.put_value[D: disk::Device](
         }
     }
     try check_numbered_name(parent, name: place.name.view())
-    let entry = try await mut self.value_entry(device, value, parent, existing, writing, mut staged, alloc)
+    let entry = try await mut self.value_entry(device, value, parent, existing, writing, mut staged, secrets, alloc)
     try await mut self.place_entry(device, place, take entry, existing, resolution, writing, mut staged, alloc)
 } Store.put_value
 
@@ -93,8 +95,8 @@ fn Store.place_entry[D: disk::Device](
     mut staged.touch(resolution.found.view(), count: ancestors, children_changed: added, alloc)
 } Store.place_entry
 
-/// The entry a `Put` or `Add` of `value` writes over `existing`, below a dir of declaration `parent`.
-fn Store.value_entry[D: disk::Device](
+/// The entry a `Put` or `Add` of `value` writes over `existing`, below a dir of declaration `parent`: a secret record when the value, its dir or the record it replaces is secret, sealed through `secrets`; a blob below a `secret` dir fails with `store.kind`.
+pkg fn Store.value_entry[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     value: Value,
@@ -102,6 +104,7 @@ fn Store.value_entry[D: disk::Device](
     existing: Option[NodeEntry],
     writing: Writing,
     mut staged: Staged,
+    secrets: K,
     alloc: mem::Alloc,
     ) -> NodeEntry fails StoreError uses wait {
     let kind = match value {
@@ -122,29 +125,33 @@ fn Store.value_entry[D: disk::Device](
         Some(declaration) => declaration.secret
         None => false
     }
-    let secret = match value {
-        Value.Record(type: _, bytes: _, secret: held) => held
-        Value.Blob(_) => false
-    }
-    if secret or secret_dir {
-        fail StoreError.Kind
+    let replaces_secret = match existing {
+        Some(old) => old.secret != 0
+        None => false
     }
     return match value {
-        Value.Record(type: type, bytes: bytes, secret: _) => try await mut self.record_entry(device, type, bytes: bytes.view(), parent, existing, writing, mut staged, alloc)
-        Value.Blob(id) => try await mut self.blob_entry(device, id, writing, alloc)
+        Value.Record(type: type, bytes: bytes, secret: flagged) => try await mut self.record_entry(device, type, bytes: bytes.view(), parent, existing, sealing: flagged or secret_dir or replaces_secret, writing, mut staged, secrets, alloc)
+        Value.Blob(id) => {
+            if secret_dir {
+                fail StoreError.Kind
+            }
+            return try await mut self.blob_entry(device, id, writing, alloc)
+        }
     }
 } Store.value_entry
 
 /// The entry of a record of `type` and wire bytes `bytes`, checked against its declared type: its dir's element type, else the node's own, else `type`.
-fn Store.record_entry[D: disk::Device](
+fn Store.record_entry[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     type: TypeRef,
     bytes: Slice[u8],
     parent: Option[DirDecl],
     existing: Option[NodeEntry],
+    sealing: bool,
     writing: Writing,
     mut staged: Staged,
+    secrets: K,
     alloc: mem::Alloc,
     ) -> NodeEntry fails StoreError uses wait {
     let declared = try await mut self.declared_type(device, parent, existing, alloc)
@@ -163,13 +170,29 @@ fn Store.record_entry[D: disk::Device](
     if record.len() > MOST_RECORD_BYTES {
         fail StoreError.TooLarge
     }
+    var secret: u64 = 0
+    if sealing {
+        secret = match existing {
+            Some(old) => old.secret
+            None => 0
+        }
+        var seed = Array[u8, 32].filled(0)
+        if secret == 0 {
+            seed = secrets.seed()
+            secret = try await mut self.new_secret(device, seed, commit: writing.number, alloc)
+            mut staged.secrets.push(secret)
+        } else {
+            seed = try self.seed_of(secret)
+        }
+        record = try await secrets.seal(secret, seed, schema: type.schema, value: record.view(), alloc)
+    }
     let type_id = try await mut self.type_id(device, type, mut staged, alloc)
     let content = mut self.record_content(take record, agent: writing.agent, mut staged, alloc)
     let held = match existing {
         Some(old) => old.held
         None => false
     }
-    return NodeEntry(kind: NodeKind.Record.code(), version: writing.number, subtree: 0, origins: writing.origins, type: type_id, declared: 0, secret: 0, expires: 0, hash: None, held: held, content: take content)
+    return NodeEntry(kind: NodeKind.Record.code(), version: writing.number, subtree: 0, origins: writing.origins, type: type_id, declared: 0, secret: secret, expires: 0, hash: None, held: held, content: take content)
 } Store.record_entry
 
 /// What holds a record's bytes: the entry itself up to 1 KiB, else, and always for an agent's or child principal's, a value record naming a new item.

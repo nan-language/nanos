@@ -33,6 +33,8 @@ pub protocol Keys {
     pub fn rotate(rotation: Rotation) fails KeysFailure limits irreversible(erase)
     /// Revokes the key of `principal`: its record holds no key and no former one.
     pub fn revoke(principal: ident::Principal) fails KeysFailure limits recorded
+    /// The envelope sealing `value`, a record of schema `schema`, as the secret record `secret` whose keyring slot holds `seed`: `store`'s `Sealing` operation.
+    pub fn seal_secret(secret: u64, seed: Array[u8, 32], schema: ident::HashValue, value: mem::Bytes) -> mem::Bytes fails store::service::Failure limits traceless
     /// The keyed task serving request `request` gives its reply.
     fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Keys
@@ -209,6 +211,34 @@ pub fn Keyring.issue(mut self, take child: ident::Principal, mut env: Env, mut c
     return Issued(key: core::crypto::SecretKey.of_seed(seed).public_key().bytes, seed: seed)
 } Keyring.issue
 
+/// The envelope of a secret record: its secret id, a random nonce, and the XChaCha20-Poly1305 sealing of `value` under its node key, with the secret id and `schema` as associated data.
+pub fn Keyring.seal_secret(
+    mut self,
+    take secret: u64,
+    take seed: Array[u8, 32],
+    take schema: ident::HashValue,
+    take value: mem::Bytes,
+    mut env: Env,
+    mut cx: sys::Cx[Keys],
+    ) -> mem::Bytes fails store::service::Failure {
+    let Some(held) = self.held else {
+        fail store::service::Failure.Denied
+    }
+    let alloc = env.alloc
+    var nonce = Array[u8, 24].filled(0)
+    discard attempt env.random.fill(mut nonce.view_mut())
+    var envelope = mem::Bytes.empty(alloc)
+    for at in 0..<8u32 {
+        mut envelope.push(u8.truncate(secret >> (8 * at)))
+    }
+    var aad = mem::Bytes.empty(alloc)
+    mut aad.append(envelope.view())
+    mut aad.append(schema.bytes.view())
+    mut envelope.append(nonce.view())
+    mut envelope.append(crypto::seal(node_key(held.master, seed, secret, alloc), nonce, aad: aad.view(), plain: value.view(), alloc).view())
+    return envelope
+} Keyring.seal_secret
+
 pub fn Keyring.rotate(mut self, take rotation: Rotation, mut env: Env, mut cx: sys::Cx[Keys]) fails KeysFailure {
     if not env.kept {
         fail KeysFailure.Unavailable
@@ -310,6 +340,19 @@ fn generated(random: sys::Random) -> Held {
 } generated
 
 /// 32 bytes drawn from `random`, zeros once it is revoked.
+/// The node key of the secret `secret` whose keyring slot holds `seed`, derived from the keyring master key `master`.
+fn node_key(master: Array[u8, 32], seed: Array[u8, 32], secret: u64, alloc: mem::Alloc) -> crypto::Key {
+    var material = Array[core::Secret[u8], 72].filled(core::Secret.of(0u8))
+    for at in 0..<32usize {
+        material[at] = core::Secret.of(master[at])
+        material[32 + at] = core::Secret.of(seed[at])
+    }
+    for at in 0..<8usize {
+        material[64 + at] = core::Secret.of(u8.truncate(secret >> u32.truncate(8 * at)))
+    }
+    return crypto::derive_key("NaN OS store node key 1", material: material.view(), alloc)
+} node_key
+
 fn drawn(random: sys::Random) -> Array[u8, 32] {
     var bytes = Array[u8, 32].filled(0)
     discard attempt random.fill(mut bytes.view_mut())
@@ -532,3 +575,15 @@ test purposes_take_their_signers for signs {
     expect signs(agent, kind: "handshake") and not signs(agent, kind: "approval") and not signs(owner, kind: "anchor")
     expect enrollable(agent) and enrollable(vendor) and not enrollable(owner)
 } purposes_take_their_signers
+
+test node_keys_derive_from_the_master_key_the_seed_and_the_secret for node_key {
+    let alloc = testing::world().alloc
+    var master = Array[u8, 32].filled(0)
+    var seed = Array[u8, 32].filled(0)
+    for at in 0..<32usize {
+        master[at] = u8.truncate(at)
+        seed[at] = u8.truncate(32 + at)
+    }
+    let key = node_key(master, seed, secret: 0x4746_4544_4342_4140, alloc)
+    expect key.bytes[0].reveal() == 0xE3 and key.bytes[1].reveal() == 0x16 and key.bytes[31].reveal() == 0xB5
+} node_keys_derive_from_the_master_key_the_seed_and_the_secret

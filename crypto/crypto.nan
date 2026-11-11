@@ -1,0 +1,118 @@
+//! The ciphers of NaN OS: XChaCha20-Poly1305 sealing and BLAKE3 key derivation, computing on secret values in constant time.
+
+/// A 256-bit secret key.
+pub closed struct Key {
+    pub bytes: Array[core::Secret[u8], 32]
+} Key
+
+/// The key holding `bytes`.
+pub fn Key.of(bytes: Array[u8, 32]) -> Key {
+    var held = Array[core::Secret[u8], 32].filled(core::Secret.of(0u8))
+    for at in 0..<32usize {
+        held[at] = core::Secret.of(bytes[at])
+    }
+    return Key(bytes: held)
+} Key.of
+
+/// The XChaCha20-Poly1305 sealing of `plain` under `key` and the 192-bit nonce `nonce`: its ciphertext, then the 16-byte tag over `aad` and the ciphertext.
+pub fn seal(
+    key: Key,
+    nonce: Array[u8, 24],
+    aad: Slice[u8],
+    plain: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> mem::Bytes {
+    var head = Array[core::Secret[u32], 4].filled(core::Secret.of(0u32))
+    for at in 0..<4usize {
+        head[at] = core::Secret.of(nonce.view().u32_le(4 * at))
+    }
+    let subkey = hchacha(key.words(), nonce: head)
+    var tail = Array[core::Secret[u32], 3].filled(core::Secret.of(0u32))
+    tail[1] = core::Secret.of(nonce.view().u32_le(16))
+    tail[2] = core::Secret.of(nonce.view().u32_le(20))
+    var sealed = mem::Bytes.empty(alloc)
+    var counter: u32 = 1
+    var at: usize = 0
+    while at < plain.len() {
+        let stream = block(subkey, counter, nonce: tail)
+        var index: usize = 0
+        while index < 64 and at + index < plain.len() {
+            let keyed = byte_of(stream.words[index / 4], index: index % 4)
+            mut sealed.push(keyed.bit_xor(core::Secret.of(plain[at + index])).reveal())
+            index += 1
+        }
+        at += 64
+        counter += 1
+    }
+    var mac = Mac.of(block(subkey, counter: 0, nonce: tail))
+    var data = mem::Bytes.empty(alloc)
+    mut data.append(aad)
+    padded(mut data)
+    mut data.append(sealed.view())
+    padded(mut data)
+    push_u64_le(mut data, value: u64.widen(aad.len()))
+    push_u64_le(mut data, value: u64.widen(sealed.len()))
+    var offset: usize = 0
+    while offset < data.len() {
+        mut mac.absorb(data.view(), at: offset)
+        offset += 16
+    }
+    mut sealed.append(mac.tag().view())
+    return sealed
+} seal
+
+/// The key's eight little-endian words.
+fn Key.words(self) -> Array[core::Secret[u32], 8] {
+    var words = Array[core::Secret[u32], 8].filled(core::Secret.of(0u32))
+    for at in 0..<8usize {
+        words[at] = word_le(self.bytes.view(), at: 4 * at)
+    }
+    return words
+} Key.words
+
+fn push_u64_le(mut data: mem::Bytes, value: u64) {
+    for at in 0..<8u32 {
+        mut data.push(u8.truncate(value >> (8 * at)))
+    }
+} push_u64_le
+
+/// Pads `data` with zero bytes to a multiple of 16.
+fn padded(mut data: mem::Bytes) {
+    while data.len() % 16 != 0 {
+        mut data.push(0)
+    }
+} padded
+
+test sealing_follows_the_xchacha_draft for seal {
+    let alloc = testing::world().alloc
+    var key = Array[u8, 32].filled(0)
+    var nonce = Array[u8, 24].filled(0)
+    for at in 0..<32usize {
+        key[at] = u8.truncate(0x80 + at)
+    }
+    for at in 0..<24usize {
+        nonce[at] = u8.truncate(0x40 + at)
+    }
+    let aad = b"\x50\x51\x52\x53\xC0\xC1\xC2\xC3\xC4\xC5\xC6\xC7"
+    let sealed = seal(Key.of(key), nonce, aad, plain: b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.", alloc)
+    let bytes = sealed.view()
+    expect sealed.len() == 130 and bytes[0] == 0xBD and bytes[1] == 0x6D and bytes[15] == 0x39 and bytes[114] == 0xC0 and bytes[115] == 0x87 and bytes[129] == 0x49
+} sealing_follows_the_xchacha_draft
+
+test sealing_short_and_empty_values for seal {
+    let alloc = testing::world().alloc
+    var key = Array[u8, 32].filled(0)
+    var nonce = Array[u8, 24].filled(0)
+    for at in 0..<32usize {
+        key[at] = u8.truncate(at)
+    }
+    for at in 0..<24usize {
+        nonce[at] = u8.truncate(at)
+    }
+    let short = seal(Key.of(key), nonce, aad: b"ab", plain: b"hello", alloc)
+    let empty = seal(Key.of(key), nonce, aad: b"", plain: b"", alloc)
+    let held = short.view()
+    let tag = empty.view()
+    expect short.len() == 21 and held[0] == 0xF6 and held[4] == 0xFF and held[5] == 0xE9 and held[20] == 0xA4
+    expect empty.len() == 16 and tag[0] == 0x2D and tag[15] == 0x90
+} sealing_short_and_empty_values

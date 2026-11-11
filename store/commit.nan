@@ -38,34 +38,50 @@ pub fn Store.commit[D: disk::Device](
     now: ident::WallTime,
     alloc: mem::Alloc,
     ) -> Committed fails StoreError uses wait {
-    return try await mut self.commit_as(device, branch, take transaction, take stamp, kind: CommitKind.Write, now, alloc)
+    return try await mut self.commit_sealed(device, branch, take transaction, take stamp, secrets: Unsealed(), now, alloc)
 } Store.commit
 
+/// Commits `transaction` to `branch` as [Store.commit] does, its secret records sealed through `secrets`.
+pub fn Store.commit_sealed[D: disk::Device, K: Secrets](
+    mut self,
+    device: D,
+    branch: Str,
+    take transaction: Transaction,
+    take stamp: Stamp,
+    secrets: K,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Committed fails StoreError uses wait {
+    return try await mut self.commit_as(device, branch, take transaction, take stamp, kind: CommitKind.Write, secrets, now, alloc)
+} Store.commit_sealed
+
 /// Commits `transaction` to `branch` as a commit of `kind`.
-pkg fn Store.commit_as[D: disk::Device](
+pkg fn Store.commit_as[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     branch: Str,
     take transaction: Transaction,
     take stamp: Stamp,
     take kind: CommitKind,
+    secrets: K,
     now: ident::WallTime,
     alloc: mem::Alloc,
     ) -> Committed fails StoreError uses wait {
-    return match try await mut self.stage(device, branch, take transaction, take stamp, take kind, now, alloc) {
+    return match try await mut self.stage(device, branch, take transaction, take stamp, take kind, secrets, now, alloc) {
         Some(earlier) => earlier
         None => try await mut self.flush_one(device, alloc)
     }
 } Store.commit_as
 
 /// Checks and applies `transaction` to `branch`'s trees as a commit of `kind`, undoing it when a check fails, then seals it; gives the commit its request key made earlier instead when there is one.
-fn Store.stage[D: disk::Device](
+fn Store.stage[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     branch: Str,
     take transaction: Transaction,
     take stamp: Stamp,
     take kind: CommitKind,
+    secrets: K,
     now: ident::WallTime,
     alloc: mem::Alloc,
     ) -> Option[Committed] fails StoreError uses wait {
@@ -86,12 +102,12 @@ fn Store.stage[D: disk::Device](
     let adding = transaction_bytes(transaction)
     try self.check_agent_share(adding, principal: stamp.principal)
     var staged = Staged.empty(alloc)
-    var writing = try await mut self.validate(device, head, transaction, stamp, now, mut staged, alloc)
+    var writing = try await mut self.validate(device, head, transaction, stamp, now, mut staged, secrets, alloc)
     if self.free_bytes() < adding {
         try await mut self.undo(device, mut staged, alloc)
         try await mut self.make_space(device, adding, principal: stamp.principal, now, alloc)
         staged = Staged.empty(alloc)
-        writing = try await mut self.validate(device, head, transaction, stamp, now, mut staged, alloc)
+        writing = try await mut self.validate(device, head, transaction, stamp, now, mut staged, secrets, alloc)
     }
     try await mut self.request_entry(device, key: transaction.key, stamp, writing, digest, mut staged, alloc)
     var meta = commit_meta(transaction, stamp, writing, branch: self.heads[head].branch, recorded: staged.recorded, alloc)
@@ -101,7 +117,7 @@ fn Store.stage[D: disk::Device](
 } Store.stage
 
 /// Checks `transaction`'s writes and applies them to the trees of branch `head` in the commit procedure's order, undoing them when a check fails, and gives what applying them needed.
-fn Store.validate[D: disk::Device](
+fn Store.validate[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     head: usize,
@@ -109,6 +125,7 @@ fn Store.validate[D: disk::Device](
     stamp: Stamp,
     now: ident::WallTime,
     mut staged: Staged,
+    secrets: K,
     alloc: mem::Alloc,
     ) -> Writing fails StoreError uses wait {
     let head_number = self.heads[head].branch.head.number
@@ -120,7 +137,7 @@ fn Store.validate[D: disk::Device](
     let read = try await mut self.reads_hold(device, head, reads: transaction.reads.view(), now, alloc)
     let origins = try await mut self.origin_id(device, labels: stamp.origins.view(), mut staged, alloc)
     let writing = Writing(head: head, number: self.counters.commit, base: base, origins: origins, typed: stamp.typed, agent: adds_agent_bytes(stamp.principal), now: now)
-    let outcome = attempt await mut self.apply_writes(device, writes: transaction.writes.view(), writing, mut staged, alloc)
+    let outcome = attempt await mut self.apply_writes(device, writes: transaction.writes.view(), writing, mut staged, secrets, alloc)
     let serializable = transaction.plan.is_some() or touches_sys(transaction.writes.view(), alloc)
     let refused = match outcome {
         Ok(_) => refusal(staged.conflict, read: read or not serializable, expected)
@@ -151,16 +168,17 @@ fn refusal(conflict: bool, read: bool, expected: bool) -> Option[StoreError] {
 } refusal
 
 /// Applies `writes` in order.
-fn Store.apply_writes[D: disk::Device](
+fn Store.apply_writes[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     writes: Slice[Write],
     writing: Writing,
     mut staged: Staged,
+    secrets: K,
     alloc: mem::Alloc,
     ) fails StoreError uses wait {
     for write in writes {
-        try await mut self.apply_write(device, write, writing, mut staged, alloc)
+        try await mut self.apply_write(device, write, writing, mut staged, secrets, alloc)
     }
     try await mut self.update_ancestors(device, number: writing.number, mut staged, alloc)
 } Store.apply_writes
@@ -283,10 +301,11 @@ pub closed struct Request {
 } Request
 
 /// Commits `requests` in order through one log flush, or several when the log bound needs an index flush between them, each checked as [Store.commit] checks it against the heads the ones before it left and giving its own outcome; a device failure fails every commit its log flush carries with `store.io`, and the requests whose keys name them.
-pub fn Store.commit_all[D: disk::Device](
+pub fn Store.commit_all[D: disk::Device, K: Secrets](
     mut self,
     device: D,
     take requests: mem::List[Request],
+    secrets: K,
     now: ident::WallTime,
     alloc: mem::Alloc,
     ) -> mem::List[Result[Committed, StoreError]] fails task::Cancelled uses wait {
@@ -299,7 +318,7 @@ pub fn Store.commit_all[D: disk::Device](
             numbered = self.counters.commit
         }
         let Request(branch: branch, transaction: transaction, stamp: stamp) = request
-        match first attempt await mut self.stage(device, branch: branch.as_str(), take transaction, take stamp, kind: CommitKind.Write, now, alloc) {
+        match first attempt await mut self.stage(device, branch: branch.as_str(), take transaction, take stamp, kind: CommitKind.Write, secrets, now, alloc) {
             Ok(Some(earlier)) => mut outcomes.push(Ok(take earlier))
             Ok(None) => {
                 mut sealed.push(outcomes.len())
