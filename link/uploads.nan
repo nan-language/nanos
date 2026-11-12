@@ -1,0 +1,188 @@
+//! Uploads: `put` streaming the bytes of its data lines into a draft of the store, then committing the blob at its path.
+
+/// The data lines one upload holds before its keyed task appends them; one more fails it.
+const QUEUED_CHUNKS: usize = 256
+
+/// An upload under way: the `put` it serves and where its data lines go.
+pub open struct Upload derives Send {
+    number: u64
+    chunks: task::Sender[mem::Bytes]
+} Upload
+
+/// What a `put` uploads: its path, its size and the blob id its bytes must have, the principal and session it acts for, and its request key.
+pub closed struct Putting derives Encode {
+    pub path: ident::Path
+    pub size: u64
+    pub blake3: ident::HashValue
+    pub principal: ident::Principal
+    pub session: ident::SessionId
+    pub key: text::String
+} Putting
+
+/// `put <path> <size> <blake3>`: a keyed task appends the data lines that follow to a draft of the store, closes it into the blob of id `<blake3>` and commits the blob at the path, `request.hash-mismatch` when the bytes have another id.
+fn Linker.put(
+    mut self,
+    take request: Request,
+    number: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let alloc = env.alloc
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    let putting = match self.putting(request, at, now_utc: now_utc_ns(env.wall, clock: env.clock), alloc) {
+        Ok(made) => made
+        Err(failure) => {
+            let block = self.running[at].failed(take failure, alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+            return
+        }
+    }
+    let task::Channel(sender: chunks, receiver: arriving) = task::Channel[mem::Bytes].bounded(QUEUED_CHUNKS, alloc)
+    mut env.uploads.push(Upload(number: number, chunks: take chunks))
+    let block = self.running[at].block(Verdict.Ok, alloc)
+    let slot = self.running[at].slot
+    let tree = env.tree
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take putting, take arriving, take block](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let answered = try await uploaded(take putting, chunks: take arriving, take block, tree, alloc)
+        discard attempt await out.responded(number, block: take answered)
+    })
+} Linker.put
+
+/// What the `put` running at `at` uploads, once its operands are a path, a size of at most `MOST_PUT_BYTES` and a full blob id, and the session's principal may write the path.
+fn Linker.putting(
+    self,
+    request: Request,
+    at: usize,
+    now_utc: i64,
+    alloc: mem::Alloc,
+    ) -> Result[Putting, Failure] {
+    let session = self.running[at].session
+    let Some(session_at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return Err(Failure.of("auth.denied", subject: "put", alloc).expecting("a session", found: "none", alloc))
+    }
+    if request.operands.len() != 3 {
+        return Err(Failure.of("request.invalid-operand", subject: "put", alloc).expecting("put <path> <size> <blake3>", found: self.running[at].operand.as_str(), alloc))
+    }
+    let Some(path) = path_of(request.operands[0].as_str(), alloc) else {
+        return Err(Failure.of("request.invalid-operand", subject: request.operands[0].as_str(), alloc).expecting("a path", found: request.operands[0].as_str(), alloc))
+    }
+    let Some(size) = number_of(request.operands[1].as_str()) else {
+        return Err(Failure.of("request.invalid-operand", subject: request.operands[1].as_str(), alloc).expecting("a size in bytes", found: request.operands[1].as_str(), alloc))
+    }
+    if size > MOST_PUT_BYTES {
+        return Err(Failure.of("request.too-large", subject: request.operands[1].as_str(), alloc).expecting("at most 64 MiB", found: request.operands[1].as_str(), alloc))
+    }
+    let Some(ident::HashText.Full(blake3)) = ident::HashText.parse(request.operands[2].as_str()) else {
+        return Err(Failure.of("request.invalid-operand", subject: request.operands[2].as_str(), alloc).expecting("a blob id in its full form", found: request.operands[2].as_str(), alloc))
+    }
+    let principal = self.sessions[session_at].principal
+    let writes = match self.holdings.position(fn(each: Holding) => each.principal == principal) {
+        Some(held) => self.holdings[held].writes(path.text.as_str(), now_utc)
+        None => false
+    }
+    if not writes {
+        return Err(denied(path.text.as_str(), right: write_right(path.text.as_str()).as_str(), alloc))
+    }
+    let key = match self.key_of_request(request, session, alloc) {
+        Ok(made) => made
+        Err(failure) => return Err(take failure)
+    }
+    return Ok(Putting(path: take path, size: size, blake3: blake3, principal: ident::Principal(text: principal.text), session: ident::SessionId(boot: self.boot(), number: session), key: take key))
+} Linker.putting
+
+/// Passes the bytes of a data line received on the connection numbered `connection` to the upload of its `put`; an upload without room for them fails.
+fn Linker.upload(mut self, connection: u64, take bytes: mem::Bytes, mut env: Env) {
+    let Some(at) = self.running.position(fn(each: Running) => each.connection == connection and each.verb.as_str() == "put") else {
+        return
+    }
+    let number = self.running[at].number
+    let Some(upload) = env.uploads.position(fn(each: Upload) => each.number == number) else {
+        return
+    }
+    match env.uploads[upload].chunks.offer(take bytes) {
+        Some(_) => {
+            discard mut env.uploads.remove(upload)
+        }
+        None => {
+        }
+    }
+} Linker.upload
+
+/// Forgets the upload of the `put` numbered `number`, ending its data.
+fn Env.forget_upload(mut self, number: u64) {
+    mut self.uploads.retain(fn(each: Upload) => each.number != number)
+} Env.forget_upload
+
+/// Uploads the bytes `chunks` brings into a draft through a View acting for the principal of `putting`, closes it into the blob `putting` names and commits it at its path, giving `block` with its `blob` record, or failed with the store's code.
+fn uploaded(
+    take putting: Putting,
+    take chunks: task::Receiver[mem::Bytes],
+    take block: Block,
+    tree: store::service::View,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
+    var answered = block
+    let failure = match try await stored(putting, take chunks, tree, alloc) {
+        Ok(committed) => {
+            var record = Record.of("blob", alloc)
+            mut record.subject(Dyn[Render].view(putting.path))
+            mut record.field("size_bytes", value: Dyn[Render].view(putting.size))
+            mut record.hash("blake3", value: putting.blake3)
+            mut record.field("commit", value: Dyn[Render].view(committed))
+            mut answered.records.push(take record)
+            return answered
+        }
+        Err(failed) => failed
+    }
+    answered.verdict = Verdict.Failed
+    mut answered.records.push(failure.record(alloc))
+    return answered
+} uploaded
+
+/// The commit of the blob `putting` uploads from `chunks`.
+fn stored(putting: Putting, take chunks: task::Receiver[mem::Bytes], tree: store::service::View, alloc: mem::Alloc) -> Result[ident::CommitId, Failure] fails task::Cancelled uses wait {
+    let subject = putting.path.text.as_str()
+    let acting = match first attempt await tree.acting(ident::Principal(text: putting.principal.text), session: putting.session, alloc) {
+        Ok(view) => view
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(Failure.of(failed.code().as_str(), subject, alloc))
+    }
+    let draft = match first attempt await acting.draft(alloc) {
+        Ok(number) => number
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(Failure.of(failed.code().as_str(), subject, alloc))
+    }
+    var receiver = chunks
+    var received: u64 = 0
+    while received < putting.size {
+        let Some(chunk) = try await mut receiver.receive() else {
+            return Err(Failure.of("request.too-large", subject, alloc).expecting("the data lines of the put", found: "an upload without room for them", alloc))
+        }
+        received = received.saturating_add(u64.widen(chunk.len()))
+        if received > putting.size {
+            return Err(Failure.of("request.hash-mismatch", subject, alloc).expecting("the bytes the size names", found: "more bytes", alloc))
+        }
+        match first attempt await acting.draft_append(draft, bytes: take chunk, alloc) {
+            Ok(_) => {
+            }
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => return Err(Failure.of(failed.code().as_str(), subject, alloc))
+        }
+    }
+    let closed = match first attempt await acting.draft_close(draft, expected: Some(putting.blake3), alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(store::service::ViewError.Failed(store::service::Failure.HashMismatch)) => return Err(Failure.of("request.hash-mismatch", subject, alloc))
+        Err(failed) => return Err(Failure.of(failed.code().as_str(), subject, alloc))
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: ident::Path(text: text::String.of(subject, alloc)), value: store::Value.Blob(closed.id)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: Some(text::String.of(putting.key.as_str(), alloc)), plan: None, intent: None)
+    return match first attempt await acting.commit(take transaction, typed: true, alloc) {
+        Ok(done) => Ok(done.number)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(Failure.of(failed.code().as_str(), subject, alloc))
+    }
+} stored

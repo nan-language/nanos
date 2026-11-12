@@ -3,6 +3,9 @@
 /// The most bytes a request holds.
 pub const MOST_REQUEST_BYTES: usize = 1_048_576
 
+/// The most bytes one `put` uploads.
+pub const MOST_PUT_BYTES: u64 = 67_108_864
+
 /// The most delimiters a request holds open at once.
 const MOST_DEPTH: usize = 64
 
@@ -36,16 +39,18 @@ pub closed struct Failure derives Encode {
     pub fixes: mem::List[text::String]
 } Failure
 
-/// The lines of a request gathered so far, joined by spaces, and how many delimiters they leave open.
+/// The lines of a request gathered so far, joined by spaces, how many delimiters they leave open, and the bytes of the data lines a `put` still expects.
 pub closed struct Gathered derives Encode {
     pub text: text::String
     pub depth: u32
+    pub left: u64
 } Gathered
 
-/// What a line gives the request being gathered: the request's text once it ends, nothing yet, or its failure.
+/// What a line gives the request being gathered: the request's text once it ends, nothing yet, the bytes a data line of a `put` decodes to, or its failure.
 pub closed enum Gathering derives Eq {
     Ended(text::String)
     Continued
+    Data(mem::Bytes)
     Failed(code: text::Fixed[32])
 } Gathering
 
@@ -61,11 +66,14 @@ pub fn Failure.expecting(take self, expected: Str, found: Str, alloc: mem::Alloc
     return failure
 } Failure.expecting
 
-pub fn Gathered.empty(alloc: mem::Alloc) -> Gathered = Gathered(text: text::String.empty(alloc), depth: 0)
+pub fn Gathered.empty(alloc: mem::Alloc) -> Gathered = Gathered(text: text::String.empty(alloc), depth: 0, left: 0)
 
-/// Adds the line `line`, without its line end, to the request being gathered. The request ends with a line that leaves no delimiter open and does not end with `,`; an empty line while a delimiter is open ends it with `request.unbalanced`, and a line that is not UTF-8 or holds a control character with `request.malformed`.
+/// Adds the line `line`, without its line end, to the request being gathered. The request ends with a line that leaves no delimiter open and does not end with `,`; an empty line while a delimiter is open ends it with `request.unbalanced`, and a line that is not UTF-8 or holds a control character with `request.malformed`. The lines after a `put` are its data, base64 until its size is decoded.
 pub validator fn Gathered.add(mut self, line: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Gathering {
     let bytes = line.inspect()
+    if self.left > 0 {
+        return mut self.data(bytes, alloc)
+    }
     if self.depth > 0 and bytes.len() == 0 {
         return mut self.refuse("request.unbalanced", alloc)
     }
@@ -100,8 +108,38 @@ pub validator fn Gathered.add(mut self, line: Untrusted[Slice[u8]], alloc: mem::
     var ended = text::String.empty(alloc)
     mut ended.append(self.text.as_str())
     mut self.text.clear()
+    self.left = put_size(ended.as_str(), alloc)
     return Gathering.Ended(take ended)
 } Gathered.add
+
+/// The bytes the base64 data line `line` of a `put` decodes to, `request.malformed` ending the data when it is no base64.
+fn Gathered.data(mut self, line: Slice[u8], alloc: mem::Alloc) -> Gathering {
+    var quoted = mem::Bytes.empty(alloc)
+    mut quoted.push(b'"')
+    mut quoted.append(line)
+    mut quoted.push(b'"')
+    let Ok(decoded) = attempt text::json::Codec[mem::Bytes].decode(Untrusted.of(quoted.view()), alloc) else {
+        self.left = 0
+        return Gathering.Failed(code: text::Fixed[32].of("request.malformed"))
+    }
+    self.left = self.left.saturating_sub(u64.widen(decoded.len()))
+    return Gathering.Data(take decoded)
+} Gathered.data
+
+/// The size a `put` request `text` declares, the bytes of data lines following it; 0 for any other request or a size past `MOST_PUT_BYTES`.
+fn put_size(text: Str, alloc: mem::Alloc) -> u64 {
+    let Some(words) = words_of(text, alloc) else {
+        return 0
+    }
+    if words.len() < 4 or words[1].as_str() != "put" {
+        return 0
+    }
+    let size = number_of(words[3].as_str()).value_or(0)
+    if size > MOST_PUT_BYTES {
+        return 0
+    }
+    return size
+} put_size
 
 /// Clears the request being gathered, which ends with `code`.
 fn Gathered.refuse(mut self, code: Str, alloc: mem::Alloc) -> Gathering {
@@ -400,3 +438,27 @@ test lines_gather_while_delimiters_are_open for Gathered.add {
     let ended = mut gathered.add(Untrusted.of(b""), alloc)
     expect ended == Gathering.Failed(code: text::Fixed[32].of("request.unbalanced"))
 } lines_gather_while_delimiters_are_open
+
+test put_data_lines_decode_as_base64_until_its_size for Gathered.add {
+    let alloc = testing::world().alloc
+    var gathered = Gathered.empty(alloc)
+    let request = mut gathered.add(Untrusted.of(b"9 put /data/agent.ops/pkgs/hello.txt 6 aghey7a3thn72uhhok"), alloc)
+    let Gathering.Ended(text) = request else {
+        expect false
+        return
+    }
+    expect text.as_str().starts_with("9 put ") and gathered.left == 6
+    let data = mut gathered.add(Untrusted.of(b"aGVsbG8K"), alloc)
+    let Gathering.Data(bytes) = data else {
+        expect false
+        return
+    }
+    expect bytes.view() == b"hello\n" and gathered.left == 0
+    let next = mut gathered.add(Untrusted.of(b"10 get /"), alloc)
+    let ended_next = match next {
+        Gathering.Ended(line) => line.as_str() == "10 get /"
+        else => false
+    }
+    let oversized = mut gathered.add(Untrusted.of(b"11 put /data/x 99999999999 aghey7a3thn72uhhok"), alloc)
+    expect ended_next and oversized != Gathering.Continued and gathered.left == 0
+} put_data_lines_decode_as_base64_until_its_size

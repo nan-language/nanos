@@ -18,10 +18,73 @@ pub closed struct KeptPlan derives Encode {
     pub ended_ns: Option[u64]
 } KeptPlan
 
-/// `plan <steps>`: a keyed task previews the steps for the session's principal, at most `SessionBudget.previews` previews of its sessions running at once.
+/// `plan <steps>`: a keyed task previews the steps for the session's principal.
 fn Linker.plan(
     mut self,
     take request: Request,
+    number: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let list = match request.operands.get(0) {
+        Some(word) => text::String.of(word.as_str(), alloc: env.alloc)
+        None => text::String.empty(env.alloc)
+    }
+    let steps = steps_of(list.as_str(), alloc: env.alloc)
+    mut self.preview_steps(take request, take steps, number, mut env, mut cx)
+} Linker.plan
+
+/// `undo <commit or plan>`: a keyed task previews the inverse plan: `revert <commit>`, or the reverts of a plan's span commits, newest first.
+fn Linker.undo(
+    mut self,
+    take request: Request,
+    number: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let steps = self.inverse_steps(request, alloc: env.alloc)
+    mut self.preview_steps(take request, take steps, number, mut env, mut cx)
+} Linker.undo
+
+/// The inverse steps of the commit or the kept plan `request` names.
+fn Linker.inverse_steps(self, request: Request, alloc: mem::Alloc) -> Result[mem::List[Written], Failure] {
+    let operand = match request.operands.get(0) {
+        Some(word) => text::String.of(word.as_str(), alloc)
+        None => text::String.empty(alloc)
+    }
+    var commits = mem::List[ident::CommitId].empty(alloc)
+    match ident::CommitId.parse(operand.as_str()) {
+        Some(commit) => mut commits.push(commit)
+        None => {
+            let plan_at = match self.plan_named(operand.as_str(), alloc) {
+                Ok(found) => found
+                Err(failure) => return Err(take failure)
+            }
+            for commit in self.plans[plan_at].commits {
+                mut commits.insert(0, value: commit)
+            }
+        }
+    }
+    if commits.len() == 0 {
+        return Err(Failure.of("request.invalid-operand", subject: operand.as_str(), alloc).expecting("a commit, or a plan that committed", found: operand.as_str(), alloc))
+    }
+    var steps = mem::List[Written].empty(alloc)
+    for commit in commits {
+        var text = text::String.of("revert ", alloc)
+        mut text.write(Dyn[Render].view(commit), budget: 32)
+        match step_of(text.as_str(), alloc) {
+            Ok(written) => mut steps.push(take written)
+            Err(failure) => return Err(take failure)
+        }
+    }
+    return Ok(take steps)
+} Linker.inverse_steps
+
+/// Has a keyed task preview `steps`, the steps `request` gives or their failure, for the session's principal, at most `SessionBudget.previews` previews of its sessions running at once.
+fn Linker.preview_steps(
+    mut self,
+    take request: Request,
+    take steps: Result[mem::List[Written], Failure],
     number: u64,
     mut env: Env,
     mut cx: sys::Cx[LinkSession],
@@ -32,7 +95,11 @@ fn Linker.plan(
     }
     let session = self.running[at].session
     let slot = self.running[at].slot
-    let asked = match self.planning(request, session, now_utc: now_utc_ns(env.wall, clock: env.clock), alloc) {
+    let asked = match steps {
+        Ok(found) => self.planning(request, steps: take found, session, now_utc: now_utc_ns(env.wall, clock: env.clock), alloc)
+        Err(failure) => Err(take failure)
+    }
+    let planned = match asked {
         Ok(made) => made
         Err(failure) => {
             let block = self.running[at].failed(take failure, alloc)
@@ -42,31 +109,24 @@ fn Linker.plan(
     }
     let tree = env.tree
     let oversight = env.oversight
-    mut cx.spawn(key: ANSWERING + slot, run: fn[take asked](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 131_072 {
-        let outcome = try await preview(take asked, tree, oversight, alloc)
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take planned](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 131_072 {
+        let outcome = try await preview(take planned, tree, oversight, alloc)
         discard attempt await out.previewed(number, take outcome)
     })
     mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
-} Linker.plan
+} Linker.preview_steps
 
-/// What the preview of `request` in the session numbered `session` needs: its steps and options, the session's principal and what it holds, its taint, and the sessions open; refused without a session, with steps or options of the wrong form, or while the principal's sessions run their most previews.
+/// What the preview of `steps` for `request` in the session numbered `session` needs: the steps and the request's options, the session's principal and what it holds, its taint, and the sessions open; refused without a session, with options of the wrong form, or while the principal's sessions run their most previews.
 fn Linker.planning(
     self,
     request: Request,
+    take steps: mem::List[Written],
     session: u64,
     now_utc: i64,
     alloc: mem::Alloc,
     ) -> Result[Planning, Failure] {
     let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
-        return Err(Failure.of("auth.denied", subject: "plan", alloc).expecting("a session", found: "none", alloc))
-    }
-    let list = match request.operands.get(0) {
-        Some(word) => word.as_str()
-        None => ""
-    }
-    let steps = match steps_of(list, alloc) {
-        Ok(found) => found
-        Err(failure) => return Err(take failure)
+        return Err(Failure.of("auth.denied", subject: request.verb.as_str(), alloc).expecting("a session", found: "none", alloc))
     }
     let options = match options_of(request, plans: self.config.plans, alloc) {
         Ok(found) => found
@@ -75,7 +135,8 @@ fn Linker.planning(
     let principal = self.sessions[at].principal
     var previewing: u32 = 0
     for running in self.running {
-        if running.verb.as_str() != "plan" or (running.session == session and running.id == request.id) {
+        let previews = running.verb.as_str() == "plan" or running.verb.as_str() == "undo"
+        if not previews or (running.session == session and running.id == request.id) {
             continue
         }
         match self.sessions.position(fn(each: Session) => each.number == running.session) {
