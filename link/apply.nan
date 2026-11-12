@@ -24,9 +24,10 @@ pub closed struct Applying derives Encode {
     pub scheduled: Option[ident::WallTime]
 } Applying
 
-/// How an apply goes on: a span committed, its health window or confirmation running until `until`; an outbox entry delivered or failed; or the plan ended in `state`, with the code of its failure.
+/// How an apply goes on: a span committed, its health window or confirmation running until `until`; the encoding of the reply to the request of a call step; an outbox entry delivered or failed; or the plan ended in `state`, with the code of its failure.
 pub closed enum Moved derives Encode {
     Committed(span: u32, commit: ident::CommitId, until: Option[ident::WallTime])
+    Replied(step: u32, reply: mem::Bytes)
     Delivered(entry: text::String)
     Ended(state: PlanState, code: Option[text::String])
 } Moved
@@ -116,7 +117,7 @@ fn applied(
     return Moved.Ended(state: PlanState.Applied, code: None)
 } applied
 
-/// Follows the span `span` of `applying` once `commit` committed it: tells `out` of the commit and the end of its window, carries out its commands below the point of no return through `control`, awaits its activations, watches its health window and awaits its confirmation, then delivers its outbox; the end of the plan when one of them ends it.
+/// Follows the span `span` of `applying` once `commit` committed it: tells `out` of the commit and the end of its window, carries out its commands below the point of no return through `control`, telling `out` of their replies, awaits its activations, watches its health window and awaits its confirmation, then delivers its outbox; the end of the plan when one of them ends it.
 fn committed_span(
     applying: Applying,
     span: SpanWork,
@@ -148,9 +149,12 @@ fn committed_span(
             continue
         }
         match try await carried_out(commanded, control, alloc) {
-            Some(code) => return Some(finish_as(PlanState.Failed, code: code.as_str(), alloc))
-            None => {
+            Ok(Some(reply)) => {
+                discard attempt await out.plan_moved(applying.number, moved: Moved.Replied(step: commanded.step, reply: take reply))
             }
+            Ok(None) => {
+            }
+            Err(code) => return Some(finish_as(PlanState.Failed, code: code.as_str(), alloc))
         }
     }
     try await converged(tree_activations(span, alloc), commit, tree: acting, clocks, alloc)
@@ -203,7 +207,7 @@ pub fn entry_id(hash: ident::HashValue, span: u32, n: usize, alloc: mem::Alloc) 
     return id
 } entry_id
 
-/// The write of the outbox entry of `commanded`, the n-th irreversible delivery of span `span` of `applying`, in `status` after `attempts` attempts.
+/// The write of the outbox entry of `commanded`, the n-th irreversible delivery of span `span` of `applying`, in `status` after `attempts` attempts, holding the encoding of its reply `reply`.
 fn entry_write(
     applying: Applying,
     span: u32,
@@ -211,6 +215,7 @@ fn entry_write(
     commanded: InstanceStep,
     status: DeliveryStatus,
     attempts: u32,
+    reply: Option[mem::Bytes],
     alloc: mem::Alloc,
     ) -> Option[store::Write] {
     let Some(delivery) = commanded.delivery(issuer: applying.plan.principal, alloc) else {
@@ -223,7 +228,17 @@ fn entry_write(
     mut key.write(Dyn[Render].view(n), budget: 12)
     var payload = mem::Bytes.empty(alloc)
     mut payload.append(commanded.message.view())
-    let entry = OutboxEntry(plan: applying.hash, span: span, delivery: take delivery, key: take key, payload: take payload, status: status, attempts: attempts, reply: None)
+    var held: Option[mem::Bytes] = None
+    match reply {
+        Some(bytes) => {
+            var copy = mem::Bytes.empty(alloc)
+            mut copy.append(bytes.view())
+            held = Some(take copy)
+        }
+        None => {
+        }
+    }
+    let entry = OutboxEntry(plan: applying.hash, span: span, delivery: take delivery, key: take key, payload: take payload, status: status, attempts: attempts, reply: take held)
     var bytes = mem::Bytes.empty(alloc)
     mem::wire::Codec[OutboxEntry].encode(entry, out: mut bytes)
     var path = text::String.of("/sys/outbox/", alloc)
@@ -242,7 +257,7 @@ fn entries_in(
     ) -> mem::List[store::Write] {
     var writes = mem::List[store::Write].empty(alloc)
     for at in from..<entries.len() {
-        match entry_write(applying, span, n: at + 1, commanded: entries[at], status, attempts: 0, alloc) {
+        match entry_write(applying, span, n: at + 1, commanded: entries[at], status, attempts: 0, reply: None, alloc) {
             Some(write) => mut writes.push(take write)
             None => {
             }
@@ -282,30 +297,23 @@ fn deliver_outbox(
     }
     for at in 0..<entries.len() {
         var attempts: u32 = 0
-        var failure: Option[text::Fixed[32]] = None
-        while attempts < DELIVERY_ATTEMPTS {
-            attempts += 1
-            failure = try await carried_out(commanded: entries[at], control, alloc)
-            let restarting = match failure {
-                Some(code) => code.as_str() == "port.stopped"
-                None => false
-            }
-            if not restarting {
-                break
-            }
-            try await clocks.clock.sleep(RETRY_MS)
+        let outcome = try await attempted(commanded: entries[at], control, clocks, mut attempts, alloc)
+        let failed = outcome.is_err()
+        let status = match failed {
+            true => DeliveryStatus.Failed
+            false => DeliveryStatus.Delivered
         }
-        let status = match failure {
-            Some(_) => DeliveryStatus.Failed
-            None => DeliveryStatus.Delivered
+        let reply = match outcome {
+            Ok(found) => found
+            Err(_) => None
         }
         var writes = mem::List[store::Write].empty(alloc)
-        match entry_write(applying, span: span.span, n: at + 1, commanded: entries[at], status, attempts, alloc) {
+        match entry_write(applying, span: span.span, n: at + 1, commanded: entries[at], status, attempts, reply, alloc) {
             Some(write) => mut writes.push(take write)
             None => {
             }
         }
-        if failure.is_some() {
+        if failed {
             for write in take entries_in(applying, span: span.span, entries, from: at + 1, status: DeliveryStatus.Cancelled, alloc) {
                 mut writes.push(take write)
             }
@@ -315,13 +323,42 @@ fn deliver_outbox(
             None => {
             }
         }
+        match reply {
+            Some(bytes) => {
+                discard attempt await out.plan_moved(applying.number, moved: Moved.Replied(step: entries[at].step, reply: take bytes))
+            }
+            None => {
+            }
+        }
         discard attempt await out.plan_moved(applying.number, moved: Moved.Delivered(entry: entry_id(applying.hash, span: span.span, n: at + 1, alloc)))
-        if failure.is_some() {
+        if failed {
             return Some(text::String.of("plan.delivery-failed", alloc))
         }
     }
     return None
 } deliver_outbox
+
+/// Carries out `commanded` through `control`, again after `RETRY_MS` while its target is restarting, at most `DELIVERY_ATTEMPTS` attempts in all, counted in `attempts`: the encoding of the reply to its request when it is one, or the code of its failure.
+fn attempted(
+    commanded: InstanceStep,
+    control: os::Control,
+    clocks: Clocks,
+    mut attempts: u32,
+    alloc: mem::Alloc,
+    ) -> Result[Option[mem::Bytes], text::Fixed[32]] fails task::Cancelled uses wait {
+    loop {
+        attempts += 1
+        let outcome = try await carried_out(commanded, control, alloc)
+        let restarting = match outcome {
+            Err(code) => code.as_str() == "port.stopped"
+            Ok(_) => false
+        }
+        if not restarting or attempts >= DELIVERY_ATTEMPTS {
+            return outcome
+        }
+        try await clocks.clock.sleep(RETRY_MS)
+    }
+} attempted
 
 /// The end of an apply in `state` with the code `code`.
 fn finish_as(state: PlanState, code: Str, alloc: mem::Alloc) -> Moved {

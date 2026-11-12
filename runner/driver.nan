@@ -290,6 +290,51 @@ fn Shared.ordered_port(self, mut driver: Driver, credit: os::Credit) -> Result[o
     }
 } Shared.ordered_port
 
+/// Calls the instance of `driver` with `encoded`, a call of the protocol of hash `hash`, on a task of `s` under the cause `cause`, through a port minted for the call alone and revoked once it is answered or in the instance's intake, telling `done` of its reply.
+fn Shared.call(
+    self,
+    driver: Driver,
+    hash: sys::ProtocolHash,
+    take encoded: sys::Encoded,
+    request: bool,
+    take done: task::Sender[Result[os::Outcome, os::ControlError]],
+    cause: u64,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    let moniker = ident::Moniker(text: driver.moniker.text)
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let minted = await when directory => directory.mint(moniker, credit: os::Credit(messages: 1, calls: 1), alloc)
+    let port = match minted {
+        Some(found) => found
+        None => {
+            discard attempt await done.send(Err(os::ControlError.Missing))
+            return
+        }
+    }
+    let header = os::Header.of_work(cause, slot: 0)
+    discard s.spawn(fn[take port, take encoded, take done]() fails task::Cancelled uses wait limits stack 16_384 {
+        var given = Some(take encoded)
+        let answered = attempt await sys::run_headed(header.carried(), body: fn[mut given]() -> sys::Encoded fails os::PortError[Never] uses wait {
+            let Some(call) = mut given.extract() else {
+                return sys::Encoded.empty(alloc)
+            }
+            if not request {
+                try await port.handle().post(hash, take call)
+                return sys::Encoded.empty(alloc)
+            }
+            return try await port.handle().request(hash, take call, alloc)
+        })
+        take port.close()
+        let outcome: Result[os::Outcome, os::ControlError] = match first answered {
+            Ok(reply) => Ok(os::Outcome.Replied(take reply))
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            Err(failure) => Err(os::ControlError.Unanswered(take failure))
+        }
+        discard attempt await done.send(take outcome)
+    })
+} Shared.call
+
 /// The protocol schema the instance of `driver` serves and the bundle it runs.
 fn Shared.described(self, driver: Driver) -> Result[os::Outcome, os::ControlError] {
     return match self.components.schema(driver.spec.component.as_str(), alloc: self.config.alloc) {
@@ -486,6 +531,7 @@ fn Shared.order[J: Journal](
         os::Action.Redeliver(seq: seq) => try await self.read_state(mut driver, reading: Reading.Letter(seq: seq), cause, take done, sender, s)
         os::Action.Restore(number: number) => try await self.read_state(mut driver, reading: Reading.Checkpoint(number: number), cause, take done, sender, s)
         os::Action.Fork(forking: forking) => try await self.fork(mut driver, take forking, take done, s)
+        os::Action.Call(hash: hash, encoded: encoded, request: request) => try await self.call(driver, hash, take encoded, request, take done, cause, s)
         os::Action.Start => {
             mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
             try await self.create_or_start(mut driver, sender, journal, s)

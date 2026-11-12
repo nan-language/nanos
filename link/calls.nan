@@ -1,0 +1,317 @@
+//! Calls: the arguments of a `call` step encoded as the call of an operation against the protocol schema its instance serves, written in NaN's call form, and its reply rendered, through named schemas.
+
+/// The encoding of the call of `operation` with `arguments`, its construction text between the parentheses: `request.invalid-operand` for an operation taking a capability or for arguments out of NaN's call form, `request.unknown-name` for a label naming no parameter, and `schema.invalid` for a value its type rejects.
+pub fn encoded_call(operation: sys::OperationSchema, arguments: Str, alloc: mem::Alloc) -> Result[mem::Bytes, Failure] {
+    let name = operation.name.as_str()
+    var parameters = mem::List[Parameter].empty(alloc)
+    for parameter in operation.parameters {
+        let sys::TypeSchema.Encoded(named) = parameter.value else {
+            return Err(Failure.of("request.invalid-operand", subject: name, alloc).expecting("an operation whose parameters hold no capability", found: parameter.name.as_str(), alloc))
+        }
+        let Some(copy) = duplicate(named, alloc) else {
+            return Err(Failure.of("store.corrupt", subject: name, alloc))
+        }
+        mut parameters.push(Parameter(name: text::String.of(parameter.name.as_str(), alloc), position: parameter.position, schema: take copy))
+    }
+    let text = match call_text(name, arguments, parameters, alloc) {
+        Ok(written) => written
+        Err(failure) => return Err(take failure)
+    }
+    let schema = call_schema(name, parameters, alloc)
+    return match attempt text::construction::encode_as(schema, raw: Untrusted.of(text.as_str().as_bytes()), alloc) {
+        Ok(bytes) => Ok(take bytes)
+        Err(error) => Err(invalid(name, type: name, error, alloc))
+    }
+} encoded_call
+
+/// A parameter of an operation: its name, its position among the operation's parameters as declared, and the named schema of its type.
+struct Parameter {
+    name: text::String
+    position: u32
+    schema: mem::wire::NamedSchema
+} Parameter
+
+/// The construction text of the call of `operation` with `arguments`, written in NaN's call form: the first argument unlabelled or labelled, binding the parameter declared first when unlabelled, and the others labelled with their parameters' names; the arguments go in the order of `parameters`.
+fn call_text(operation: Str, arguments: Str, parameters: mem::List[Parameter], alloc: mem::Alloc) -> Result[text::String, Failure] {
+    var values = mem::List[Option[text::String]].empty(alloc)
+    for _ in parameters {
+        mut values.push(None)
+    }
+    var leading = true
+    for item in take split_outside(arguments, separator: b',', alloc) {
+        if item.byte_len() == 0 {
+            continue
+        }
+        let written = item.as_str()
+        var index: Option[usize] = None
+        var start: usize = 0
+        match labelled_at(written) {
+            Some(end) => {
+                let Some(name) = written.slice_bytes(0, end) else {
+                    continue
+                }
+                index = parameters.position(fn(parameter: Parameter) => parameter.name.as_str() == name)
+                if index.is_none() {
+                    return Err(Failure.of("request.unknown-name", subject: name, alloc).expecting(names_of(parameters, alloc).as_str(), found: name, alloc))
+                }
+                start = end + 2
+            }
+            None => {
+                if leading {
+                    index = parameters.position(fn(parameter: Parameter) => parameter.position == 0)
+                }
+                if index.is_none() {
+                    var expected = text::String.of("each argument after the first labelled with its parameter among:", alloc)
+                    mut expected.append(names_of(parameters, alloc).as_str())
+                    return Err(Failure.of("request.invalid-operand", subject: operation, alloc).expecting(expected.as_str(), found: written, alloc))
+                }
+            }
+        }
+        let at = index.value_or(0)
+        if values[at].is_some() {
+            return Err(Failure.of("request.invalid-operand", subject: operation, alloc).expecting("each parameter given once", found: written, alloc))
+        }
+        let Some(value) = written.slice_bytes(start, end: written.byte_len()) else {
+            continue
+        }
+        values[at] = Some(text::String.of(value, alloc))
+        leading = false
+    }
+    var text = text::String.of(operation, alloc)
+    if parameters.len() == 0 {
+        if not leading {
+            return Err(Failure.of("request.invalid-operand", subject: operation, alloc).expecting("no arguments", found: arguments, alloc))
+        }
+        return Ok(take text)
+    }
+    mut text.push('(')
+    var separated = false
+    for at in 0..<parameters.len() {
+        let Some(value) = values[at] else {
+            continue
+        }
+        if separated {
+            mut text.append(", ")
+        }
+        mut text.append(parameters[at].name.as_str())
+        mut text.append(": ")
+        mut text.append(value.as_str())
+        separated = true
+    }
+    mut text.push(')')
+    return Ok(take text)
+} call_text
+
+/// The named schema of the calls of `operation`: a variant keyed by its name, holding the record of its parameters when it has some.
+fn call_schema(operation: Str, parameters: mem::List[Parameter], alloc: mem::Alloc) -> mem::wire::NamedSchema {
+    var nodes = mem::List[mem::wire::SchemaNode].empty(alloc)
+    var names = mem::List[mem::wire::SchemaName].empty(alloc)
+    mut nodes.push(mem::wire::SchemaNode.Bool)
+    var payload: Option[usize] = None
+    if parameters.len() > 0 {
+        mut nodes.push(mem::wire::SchemaNode.Bool)
+        var fields = mem::List[mem::wire::SchemaField].empty(alloc)
+        for parameter in parameters {
+            let root = appended(mut nodes, mut names, schema: parameter.schema, alloc)
+            mut fields.push(mem::wire::SchemaField(key: text::String.of(parameter.name.as_str(), alloc), aliases: mem::List.empty(alloc), defaulted: false, value: root))
+        }
+        nodes[1] = mem::wire::SchemaNode.Record(open: false, fields: take fields)
+        payload = Some(1)
+    }
+    var variants = mem::List[mem::wire::SchemaVariant].empty(alloc)
+    mut variants.push(mem::wire::SchemaVariant(key: text::String.of(operation, alloc), aliases: mem::List.empty(alloc), payload: payload))
+    nodes[0] = mem::wire::SchemaNode.Variant(open: false, variants: take variants)
+    return mem::wire::NamedSchema(tree: mem::wire::Schema(nodes: take nodes), names: take names)
+} call_schema
+
+/// The named schema of the replies of `operation`, `Result` of its result and failure, `Never` failing for none; `None` for a one-way operation.
+pub fn reply_schema(operation: sys::OperationSchema, alloc: mem::Alloc) -> Option[mem::wire::NamedSchema] {
+    let Some(sys::TypeSchema.Encoded(result)) = operation.result else {
+        return None
+    }
+    var nodes = mem::List[mem::wire::SchemaNode].empty(alloc)
+    var names = mem::List[mem::wire::SchemaName].empty(alloc)
+    mut nodes.push(mem::wire::SchemaNode.Bool)
+    mut names.push(mem::wire::SchemaName(node: 0, path: text::String.of("core::Result", alloc)))
+    var variants = mem::List[mem::wire::SchemaVariant].empty(alloc)
+    let ok = appended(mut nodes, mut names, schema: result, alloc)
+    mut variants.push(mem::wire::SchemaVariant(key: text::String.of("Ok", alloc), aliases: mem::List.empty(alloc), payload: Some(ok)))
+    match operation.failure {
+        Some(sys::TypeSchema.Encoded(failure)) => {
+            let err = appended(mut nodes, mut names, schema: failure, alloc)
+            mut variants.push(mem::wire::SchemaVariant(key: text::String.of("Err", alloc), aliases: mem::List.empty(alloc), payload: Some(err)))
+        }
+        else => {
+        }
+    }
+    nodes[0] = mem::wire::SchemaNode.Variant(open: false, variants: take variants)
+    return Some(mem::wire::NamedSchema(tree: mem::wire::Schema(nodes: take nodes), names: take names))
+} reply_schema
+
+/// Appends the tree of `schema` and its names to `nodes` and `names`, its node numbers moved past those held, and gives the number of its root.
+fn appended(mut nodes: mem::List[mem::wire::SchemaNode], mut names: mem::List[mem::wire::SchemaName], schema: mem::wire::NamedSchema, alloc: mem::Alloc) -> usize {
+    let base = nodes.len()
+    for node in schema.tree.nodes {
+        mut nodes.push(moved_node(node, by: base, alloc))
+    }
+    for name in schema.names {
+        mut names.push(mem::wire::SchemaName(node: name.node + base, path: text::String.of(name.path.as_str(), alloc)))
+    }
+    return base
+} appended
+
+/// `node` with each node number it names moved by `by`.
+fn moved_node(node: mem::wire::SchemaNode, by: usize, alloc: mem::Alloc) -> mem::wire::SchemaNode {
+    return match node {
+        mem::wire::SchemaNode.Bool => mem::wire::SchemaNode.Bool
+        mem::wire::SchemaNode.Char => mem::wire::SchemaNode.Char
+        mem::wire::SchemaNode.Text => mem::wire::SchemaNode.Text
+        mem::wire::SchemaNode.Bytes => mem::wire::SchemaNode.Bytes
+        mem::wire::SchemaNode.Unsigned(width: width) => mem::wire::SchemaNode.Unsigned(width: width)
+        mem::wire::SchemaNode.Signed(width: width) => mem::wire::SchemaNode.Signed(width: width)
+        mem::wire::SchemaNode.Float(width: width) => mem::wire::SchemaNode.Float(width: width)
+        mem::wire::SchemaNode.BoundedText(capacity: capacity) => mem::wire::SchemaNode.BoundedText(capacity: capacity)
+        mem::wire::SchemaNode.Sequence(element: element, length: length, capacity: capacity, unique: unique) => mem::wire::SchemaNode.Sequence(element: element + by, length: length, capacity: capacity, unique: unique)
+        mem::wire::SchemaNode.Map(key: key, value: value) => mem::wire::SchemaNode.Map(key: key + by, value: value + by)
+        mem::wire::SchemaNode.Record(open: open, fields: fields) => mem::wire::SchemaNode.Record(open: open, fields: moved_fields(fields, by, alloc))
+        mem::wire::SchemaNode.Variant(open: open, variants: variants) => mem::wire::SchemaNode.Variant(open: open, variants: moved_variants(variants, by, alloc))
+        mem::wire::SchemaNode.Back(depth: depth) => mem::wire::SchemaNode.Back(depth: depth)
+    }
+} moved_node
+
+fn moved_fields(fields: mem::List[mem::wire::SchemaField], by: usize, alloc: mem::Alloc) -> mem::List[mem::wire::SchemaField] {
+    var moved = mem::List[mem::wire::SchemaField].empty(alloc)
+    for field in fields {
+        mut moved.push(mem::wire::SchemaField(key: text::String.of(field.key.as_str(), alloc), aliases: texts_of_list(field.aliases, alloc), defaulted: field.defaulted, value: field.value + by))
+    }
+    return moved
+} moved_fields
+
+fn moved_variants(variants: mem::List[mem::wire::SchemaVariant], by: usize, alloc: mem::Alloc) -> mem::List[mem::wire::SchemaVariant] {
+    var moved = mem::List[mem::wire::SchemaVariant].empty(alloc)
+    for variant in variants {
+        let payload = match variant.payload {
+            Some(node) => Some(node + by)
+            None => None
+        }
+        mut moved.push(mem::wire::SchemaVariant(key: text::String.of(variant.key.as_str(), alloc), aliases: texts_of_list(variant.aliases, alloc), payload: payload))
+    }
+    return moved
+} moved_variants
+
+/// A copy of `texts`.
+fn texts_of_list(texts: mem::List[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var copies = mem::List[text::String].empty(alloc)
+    for each in texts {
+        mut copies.push(text::String.of(each.as_str(), alloc))
+    }
+    return copies
+} texts_of_list
+
+/// The names of `parameters`, each after a space.
+fn names_of(parameters: mem::List[Parameter], alloc: mem::Alloc) -> text::String {
+    var names = text::String.empty(alloc)
+    for parameter in parameters {
+        mut names.push(' ')
+        mut names.append(parameter.name.as_str())
+    }
+    return names
+} names_of
+
+/// Where the label of the argument `item` ends, before its `: `, when it starts with one.
+fn labelled_at(item: Str) -> Option[usize] {
+    let bytes = item.as_bytes()
+    for at in 0..<bytes.len() {
+        let byte = bytes[at]
+        if byte == b':' {
+            if at > 0 and at + 1 < bytes.len() and bytes[at + 1] == b' ' {
+                return Some(at)
+            }
+            return None
+        }
+        if not ((byte >= b'a' and byte <= b'z') or (byte >= b'0' and byte <= b'9') or byte == b'_') {
+            return None
+        }
+    }
+    return None
+} labelled_at
+
+/// The canonical rendering of `raw`, a reply that `reply` reads: its result, or `Err` and its failure; `Malformed` when it does not decode.
+pub fn reply_text(reply: mem::wire::NamedSchema, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text::String {
+    var rendered = text::String.empty(alloc)
+    if (attempt text::construction::render_as(reply, raw, alloc, out: mut rendered)).is_err() {
+        return text::String.of("Malformed", alloc)
+    }
+    let text = rendered.as_str()
+    if text.starts_with("Ok(") and text.ends_with(")") {
+        return part_of(text, start: 3, end: text.byte_len() - 1, alloc)
+    }
+    return rendered
+} reply_text
+
+/// Why a feed refuses a refresh, for tests.
+enum Refused derives Render, Encode {
+    TooMany
+} Refused
+
+/// A protocol whose calls tests encode.
+protocol Feeds {
+    pub fn refresh(limit: u32, label: text::String) -> u64 fails Refused limits recorded
+    pub fn ping() limits traceless
+} Feeds
+
+/// The schema of the operation `name` of `Feeds`, for tests.
+fn feeds_operation(name: Str, alloc: mem::Alloc) -> sys::OperationSchema {
+    var schema = sys::Wire[Feeds].schema(alloc)
+    let at = schema.operations.position(fn(each: sys::OperationSchema) => each.name.as_str() == name).value_or(0)
+    return mut schema.operations.remove(at)
+} feeds_operation
+
+test calls_encode_and_reply_as_their_protocol_does for encoded_call {
+    let alloc = testing::world().alloc
+    let refresh = feeds_operation("refresh", alloc)
+    let ping = feeds_operation("ping", alloc)
+    var expected = sys::Encoded.empty(alloc)
+    discard sys::Wire[Feeds].refresh(mut expected, limit: 3, label: text::String.of("news", alloc))
+    let Ok(positional) = encoded_call(refresh, arguments: "3, label: \"news\"", alloc) else {
+        expect false
+        return
+    }
+    let Ok(named) = encoded_call(refresh, arguments: "label: \"news\", limit: 3", alloc) else {
+        expect false
+        return
+    }
+    expect positional.view() == expected.bytes.view() and named.view() == expected.bytes.view()
+    var silent = sys::Encoded.empty(alloc)
+    sys::Wire[Feeds].ping(mut silent)
+    let Ok(pinged) = encoded_call(ping, arguments: "", alloc) else {
+        expect false
+        return
+    }
+    let one_way = reply_schema(ping, alloc)
+    expect pinged.view() == silent.bytes.view() and one_way.is_none()
+    let Some(reply) = reply_schema(refresh, alloc) else {
+        expect false
+        return
+    }
+    var answered = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Result[u64, Refused]].encode(Ok(412), out: mut answered)
+    var declined = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Result[u64, Refused]].encode(Err(Refused.TooMany), out: mut declined)
+    let total = reply_text(reply, raw: Untrusted.of(answered.view()), alloc)
+    let failure = reply_text(reply, raw: Untrusted.of(declined.view()), alloc)
+    expect total.as_str() == "412" and failure.as_str() == "Err(Refused.TooMany)"
+    let Err(unknown) = encoded_call(refresh, arguments: "3, count: 2", alloc) else {
+        expect false
+        return
+    }
+    let Err(malformed) = encoded_call(refresh, arguments: "lots, label: \"news\"", alloc) else {
+        expect false
+        return
+    }
+    let Err(unlabelled) = encoded_call(refresh, arguments: "3, \"news\"", alloc) else {
+        expect false
+        return
+    }
+    expect unknown.code.as_str() == "request.unknown-name" and malformed.code.as_str() == "schema.invalid" and unlabelled.code.as_str() == "request.invalid-operand"
+} calls_encode_and_reply_as_their_protocol_does

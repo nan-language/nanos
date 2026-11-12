@@ -1,6 +1,6 @@
 //! Plans: the `plan` verb previewing plans from keyed tasks, the plans the link keeps by their hash, their lifecycle states, events and records at `/live/plans`.
 
-/// A plan the link keeps: its hash, its record, the work of its spans, the subjects the policy decides, the session that previewed it, its state, the span it reached, the commits of its spans, the end of the running health window or confirmation wait, the request key and the request number it applies under, the code it ended with, and when it was previewed and ended in monotonic time.
+/// A plan the link keeps: its hash, its record, the work of its spans, the subjects the policy decides, the session that previewed it, its state, the span it reached, the commits of its spans, the replies to the requests of its call steps, the end of the running health window or confirmation wait, the request key and the request number it applies under, the code it ended with, and when it was previewed and ended in monotonic time.
 pub closed struct KeptPlan derives Encode {
     pub hash: ident::HashValue
     pub plan: Plan
@@ -10,6 +10,7 @@ pub closed struct KeptPlan derives Encode {
     pub state: PlanState
     pub span: u32
     pub commits: mem::List[ident::CommitId]
+    pub replies: mem::List[StepReply]
     pub until: Option[ident::WallTime]
     pub key: Option[text::String]
     pub applying: Option[u64]
@@ -17,6 +18,12 @@ pub closed struct KeptPlan derives Encode {
     pub previewed_ns: u64
     pub ended_ns: Option[u64]
 } KeptPlan
+
+/// The encoding of the reply to the request of a call step.
+pub closed struct StepReply derives Encode {
+    pub step: u32
+    pub reply: mem::Bytes
+} StepReply
 
 /// `plan <steps>`: a keyed task previews the steps for the session's principal.
 fn Linker.plan(
@@ -33,6 +40,31 @@ fn Linker.plan(
     let steps = steps_of(list.as_str(), alloc: env.alloc)
     mut self.preview_steps(take request, take steps, number, mut env, mut cx)
 } Linker.plan
+
+/// `call <moniker> <op>(<args>)`: a keyed task previews the one-step plan of that call for the session's principal, and the plan applies at once under the request's key, answering as `apply` does with its reply first.
+fn Linker.call(
+    mut self,
+    take request: Request,
+    number: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let alloc = env.alloc
+    var written = text::String.of("call ", alloc)
+    mut written.append(request.operand_text(alloc).as_str())
+    var steps: Result[mem::List[Written], Failure] = Ok(mem::List.empty(alloc))
+    match step_of(written.as_str(), alloc) {
+        Ok(step) => {
+            var single = mem::List[Written].empty(alloc)
+            mut single.push(take step)
+            steps = Ok(take single)
+        }
+        Err(failure) => {
+            steps = Err(take failure)
+        }
+    }
+    mut self.preview_steps(take request, take steps, number, mut env, mut cx)
+} Linker.call
 
 /// `undo <commit or plan>`: a keyed task previews the inverse plan: `revert <commit>`, or the reverts of a plan's span commits, newest first.
 fn Linker.undo(
@@ -136,7 +168,8 @@ fn Linker.planning(
     let principal = self.sessions[at].principal
     var previewing: u32 = 0
     for running in self.running {
-        let previews = running.verb.as_str() == "plan" or running.verb.as_str() == "undo"
+        let verb = running.verb.as_str()
+        let previews = (verb == "plan" or verb == "undo" or verb == "call") and self.plans.position(fn(each: KeptPlan) => each.applying == Some(running.number)).is_none()
         if not previews or (running.session == session and running.id == request.id) {
             continue
         }
@@ -172,7 +205,7 @@ fn Linker.planning(
     return Ok(Planning(steps: take steps, options: take options, principal: ident::Principal(text: principal.text), session: ident::SessionId(boot: self.boot(), number: session), holding: take holding, plans: self.config.plans, taint: take taint, open: take open, json: request.has("json-in"), now_utc: now_utc))
 } Linker.planning
 
-/// Answers the `plan` numbered `number` with its effect set, keeping the plan, or with the failure ending its preview.
+/// Answers the `plan` numbered `number` with its effect set, keeping the plan, or with the failure ending its preview; the plan of a `call` applies at once under its key.
 fn Linker.previewed(
     mut self,
     take number: u64,
@@ -193,21 +226,37 @@ fn Linker.previewed(
         }
     }
     let Previewed(hash: hash, plan: plan, spans: spans, subjects: subjects, records: records) = previewed
-    var block = self.running[at].block(Verdict.Ok, alloc)
-    for record in take records {
-        mut block.records.push(take record)
-    }
     let session = self.running[at].session
-    mut self.respond(at, take block, mut env, mut cx)
+    let calling = self.running[at].verb.as_str() == "call"
+    if not calling {
+        var block = self.running[at].block(Verdict.Ok, alloc)
+        for record in take records {
+            mut block.records.push(take record)
+        }
+        mut self.respond(at, take block, mut env, mut cx)
+    }
     let now = now_ns(env.clock)
     mut self.forget_plans(now, mut env, mut cx)
-    match self.plans.position(fn(each: KeptPlan) => each.hash == hash) {
-        Some(_) => return
-        None => {
-        }
+    if self.plans.position(fn(each: KeptPlan) => each.hash == hash).is_none() {
+        mut self.plans.push(KeptPlan(hash: hash, plan: take plan, spans: take spans, subjects: take subjects, session: session, state: PlanState.Previewed, span: 0, commits: mem::List.empty(alloc), replies: mem::List.empty(alloc), until: None, key: None, applying: None, code: None, previewed_ns: now, ended_ns: None))
+        mut self.announce(self.plans.len() - 1, mut env, mut cx)
     }
-    mut self.plans.push(KeptPlan(hash: hash, plan: take plan, spans: take spans, subjects: take subjects, session: session, state: PlanState.Previewed, span: 0, commits: mem::List.empty(alloc), until: None, key: None, applying: None, code: None, previewed_ns: now, ended_ns: None))
-    mut self.announce(self.plans.len() - 1, mut env, mut cx)
+    if not calling {
+        return
+    }
+    let Some(plan_at) = self.plans.position(fn(each: KeptPlan) => each.hash == hash) else {
+        return
+    }
+    if self.plans[plan_at].state != PlanState.Previewed {
+        let block = self.running[at].failed(Failure.of("plan.busy", subject: hash.short_form().as_str(), alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    self.plans[plan_at].key = match self.running[at].keyed {
+        Some(keyed) => Some(text::String.of(keyed.key.as_str(), alloc))
+        None => None
+    }
+    mut self.start_applying(plan_at, at, scheduled: None, mut env, mut cx)
 } Linker.previewed
 
 /// Emits the event of the state of the plan kept at `at` and publishes its record at `/live/plans`.
@@ -369,8 +418,6 @@ fn Linker.apply(
         mut self.respond(at, take block, mut env, mut cx)
         return
     }
-    let session = ident::SessionId(boot: self.boot(), number: self.running[at].session)
-    let slot = self.running[at].slot
     let scheduled = match request.flag("when") {
         Some(written) => match scheduled_time(written, now: env.wall.now(env.clock)) {
             Some(time) => Some(time)
@@ -382,6 +429,22 @@ fn Linker.apply(
         }
         None => None
     }
+    mut self.start_applying(plan_at, at, scheduled, mut env, mut cx)
+} Linker.apply
+
+/// Has a keyed task apply the plan kept at `plan_at` for the request running at `at`, at the wall time `scheduled` when it is timed.
+fn Linker.start_applying(
+    mut self,
+    plan_at: usize,
+    at: usize,
+    scheduled: Option[ident::WallTime],
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let alloc = env.alloc
+    let number = self.running[at].number
+    let slot = self.running[at].slot
+    let session = ident::SessionId(boot: self.boot(), number: self.running[at].session)
     let Some(applying) = self.applying_work(plan_at, number, session, scheduled, alloc) else {
         let block = self.running[at].failed(Failure.of("store.corrupt", subject: "plan", alloc), alloc)
         mut self.respond(at, take block, mut env, mut cx)
@@ -402,7 +465,7 @@ fn Linker.apply(
         try await apply_plan(take applying, tree, control, oversight, clocks, out, alloc)
     })
     mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
-} Linker.apply
+} Linker.start_applying
 
 /// The kept plan the `apply` running at `at` names, its key set, once the rules of apply let it go on: a plan of the session's principal, previewed and not applying, or ended under this key.
 fn Linker.applying(mut self, request: Request, at: usize, alloc: mem::Alloc) -> Result[usize, Failure] {
@@ -489,6 +552,7 @@ fn Linker.plan_moved(
             self.plans[plan_at].until = until
             mut self.announce(plan_at, mut env, mut cx)
         }
+        Moved.Replied(step: step, reply: reply) => mut self.plans[plan_at].replies.push(StepReply(step: step, reply: take reply))
         Moved.Delivered(entry: entry) => mut self.announce_delivery(plan_at, take entry, mut env, mut cx)
         Moved.Ended(state: state, code: code) => {
             self.plans[plan_at].state = state
@@ -508,7 +572,7 @@ fn Linker.plan_moved(
     }
 } Linker.plan_moved
 
-/// The final block of the request running at `at` for the plan kept at `plan_at`: a `span <n>, commit` record per span committed and `plan <hash>, state`, failed with the plan's code unless it applied.
+/// The final block of the request running at `at` for the plan kept at `plan_at`: for a `call`, a `reply <step>, value` record per reply to its requests; a `span <n>, commit` record per span committed and `plan <hash>, state`, failed with the plan's code unless it applied.
 fn Linker.final_block(self, plan_at: usize, at: usize, alloc: mem::Alloc) -> Block {
     let held = self.plans[plan_at]
     let verdict = match held.state == PlanState.Applied {
@@ -516,6 +580,15 @@ fn Linker.final_block(self, plan_at: usize, at: usize, alloc: mem::Alloc) -> Blo
         false => Verdict.Failed
     }
     var block = self.running[at].block(verdict, alloc)
+    if self.running[at].verb.as_str() == "call" {
+        for replied in held.replies {
+            match reply_record(held, replied, alloc) {
+                Some(record) => mut block.records.push(take record)
+                None => {
+                }
+            }
+        }
+    }
     match held.code {
         Some(code) => {
             var subject = text::String.empty(alloc)
@@ -540,6 +613,25 @@ fn Linker.final_block(self, plan_at: usize, at: usize, alloc: mem::Alloc) -> Blo
     mut block.records.push(take summary)
     return block
 } Linker.final_block
+
+/// `reply <step>, value` of the reply `replied` to a request of the plan `held`, rendered as a value of its operation's reply type.
+fn reply_record(held: KeptPlan, replied: StepReply, alloc: mem::Alloc) -> Option[Record] {
+    for span in held.spans {
+        for commanded in span.commands {
+            if commanded.step != replied.step {
+                continue
+            }
+            let Some(rendered) = commanded.reply_text(raw: Untrusted.of(replied.reply.view()), alloc) else {
+                return None
+            }
+            var record = Record.of("reply", alloc)
+            mut record.subject(Dyn[Render].view(replied.step))
+            mut record.rendered("value", rendered: rendered.as_str(), alloc)
+            return Some(take record)
+        }
+    }
+    return None
+} reply_record
 
 /// The `pending` record of the request numbered `number`: the state of the plan it applies, its span, the commit of that span and the end of its window, or `running`.
 fn Linker.pending_record(self, number: u64, alloc: mem::Alloc) -> Record {
