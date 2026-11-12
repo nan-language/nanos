@@ -1,0 +1,221 @@
+//! Horizons: the earliest irreversible step of a plan that a later step depends on, whose real outcome no preview of that later step can see.
+
+/// Where a plan reaches its horizon: the irreversible step, the later step depending on it, and what that step does to an instance the irreversible one delivers to: `forks <moniker>` or `reads <path>`.
+struct Horizon {
+    step: u32
+    later: u32
+    reached: text::String
+} Horizon
+
+/// `plan.horizon` naming the step at the horizon of the plan `asked` previews as `stepped`, of effects `effects`, deliveries `deliveries` and activations `activations`, the grants of the instances its irreversible steps deliver to read through `tree`; its fix previews the steps up to that one alone. `None` when the plan has no horizon.
+pub fn horizon_failure(
+    asked: Planning,
+    stepped: mem::List[Stepped],
+    effects: mem::List[StepEffect],
+    deliveries: mem::List[Delivery],
+    activations: mem::List[Activation],
+    tree: store::service::View,
+    alloc: mem::Alloc,
+    ) -> Option[Failure] fails task::Cancelled uses wait {
+    var principals = mem::List[ident::Principal].empty(alloc)
+    for effect in effects {
+        if not effect.class.is_irreversible() {
+            continue
+        }
+        for moniker in take delivered_to(deliveries, step: effect.step, alloc) {
+            var name = text::Fixed[64].of("inst.")
+            mut name.append(moniker.text.as_str())
+            mut principals.push(ident::Principal(text: name))
+        }
+    }
+    if principals.len() == 0 {
+        return None
+    }
+    let holdings = try await holdings_of(tree, principals, alloc)
+    let Some(horizon) = horizon_of(stepped, effects, deliveries, activations, holdings, now_utc: asked.now_utc, alloc) else {
+        return None
+    }
+    let written = asked.steps[usize.widen(horizon.step) - 1]
+    var expected = text::String.of("no step after step ", alloc)
+    mut expected.write(Dyn[Render].view(horizon.step), budget: 12)
+    mut expected.append(" forking or reading what its deliveries reach")
+    var found = text::String.of("step ", alloc)
+    mut found.write(Dyn[Render].view(horizon.later), budget: 12)
+    mut found.push(' ')
+    mut found.append(horizon.reached.as_str())
+    var failure = Failure.of("plan.horizon", subject: written.text.as_str(), alloc).expecting(expected.as_str(), found: found.as_str(), alloc)
+    mut failure.fixes.push(plan_through(asked, step: horizon.step, alloc))
+    return Some(take failure)
+} horizon_failure
+
+/// The horizon of the steps `stepped`, of effects `effects`, deliveries `deliveries` and activations `activations`, the grants of the instances their deliveries reach being among `holdings` at the UTC time `now_utc`: the earliest irreversible step whose deliveries reach an instance that a later step forks, by an activation or a command of its own, or that may write, through its grants, a node a later step reads.
+fn horizon_of(
+    stepped: mem::List[Stepped],
+    effects: mem::List[StepEffect],
+    deliveries: mem::List[Delivery],
+    activations: mem::List[Activation],
+    holdings: mem::List[Holding],
+    now_utc: i64,
+    alloc: mem::Alloc,
+    ) -> Option[Horizon] {
+    for effect in effects {
+        if not effect.class.is_irreversible() {
+            continue
+        }
+        let reached = delivered_to(deliveries, step: effect.step, alloc)
+        if reached.len() == 0 {
+            continue
+        }
+        for later in stepped {
+            if later.step <= effect.step {
+                continue
+            }
+            match forked_among(later, activations, reached) {
+                Some(moniker) => {
+                    var forks = text::String.of("forks ", alloc)
+                    mut forks.append(moniker.text.as_str())
+                    return Some(Horizon(step: effect.step, later: later.step, reached: take forks))
+                }
+                None => {
+                }
+            }
+            for read in later.made.reads {
+                if written_by(read.path.text.as_str(), reached, holdings, now_utc) {
+                    var reads = text::String.of("reads ", alloc)
+                    mut reads.append(read.path.text.as_str())
+                    return Some(Horizon(step: effect.step, later: later.step, reached: take reads))
+                }
+            }
+        }
+    }
+    return None
+} horizon_of
+
+/// The instances the `Message` deliveries of the step numbered `step` among `deliveries` reach, each once.
+fn delivered_to(deliveries: mem::List[Delivery], step: u32, alloc: mem::Alloc) -> mem::List[ident::Moniker] {
+    var monikers = mem::List[ident::Moniker].empty(alloc)
+    for delivery in deliveries {
+        if delivery.step != step or delivery.kind != DeliveryKind.Message {
+            continue
+        }
+        let target = delivery.target.as_str()
+        var cut = target.byte_len()
+        for at in 0..<target.byte_len() {
+            if target.as_bytes()[at] == b'.' {
+                cut = at
+            }
+        }
+        let Some(name) = target.slice_bytes(0, end: cut) else {
+            continue
+        }
+        let moniker = ident::Moniker(text: text::Fixed[59].of(name))
+        if monikers.position(fn(known: ident::Moniker) => known == moniker).is_none() {
+            mut monikers.push(take moniker)
+        }
+    }
+    return monikers
+} delivered_to
+
+/// The instance among `reached` that the step `later` forks: one an activation of it among `activations` starts or restarts, or the one its command names.
+fn forked_among(later: Stepped, activations: mem::List[Activation], reached: mem::List[ident::Moniker]) -> Option[ident::Moniker] {
+    for activation in activations {
+        if activation.step != later.step or activation.kind == ActivationKind.Stop or activation.kind == ActivationKind.Reboot {
+            continue
+        }
+        if reached.position(fn(moniker: ident::Moniker) => moniker == activation.moniker).is_some() {
+            return Some(ident::Moniker(text: activation.moniker.text))
+        }
+    }
+    let Some(commanded) = later.command else {
+        return None
+    }
+    if reached.position(fn(moniker: ident::Moniker) => moniker == commanded.moniker).is_some() {
+        return Some(ident::Moniker(text: commanded.moniker.text))
+    }
+    return None
+} forked_among
+
+/// Whether one of the instances `reached` may write the node at `path` through its grants among `holdings` at the UTC time `now_utc`.
+fn written_by(path: Str, reached: mem::List[ident::Moniker], holdings: mem::List[Holding], now_utc: i64) -> bool {
+    for holding in holdings {
+        let principal = holding.principal.text.as_str()
+        if not principal.starts_with("inst.") {
+            continue
+        }
+        let Some(name) = principal.slice_bytes(5, end: principal.byte_len()) else {
+            continue
+        }
+        if reached.position(fn(moniker: ident::Moniker) => moniker.text.as_str() == name).is_some() and holding.view_writes(path, now_utc) {
+            return true
+        }
+    }
+    return false
+} written_by
+
+/// `plan [<steps>]` of the steps of `asked` up to the one numbered `step`, with its options.
+fn plan_through(asked: Planning, step: u32, alloc: mem::Alloc) -> text::String {
+    var fix = text::String.of("plan [", alloc)
+    for at in 0..<usize.widen(step) {
+        if at > 0 {
+            mut fix.append(", ")
+        }
+        mut fix.append(asked.steps[at].text.as_str())
+    }
+    mut fix.push(']')
+    match asked.options.intent {
+        Some(intent) => {
+            mut fix.append(" --intent ")
+            mut fix.write(Dyn[Render].view(Quoted(text: text::String.of(intent.as_str(), alloc))), budget: 2_100)
+        }
+        None => {
+        }
+    }
+    match asked.options.confirm_within_s {
+        Some(seconds) => {
+            mut fix.append(" --confirm-within ")
+            mut fix.write(Dyn[Render].view(seconds), budget: 12)
+        }
+        None => {
+        }
+    }
+    if asked.options.health_s != asked.plans.health_s {
+        mut fix.append(" --health ")
+        mut fix.write(Dyn[Render].view(asked.options.health_s), budget: 12)
+    }
+    return fix
+} plan_through
+
+test horizons_fall_on_irreversible_steps_a_later_step_depends_on for horizon_of {
+    let alloc = testing::world().alloc
+    let sending = Reversibility.Irreversible(kinds: IrreversibleKinds(emit: true, actuate: false, erase: false, spend: false))
+    var effects = mem::List[StepEffect].empty(alloc)
+    mut effects.push(StepEffect(step: 1, span: 1, class: sending, basis: Basis.Declared, reply: None))
+    mut effects.push(StepEffect(step: 2, span: 2, class: Reversibility.Restorable, basis: Basis.Observed, reply: None))
+    var deliveries = mem::List[Delivery].empty(alloc)
+    mut deliveries.push(Delivery(step: 1, kind: DeliveryKind.Message, issuer: ident::Principal(text: text::Fixed[64].of("owner")), target: text::String.of("app.mailer.send", alloc), code: None, destination: text::String.empty(alloc), size_bytes: 0, blake3: ident::HashValue.of_content(b""), class: sending))
+    var reads = mem::List[NodeRead].empty(alloc)
+    mut reads.push(NodeRead(path: ident::Path(text: text::String.of("/data/inst.app.mailer/sent", alloc)), commit: ident::CommitId(number: 4)))
+    var stepped = mem::List[Stepped].empty(alloc)
+    mut stepped.push(Stepped(step: 1, before: ident::CommitId(number: 4), after: ident::CommitId(number: 4), made: Made(writes: mem::List.empty(alloc), reads: mem::List.empty(alloc)), command: None))
+    mut stepped.push(Stepped(step: 2, before: ident::CommitId(number: 4), after: ident::CommitId(number: 5), made: Made(writes: mem::List.empty(alloc), reads: take reads), command: None))
+    var rights = mem::Set[os::Right].empty(alloc)
+    discard mut rights.insert(os::Right.Write)
+    var grants = mem::List[Held].empty(alloc)
+    mut grants.push(Held(number: 7, grant: os::Grant(holder: ident::Principal(text: text::Fixed[64].of("inst.app.mailer")), object: os::Object.Tree(prefix: ident::Path(text: text::String.of("/data/inst.app.mailer", alloc)), branch: text::String.of("main", alloc)), rights: take rights, caveats: os::Caveats.none(), parent: Some(1), granted_by: ident::CommitId(number: 2))))
+    var holdings = mem::List[Holding].empty(alloc)
+    mut holdings.push(Holding(principal: ident::Principal(text: text::Fixed[64].of("inst.app.mailer")), grants: take grants, keyed: false))
+    let Some(read) = horizon_of(stepped, effects, deliveries, activations: mem::List.empty(alloc), holdings, now_utc: 0, alloc) else {
+        expect false
+        return
+    }
+    expect read.step == 1 and read.later == 2 and read.reached.as_str() == "reads /data/inst.app.mailer/sent"
+    var activations = mem::List[Activation].empty(alloc)
+    mut activations.push(Activation(moniker: ident::Moniker(text: text::Fixed[59].of("app.mailer")), step: 2, kind: ActivationKind.Restart, migration: None, pause_ms: 2))
+    let Some(forked) = horizon_of(stepped, effects, deliveries, activations, holdings: mem::List.empty(alloc), now_utc: 0, alloc) else {
+        expect false
+        return
+    }
+    expect forked.reached.as_str() == "forks app.mailer"
+    let unreached = horizon_of(stepped, effects, deliveries, activations: mem::List.empty(alloc), holdings: mem::List.empty(alloc), now_utc: 0, alloc)
+    expect unreached.is_none()
+} horizons_fall_on_irreversible_steps_a_later_step_depends_on
