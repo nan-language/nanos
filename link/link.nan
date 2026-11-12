@@ -1,6 +1,6 @@
 //! The `link` instance: the protocol through which agents and humans reach the system, served on the serial and port transports.
 
-/// The keys of the keyed tasks: the serial transport's reader, the one reading the facts of the ready record, the one handing lines to `console`, the one reading the principals' grants, the one telling the journal and `/live` of sessions, and those answering requests and writing to each connection, plus the slot of each.
+/// The keys of the keyed tasks: the serial transport's reader, the one reading the facts of the ready record, the one handing lines to `console`, the one reading the principals' grants, the one telling the journal and `/live` of sessions, the one reverting the plans a restart interrupted, and those answering requests and writing to each connection, plus the slot of each.
 const READING: u64 = 1
 
 const OPENING: u64 = 3
@@ -10,6 +10,8 @@ const CONSOLING: u64 = 4
 const GRANTING: u64 = 5
 
 const NOTIFYING: u64 = 6
+
+const RECOVERING: u64 = 7
 
 const ANSWERING: u64 = 0x1_0000_0000
 
@@ -129,9 +131,10 @@ pub closed struct Running derives Encode {
     pub pending: bool
     pub principal: Option[ident::Principal]
     pub resume: Option[u64]
+    pub keyed: Option[Keyed]
 } Running
 
-/// The state of `link`: its configuration, the facts read at its start, its connections and the number of the next, the requests running and the number of the next, the sessions open and the number of the next, what the principals holding them hold and what their sessions spent and gained, whether their grants are being read and whether they changed meanwhile, the watches, when the ready record went out, the console lines waiting for `console` and whether one is being handed over, the notices waiting for the journal and `/live` and whether one is being told, and the plans it keeps.
+/// The state of `link`: its configuration, the facts read at its start, its connections and the number of the next, the requests running and the number of the next, the sessions open and the number of the next, what the principals holding them hold and what their sessions spent and gained, whether their grants are being read and whether they changed meanwhile, the watches, when the ready record went out, the console lines waiting for `console` and whether one is being handed over, the notices waiting for the journal and `/live` and whether one is being told, the plans it keeps, and the results of the latest mutating requests of each session.
 pub closed struct Linker derives Encode {
     pub config: LinkConfig
     pub facts: Option[Facts]
@@ -152,6 +155,7 @@ pub closed struct Linker derives Encode {
     pub notices: mem::List[Notice]
     pub notifying: bool
     pub plans: mem::List[KeptPlan]
+    pub results: mem::List[KeptResult]
 } Linker
 
 impl Linker: sys::Component[Env, LinkSession]
@@ -182,10 +186,10 @@ pub fn Linker.start(mut env: Env) -> Linker {
     let alloc = env.alloc
     var connections = mem::List[Connection].empty(alloc)
     mut connections.push(Connection.of(SERIAL_CONNECTION, transport: Transport.Serial, opener: 0, slot: 0, alloc))
-    return Linker(config: env.config, facts: None, connections: take connections, next_connection: SERIAL_CONNECTION + 1, running: mem::List.empty(alloc), next: 1, sessions: mem::List.empty(alloc), next_session: 1, holdings: mem::List.empty(alloc), tallies: mem::List.empty(alloc), granting: false, stale: false, watches: mem::List.empty(alloc), ready_ns: 0, lines: mem::List.empty(alloc), consoling: false, notices: mem::List.empty(alloc), notifying: false, plans: mem::List.empty(alloc))
+    return Linker(config: env.config, facts: None, connections: take connections, next_connection: SERIAL_CONNECTION + 1, running: mem::List.empty(alloc), next: 1, sessions: mem::List.empty(alloc), next_session: 1, holdings: mem::List.empty(alloc), tallies: mem::List.empty(alloc), granting: false, stale: false, watches: mem::List.empty(alloc), ready_ns: 0, lines: mem::List.empty(alloc), consoling: false, notices: mem::List.empty(alloc), notifying: false, plans: mem::List.empty(alloc), results: mem::List.empty(alloc))
 } Linker.start
 
-/// Listens on serial, reads the facts of the ready record and subscribes to the grants and principals.
+/// Listens on serial, reads the facts of the ready record and subscribes to the grants and principals, and once started reverts each span commit that awaited its confirmation when `link` stopped.
 pub fn Linker.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[LinkSession]) {
     let console = env.console
     let tree = env.tree
@@ -198,6 +202,11 @@ pub fn Linker.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: 
         let facts = try await facts_of(tree, own, alloc)
         discard attempt await out.opened(take facts)
     })
+    if reason == sys::ResumeReason.Started {
+        mut cx.spawn(key: RECOVERING, run: fn(out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+            try await recover_plans(tree, alloc)
+        })
+    }
 } Linker.resume
 
 /// Writes the ready record to each connection, ahead of any block.
@@ -244,6 +253,7 @@ fn Linker.responded(
     }
     let done = mut self.running.remove(at)
     mut env.forget_upload(number)
+    mut self.keep_result(done, block, alloc: env.alloc)
     mut self.deliver(connection: done.connection, session: done.session, take block, cut: done.cut, mut env, mut cx)
 } Linker.responded
 
@@ -307,7 +317,12 @@ fn Linker.run(
     let number = self.next
     self.next += 1
     let cut = self.cut_for(request, budget: self.budget_of(session), alloc)
-    mut self.running.push(Running(number: number, slot: slot, connection: connection, session: session, id: request.id, verb: request.verb, operand: first_operand(request, alloc), cut: take cut, pending: false, principal: None, resume: None))
+    mut self.running.push(Running(number: number, slot: slot, connection: connection, session: session, id: request.id, verb: request.verb, operand: first_operand(request, alloc), cut: take cut, pending: false, principal: None, resume: None, keyed: None))
+    match mut self.keyed_request(request, session, mut env, mut cx) {
+        true => {
+        }
+        false => return
+    }
     match request.verb.as_str() {
         "watch" => mut self.watch(take request, number, mut env, mut cx)
         "cancel" => mut self.cancel(take request, number, mut env, mut cx)
@@ -450,6 +465,7 @@ fn Linker.respond(
     mut cx: sys::Cx[LinkSession],
     ) {
     let done = mut self.running.remove(at)
+    mut self.keep_result(done, block, alloc: env.alloc)
     mut self.deliver(connection: done.connection, session: done.session, take block, cut: done.cut, mut env, mut cx)
 } Linker.respond
 

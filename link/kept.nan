@@ -1,0 +1,141 @@
+//! Request keys: the key and identity of each mutating request, and the results of the latest mutating requests of each session, which a request repeating a key gets again.
+
+/// The key and identity of a mutating request: its verb, operands and flags other than `--session`, `--budget`, `--skip`, `--json` and `--fields`.
+pub closed struct Keyed derives Encode {
+    pub key: text::String
+    pub identity: text::String
+} Keyed
+
+/// The result a mutating request of a session gave under its key.
+pub closed struct KeptResult derives Encode {
+    pub session: u64
+    pub principal: ident::Principal
+    pub keyed: Keyed
+    pub block: Block
+} KeptResult
+
+/// Whether the verb `verb` mutates the machine and takes a request key.
+fn mutates(verb: Str) -> bool {
+    return match verb {
+        "apply" or "call" or "confirm" or "cancel" or "put" or "extract" or "delegate" or "approve" or "freeze" => true
+        else => false
+    }
+} mutates
+
+/// The identity of `request`: its verb, operands and flags other than `--session`, `--budget`, `--skip`, `--json` and `--fields`.
+fn identity_of(request: Request, alloc: mem::Alloc) -> text::String {
+    var identity = text::String.of(request.verb.as_str(), alloc)
+    for operand in request.operands {
+        mut identity.push(' ')
+        mut identity.append(operand.as_str())
+    }
+    for flag in request.flags {
+        let name = flag.name.as_str()
+        if name == "session" or name == "budget" or name == "skip" or name == "json" or name == "fields" {
+            continue
+        }
+        mut identity.append(" --")
+        mut identity.append(name)
+        match flag.value {
+            Some(value) => {
+                mut identity.push(' ')
+                mut identity.append(value.as_str())
+            }
+            None => {
+            }
+        }
+    }
+    return identity
+} identity_of
+
+/// Notes the key of the mutating request running last, of the session numbered `session`, and whether it goes on: a key a kept result of its principal's sessions holds answers the request with that result when its identity is equal and refuses it with `request.key-reused` otherwise.
+fn Linker.keyed_request(
+    mut self,
+    request: Request,
+    session: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) -> bool {
+    let alloc = env.alloc
+    let at = self.running.len() - 1
+    if not mutates(request.verb.as_str()) or session == 0 {
+        return true
+    }
+    let key = match self.key_of_request(request, session, alloc) {
+        Ok(made) => made
+        Err(failure) => {
+            let block = self.running[at].failed(take failure, alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+            return false
+        }
+    }
+    let identity = identity_of(request, alloc)
+    let Some(session_at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return true
+    }
+    let principal = self.sessions[session_at].principal
+    match self.results.position(fn(each: KeptResult) => each.principal == principal and each.keyed.key.as_str() == key.as_str()) {
+        Some(found) => {
+            if self.results[found].keyed.identity.as_str() != identity.as_str() {
+                let block = self.running[at].failed(Failure.of("request.key-reused", subject: key.as_str(), alloc).expecting("the request the key named before", found: identity.as_str(), alloc), alloc)
+                mut self.respond(at, take block, mut env, mut cx)
+                return false
+            }
+            let Some(again) = duplicate(self.results[found].block, alloc) else {
+                return true
+            }
+            var block = again
+            block.id = request.id
+            let done = mut self.running.remove(at)
+            mut self.deliver(connection: done.connection, session: done.session, take block, cut: done.cut, mut env, mut cx)
+            return false
+        }
+        None => {
+        }
+    }
+    self.running[at].keyed = Some(Keyed(key: take key, identity: take identity))
+    return true
+} Linker.keyed_request
+
+/// Keeps the result `block` of the mutating request `done` under its key, the oldest result of its session giving way beyond `PlanConfig.key_results`.
+fn Linker.keep_result(mut self, done: Running, block: Block, alloc: mem::Alloc) {
+    let Some(keyed) = done.keyed else {
+        return
+    }
+    let Some(session_at) = self.sessions.position(fn(each: Session) => each.number == done.session) else {
+        return
+    }
+    let Some(copy) = duplicate(block, alloc) else {
+        return
+    }
+    let Some(keyed_copy) = duplicate(keyed, alloc) else {
+        return
+    }
+    var held: u32 = 0
+    for result in self.results {
+        if result.session == done.session {
+            held += 1
+        }
+    }
+    if held >= self.config.plans.key_results {
+        match self.results.position(fn(each: KeptResult) => each.session == done.session) {
+            Some(oldest) => {
+                discard mut self.results.remove(oldest)
+            }
+            None => {
+            }
+        }
+    }
+    mut self.results.push(KeptResult(session: done.session, principal: ident::Principal(text: self.sessions[session_at].principal.text), keyed: take keyed_copy, block: take copy))
+} Linker.keep_result
+
+test identities_leave_out_how_blocks_print for identity_of {
+    let alloc = testing::world().alloc
+    let Read.Request(request) = Request.read("7 apply aeixtdsr2vw5ljsyma --key deploy.1 --budget 200 --json", alloc) else {
+        expect false
+        return
+    }
+    let identity = identity_of(request, alloc)
+    expect identity.as_str() == "apply aeixtdsr2vw5ljsyma --key deploy.1"
+    expect mutates("put") and mutates("confirm") and not mutates("plan") and not mutates("get")
+} identities_leave_out_how_blocks_print
