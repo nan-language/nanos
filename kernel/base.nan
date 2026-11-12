@@ -87,6 +87,7 @@ struct Base derives Copy {
     machine: os::Machine
     switch: power::Switch
     sessions_live: os::Live
+    plans_live: os::Live
     callers: os::Callers
 } Base
 
@@ -550,7 +551,7 @@ fn Base.serve_power(self, take world: nanos::World, take serving: runner::Servin
     })
 } Base.serve_power
 
-/// Serves `link` on its ports to the console UART, to `keys`, to `console` and to itself, its View of the tree, the kernel's entropy and the clocks, with its configuration record, the configuration by default when it has none.
+/// Serves `link` on its ports to the console UART, to `keys`, to `console`, to `policy` and to itself, its View of the tree, the kernel's entropy and the clocks, with its configuration record, the configuration by default when it has none.
 fn Base.serve_link(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     let alloc = world.alloc
     let Ok(consoling) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "console") else {
@@ -577,6 +578,12 @@ fn Base.serve_link(self, take world: nanos::World, take serving: runner::Serving
     let Ok(own) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "own") else {
         return runner::Ended.EnvIncomplete
     }
+    let Ok(overseeing) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "oversight") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Some(oversight) = os::Port[policy::Oversight].of(overseeing) else {
+        return runner::Ended.EnvIncomplete
+    }
     let config = match mut serving.take_config() {
         Some(record) => match attempt mem::wire::Codec[link::LinkConfig].decode(record.view(), alloc) {
             Ok(configured) => configured
@@ -587,7 +594,7 @@ fn Base.serve_link(self, take world: nanos::World, take serving: runner::Serving
     let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
         return runner::Ended.EnvIncomplete
     }
-    let env = link::Env.of(console, tree, keys: keyring, attendant, own, events, live: self.sessions_live, callers: self.callers, random: world.random, clock: world.clock, wall: self.wall, config, alloc)
+    let env = link::Env.of(console, tree, keys: keyring, attendant, oversight, own, events, live: self.sessions_live, plans_live: self.plans_live, callers: self.callers, random: world.random, clock: world.clock, wall: self.wall, config, alloc)
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
     mut peers.push(sys::Wire[store::service::Watcher].schema(alloc))
     return try await runner::Driven[link::Linker, link::Env, link::LinkSession].run(take env, exec: world.exec, alloc, take serving, take peers, release: fn(take ended: link::Env) limits stack 4_096 {
@@ -739,13 +746,16 @@ fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem
 /// Adds the specifications and grants of `link` and `console`, running `bundle`.
 fn Building.add_link(mut self, bundle: ident::HashValue, alloc: mem::Alloc) {
     var linking = os::InstanceSpec.of(principal: principal("system"), bundle, component: LINKER, alloc)
-    mut self.grant(mut linking, holder: "link", field: "tree", object: tree_of("/", alloc), granted: read_rights(alloc), alloc)
+    mut self.grant(mut linking, holder: "link", field: "tree", object: tree_of("/", alloc), granted: admin_rights(alloc), alloc)
     mut self.grant(mut linking, holder: "link", field: "clock", object: os::Object.Clock, granted: mem::Set.empty(alloc), alloc)
     mut self.grant(mut linking, holder: "link", field: "random", object: os::Object.Random, granted: mem::Set.empty(alloc), alloc)
     var verifying = mem::List[text::String].empty(alloc)
     mut verifying.push(text::String.of("verify", alloc))
     discard mut linking.wiring.insert(text::String.of("keys", alloc), value: os::Wire(target: os::Target.Instance(moniker("keys")), operations: Some(take verifying), credit: os::Credit(messages: 4, calls: 4)))
     discard mut linking.wiring.insert(text::String.of("own", alloc), value: os::Wire(target: os::Target.Instance(moniker("link")), operations: None, credit: os::Credit(messages: link::WATCH_CREDIT, calls: 1)))
+    var deciding = mem::List[text::String].empty(alloc)
+    mut deciding.push(text::String.of("decide", alloc))
+    discard mut linking.wiring.insert(text::String.of("oversight", alloc), value: os::Wire(target: os::Target.Instance(moniker("policy")), operations: Some(take deciding), credit: os::Credit(messages: 4, calls: 4)))
     var consoling = mem::List[text::String].empty(alloc)
     mut consoling.push(text::String.of("write", alloc))
     mut consoling.push(text::String.of("read", alloc))
@@ -923,7 +933,7 @@ fn run_base(
     let switching = power::MintedSwitch.of(switched, alloc: config.alloc)
     defer take switching.close()
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: switching.mint(), sessions_live: lives.sessions.mint(), callers: lives.callers.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: switching.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint())
     var requested = incoming
     var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced))
     defer abandon_given(take given)
@@ -988,21 +998,23 @@ linear struct Roots {
     keys: os::MintedLive
     boot: os::MintedLive
     sessions: os::MintedLive
+    plans: os::MintedLive
     callers: os::MintedCallers
 } Roots
 
 fn Roots.of(posted: task::Sender[os::Posting], take monikers: task::Cown[mem::Map[u32, ident::Moniker]], alloc: mem::Alloc) -> Roots {
-    return Roots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), callers: os::MintedCallers.of(take monikers, alloc))
+    return Roots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), plans: os::MintedLive.of(posted, own: "/live/plans", alloc), callers: os::MintedCallers.of(take monikers, alloc))
 } Roots.of
 
 /// Revokes the root entries.
 fn Roots.close(take self) {
-    let Roots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, callers: calling) = self
+    let Roots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, plans: planned, callers: calling) = self
     take stored.close()
     take managed.close()
     take keyed.close()
     take booted.close()
     take linked.close()
+    take planned.close()
     take calling.close()
 } Roots.close
 
@@ -1163,6 +1175,13 @@ fn read_rights(alloc: mem::Alloc) -> mem::Set[os::Right] {
     return set
 } read_rights
 
+/// The rights of a `Tree` grant reading, writing and branching its subtree.
+fn admin_rights(alloc: mem::Alloc) -> mem::Set[os::Right] {
+    var set = tree_rights(alloc)
+    discard mut set.insert(os::Right.Admin)
+    return set
+} admin_rights
+
 /// The rights of a `Tree` grant reading and writing its subtree.
 fn tree_rights(alloc: mem::Alloc) -> mem::Set[os::Right] {
     var set = mem::Set[os::Right].empty(alloc)
@@ -1201,7 +1220,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     defer take switching.close()
     let naming = os::MintedCallers.of(rings.monikers(), alloc)
     defer take naming.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), callers: naming.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint())
     let task::Channel(sender: logs, receiver: unlogged) = task::Channel[journal::Logged].bounded(1, alloc)
     discard unlogged
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, reservations: Reserver(requests: take requests, alloc: alloc), config, postings: posted, logs, gauges: runner::Gauges.empty(alloc), tracings: take untraced, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {

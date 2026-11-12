@@ -1,0 +1,613 @@
+//! Materials: the writes each tree step of a plan makes against the head of a branch, the nodes it reads, and the authority it needs.
+
+/// The most grants one scan of `/sys/grants` gives.
+const GRANTS_SCANNED: u32 = 256
+
+/// What a tree step makes: its writes, in order, and the nodes they read with the commit that last wrote each, `#0` for an absent one.
+pub closed struct Made derives Encode {
+    pub writes: mem::List[store::Write]
+    pub reads: mem::List[NodeRead]
+} Made
+
+/// A grant as `/sys/grants` holds it: its number, its parent's and its holder.
+struct Granted {
+    number: u64
+    parent: Option[u64]
+    holder: ident::Principal
+} Granted
+
+/// The writes of the tree step `written` against the head of `view`, after checking it against `holding` at the UTC time `now_utc`; values are JSON when `json`, and a grant written without the commit granting it names `base`.
+pub fn materialize(
+    written: Written,
+    view: store::service::View,
+    holding: Holding,
+    now_utc: i64,
+    json: bool,
+    base: ident::CommitId,
+    alloc: mem::Alloc,
+    ) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    let made = match written.step {
+        Step.Write(target: target, value: value) => try await made_write(target.as_str(), value: value.as_str(), view, json, alloc)
+        Step.Delete(path: path) => try await made_delete(path.text.as_str(), view, alloc)
+        Step.Start(moniker: moniker) => try await made_lifecycle(moniker, stopped: false, view, holding, now_utc, alloc)
+        Step.Stop(moniker: moniker) => try await made_lifecycle(moniker, stopped: true, view, holding, now_utc, alloc)
+        Step.Grant(spec: spec) => try await made_grant(spec.as_str(), view, holding, now_utc, json, base, alloc)
+        Step.Revoke(grant: number) => try await made_revoke(number, view, holding, now_utc, alloc)
+        Step.Revert(commit: commit) => try await made_revert(commit, view, alloc)
+        else => return Err(Failure.of("request.invalid-operand", subject: written.text.as_str(), alloc).expecting("a tree step", found: written.text.as_str(), alloc))
+    }
+    let done = match made {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    match written.expected {
+        Some(version) => {
+            match try await expectation(version, reads: done.reads, view, alloc) {
+                Some(failure) => return Err(take failure)
+                None => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    match written.step {
+        Step.Write(target: _, value: _) or Step.Delete(path: _) or Step.Revert(commit: _) => {
+            for write in done.writes {
+                let path = written_path(write, alloc)
+                if not holding.writes(path.as_str(), now_utc) {
+                    return Err(denied(path.as_str(), right: write_right(path.as_str()).as_str(), alloc))
+                }
+            }
+        }
+        else => {
+        }
+    }
+    return Ok(take done)
+} materialize
+
+/// The node at `path` through `view` at its head, `None` when there is none.
+pub fn node_at(view: store::service::View, path: Str, alloc: mem::Alloc) -> Result[Option[store::Node], Failure] fails task::Cancelled uses wait {
+    let Some(named) = path_of(path, alloc) else {
+        return Err(Failure.of("request.invalid-operand", subject: path, alloc).expecting("a path", found: path, alloc))
+    }
+    return match first attempt await view.get(take named, at: None, alloc) {
+        Ok(node) => Ok(Some(take node))
+        Err(store::service::ViewError.Failed(store::service::Failure.NotFound)) => Ok(None)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(Failure.of(failed.code().as_str(), subject: path, alloc))
+    }
+} node_at
+
+/// `plan.stale` unless the node the step reads first is at the commit or has the hash `version` names.
+fn expectation(version: store::Version, reads: mem::List[NodeRead], view: store::service::View, alloc: mem::Alloc) -> Option[Failure] fails task::Cancelled uses wait {
+    let Some(read) = reads.get(0) else {
+        return None
+    }
+    let path = read.path.text.as_str()
+    let node = match try await node_at(view, path, alloc) {
+        Ok(found) => found
+        Err(failure) => return Some(take failure)
+    }
+    let met = match version {
+        store::Version.Commit(commit) => match node {
+            Some(present) => present.version == commit
+            None => false
+        }
+        store::Version.Hash(hash) => match node {
+            Some(present) => present.hash == Some(hash)
+            None => false
+        }
+        store::Version.Absent => node.is_none()
+    }
+    if met {
+        return None
+    }
+    return Some(Failure.of("plan.stale", subject: path, alloc).expecting("the node --expect names", found: "a node changed since", alloc))
+} expectation
+
+/// `write <target> <value>`: the record or blob at `target`; else a field of the record at the longest prefix of `target` ending before a `.` of its last segment; else a new node.
+fn made_write(target: Str, value: Str, view: store::service::View, json: bool, alloc: mem::Alloc) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    match try await node_at(view, path: target, alloc) {
+        Ok(Some(node)) => return whole_write(node, value, json, alloc)
+        Ok(None) => {
+        }
+        Err(failure) => return Err(take failure)
+    }
+    let segment_start = match last_slash(target) {
+        Some(at) => at + 1
+        None => 0
+    }
+    var at = target.byte_len()
+    while at > segment_start {
+        at -= 1
+        if target.as_bytes()[at] != b'.' {
+            continue
+        }
+        let Some(prefix) = target.slice_bytes(0, end: at) else {
+            continue
+        }
+        let Some(field) = target.slice_bytes(at + 1, end: target.byte_len()) else {
+            continue
+        }
+        match try await node_at(view, path: prefix, alloc) {
+            Ok(Some(node)) => {
+                if node.kind == store::NodeKind.Record {
+                    return field_write(node, field, value, json, alloc)
+                }
+            }
+            Ok(None) => {
+            }
+            Err(failure) => return Err(take failure)
+        }
+    }
+    return try await new_write(target, value, view, json, alloc)
+} made_write
+
+/// The write replacing the record or blob `node` with `value`.
+fn whole_write(node: store::Node, value: Str, json: bool, alloc: mem::Alloc) -> Result[Made, Failure] {
+    let path = node.path.text.as_str()
+    if node.kind == store::NodeKind.Blob {
+        let Some(hash) = blob_of(value) else {
+            return Err(Failure.of("schema.mismatch", subject: path, alloc).expecting("the id of a blob the store holds", found: value, alloc))
+        }
+        return Ok(made_put(node.path, value: store::Value.Blob(hash), version: node.version, alloc))
+    }
+    if node.kind != store::NodeKind.Record {
+        return Err(Failure.of("store.kind", subject: path, alloc).expecting("a record or a blob", found: "a dir or a stream", alloc))
+    }
+    let Some(declared) = node.declared else {
+        return Err(Failure.of("schema.unknown", subject: path, alloc))
+    }
+    return match typed_value(declared.name.as_str(), value, json, subject: path, alloc) {
+        Ok(bytes) => Ok(made_put(node.path, value: store::Value.Record(type: store::TypeRef(name: text::String.of(declared.name.as_str(), alloc), schema: declared.schema), bytes: take bytes, secret: node.secret), version: node.version, alloc))
+        Err(failure) => Err(take failure)
+    }
+} whole_write
+
+/// The write replacing the field `field` of the record `node` with `value`: the record's JSON with that member replaced, decoded as its type.
+fn field_write(node: store::Node, field: Str, value: Str, json: bool, alloc: mem::Alloc) -> Result[Made, Failure] {
+    let path = node.path.text.as_str()
+    let Some(declared) = node.declared else {
+        return Err(Failure.of("schema.unknown", subject: path, alloc))
+    }
+    let Some(raw) = node.value else {
+        return Err(Failure.of("schema.unknown", subject: path, alloc))
+    }
+    let Some(current) = json_of_value(declared.name.as_str(), raw: raw.view(), alloc) else {
+        return Err(Failure.of("schema.unknown", subject: path, alloc).expecting("a type the link holds", found: declared.name.as_str(), alloc))
+    }
+    var replacement = text::String.empty(alloc)
+    if json {
+        mut replacement.append(value)
+    } else {
+        json_value(value, out: mut replacement, alloc)
+    }
+    let Some(spliced) = json_spliced(current.as_str(), path: field, value: replacement.as_str(), alloc) else {
+        var expected = text::String.of("a field of ", alloc)
+        mut expected.append(declared.name.as_str())
+        return Err(Failure.of("request.invalid-operand", subject: field, alloc).expecting(expected.as_str(), found: field, alloc))
+    }
+    return match typed_value(declared.name.as_str(), value: spliced.as_str(), json: true, subject: path, alloc) {
+        Ok(bytes) => Ok(made_put(node.path, value: store::Value.Record(type: store::TypeRef(name: text::String.of(declared.name.as_str(), alloc), schema: declared.schema), bytes: take bytes, secret: node.secret), version: node.version, alloc))
+        Err(failure) => Err(take failure)
+    }
+} field_write
+
+/// The write creating the node at `target`: a blob when `value` names one, else a record of the type its dir declares for its children, or of the type its construction literal names.
+fn new_write(target: Str, value: Str, view: store::service::View, json: bool, alloc: mem::Alloc) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    let Some(path) = path_of(target, alloc) else {
+        return Err(Failure.of("request.invalid-operand", subject: target, alloc).expecting("a path", found: target, alloc))
+    }
+    let absent = ident::CommitId(number: 0)
+    match blob_of(value) {
+        Some(hash) => return Ok(made_put(path, value: store::Value.Blob(hash), version: absent, alloc))
+        None => {
+        }
+    }
+    let parent = match last_slash(target) {
+        Some(at) => part_of(target, start: 0, end: at, alloc)
+        None => text::String.empty(alloc)
+    }
+    var type = match try await element_type(view, path: parent.as_str(), alloc) {
+        Ok(declared) => declared
+        Err(failure) => return Err(take failure)
+    }
+    if type.is_none() and not json {
+        type = type_named_by(value, alloc)
+    }
+    let Some(name) = type else {
+        return Err(Failure.of("schema.unknown", subject: target, alloc).expecting("a value whose type its dir declares or its construction literal names", found: value, alloc))
+    }
+    match decode_value(name.as_str(), text: value, json, alloc) {
+        Decoded.Bytes(bytes: bytes, schema: schema) => return Ok(made_put(path, value: store::Value.Record(type: store::TypeRef.of(name.as_str(), schema, alloc), bytes: take bytes, secret: false), version: absent, alloc))
+        Decoded.Invalid(error) => return Err(invalid(target, type: name.as_str(), error, alloc))
+        Decoded.Unknown => return Err(Failure.of("schema.unknown", subject: target, alloc).expecting("a type the link holds", found: name.as_str(), alloc))
+    }
+} new_write
+
+/// The type the dir at `path` declares for its record children, `None` when it declares none or does not exist.
+fn element_type(view: store::service::View, path: Str, alloc: mem::Alloc) -> Result[Option[text::String], Failure] fails task::Cancelled uses wait {
+    if path.byte_len() == 0 {
+        return Ok(None)
+    }
+    let dir = match try await node_at(view, path, alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => return Ok(None)
+        Err(failure) => return Err(take failure)
+    }
+    return match dir.declaration {
+        Some(store::Declaration.Dir(declared)) => match declared.element {
+            Some(element) => match element.type {
+                Some(type) => Ok(Some(text::String.of(type.name.as_str(), alloc)))
+                None => Ok(None)
+            }
+            None => Ok(None)
+        }
+        else => Ok(None)
+    }
+} element_type
+
+/// The encoding of `value` as a value of the type `type`, failing with `schema.invalid` naming the decoder's error.
+fn typed_value(type: Str, value: Str, json: bool, subject: Str, alloc: mem::Alloc) -> Result[mem::Bytes, Failure] {
+    return match decode_value(type, text: value, json, alloc) {
+        Decoded.Bytes(bytes: bytes, schema: _) => Ok(take bytes)
+        Decoded.Invalid(error) => Err(invalid(subject, type, error, alloc))
+        Decoded.Unknown => Err(Failure.of("schema.unknown", subject, alloc).expecting("a type the link holds", found: type, alloc))
+    }
+} typed_value
+
+/// The `schema.invalid` failure of a value of `type` its decoder rejects with `error`.
+fn invalid(subject: Str, type: Str, error: core::DecodeError, alloc: mem::Alloc) -> Failure {
+    var expected = text::String.of("a value of ", alloc)
+    mut expected.append(type)
+    var found = text::String.empty(alloc)
+    mut found.write(Dyn[Render].view(error), budget: 64)
+    return Failure.of("schema.invalid", subject, alloc).expecting(expected.as_str(), found: found.as_str(), alloc)
+} invalid
+
+/// The blob a value names by its full hash.
+fn blob_of(value: Str) -> Option[ident::HashValue] {
+    return match ident::HashText.parse(value) {
+        Some(ident::HashText.Full(hash)) => Some(hash)
+        else => None
+    }
+} blob_of
+
+/// A `Put` of `value` at `path`, reading the node as the commit `version` left it.
+fn made_put(path: ident::Path, take value: store::Value, version: ident::CommitId, alloc: mem::Alloc) -> Made {
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), value: take value))
+    var reads = mem::List[NodeRead].empty(alloc)
+    mut reads.push(NodeRead(path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), commit: version))
+    return Made(writes: take writes, reads: take reads)
+} made_put
+
+/// `delete <path>`: the node and its subtree.
+fn made_delete(path: Str, view: store::service::View, alloc: mem::Alloc) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    let node = match try await node_at(view, path, alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => return Err(Failure.of("store.not-found", subject: path, alloc))
+        Err(failure) => return Err(take failure)
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Delete(path: ident::Path(text: text::String.of(path, alloc))))
+    var reads = mem::List[NodeRead].empty(alloc)
+    mut reads.push(NodeRead(path: ident::Path(text: text::String.of(path, alloc)), commit: node.version))
+    return Ok(Made(writes: take writes, reads: take reads))
+} made_delete
+
+/// `start <moniker>` and `stop <moniker>`: the instance's specification with `stopped` written.
+fn made_lifecycle(
+    moniker: ident::Moniker,
+    stopped: bool,
+    view: store::service::View,
+    holding: Holding,
+    now_utc: i64,
+    alloc: mem::Alloc,
+    ) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    if not holding.controls(moniker, right: os::Right.Lifecycle, now_utc) {
+        return Err(denied(moniker.text.as_str(), right: "instance.lifecycle", alloc))
+    }
+    var path = text::String.of("/sys/instances/", alloc)
+    mut path.append(moniker.text.as_str())
+    let node = match try await node_at(view, path: path.as_str(), alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => return Err(Failure.of("request.unknown-name", subject: moniker.text.as_str(), alloc).expecting("an instance with a specification", found: moniker.text.as_str(), alloc))
+        Err(failure) => return Err(take failure)
+    }
+    let Some(declared) = node.declared else {
+        return Err(Failure.of("schema.unknown", subject: path.as_str(), alloc))
+    }
+    let Some(raw) = node.value else {
+        return Err(Failure.of("schema.unknown", subject: path.as_str(), alloc))
+    }
+    let Ok(held) = attempt mem::wire::Codec[os::InstanceSpec].decode(raw.view(), alloc) else {
+        return Err(Failure.of("schema.invalid", subject: path.as_str(), alloc))
+    }
+    var spec = held
+    spec.stopped = stopped
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::InstanceSpec].encode(spec, out: mut bytes)
+    return Ok(made_put(node.path, value: store::Value.Record(type: store::TypeRef(name: text::String.of(declared.name.as_str(), alloc), schema: declared.schema), bytes: take bytes, secret: false), version: node.version, alloc))
+} made_lifecycle
+
+/// The grants `/sys/grants` holds, by number.
+fn grants_of(view: store::service::View, alloc: mem::Alloc) -> Result[mem::List[Granted], Failure] fails task::Cancelled uses wait {
+    var found = mem::List[Granted].empty(alloc)
+    var from = text::String.empty(alloc)
+    loop {
+        let nodes = match first attempt await view.scan(ident::Path(text: text::String.of("/sys/grants", alloc)), from: text::String.of(from.as_str(), alloc), to: text::String.empty(alloc), limit: GRANTS_SCANNED, alloc) {
+            Ok(scanned) => scanned
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: "/sys/grants", alloc))
+        }
+        var read: u32 = 0
+        for node in take nodes {
+            let path = node.path.text.as_str()
+            let name = part_of(path, start: last_slash(path).value_or(0) + 1, end: path.byte_len(), alloc)
+            if name.as_str() == from.as_str() {
+                continue
+            }
+            read += 1
+            from = text::String.of(name.as_str(), alloc)
+            let Some(number) = grant_number_of(name.as_str()) else {
+                continue
+            }
+            let Some(value) = node.value else {
+                continue
+            }
+            let Ok(grant) = attempt mem::wire::Codec[os::Grant].decode(value.view(), alloc) else {
+                continue
+            }
+            mut found.push(Granted(number: number, parent: grant.parent, holder: ident::Principal(text: grant.holder.text)))
+        }
+        if read == 0 {
+            return Ok(take found)
+        }
+    }
+} grants_of
+
+/// The path of the grant numbered `number`.
+fn grant_path(number: u64, alloc: mem::Alloc) -> text::String {
+    var path = text::String.of("/sys/grants/g", alloc)
+    mut path.write(Dyn[Render].view(number), budget: 24)
+    return path
+} grant_path
+
+/// `grant <spec>`: the grant, its generated `granted_by` the commit `base`, written at the next number after the grants held, once chapter 09's validity holds for the plan's principal.
+fn made_grant(
+    spec: Str,
+    view: store::service::View,
+    holding: Holding,
+    now_utc: i64,
+    json: bool,
+    base: ident::CommitId,
+    alloc: mem::Alloc,
+    ) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    let grant = match granted_value(spec, json, base, alloc) {
+        Ok(decoded) => decoded
+        Err(failure) => return Err(take failure)
+    }
+    let held = match try await grants_of(view, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    match try await validity(grant, held, view, holding, now_utc, alloc) {
+        Some(failure) => return Err(take failure)
+        None => {
+        }
+    }
+    var next: u64 = 1
+    for each in held {
+        if each.number >= next {
+            next = each.number + 1
+        }
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::Grant].encode(grant, out: mut bytes)
+    let path = grant_path(next, alloc)
+    let value = store::Value.Record(type: store::TypeRef.of("os::Grant", schema: mem::wire::Codec[os::Grant].schema_hash(), alloc), bytes: take bytes, secret: false)
+    return Ok(made_put(ident::Path(text: take path), take value, version: ident::CommitId(number: 0), alloc))
+} made_grant
+
+/// The grant `spec` writes, a construction literal or with `json` a JSON object of a grant whose `granted_by` it may leave out, which then names `base`.
+fn granted_value(spec: Str, json: bool, base: ident::CommitId, alloc: mem::Alloc) -> Result[os::Grant, Failure] {
+    var text = text::String.of(spec, alloc)
+    match decode_value("os::Grant", text: spec, json, alloc) {
+        Decoded.Invalid(core::DecodeError.MissingField) => {
+            let Some(cut) = spec.byte_len().checked_sub(1) else {
+                return Err(Failure.of("schema.invalid", subject: spec, alloc))
+            }
+            text = part_of(spec, start: 0, end: cut, alloc)
+            match json {
+                true => mut text.append(",\"granted_by\":{\"number\":")
+                false => mut text.append(", granted_by: CommitId(number: ")
+            }
+            mut text.write(Dyn[Render].view(base.number), budget: 24)
+            match json {
+                true => mut text.append("}}")
+                false => mut text.append("))")
+            }
+        }
+        else => {
+        }
+    }
+    return match decode_value("os::Grant", text: text.as_str(), json, alloc) {
+        Decoded.Bytes(bytes: bytes, schema: _) => match attempt mem::wire::Codec[os::Grant].decode(Untrusted.of(bytes.view()), alloc) {
+            Ok(grant) => Ok(take grant)
+            Err(error) => Err(invalid(spec, type: "os::Grant", error, alloc))
+        }
+        Decoded.Invalid(error) => Err(invalid(spec, type: "os::Grant", error, alloc))
+        Decoded.Unknown => Err(Failure.of("schema.unknown", subject: spec, alloc))
+    }
+} granted_value
+
+/// The failure of a grant chapter 09's validity refuses for the plan's principal: a holder without a record, a parent that is not live or not held by the principal, a right beyond the parent's.
+fn validity(
+    grant: os::Grant,
+    held: mem::List[Granted],
+    view: store::service::View,
+    holding: Holding,
+    now_utc: i64,
+    alloc: mem::Alloc,
+    ) -> Option[Failure] fails task::Cancelled uses wait {
+    let holder = grant.holder.text.as_str()
+    var holder_path = text::String.empty(alloc)
+    if holder.starts_with("inst.") {
+        mut holder_path.append("/sys/instances/")
+        mut holder_path.append(part_of(holder, start: 5, end: holder.byte_len(), alloc).as_str())
+    } else {
+        mut holder_path.append("/sys/principals/")
+        mut holder_path.append(holder)
+    }
+    if holder != "system" {
+        match try await node_at(view, path: holder_path.as_str(), alloc) {
+            Ok(Some(_)) => {
+            }
+            Ok(None) => return Some(Failure.of("auth.unknown-holder", subject: holder, alloc))
+            Err(failure) => return Some(take failure)
+        }
+    }
+    let Some(parent) = grant.parent else {
+        return Some(Failure.of("auth.unknown-parent", subject: holder, alloc).expecting("a parent grant", found: "None", alloc))
+    }
+    let Some(at) = held.position(fn(each: Granted) => each.number == parent) else {
+        return Some(Failure.of("auth.unknown-parent", subject: grant_path(parent, alloc).as_str(), alloc))
+    }
+    if held[at].holder != holding.principal and not holding.governs(now_utc) {
+        return Some(Failure.of("auth.not-holder", subject: grant_path(parent, alloc).as_str(), alloc))
+    }
+    let parent_rights = match try await node_at(view, path: grant_path(parent, alloc).as_str(), alloc) {
+        Ok(Some(node)) => match node.value {
+            Some(raw) => match attempt mem::wire::Codec[os::Grant].decode(raw.view(), alloc) {
+                Ok(parent_grant) => parent_grant.rights
+                Err(_) => return Some(Failure.of("schema.invalid", subject: grant_path(parent, alloc).as_str(), alloc))
+            }
+            None => return Some(Failure.of("auth.unknown-parent", subject: grant_path(parent, alloc).as_str(), alloc))
+        }
+        Ok(None) => return Some(Failure.of("auth.unknown-parent", subject: grant_path(parent, alloc).as_str(), alloc))
+        Err(failure) => return Some(take failure)
+    }
+    for right in grant.rights {
+        if not parent_rights.contains(right) {
+            return Some(Failure.of("auth.not-within", subject: grant_path(parent, alloc).as_str(), alloc))
+        }
+    }
+    return None
+} validity
+
+/// `revoke g<n>`: the grant and every grant descending from it, when the plan's principal holds it or one of its ancestors, or governs the machine.
+fn made_revoke(number: u64, view: store::service::View, holding: Holding, now_utc: i64, alloc: mem::Alloc) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    let held = match try await grants_of(view, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let Some(_) = held.position(fn(each: Granted) => each.number == number) else {
+        return Err(Failure.of("request.unknown-name", subject: grant_path(number, alloc).as_str(), alloc))
+    }
+    var revoker = holding.governs(now_utc)
+    var ancestor = Some(number)
+    var hops: usize = 0
+    while not revoker and hops <= held.len() {
+        let Some(current) = ancestor else {
+            break
+        }
+        let Some(at) = held.position(fn(each: Granted) => each.number == current) else {
+            break
+        }
+        revoker = held[at].holder == holding.principal
+        ancestor = held[at].parent
+        hops += 1
+    }
+    if not revoker {
+        return Err(Failure.of("auth.not-revoker", subject: grant_path(number, alloc).as_str(), alloc))
+    }
+    var revoked = mem::List[u64].empty(alloc)
+    mut revoked.push(number)
+    var grown = true
+    while grown {
+        grown = false
+        for each in held {
+            let Some(parent) = each.parent else {
+                continue
+            }
+            if revoked.position(fn(known: u64) => known == parent).is_some() and revoked.position(fn(known: u64) => known == each.number).is_none() {
+                mut revoked.push(each.number)
+                grown = true
+            }
+        }
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    var reads = mem::List[NodeRead].empty(alloc)
+    for gone in revoked {
+        let path = grant_path(gone, alloc)
+        let version = match try await node_at(view, path: path.as_str(), alloc) {
+            Ok(Some(node)) => node.version
+            Ok(None) => continue
+            Err(failure) => return Err(take failure)
+        }
+        mut writes.push(store::Write.Delete(path: ident::Path(text: text::String.of(path.as_str(), alloc))))
+        mut reads.push(NodeRead(path: ident::Path(text: take path), commit: version))
+    }
+    return Ok(Made(writes: take writes, reads: take reads))
+} made_revoke
+
+/// `revert #<n>`: the writes restoring what the commit wrote, three-way checked against the commits after it.
+fn made_revert(commit: ident::CommitId, view: store::service::View, alloc: mem::Alloc) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    let writes = match first attempt await view.revert(commit, dry_run: true, alloc) {
+        Ok(store::Reverted.Writes(found)) => found
+        Ok(store::Reverted.Committed(_)) => return Err(Failure.of("store.kind", subject: "revert", alloc))
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => {
+            var subject = text::String.empty(alloc)
+            mut subject.write(Dyn[Render].view(commit), budget: 32)
+            return Err(Failure.of(failed.code().as_str(), subject: subject.as_str(), alloc))
+        }
+    }
+    var reads = mem::List[NodeRead].empty(alloc)
+    for write in writes {
+        let path = written_path(write, alloc)
+        let version = match try await node_at(view, path: path.as_str(), alloc) {
+            Ok(Some(node)) => node.version
+            Ok(None) => ident::CommitId(number: 0)
+            Err(failure) => return Err(take failure)
+        }
+        mut reads.push(NodeRead(path: ident::Path(text: take path), commit: version))
+    }
+    return Ok(Made(writes: take writes, reads: take reads))
+} made_revert
+
+/// The path a write names.
+pub fn written_path(write: store::Write, alloc: mem::Alloc) -> text::String {
+    let path = match write {
+        store::Write.Put(path: path, value: _) or store::Write.Add(path: path, value: _) => path.text.as_str()
+        store::Write.Make(path: path, declaration: _) => path.text.as_str()
+        store::Write.Delete(path: path) => path.text.as_str()
+        store::Write.Append(path: path, entries: _) => path.text.as_str()
+        store::Write.Expire(path: path, at: _) => path.text.as_str()
+        store::Write.Hold(path: path, on: _) => path.text.as_str()
+        store::Write.Trim(path: path, below: _) => path.text.as_str()
+    }
+    return text::String.of(path, alloc)
+} written_path
+
+/// Where the last `/` of `text` lies.
+pub fn last_slash(text: Str) -> Option[usize] {
+    var found: Option[usize] = None
+    let bytes = text.as_bytes()
+    for at in 0..<bytes.len() {
+        if bytes[at] == b'/' {
+            found = Some(at)
+        }
+    }
+    return found
+} last_slash
+
+/// The part of `text` from `start` to `end`, empty when that is none.
+pub fn part_of(text: Str, start: usize, end: usize, alloc: mem::Alloc) -> text::String {
+    return match text.slice_bytes(start, end) {
+        Some(part) => text::String.of(part, alloc)
+        None => text::String.empty(alloc)
+    }
+} part_of

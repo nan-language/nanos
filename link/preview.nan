@@ -1,0 +1,121 @@
+//! Previews: a plan's tree steps applied, one commit each, to a preview branch forked from the head of `main` through a View acting for the plan's principal in its session; its effect set computed and decided by the policy; the branch deleted at the end.
+
+/// A session open when a preview starts: its id, its principal and the instances on its transport's path.
+pub closed struct OpenSession derives Encode {
+    pub session: ident::SessionId
+    pub principal: ident::Principal
+    pub path: mem::List[ident::Moniker]
+} OpenSession
+
+/// What a preview needs: the steps and options, the principal and the session previewing, what the principal holds, the configuration of plans, the session's taint, the sessions open, whether values are JSON, and the UTC time.
+pub closed struct Planning derives Encode {
+    pub steps: mem::List[Written]
+    pub options: Options
+    pub principal: ident::Principal
+    pub session: ident::SessionId
+    pub holding: Holding
+    pub plans: PlanConfig
+    pub taint: mem::List[ident::OriginLabel]
+    pub open: mem::List[OpenSession]
+    pub json: bool
+    pub now_utc: i64
+} Planning
+
+/// The part of a plan one commit applies: its number, its writes in order, the nodes they read, and the instances it activates.
+pub closed struct SpanWork derives Encode {
+    pub span: u32
+    pub writes: mem::List[store::Write]
+    pub reads: mem::List[NodeRead]
+    pub activations: mem::List[Activation]
+} SpanWork
+
+/// A plan a preview kept: its hash, its record, the work of its spans, and the records printing its effect set.
+pub closed struct Previewed derives Encode {
+    pub hash: ident::HashValue
+    pub plan: Plan
+    pub spans: mem::List[SpanWork]
+    pub records: mem::List[Record]
+} Previewed
+
+/// What a preview gives: the plan it kept, or the failure ending it.
+pub closed enum Preview derives Encode {
+    Kept(Previewed)
+    Failed(Failure)
+} Preview
+
+/// A step applied to the preview branch: its number, the commits before and after it, and what it made.
+pub closed struct Stepped derives Encode {
+    pub step: u32
+    pub before: ident::CommitId
+    pub after: ident::CommitId
+    pub made: Made
+} Stepped
+
+/// Previews the plan `asked` writes through `tree`, deciding it with `oversight`.
+pub fn preview(take asked: Planning, tree: store::service::View, oversight: os::Port[policy::Oversight], alloc: mem::Alloc) -> Preview fails task::Cancelled uses wait {
+    let acting = match first attempt await tree.acting(ident::Principal(text: asked.principal.text), session: asked.session, alloc) {
+        Ok(view) => view
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Preview.Failed(Failure.of(failed.code().as_str(), subject: "main", alloc))
+    }
+    let branched = match first attempt await acting.preview(alloc) {
+        Ok(made) => made
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Preview.Failed(Failure.of(failed.code().as_str(), subject: "main", alloc))
+    }
+    let store::service::Branched(branch: branch, view: forked) = branched
+    let outcome = try await preview_on(asked, main: acting, forked, branch: branch.name.as_str(), base: branch.head, oversight, alloc)
+    match attempt await acting.delete_branch(text::String.of(branch.name.as_str(), alloc), alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+    return outcome
+} preview
+
+/// Applies each step of `asked` to the preview branch `branch` through `forked`, its head at `base`, then computes the plan's effect set.
+fn preview_on(
+    asked: Planning,
+    main: store::service::View,
+    forked: store::service::View,
+    branch: Str,
+    base: ident::CommitId,
+    oversight: os::Port[policy::Oversight],
+    alloc: mem::Alloc,
+    ) -> Preview fails task::Cancelled uses wait {
+    var stepped = mem::List[Stepped].empty(alloc)
+    var head = base
+    var index: u32 = 0
+    for written in asked.steps {
+        index += 1
+        let made = match try await materialize(written, view: forked, holding: asked.holding, now_utc: asked.now_utc, json: asked.json, base, alloc) {
+            Ok(found) => found
+            Err(failure) => return Preview.Failed(take failure)
+        }
+        var after = head
+        if made.writes.len() > 0 {
+            let Some(writes) = duplicate(made.writes, alloc) else {
+                return Preview.Failed(Failure.of("store.corrupt", subject: written.text.as_str(), alloc))
+            }
+            let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+            after = match first attempt await forked.commit(take transaction, typed: true, alloc) {
+                Ok(done) => done.number
+                Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+                Err(failed) => return Preview.Failed(Failure.of(failed.code().as_str(), subject: written.text.as_str(), alloc))
+            }
+        }
+        mut stepped.push(Stepped(step: index, before: head, after: after, made: take made))
+        head = after
+    }
+    return try await effects_of(asked, main, forked, branch, base, take stepped, oversight, alloc)
+} preview_on
+
+/// A copy of `value`, through its encoding.
+pub fn duplicate[T: Encode](value: T, alloc: mem::Alloc) -> Option[T] {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[T].encode(value, out: mut bytes)
+    return match attempt mem::wire::Codec[T].decode(Untrusted.of(bytes.view()), alloc) {
+        Ok(copy) => Some(take copy)
+        Err(_) => None
+    }
+} duplicate

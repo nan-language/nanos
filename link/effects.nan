@@ -1,0 +1,623 @@
+//! Effect sets: the delta a preview's steps leave on its branch with the fields each change differs in, the instances they activate, each step's class and span, the sessions they can cut, the authority they widen, the policy's decision, the costs, and the records printing them.
+
+/// The intake pause a restart is expected to take, in milliseconds.
+const RESTART_PAUSE_MS: u32 = 2
+
+/// What the changes of a preview show: the lines printing each change and the activations they make.
+struct Observed {
+    lines: mem::List[mem::List[text::String]]
+    activations: mem::List[Activation]
+} Observed
+
+/// What the steps of a preview give: their effects, the authority they widen, the subjects the policy decides, the nodes they read and the bytes they write.
+struct Assessed {
+    effects: mem::List[StepEffect]
+    widenings: mem::List[Widening]
+    subjects: mem::List[policy::Subject]
+    reads: mem::List[NodeRead]
+    store_bytes: u64
+} Assessed
+
+/// Computes the effect set of the steps `stepped` applied to the preview branch `branch` from `base`, has `oversight` decide the plan, and keeps the plan.
+pub fn effects_of(
+    asked: Planning,
+    main: store::service::View,
+    forked: store::service::View,
+    branch: Str,
+    base: ident::CommitId,
+    take stepped: mem::List[Stepped],
+    oversight: os::Port[policy::Oversight],
+    alloc: mem::Alloc,
+    ) -> Preview fails task::Cancelled uses wait {
+    let changes = match try await delta_of(forked, branch, stepped, alloc) {
+        Ok(found) => found
+        Err(failure) => return Preview.Failed(take failure)
+    }
+    let observed = match try await observe(changes, main, forked, base, alloc) {
+        Ok(found) => found
+        Err(failure) => return Preview.Failed(take failure)
+    }
+    let Observed(lines: lines, activations: activations) = observed
+    let Assessed(effects: effects, widenings: widenings, subjects: subjects, reads: reads, store_bytes: store_bytes) = assess(asked, stepped, activations, alloc)
+    let approvals = match try await decided(take subjects, at_apply: false, oversight, alloc) {
+        Ok(found) => found
+        Err(failure) => return Preview.Failed(take failure)
+    }
+    let cuts = cuts_of(activations, open: asked.open, alloc)
+    var confirm_within_s: Option[u32] = None
+    match asked.options.confirm_within_s {
+        Some(seconds) => {
+            if seconds > 0 {
+                confirm_within_s = Some(seconds)
+            }
+        }
+        None => {
+            if cuts.len() > 0 {
+                confirm_within_s = Some(asked.plans.confirm_s)
+            }
+        }
+    }
+    let Some(span_activations) = duplicate(activations, alloc) else {
+        return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
+    }
+    let Some(span_reads) = duplicate(reads, alloc) else {
+        return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
+    }
+    let Some(writes) = span_writes(stepped, alloc) else {
+        return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
+    }
+    let effect_set = EffectSet(base: base, branch: text::String.of("main", alloc), steps: take effects, delta: take changes, activations: take activations, widenings: take widenings, deliveries: mem::List.empty(alloc), faults: mem::List.empty(alloc), approvals: take approvals, cuts: take cuts, taint: labels_of(asked.taint, alloc), costs: Costs(cpu_ns: 0, memory_bytes: 0, store_bytes: store_bytes, energy_mj: 0))
+    var plan = Plan(principal: ident::Principal(text: asked.principal.text), steps: texts_of(asked.steps, alloc), options: PlanOptions(intent: text_copy(asked.options.intent, alloc), confirm_within_s: confirm_within_s, health_s: asked.options.health_s), effects: take effect_set, inputs: RecordedInputs(reads: take reads, live: mem::List.empty(alloc), values: mem::List.empty(alloc)))
+    let hash = mut plan.hashed(alloc)
+    let records = effect_records(plan, hash, lines, alloc)
+    var spans = mem::List[SpanWork].empty(alloc)
+    mut spans.push(SpanWork(span: 1, writes: take writes, reads: take span_reads, activations: take span_activations))
+    return Preview.Kept(Previewed(hash: hash, plan: take plan, spans: take spans, records: take records))
+} effects_of
+
+/// The lines printing each change of `changes`, from `base` through `main` to the head of `forked`, and the activations they make.
+fn observe(changes: mem::List[NodeChange], main: store::service::View, forked: store::service::View, base: ident::CommitId, alloc: mem::Alloc) -> Result[Observed, Failure] fails task::Cancelled uses wait {
+    var lines = mem::List[mem::List[text::String]].empty(alloc)
+    var activations = mem::List[Activation].empty(alloc)
+    for change in changes {
+        let path = change.path.text.as_str()
+        let before = match try await node_as_of(main, path, at: Some(base), alloc) {
+            Ok(found) => found
+            Err(failure) => return Err(take failure)
+        }
+        let after = match try await node_as_of(forked, path, at: None, alloc) {
+            Ok(found) => found
+            Err(failure) => return Err(take failure)
+        }
+        mut lines.push(change_lines(before, after, alloc))
+        match activation_of(path, before, after, step: change.step, alloc) {
+            Some(activation) => mut activations.push(take activation)
+            None => {
+            }
+        }
+    }
+    return Ok(Observed(lines: take lines, activations: take activations))
+} observe
+
+/// What the steps `stepped` of `asked` give, `activations` being the activations their changes make.
+fn assess(asked: Planning, stepped: mem::List[Stepped], activations: mem::List[Activation], alloc: mem::Alloc) -> Assessed {
+    var assessed = Assessed(effects: mem::List.empty(alloc), widenings: mem::List.empty(alloc), subjects: mem::List.empty(alloc), reads: mem::List.empty(alloc), store_bytes: 0)
+    for each in stepped {
+        let written = asked.steps[usize.widen(each.step) - 1]
+        let activates = activations.position(fn(activation: Activation) => activation.step == each.step).is_some()
+        let class = class_of(written.step, activates)
+        mut assessed.effects.push(StepEffect(step: each.step, span: 1, class: class, basis: Basis.Observed, reply: None))
+        let widened = widenings_of(each, alloc)
+        mut assessed.subjects.push(subject_of(asked, written, made: each.made, class, widens: widened.len() > 0, alloc))
+        for widening in take widened {
+            mut assessed.widenings.push(take widening)
+        }
+        for read in each.made.reads {
+            if assessed.reads.position(fn(known: NodeRead) => known.path == read.path).is_none() {
+                mut assessed.reads.push(NodeRead(path: ident::Path(text: text::String.of(read.path.text.as_str(), alloc)), commit: read.commit))
+            }
+        }
+        assessed.store_bytes = assessed.store_bytes.saturating_add(bytes_written(each.made.writes))
+    }
+    return assessed
+} assess
+
+/// The writes of every step of `stepped`, in order, `None` when one does not copy.
+fn span_writes(stepped: mem::List[Stepped], alloc: mem::Alloc) -> Option[mem::List[store::Write]] {
+    var writes = mem::List[store::Write].empty(alloc)
+    for each in stepped {
+        let Some(copies) = duplicate(each.made.writes, alloc) else {
+            return None
+        }
+        for write in take copies {
+            mut writes.push(take write)
+        }
+    }
+    return Some(take writes)
+} span_writes
+
+/// The canonical texts of `steps`.
+fn texts_of(steps: mem::List[Written], alloc: mem::Alloc) -> mem::List[text::String] {
+    var texts = mem::List[text::String].empty(alloc)
+    for written in steps {
+        mut texts.push(text::String.of(written.text.as_str(), alloc))
+    }
+    return texts
+} texts_of
+
+/// A copy of `labels`.
+fn labels_of(labels: mem::List[ident::OriginLabel], alloc: mem::Alloc) -> mem::List[ident::OriginLabel] {
+    var copies = mem::List[ident::OriginLabel].empty(alloc)
+    for label in labels {
+        mut copies.push(ident::OriginLabel(text: label.text))
+    }
+    return copies
+} labels_of
+
+/// A copy of `text`.
+fn text_copy(text: Option[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    return match text {
+        Some(held) => Some(text::String.of(held.as_str(), alloc))
+        None => None
+    }
+} text_copy
+
+/// The changes the steps `stepped` made to the preview branch `branch`, in path order, each with the last step changing it, its content before the first and after the last.
+fn delta_of(forked: store::service::View, branch: Str, stepped: mem::List[Stepped], alloc: mem::Alloc) -> Result[mem::List[NodeChange], Failure] fails task::Cancelled uses wait {
+    var changes = mem::List[NodeChange].empty(alloc)
+    for each in stepped {
+        if each.after == each.before {
+            continue
+        }
+        let from = store::Point.Commit(branch: text::String.of(branch, alloc), commit: each.before)
+        let to = store::Point.Commit(branch: text::String.of(branch, alloc), commit: each.after)
+        let edits = match first attempt await forked.diff(take from, take to, path: ident::Path(text: text::String.of("/", alloc)), alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: branch, alloc))
+        }
+        for edit in edits {
+            match changes.position(fn(known: NodeChange) => known.path == edit.path) {
+                Some(at) => {
+                    changes[at].step = each.step
+                    changes[at].after = edit.to
+                }
+                None => mut changes.push(NodeChange(path: ident::Path(text: text::String.of(edit.path.text.as_str(), alloc)), step: each.step, before: edit.from, after: edit.to))
+            }
+        }
+    }
+    mut changes.retain(fn(change: NodeChange) => change.before != change.after)
+    mut changes.sort_by(fn(left: NodeChange, right: NodeChange) => left.path.text.as_str().as_bytes().cmp(right.path.text.as_str().as_bytes()))
+    return Ok(take changes)
+} delta_of
+
+/// The node at `path` through `view`, as of the commit `at` or at its head, `None` when there is none.
+fn node_as_of(view: store::service::View, path: Str, at: Option[ident::CommitId], alloc: mem::Alloc) -> Result[Option[store::Node], Failure] fails task::Cancelled uses wait {
+    let Some(named) = path_of(path, alloc) else {
+        return Err(Failure.of("request.invalid-operand", subject: path, alloc))
+    }
+    return match first attempt await view.get(take named, at, alloc) {
+        Ok(node) => Ok(Some(take node))
+        Err(store::service::ViewError.Failed(store::service::Failure.NotFound)) => Ok(None)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(Failure.of(failed.code().as_str(), subject: path, alloc))
+    }
+} node_as_of
+
+/// The `-` and `+` lines of a change from `before` to `after`: the fields of a record that differ, or the ids of a blob.
+fn change_lines(before: Option[store::Node], after: Option[store::Node], alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    let old_items = node_items(before, alloc)
+    let new_items = node_items(after, alloc)
+    for item in old_items {
+        if new_items.position(fn(other: text::String) => other.as_str() == item.as_str()).is_none() {
+            var line = text::String.of("- ", alloc)
+            mut line.append(item.as_str())
+            mut lines.push(take line)
+        }
+    }
+    for item in new_items {
+        if old_items.position(fn(other: text::String) => other.as_str() == item.as_str()).is_none() {
+            var line = text::String.of("+ ", alloc)
+            mut line.append(item.as_str())
+            mut lines.push(take line)
+        }
+    }
+    return lines
+} change_lines
+
+/// The items a node's change compares: each field of a record as `name: value` in canonical rendering, or a blob's id; none for an absent node.
+fn node_items(node: Option[store::Node], alloc: mem::Alloc) -> mem::List[text::String] {
+    var items = mem::List[text::String].empty(alloc)
+    let Some(present) = node else {
+        return items
+    }
+    if present.kind == store::NodeKind.Blob {
+        match present.hash {
+            Some(hash) => {
+                var item = text::String.of("blob: ", alloc)
+                mut item.append(hash.short_form().as_str())
+                mut items.push(take item)
+            }
+            None => {
+            }
+        }
+        return items
+    }
+    let Some(rendered) = value_text(present, alloc) else {
+        return items
+    }
+    let text = rendered.as_str()
+    let Some(open) = text.find("(") else {
+        mut items.push(take rendered)
+        return items
+    }
+    let inner = part_of(text, start: open + 1, end: text.byte_len().saturating_sub(1), alloc)
+    for item in take split_outside(inner.as_str(), separator: b',', alloc) {
+        if item.byte_len() > 0 {
+            mut items.push(take item)
+        }
+    }
+    return items
+} node_items
+
+/// The activation a change of `path` from `before` to `after` by the step `step` makes: a restart for a configuration record, a start or a stop for a specification whose instance it makes run or stop.
+fn activation_of(path: Str, before: Option[store::Node], after: Option[store::Node], step: u32, alloc: mem::Alloc) -> Option[Activation] {
+    match instance_named(path, dir: "/sys/config/") {
+        Some(moniker) => return Some(Activation(moniker: take moniker, step: step, kind: ActivationKind.Restart, migration: None, pause_ms: RESTART_PAUSE_MS))
+        None => {
+        }
+    }
+    let Some(moniker) = instance_named(path, dir: "/sys/instances/") else {
+        return None
+    }
+    let ran = runs(before, alloc)
+    let runs_after = runs(after, alloc)
+    if runs_after and not ran {
+        return Some(Activation(moniker: take moniker, step: step, kind: ActivationKind.Start, migration: None, pause_ms: 0))
+    }
+    if ran and not runs_after {
+        return Some(Activation(moniker: take moniker, step: step, kind: ActivationKind.Stop, migration: None, pause_ms: 0))
+    }
+    return None
+} activation_of
+
+/// Whether the specification `node` holds keeps its instance running: it exists and is not `stopped`.
+fn runs(node: Option[store::Node], alloc: mem::Alloc) -> bool {
+    let Some(present) = node else {
+        return false
+    }
+    let Some(raw) = present.value else {
+        return false
+    }
+    return match attempt mem::wire::Codec[os::InstanceSpec].decode(raw.view(), alloc) {
+        Ok(spec) => not spec.stopped
+        Err(_) => false
+    }
+} runs
+
+/// The class of a step: `restorable` for `start` and `stop` and for a step activating an instance, `recorded` for the other tree steps.
+fn class_of(step: Step, activates: bool) -> Reversibility {
+    let restorable = match step {
+        Step.Start(moniker: _) or Step.Stop(moniker: _) => true
+        else => activates
+    }
+    if restorable {
+        return Reversibility.Restorable
+    }
+    return Reversibility.Recorded
+} class_of
+
+/// The authority the step `stepped` gives holders: each grant its writes add.
+fn widenings_of(stepped: Stepped, alloc: mem::Alloc) -> mem::List[Widening] {
+    var widenings = mem::List[Widening].empty(alloc)
+    for write in stepped.made.writes {
+        let store::Write.Put(path: path, value: value) = write else {
+            continue
+        }
+        if not path.text.as_str().starts_with("/sys/grants/") {
+            continue
+        }
+        let store::Value.Record(type: _, bytes: bytes, secret: _) = value else {
+            continue
+        }
+        let Ok(grant) = attempt mem::wire::Codec[os::Grant].decode(Untrusted.of(bytes.view()), alloc) else {
+            continue
+        }
+        var authority = text::String.empty(alloc)
+        mut authority.write(Dyn[Render].view(grant.object), budget: 512)
+        mut authority.append(" ")
+        mut authority.write(Dyn[Render].view(grant.rights), budget: 256)
+        mut widenings.push(Widening(holder: ident::Principal(text: grant.holder.text), step: stepped.step, authority: take authority))
+    }
+    return widenings
+} widenings_of
+
+/// The subject the policy decides for the step `written` of class `class`, which makes `made` and widens authority when `widens`.
+fn subject_of(asked: Planning, written: Written, made: Made, class: Reversibility, widens: bool, alloc: mem::Alloc) -> policy::Subject {
+    var operations = mem::List[text::String].empty(alloc)
+    var kind = text::String.of("step.", alloc)
+    mut kind.append(part_of(written.text.as_str(), start: 0, end: written.text.as_str().find(" ").value_or(written.text.byte_len()), alloc).as_str())
+    mut operations.push(take kind)
+    var reversibility = text::String.of("reversibility.", alloc)
+    mut reversibility.write(Dyn[Render].view(class), budget: 64)
+    mut operations.push(take reversibility)
+    if widens {
+        mut operations.push(text::String.of("widening", alloc))
+    }
+    var objects = mem::List[text::String].empty(alloc)
+    for write in made.writes {
+        mut objects.push(written_path(write, alloc))
+    }
+    match written.step {
+        Step.Start(moniker: moniker) or Step.Stop(moniker: moniker) => mut objects.push(text::String.of(moniker.text.as_str(), alloc))
+        else => {
+        }
+    }
+    return policy::Subject(principal: ident::Principal(text: asked.principal.text), operations: take operations, objects: take objects, provenance: None, tainted: asked.taint.len() > 0, destinations: mem::List.empty(alloc), rule_of_two: false, exceeds: mem::List.empty(alloc), ask_caveat: false)
+} subject_of
+
+/// The approvals the policy's decision of `subjects` requires through `oversight`, at the plan's apply when `at_apply`: `policy.denied` naming the deciding rules for `Deny`, an `ask` for each asking rule, and a `notify` for `Notify`.
+pub fn decided(take subjects: mem::List[policy::Subject], at_apply: bool, oversight: os::Port[policy::Oversight], alloc: mem::Alloc) -> Result[mem::List[ApprovalNeed], Failure] fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[policy::Oversight].decide(mut call, take subjects, at_apply)
+    let verdict = match first attempt await oversight.call(take call, reply, alloc) {
+        Ok(found) => found
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return Err(Failure.of("port.server-stopped", subject: "policy", alloc))
+    }
+    var rules = text::String.empty(alloc)
+    for rule in verdict.rules {
+        if rules.byte_len() > 0 {
+            mut rules.append(", ")
+        }
+        mut rules.append(rule.as_str())
+    }
+    var approvals = mem::List[ApprovalNeed].empty(alloc)
+    match verdict.decision {
+        policy::Decision.Deny => return Err(Failure.of("policy.denied", subject: rules.as_str(), alloc))
+        policy::Decision.Ask => {
+            for requirement in verdict.requirements {
+                var approvers = mem::List[text::String].empty(alloc)
+                for approver in requirement.approvers {
+                    mut approvers.push(text::String.of(approver.as_str(), alloc))
+                }
+                mut approvals.push(ApprovalNeed(rule: 0, decision: text::String.of("ask", alloc), reason: text::String.of(requirement.rule.as_str(), alloc), approvers: take approvers))
+            }
+        }
+        policy::Decision.Notify => mut approvals.push(ApprovalNeed(rule: 0, decision: text::String.of("notify", alloc), reason: take rules, approvers: mem::List.empty(alloc)))
+        policy::Decision.Allow => {
+        }
+    }
+    return Ok(take approvals)
+} decided
+
+/// The sessions `open` that an activation other than a start of an instance on their transport's path can cut.
+fn cuts_of(activations: mem::List[Activation], open: mem::List[OpenSession], alloc: mem::Alloc) -> mem::List[TransportCut] {
+    var cuts = mem::List[TransportCut].empty(alloc)
+    for activation in activations {
+        if activation.kind == ActivationKind.Start {
+            continue
+        }
+        for session in open {
+            let on_path = session.path.position(fn(moniker: ident::Moniker) => moniker == activation.moniker).is_some()
+            let counted = cuts.position(fn(cut: TransportCut) => cut.session == session.session).is_some()
+            if on_path and not counted {
+                mut cuts.push(TransportCut(session: session.session, principal: ident::Principal(text: session.principal.text), step: activation.step))
+            }
+        }
+    }
+    return cuts
+} cuts_of
+
+/// The bytes of the records and stream entries `writes` writes.
+fn bytes_written(writes: mem::List[store::Write]) -> u64 {
+    var total: u64 = 0
+    for write in writes {
+        match write {
+            store::Write.Put(path: _, value: store::Value.Record(type: _, bytes: bytes, secret: _)) => {
+                total = total.saturating_add(u64.widen(bytes.len()))
+            }
+            else => {
+            }
+        }
+    }
+    return total
+} bytes_written
+
+/// The records printing the effect set of `plan`, whose hash is `hash`: a `plan` summary, then its `step`, `change` with each change's lines `lines`, `activation`, `widening`, `approval`, `cut` and `cost` records.
+pub fn effect_records(plan: Plan, hash: ident::HashValue, lines: mem::List[mem::List[text::String]], alloc: mem::Alloc) -> mem::List[Record] {
+    let effects = plan.effects
+    var records = mem::List[Record].empty(alloc)
+    mut records.push(plan_summary(effects, hash, alloc))
+    for step in effects.steps {
+        var record = Record.of("step", alloc)
+        mut record.subject(Dyn[Render].view(step.step))
+        mut record.field("span", value: Dyn[Render].view(step.span))
+        mut record.field("class", value: Dyn[Render].view(step.class))
+        mut record.field("basis", value: Dyn[Render].view(step.basis))
+        mut records.push(take record)
+    }
+    for at in 0..<effects.delta.len() {
+        var record = Record.of("change", alloc)
+        mut record.subject(Dyn[Render].view(effects.delta[at].path))
+        mut record.field("step", value: Dyn[Render].view(effects.delta[at].step))
+        match lines.get(at) {
+            Some(changed) => {
+                for line in changed {
+                    mut record.line(line.as_str(), alloc)
+                }
+            }
+            None => {
+            }
+        }
+        mut records.push(take record)
+    }
+    for activation in effects.activations {
+        var record = Record.of("activation", alloc)
+        mut record.subject(Dyn[Render].view(activation.moniker))
+        mut record.field("step", value: Dyn[Render].view(activation.step))
+        mut record.field("kind", value: Dyn[Render].view(activation.kind))
+        match activation.migration {
+            Some(migration) => mut record.field("migration", value: Dyn[Render].view(migration))
+            None => {
+            }
+        }
+        mut record.field("pause_ms", value: Dyn[Render].view(activation.pause_ms))
+        mut records.push(take record)
+    }
+    for record in take decision_records(effects, alloc) {
+        mut records.push(take record)
+    }
+    return records
+} effect_records
+
+/// The `plan` summary of an effect set: the plan's hash, base, branch, spans, the join of its steps' classes and the approvals it asks.
+fn plan_summary(effects: EffectSet, hash: ident::HashValue, alloc: mem::Alloc) -> Record {
+    var class = Reversibility.None
+    var spans: u32 = 0
+    for step in effects.steps {
+        class = class.join(step.class)
+        if step.span > spans {
+            spans = step.span
+        }
+    }
+    var asking: u32 = 0
+    for approval in effects.approvals {
+        if approval.decision.as_str() == "ask" {
+            asking += 1
+        }
+    }
+    var summary = Record.of("plan", alloc)
+    mut summary.subject(Dyn[Render].view(hash))
+    mut summary.hashes.push(Hashed(short: hash.short_form(), full: hash.full_form()))
+    mut summary.field("base", value: Dyn[Render].view(effects.base))
+    mut summary.text("branch", value: effects.branch.as_str(), alloc)
+    mut summary.field("spans", value: Dyn[Render].view(spans))
+    mut summary.field("class", value: Dyn[Render].view(class))
+    mut summary.field("approvals", value: Dyn[Render].view(asking))
+    return summary
+} plan_summary
+
+/// The `widening`, `approval`, `cut` and `cost` records of an effect set.
+fn decision_records(effects: EffectSet, alloc: mem::Alloc) -> mem::List[Record] {
+    var records = mem::List[Record].empty(alloc)
+    for widening in effects.widenings {
+        var record = Record.of("widening", alloc)
+        mut record.subject(Dyn[Render].view(widening.holder))
+        mut record.field("step", value: Dyn[Render].view(widening.step))
+        mut record.text("authority", value: widening.authority.as_str(), alloc)
+        mut records.push(take record)
+    }
+    for approval in effects.approvals {
+        var record = Record.of("approval", alloc)
+        mut record.subject(Dyn[Render].view(approval.rule))
+        mut record.text("decision", value: approval.decision.as_str(), alloc)
+        mut record.text("reason", value: approval.reason.as_str(), alloc)
+        if approval.approvers.len() > 0 {
+            mut record.field("approvers", value: Dyn[Render].view(approval.approvers))
+        }
+        mut records.push(take record)
+    }
+    for cut in effects.cuts {
+        var record = Record.of("cut", alloc)
+        mut record.subject(Dyn[Render].view(cut.session))
+        mut record.field("principal", value: Dyn[Render].view(cut.principal))
+        mut record.field("step", value: Dyn[Render].view(cut.step))
+        mut records.push(take record)
+    }
+    var cost = Record.of("cost", alloc)
+    mut cost.field("cpu_ns", value: Dyn[Render].view(effects.costs.cpu_ns))
+    mut cost.field("memory_bytes", value: Dyn[Render].view(effects.costs.memory_bytes))
+    mut cost.field("store_bytes", value: Dyn[Render].view(effects.costs.store_bytes))
+    mut cost.field("energy_mj", value: Dyn[Render].view(effects.costs.energy_mj))
+    mut records.push(take cost)
+    return records
+} decision_records
+
+/// A node holding `value`, a record of type `type` last written by the commit `version`, for tests.
+fn record_node(path: Str, type: Str, take value: mem::Bytes, version: u64, alloc: mem::Alloc) -> store::Node {
+    let declared = store::TypeRef(name: text::String.of(type, alloc), schema: ident::HashValue(bytes: Array[u8, 33].filled(0x01)))
+    return store::Node(path: ident::Path(text: text::String.of(path, alloc)), kind: store::NodeKind.Record, version: ident::CommitId(number: version), subtree: None, declared: Some(take declared), hash: None, size: u64.widen(value.len()), next: 0, origins: mem::List.empty(alloc), secret: false, expires: None, declaration: None, value: Some(Untrusted.of(take value)))
+} record_node
+
+/// The encoding of a specification of `app::Feeds`, stopped when `stopped`.
+fn spec_bytes(stopped: bool, alloc: mem::Alloc) -> mem::Bytes {
+    var spec = os::InstanceSpec.of(principal: ident::Principal(text: text::Fixed[64].of("system")), bundle: ident::HashValue(bytes: Array[u8, 33].filled(0x01)), component: "app::Feeds", alloc)
+    spec.stopped = stopped
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::InstanceSpec].encode(spec, out: mut bytes)
+    return bytes
+} spec_bytes
+
+test changes_print_their_fields_and_activate_their_instances for activation_of {
+    let alloc = testing::world().alloc
+    let spec_path = "/sys/instances/app.feeds"
+    let before = Some(record_node(spec_path, type: "os::InstanceSpec", value: spec_bytes(stopped: false, alloc), version: 3, alloc))
+    let after = Some(record_node(spec_path, type: "os::InstanceSpec", value: spec_bytes(stopped: true, alloc), version: 9, alloc))
+    let lines = change_lines(before, after, alloc)
+    expect lines.len() == 2 and lines[0].as_str() == "- stopped: false" and lines[1].as_str() == "+ stopped: true"
+    let Some(stopping) = activation_of(spec_path, before, after, step: 2, alloc) else {
+        expect false
+        return
+    }
+    expect stopping.kind == ActivationKind.Stop and stopping.step == 2 and stopping.moniker.text.as_str() == "app.feeds"
+    let Some(starting) = activation_of(spec_path, before: None, after: before, step: 1, alloc) else {
+        expect false
+        return
+    }
+    let Some(configured) = activation_of("/sys/config/app.feeds", before: None, after: None, step: 3, alloc) else {
+        expect false
+        return
+    }
+    let unchanged = activation_of(spec_path, before, after: before, step: 1, alloc)
+    let elsewhere = activation_of("/data/app.feeds", before: None, after: None, step: 1, alloc)
+    expect starting.kind == ActivationKind.Start and configured.kind == ActivationKind.Restart
+    expect unchanged.is_none() and elsewhere.is_none()
+    var activations = mem::List[Activation].empty(alloc)
+    mut activations.push(take stopping)
+    var path = mem::List[ident::Moniker].empty(alloc)
+    mut path.push(ident::Moniker(text: text::Fixed[59].of("link")))
+    mut path.push(ident::Moniker(text: text::Fixed[59].of("app.feeds")))
+    var open = mem::List[OpenSession].empty(alloc)
+    mut open.push(OpenSession(session: ident::SessionId(boot: 1, number: 4), principal: ident::Principal(text: text::Fixed[64].of("owner")), path: take path))
+    mut open.push(OpenSession(session: ident::SessionId(boot: 1, number: 5), principal: ident::Principal(text: text::Fixed[64].of("owner")), path: mem::List.empty(alloc)))
+    let cuts = cuts_of(activations, open, alloc)
+    expect cuts.len() == 1 and cuts[0].session == ident::SessionId(boot: 1, number: 4) and cuts[0].step == 2
+} changes_print_their_fields_and_activate_their_instances
+
+test effect_sets_print_as_records_in_field_order for effect_records {
+    let alloc = testing::world().alloc
+    var steps = mem::List[StepEffect].empty(alloc)
+    mut steps.push(StepEffect(step: 1, span: 1, class: Reversibility.Restorable, basis: Basis.Observed, reply: None))
+    var delta = mem::List[NodeChange].empty(alloc)
+    mut delta.push(NodeChange(path: ident::Path(text: text::String.of("/sys/config/app.feeds", alloc)), step: 1, before: None, after: None))
+    var activations = mem::List[Activation].empty(alloc)
+    mut activations.push(Activation(moniker: ident::Moniker(text: text::Fixed[59].of("app.feeds")), step: 1, kind: ActivationKind.Restart, migration: None, pause_ms: 2))
+    let effects = EffectSet(base: ident::CommitId(number: 5130), branch: text::String.of("main", alloc), steps: take steps, delta: take delta, activations: take activations, widenings: mem::List.empty(alloc), deliveries: mem::List.empty(alloc), faults: mem::List.empty(alloc), approvals: mem::List.empty(alloc), cuts: mem::List.empty(alloc), taint: mem::List.empty(alloc), costs: Costs(cpu_ns: 0, memory_bytes: 0, store_bytes: 18, energy_mj: 0))
+    var plan = Plan(principal: ident::Principal(text: text::Fixed[64].of("owner")), steps: mem::List.empty(alloc), options: PlanOptions(intent: None, confirm_within_s: None, health_s: 30), effects: take effects, inputs: RecordedInputs(reads: mem::List.empty(alloc), live: mem::List.empty(alloc), values: mem::List.empty(alloc)))
+    let hash = mut plan.hashed(alloc)
+    plan.effects.costs.store_bytes = 4_096
+    let costly = mut plan.hashed(alloc)
+    var lines = mem::List[mem::List[text::String]].empty(alloc)
+    var changed = mem::List[text::String].empty(alloc)
+    mut changed.push(text::String.of("- batch: 0", alloc))
+    mut changed.push(text::String.of("+ batch: 32", alloc))
+    mut lines.push(take changed)
+    let records = effect_records(plan, hash, lines, alloc)
+    var block = Block.of(Verdict.Ok, id: "6", verb: "plan", operand: "[1 steps]", alloc)
+    for record in take records {
+        mut block.records.push(take record)
+    }
+    let cut = Cut(budget: 4_000, sized: false, skip: 0, rest: text::String.empty(alloc), fields: mem::List.empty(alloc), json: false)
+    let written = block.text(cut, alloc)
+    let Ok(text) = attempt text::String.try_from_utf8(written.view(), alloc) else {
+        expect false
+        return
+    }
+    var expected = text::String.of("ok 6 plan [1 steps]: records 5\nplan ", alloc)
+    mut expected.append(hash.short_form().as_str())
+    mut expected.append(", base: #5130, branch: \"main\", spans: 1, class: restorable, approvals: 0\nstep 1, span: 1, class: restorable, basis: Basis.Observed\nchange /sys/config/app.feeds, step: 1\n    - batch: 0\n    + batch: 32\nactivation app.feeds, step: 1, kind: ActivationKind.Restart, pause_ms: 2\ncost cpu_ns: 0, memory_bytes: 0, store_bytes: 4096, energy_mj: 0\nok 6 plan [1 steps]: records 5\n")
+    expect hash == costly
+    expect text.as_str() == expected.as_str()
+} effect_sets_print_as_records_in_field_order

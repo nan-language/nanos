@@ -1,0 +1,203 @@
+//! Plans: the `plan` verb previewing plans from keyed tasks, the plans the link keeps by their hash, their lifecycle states, events and records at `/live/plans`.
+
+/// A plan the link keeps: its hash, its record, the work of its spans, the session that previewed it, its state, the span it reached, the commits of its spans, the end of the running health window or confirmation wait, the request key and the request number it applies under, the code it ended with, and when it was previewed and ended in monotonic time.
+pub closed struct KeptPlan derives Encode {
+    pub hash: ident::HashValue
+    pub plan: Plan
+    pub spans: mem::List[SpanWork]
+    pub session: u64
+    pub state: PlanState
+    pub span: u32
+    pub commits: mem::List[ident::CommitId]
+    pub until: Option[ident::WallTime]
+    pub key: Option[text::String]
+    pub applying: Option[u64]
+    pub code: Option[text::String]
+    pub previewed_ns: u64
+    pub ended_ns: Option[u64]
+} KeptPlan
+
+/// `plan <steps>`: a keyed task previews the steps for the session's principal, at most `SessionBudget.previews` previews of its sessions running at once.
+fn Linker.plan(mut self, take request: Request, number: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    let session = self.running[at].session
+    let slot = self.running[at].slot
+    let asked = match self.planning(request, session, now_utc: now_utc_ns(env.wall, clock: env.clock), alloc) {
+        Ok(made) => made
+        Err(failure) => {
+            let block = self.running[at].failed(take failure, alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+            return
+        }
+    }
+    let tree = env.tree
+    let oversight = env.oversight
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take asked](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 131_072 {
+        let outcome = try await preview(take asked, tree, oversight, alloc)
+        discard attempt await out.previewed(number, outcome: take outcome)
+    })
+    mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
+} Linker.plan
+
+/// What the preview of `request` in the session numbered `session` needs: its steps and options, the session's principal and what it holds, its taint, and the sessions open; refused without a session, with steps or options of the wrong form, or while the principal's sessions run their most previews.
+fn Linker.planning(self, request: Request, session: u64, now_utc: i64, alloc: mem::Alloc) -> Result[Planning, Failure] {
+    let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return Err(Failure.of("auth.denied", subject: "plan", alloc).expecting("a session", found: "none", alloc))
+    }
+    let list = match request.operands.get(0) {
+        Some(word) => word.as_str()
+        None => ""
+    }
+    let steps = match steps_of(list, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let options = match options_of(request, plans: self.config.plans, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let principal = self.sessions[at].principal
+    var previewing: u32 = 0
+    for running in self.running {
+        if running.verb.as_str() != "plan" or (running.session == session and running.id == request.id) {
+            continue
+        }
+        match self.sessions.position(fn(each: Session) => each.number == running.session) {
+            Some(other) => {
+                if self.sessions[other].principal == principal {
+                    previewing += 1
+                }
+            }
+            None => {
+            }
+        }
+    }
+    if previewing >= self.budget_of(session).previews {
+        return Err(Failure.of("budget.previews", subject: principal.text.as_str(), alloc).expecting("fewer previews running", found: "the principal's most", alloc))
+    }
+    let holding = match self.holdings.position(fn(each: Holding) => each.principal == principal) {
+        Some(held) => match duplicate(self.holdings[held], alloc) {
+            Some(copy) => copy
+            None => Holding(principal: ident::Principal(text: principal.text), grants: mem::List.empty(alloc), keyed: false)
+        }
+        None => Holding(principal: ident::Principal(text: principal.text), grants: mem::List.empty(alloc), keyed: false)
+    }
+    var taint = mem::List[ident::OriginLabel].empty(alloc)
+    match self.tallies.position(fn(each: Tally) => each.principal == principal) {
+        Some(tally) => {
+            for label in self.tallies[tally].taint {
+                mut taint.push(ident::OriginLabel(text: label.text))
+            }
+        }
+        None => {
+        }
+    }
+    var open = mem::List[OpenSession].empty(alloc)
+    for each in self.sessions {
+        var path = mem::List[ident::Moniker].empty(alloc)
+        for moniker in each.path {
+            mut path.push(ident::Moniker(text: moniker.text))
+        }
+        mut open.push(OpenSession(session: ident::SessionId(boot: self.boot(), number: each.number), principal: ident::Principal(text: each.principal.text), path: take path))
+    }
+    return Ok(Planning(steps: take steps, options: take options, principal: ident::Principal(text: principal.text), session: ident::SessionId(boot: self.boot(), number: session), holding: take holding, plans: self.config.plans, taint: take taint, open: take open, json: request.has("json-in"), now_utc: now_utc))
+} Linker.planning
+
+/// Answers the `plan` numbered `number` with its effect set, keeping the plan, or with the failure ending its preview.
+fn Linker.previewed(mut self, take number: u64, take outcome: Preview, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    let previewed = match outcome {
+        Preview.Kept(made) => made
+        Preview.Failed(failure) => {
+            let block = self.running[at].failed(take failure, alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+            return
+        }
+    }
+    let Previewed(hash: hash, plan: plan, spans: spans, records: records) = previewed
+    var block = self.running[at].block(Verdict.Ok, alloc)
+    for record in take records {
+        mut block.records.push(take record)
+    }
+    let session = self.running[at].session
+    mut self.respond(at, take block, mut env, mut cx)
+    let now = now_ns(env.clock)
+    mut self.forget_plans(now, mut env, mut cx)
+    match self.plans.position(fn(each: KeptPlan) => each.hash == hash) {
+        Some(_) => return
+        None => {
+        }
+    }
+    mut self.plans.push(KeptPlan(hash: hash, plan: take plan, spans: take spans, session: session, state: PlanState.Previewed, span: 0, commits: mem::List.empty(alloc), until: None, key: None, applying: None, code: None, previewed_ns: now, ended_ns: None))
+    mut self.announce(self.plans.len() - 1, mut env, mut cx)
+} Linker.previewed
+
+/// Emits the event of the state of the plan kept at `at` and publishes its record at `/live/plans`.
+fn Linker.announce(mut self, at: usize, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let alloc = env.alloc
+    let held = self.plans[at]
+    var commit: Option[ident::CommitId] = None
+    var commits = mem::List[ident::CommitId].empty(alloc)
+    for each in held.commits {
+        commit = Some(each)
+        mut commits.push(each)
+    }
+    let code = match held.code {
+        Some(text) => Some(text::String.of(text.as_str(), alloc))
+        None => None
+    }
+    let event = PlanEvent(plan: held.hash, state: held.state, span: held.span, commit: commit, entry: None, code: take code)
+    let record = LivePlan(state: held.state, span: held.span, commits: take commits, until: held.until, deliveries: mem::List.empty(alloc), as_of: now_ns(env.clock))
+    let hash = held.hash
+    let kind = held.state.event_kind()
+    mut self.notify(Notice.Plan(kind: kind, event: take event), mut env, mut cx)
+    mut self.notify(Notice.PlanLive(plan: hash, record: take record), mut env, mut cx)
+} Linker.announce
+
+/// Forgets the plans kept past `PlanConfig.keep_s` since their preview while previewed, or since their end once ended, withdrawing their records at `/live/plans`.
+fn Linker.forget_plans(mut self, now: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    let keep_ns = u64.widen(self.config.plans.keep_s) * 1_000_000_000
+    var at: usize = 0
+    while at < self.plans.len() {
+        let since = match self.plans[at].ended_ns {
+            Some(ended) => ended
+            None => match self.plans[at].state == PlanState.Previewed {
+                true => self.plans[at].previewed_ns
+                false => now
+            }
+        }
+        if now.saturating_sub(since) <= keep_ns {
+            at += 1
+            continue
+        }
+        let gone = mut self.plans.remove(at)
+        mut self.notify(Notice.PlanWithdrawn(plan: gone.hash), mut env, mut cx)
+    }
+} Linker.forget_plans
+
+/// The plan kept whose short or full hash `text` writes, `request.unknown-name` when none or `request.ambiguous` when several match.
+fn Linker.plan_named(self, text: Str, alloc: mem::Alloc) -> Result[usize, Failure] {
+    let Some(named) = ident::HashText.parse(text) else {
+        return Err(Failure.of("request.invalid-operand", subject: text, alloc).expecting("a plan's short or full hash", found: text, alloc))
+    }
+    var found: Option[usize] = None
+    for at in 0..<self.plans.len() {
+        if not named.names(self.plans[at].hash) {
+            continue
+        }
+        if found.is_some() {
+            return Err(Failure.of("request.ambiguous", subject: text, alloc))
+        }
+        found = Some(at)
+    }
+    return match found {
+        Some(at) => Ok(at)
+        None => Err(Failure.of("request.unknown-name", subject: text, alloc).expecting("a plan previewed in the last hour", found: text, alloc))
+    }
+} Linker.plan_named
