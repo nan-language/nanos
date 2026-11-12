@@ -31,7 +31,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `generations/` | The `generations` package: the `boot` instance, recording each boot in the boot record, `/sys/boot` and `/live/boot` |
 | `clock/` | The `clock` package: the `clock` instance and its time sources |
 | `power/` | The `power` package: the `power` instance, the power settings and the switch the core carries out |
-| `link/` | The `link` package: requests, blocks in canonical rendering and JSON, sessions under their principals' grants, queries, watches, the primer, the code catalogue and the `link` instance on the serial and port transports; in `transcripts/` the link transcripts `tools/transcripts` runs |
+| `link/` | The `link` package: requests, blocks in canonical rendering and JSON, sessions under their principals' grants, queries, watches, plans with their previews, applies and undos, uploads, request keys, the primer, the code catalogue and the `link` instance on the serial and port transports; in `transcripts/` the link transcripts `tools/transcripts` runs |
 | `console/` | The `console` package: the `console` instance, sharing the console UART with the link |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
