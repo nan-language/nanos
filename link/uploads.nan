@@ -9,11 +9,11 @@ pub open struct Upload derives Send {
     chunks: task::Sender[mem::Bytes]
 } Upload
 
-/// What a `put` uploads: its path, its size and the blob id its bytes must have, the principal and session it acts for, and its request key.
+/// What a `put` uploads: its path, its size and the blob id, in a short or full form, its bytes must have, the principal and session it acts for, and its request key.
 pub closed struct Putting derives Encode {
     pub path: ident::Path
     pub size: u64
-    pub blake3: ident::HashValue
+    pub blake3: text::String
     pub principal: ident::Principal
     pub session: ident::SessionId
     pub key: text::String
@@ -50,7 +50,7 @@ fn Linker.put(
     })
 } Linker.put
 
-/// What the `put` running at `at` uploads, once its operands are a path, a size of at most `MOST_PUT_BYTES` and a full blob id, and the session's principal may write the path.
+/// What the `put` running at `at` uploads, once its operands are a path, a size of at most `MOST_PUT_BYTES` and a blob id, and the session's principal may write the path.
 fn Linker.putting(
     self,
     request: Request,
@@ -74,8 +74,8 @@ fn Linker.putting(
     if size > MOST_PUT_BYTES {
         return Err(Failure.of("request.too-large", subject: request.operands[1].as_str(), alloc).expecting("at most 64 MiB", found: request.operands[1].as_str(), alloc))
     }
-    let Some(ident::HashText.Full(blake3)) = ident::HashText.parse(request.operands[2].as_str()) else {
-        return Err(Failure.of("request.invalid-operand", subject: request.operands[2].as_str(), alloc).expecting("a blob id in its full form", found: request.operands[2].as_str(), alloc))
+    if ident::HashText.parse(request.operands[2].as_str()).is_none() {
+        return Err(Failure.of("request.invalid-operand", subject: request.operands[2].as_str(), alloc).expecting("a blob id", found: request.operands[2].as_str(), alloc))
     }
     let principal = self.sessions[session_at].principal
     let writes = match self.holdings.position(fn(each: Holding) => each.principal == principal) {
@@ -89,7 +89,7 @@ fn Linker.putting(
         Ok(made) => made
         Err(failure) => return Err(take failure)
     }
-    return Ok(Putting(path: take path, size: size, blake3: blake3, principal: ident::Principal(text: principal.text), session: ident::SessionId(boot: self.boot(), number: session), key: take key))
+    return Ok(Putting(path: take path, size: size, blake3: text::String.of(request.operands[2].as_str(), alloc), principal: ident::Principal(text: principal.text), session: ident::SessionId(boot: self.boot(), number: session), key: take key))
 } Linker.putting
 
 /// Passes the bytes of a data line received on the connection numbered `connection` to the upload of its `put`; an upload without room for them fails.
@@ -115,7 +115,7 @@ fn Env.forget_upload(mut self, number: u64) {
     mut self.uploads.retain(fn(each: Upload) => each.number != number)
 } Env.forget_upload
 
-/// Uploads the bytes `chunks` brings into a draft through a View acting for the principal of `putting`, closes it into the blob `putting` names and commits it at its path, giving `block` with its `blob` record, or failed with the store's code.
+/// Uploads the bytes `chunks` brings into a draft through a View acting for the principal of `putting`, closes it into a blob, which must have the id `putting` names, and commits it at its path, giving `block` with its `blob` record, or failed with the store's code.
 fn uploaded(
     take putting: Putting,
     take chunks: task::Receiver[mem::Bytes],
@@ -125,12 +125,12 @@ fn uploaded(
     ) -> Block fails task::Cancelled uses wait {
     var answered = block
     let failure = match try await stored(putting, take chunks, tree, alloc) {
-        Ok(committed) => {
+        Ok(stored_blob) => {
             var record = Record.of("blob", alloc)
             mut record.subject(Dyn[Render].view(putting.path))
             mut record.field("size_bytes", value: Dyn[Render].view(putting.size))
-            mut record.hash("blake3", value: putting.blake3)
-            mut record.field("commit", value: Dyn[Render].view(committed))
+            mut record.hash("blake3", value: stored_blob.id)
+            mut record.field("commit", value: Dyn[Render].view(stored_blob.commit))
             mut answered.records.push(take record)
             return answered
         }
@@ -141,8 +141,14 @@ fn uploaded(
     return answered
 } uploaded
 
-/// The commit of the blob `putting` uploads from `chunks`.
-fn stored(putting: Putting, take chunks: task::Receiver[mem::Bytes], tree: store::service::View, alloc: mem::Alloc) -> Result[ident::CommitId, Failure] fails task::Cancelled uses wait {
+/// A blob stored: its id and the commit writing it at its path.
+pub closed struct StoredBlob derives Copy {
+    pub id: ident::HashValue
+    pub commit: ident::CommitId
+} StoredBlob
+
+/// The blob `putting` uploads from `chunks`, `request.hash-mismatch` when its id is not the one `putting` names.
+fn stored(putting: Putting, take chunks: task::Receiver[mem::Bytes], tree: store::service::View, alloc: mem::Alloc) -> Result[StoredBlob, Failure] fails task::Cancelled uses wait {
     let subject = putting.path.text.as_str()
     let acting = match first attempt await tree.acting(ident::Principal(text: putting.principal.text), session: putting.session, alloc) {
         Ok(view) => view
@@ -171,17 +177,29 @@ fn stored(putting: Putting, take chunks: task::Receiver[mem::Bytes], tree: store
             Err(failed) => return Err(Failure.of(failed.code().as_str(), subject, alloc))
         }
     }
-    let closed = match first attempt await acting.draft_close(draft, expected: Some(putting.blake3), alloc) {
+    let named = ident::HashText.parse(putting.blake3.as_str())
+    let expected = match named {
+        Some(ident::HashText.Full(hash)) => Some(hash)
+        else => None
+    }
+    let closed = match first attempt await acting.draft_close(draft, expected, alloc) {
         Ok(found) => found
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(store::service::ViewError.Failed(store::service::Failure.HashMismatch)) => return Err(Failure.of("request.hash-mismatch", subject, alloc))
         Err(failed) => return Err(Failure.of(failed.code().as_str(), subject, alloc))
     }
+    let identified = match named {
+        Some(text) => text.names(closed.id)
+        None => false
+    }
+    if not identified {
+        return Err(Failure.of("request.hash-mismatch", subject, alloc).expecting(putting.blake3.as_str(), found: closed.id.short_form().as_str(), alloc))
+    }
     var writes = mem::List[store::Write].empty(alloc)
     mut writes.push(store::Write.Put(path: ident::Path(text: text::String.of(subject, alloc)), value: store::Value.Blob(closed.id)))
     let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: Some(text::String.of(putting.key.as_str(), alloc)), plan: None, intent: None)
     return match first attempt await acting.commit(take transaction, typed: true, alloc) {
-        Ok(done) => Ok(done.number)
+        Ok(done) => Ok(StoredBlob(id: closed.id, commit: done.number))
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(failed) => Err(Failure.of(failed.code().as_str(), subject, alloc))
     }
