@@ -1,10 +1,11 @@
 //! Plans: the `plan` verb previewing plans from keyed tasks, the plans the link keeps by their hash, their lifecycle states, events and records at `/live/plans`.
 
-/// A plan the link keeps: its hash, its record, the work of its spans, the session that previewed it, its state, the span it reached, the commits of its spans, the end of the running health window or confirmation wait, the request key and the request number it applies under, the code it ended with, and when it was previewed and ended in monotonic time.
+/// A plan the link keeps: its hash, its record, the work of its spans, the subjects the policy decides, the session that previewed it, its state, the span it reached, the commits of its spans, the end of the running health window or confirmation wait, the request key and the request number it applies under, the code it ended with, and when it was previewed and ended in monotonic time.
 pub closed struct KeptPlan derives Encode {
     pub hash: ident::HashValue
     pub plan: Plan
     pub spans: mem::List[SpanWork]
+    pub subjects: mem::List[policy::Subject]
     pub session: u64
     pub state: PlanState
     pub span: u32
@@ -18,7 +19,13 @@ pub closed struct KeptPlan derives Encode {
 } KeptPlan
 
 /// `plan <steps>`: a keyed task previews the steps for the session's principal, at most `SessionBudget.previews` previews of its sessions running at once.
-fn Linker.plan(mut self, take request: Request, number: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+fn Linker.plan(
+    mut self,
+    take request: Request,
+    number: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
     let alloc = env.alloc
     let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
         return
@@ -37,13 +44,19 @@ fn Linker.plan(mut self, take request: Request, number: u64, mut env: Env, mut c
     let oversight = env.oversight
     mut cx.spawn(key: ANSWERING + slot, run: fn[take asked](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 131_072 {
         let outcome = try await preview(take asked, tree, oversight, alloc)
-        discard attempt await out.previewed(number, outcome: take outcome)
+        discard attempt await out.previewed(number, take outcome)
     })
     mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
 } Linker.plan
 
 /// What the preview of `request` in the session numbered `session` needs: its steps and options, the session's principal and what it holds, its taint, and the sessions open; refused without a session, with steps or options of the wrong form, or while the principal's sessions run their most previews.
-fn Linker.planning(self, request: Request, session: u64, now_utc: i64, alloc: mem::Alloc) -> Result[Planning, Failure] {
+fn Linker.planning(
+    self,
+    request: Request,
+    session: u64,
+    now_utc: i64,
+    alloc: mem::Alloc,
+    ) -> Result[Planning, Failure] {
     let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
         return Err(Failure.of("auth.denied", subject: "plan", alloc).expecting("a session", found: "none", alloc))
     }
@@ -107,7 +120,13 @@ fn Linker.planning(self, request: Request, session: u64, now_utc: i64, alloc: me
 } Linker.planning
 
 /// Answers the `plan` numbered `number` with its effect set, keeping the plan, or with the failure ending its preview.
-fn Linker.previewed(mut self, take number: u64, take outcome: Preview, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+fn Linker.previewed(
+    mut self,
+    take number: u64,
+    take outcome: Preview,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
     let alloc = env.alloc
     let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
         return
@@ -120,7 +139,7 @@ fn Linker.previewed(mut self, take number: u64, take outcome: Preview, mut env: 
             return
         }
     }
-    let Previewed(hash: hash, plan: plan, spans: spans, records: records) = previewed
+    let Previewed(hash: hash, plan: plan, spans: spans, subjects: subjects, records: records) = previewed
     var block = self.running[at].block(Verdict.Ok, alloc)
     for record in take records {
         mut block.records.push(take record)
@@ -134,7 +153,7 @@ fn Linker.previewed(mut self, take number: u64, take outcome: Preview, mut env: 
         None => {
         }
     }
-    mut self.plans.push(KeptPlan(hash: hash, plan: take plan, spans: take spans, session: session, state: PlanState.Previewed, span: 0, commits: mem::List.empty(alloc), until: None, key: None, applying: None, code: None, previewed_ns: now, ended_ns: None))
+    mut self.plans.push(KeptPlan(hash: hash, plan: take plan, spans: take spans, subjects: take subjects, session: session, state: PlanState.Previewed, span: 0, commits: mem::List.empty(alloc), until: None, key: None, applying: None, code: None, previewed_ns: now, ended_ns: None))
     mut self.announce(self.plans.len() - 1, mut env, mut cx)
 } Linker.previewed
 
@@ -201,3 +220,345 @@ fn Linker.plan_named(self, text: Str, alloc: mem::Alloc) -> Result[usize, Failur
         None => Err(Failure.of("request.unknown-name", subject: text, alloc).expecting("a plan previewed in the last hour", found: text, alloc))
     }
 } Linker.plan_named
+
+/// The request key of `request` in the session numbered `session`: its `--key`, else the session in its `s<b>.<n>` form, `.` and the request id.
+fn Linker.key_of_request(self, request: Request, session: u64, alloc: mem::Alloc) -> Result[text::String, Failure] {
+    match request.flag("key") {
+        Some(key) => {
+            if key.byte_len() == 0 or key.byte_len() > 64 {
+                return Err(Failure.of("request.invalid-flag", subject: "--key", alloc).expecting("1 to 64 characters of [A-Za-z0-9_.-]", found: key, alloc))
+            }
+            for byte in key.as_bytes() {
+                let allowed = (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') or byte == b'_' or byte == b'.' or byte == b'-'
+                if not allowed {
+                    return Err(Failure.of("request.invalid-flag", subject: "--key", alloc).expecting("1 to 64 characters of [A-Za-z0-9_.-]", found: key, alloc))
+                }
+            }
+            return Ok(text::String.of(key, alloc))
+        }
+        None => {
+        }
+    }
+    var key = text::String.of("s", alloc)
+    mut key.write(Dyn[Render].view(self.boot()), budget: 24)
+    mut key.push('.')
+    mut key.write(Dyn[Render].view(session), budget: 24)
+    mut key.push('.')
+    mut key.append(request.id.as_str())
+    return Ok(take key)
+} Linker.key_of_request
+
+/// `apply <plan>`: a keyed task applies the plan the session's principal previewed, under the request's key; a plan applying under another key fails with `plan.busy`, and one whose lifecycle ended with `plan.ended`, or with its final records under the key it applied with.
+fn Linker.apply(
+    mut self,
+    take request: Request,
+    number: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let alloc = env.alloc
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    let started = mut self.applying(request, at, alloc)
+    let plan_at = match started {
+        Ok(found) => found
+        Err(failure) => {
+            let block = self.running[at].failed(take failure, alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+            return
+        }
+    }
+    if self.plans[plan_at].state.ended() {
+        let block = self.final_block(plan_at, at, alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    let session = ident::SessionId(boot: self.boot(), number: self.running[at].session)
+    let slot = self.running[at].slot
+    let Some(applying) = self.applying_work(plan_at, number, session, alloc) else {
+        let block = self.running[at].failed(Failure.of("store.corrupt", subject: "plan", alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return
+    }
+    self.plans[plan_at].state = PlanState.Applying
+    self.plans[plan_at].applying = Some(number)
+    mut self.announce(plan_at, mut env, mut cx)
+    let tree = env.tree
+    let oversight = env.oversight
+    let clocks = Clocks(clock: env.clock, wall: env.wall)
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take applying](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 65_536 {
+        try await apply_plan(take applying, tree, oversight, clocks, out, alloc)
+    })
+    mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
+} Linker.apply
+
+/// The kept plan the `apply` running at `at` names, its key set, once the rules of apply let it go on: a plan of the session's principal, previewed and not applying, or ended under this key.
+fn Linker.applying(mut self, request: Request, at: usize, alloc: mem::Alloc) -> Result[usize, Failure] {
+    let session = self.running[at].session
+    let Some(session_at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return Err(Failure.of("auth.denied", subject: "apply", alloc).expecting("a session", found: "none", alloc))
+    }
+    let operand = match request.operands.get(0) {
+        Some(word) => text::String.of(word.as_str(), alloc)
+        None => text::String.empty(alloc)
+    }
+    let plan_at = match self.plan_named(operand.as_str(), alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    if self.plans[plan_at].plan.principal != self.sessions[session_at].principal {
+        return Err(Failure.of("plan.foreign", subject: operand.as_str(), alloc))
+    }
+    let key = match self.key_of_request(request, session, alloc) {
+        Ok(made) => made
+        Err(failure) => return Err(take failure)
+    }
+    let same_key = match self.plans[plan_at].key {
+        Some(held) => held.as_str() == key.as_str()
+        None => false
+    }
+    let state = self.plans[plan_at].state
+    if state.ended() {
+        if not same_key {
+            return Err(Failure.of("plan.ended", subject: operand.as_str(), alloc))
+        }
+        return Ok(plan_at)
+    }
+    if state != PlanState.Previewed {
+        return Err(Failure.of("plan.busy", subject: operand.as_str(), alloc))
+    }
+    self.plans[plan_at].key = Some(take key)
+    return Ok(plan_at)
+} Linker.applying
+
+/// What applying the plan kept at `plan_at` for the `apply` numbered `number` in `session` needs.
+fn Linker.applying_work(
+    self,
+    plan_at: usize,
+    number: u64,
+    session: ident::SessionId,
+    alloc: mem::Alloc,
+    ) -> Option[Applying] {
+    let held = self.plans[plan_at]
+    let Some(plan) = duplicate(held.plan, alloc) else {
+        return None
+    }
+    let Some(spans) = duplicate(held.spans, alloc) else {
+        return None
+    }
+    let Some(subjects) = duplicate(held.subjects, alloc) else {
+        return None
+    }
+    let key = match held.key {
+        Some(text) => text::String.of(text.as_str(), alloc)
+        None => text::String.empty(alloc)
+    }
+    return Some(Applying(number: number, hash: held.hash, plan: take plan, session: session, spans: take spans, subjects: take subjects, key: take key))
+} Linker.applying_work
+
+/// Follows the plan the `apply` numbered `number` applies: a committed span moves it into its health window, and its end gives the `apply` its final block.
+fn Linker.plan_moved(
+    mut self,
+    take number: u64,
+    take moved: Moved,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let alloc = env.alloc
+    let Some(plan_at) = self.plans.position(fn(each: KeptPlan) => each.applying == Some(number)) else {
+        return
+    }
+    match moved {
+        Moved.Committed(span: span, commit: commit, until: until) => {
+            self.plans[plan_at].state = PlanState.HealthWindow
+            self.plans[plan_at].span = span
+            mut self.plans[plan_at].commits.push(commit)
+            self.plans[plan_at].until = until
+            mut self.announce(plan_at, mut env, mut cx)
+        }
+        Moved.Ended(state: state, code: code) => {
+            self.plans[plan_at].state = state
+            self.plans[plan_at].code = code
+            self.plans[plan_at].until = None
+            self.plans[plan_at].applying = None
+            if state.ended() {
+                self.plans[plan_at].ended_ns = Some(now_ns(env.clock))
+            }
+            mut self.announce(plan_at, mut env, mut cx)
+            let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+                return
+            }
+            let block = self.final_block(plan_at, at, alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+        }
+    }
+} Linker.plan_moved
+
+/// The final block of the request running at `at` for the plan kept at `plan_at`: a `span <n>, commit` record per span committed and `plan <hash>, state`, failed with the plan's code unless it applied.
+fn Linker.final_block(self, plan_at: usize, at: usize, alloc: mem::Alloc) -> Block {
+    let held = self.plans[plan_at]
+    let verdict = match held.state == PlanState.Applied {
+        true => Verdict.Ok
+        false => Verdict.Failed
+    }
+    var block = self.running[at].block(verdict, alloc)
+    match held.code {
+        Some(code) => {
+            var subject = text::String.empty(alloc)
+            mut subject.append(held.hash.short_form().as_str())
+            mut block.records.push(Failure.of(code.as_str(), subject: subject.as_str(), alloc).record(alloc))
+        }
+        None => {
+        }
+    }
+    var span: u32 = 1
+    for commit in held.commits {
+        var record = Record.of("span", alloc)
+        mut record.subject(Dyn[Render].view(span))
+        mut record.field("commit", value: Dyn[Render].view(commit))
+        mut block.records.push(take record)
+        span += 1
+    }
+    var summary = Record.of("plan", alloc)
+    mut summary.subject(Dyn[Render].view(held.hash))
+    mut summary.hashes.push(Hashed(short: held.hash.short_form(), full: held.hash.full_form()))
+    mut summary.field("state", value: Dyn[Render].view(held.state))
+    mut block.records.push(take summary)
+    return block
+} Linker.final_block
+
+/// The `pending` record of the request numbered `number`: the state of the plan it applies, its span, the commit of that span and the end of its window, or `running`.
+fn Linker.pending_record(self, number: u64, alloc: mem::Alloc) -> Record {
+    var record = Record.of("pending", alloc)
+    let Some(plan_at) = self.plans.position(fn(each: KeptPlan) => each.applying == Some(number)) else {
+        mut record.words("running")
+        return record
+    }
+    let held = self.plans[plan_at]
+    mut record.subject(Dyn[Render].view(held.state))
+    if held.span > 0 {
+        mut record.field("span", value: Dyn[Render].view(held.span))
+    }
+    for commit in held.commits {
+        if held.commits.len() == usize.widen(held.span) {
+            mut record.field("commit", value: Dyn[Render].view(commit))
+        }
+    }
+    match held.until {
+        Some(until) => mut record.field("until", value: Dyn[Render].view(until))
+        None => {
+        }
+    }
+    return record
+} Linker.pending_record
+
+/// `confirm <commit>`: a keyed task commits the deletion of the record at `/sys/plans` of the plan of the session's principal whose provisional span commit it names, which lets its apply go on; `plan.not-provisional` for any other commit.
+fn Linker.confirm(
+    mut self,
+    take request: Request,
+    number: u64,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let alloc = env.alloc
+    let Some(at) = self.running.position(fn(each: Running) => each.number == number) else {
+        return
+    }
+    let session = self.running[at].session
+    let found = self.provisional(request, session, alloc)
+    let plan_at = match found {
+        Ok(index) => index
+        Err(failure) => {
+            let block = self.running[at].failed(take failure, alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+            return
+        }
+    }
+    let key = match self.key_of_request(request, session, alloc) {
+        Ok(made) => made
+        Err(failure) => {
+            let block = self.running[at].failed(take failure, alloc)
+            mut self.respond(at, take block, mut env, mut cx)
+            return
+        }
+    }
+    let hash = self.plans[plan_at].hash
+    let principal = ident::Principal(text: self.plans[plan_at].plan.principal.text)
+    let block = self.running[at].block(Verdict.Ok, alloc)
+    let commit = match ident::CommitId.parse(self.running[at].operand.as_str()) {
+        Some(named) => named
+        None => ident::CommitId(number: 0)
+    }
+    let slot = self.running[at].slot
+    let tree = env.tree
+    let acting_session = ident::SessionId(boot: self.boot(), number: session)
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take key, take principal, take block](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let answered = try await confirmed_plan(hash, commit, take principal, session: acting_session, take key, take block, tree, alloc)
+        discard attempt await out.responded(number, block: take answered)
+    })
+    mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
+} Linker.confirm
+
+/// The plan kept of the session's principal whose provisional span commit `request` names.
+fn Linker.provisional(self, request: Request, session: u64, alloc: mem::Alloc) -> Result[usize, Failure] {
+    let operand = match request.operands.get(0) {
+        Some(word) => text::String.of(word.as_str(), alloc)
+        None => text::String.empty(alloc)
+    }
+    let Some(commit) = ident::CommitId.parse(operand.as_str()) else {
+        return Err(Failure.of("request.invalid-operand", subject: operand.as_str(), alloc).expecting("a commit #<n>", found: operand.as_str(), alloc))
+    }
+    let Some(session_at) = self.sessions.position(fn(each: Session) => each.number == session) else {
+        return Err(Failure.of("auth.denied", subject: "confirm", alloc).expecting("a session", found: "none", alloc))
+    }
+    for at in 0..<self.plans.len() {
+        let held = self.plans[at]
+        let awaiting = held.state == PlanState.HealthWindow and held.plan.options.confirm_within_s.is_some()
+        let names = held.commits.position(fn(each: ident::CommitId) => each == commit).is_some()
+        if awaiting and names and held.plan.principal == self.sessions[session_at].principal {
+            return Ok(at)
+        }
+    }
+    return Err(Failure.of("plan.not-provisional", subject: operand.as_str(), alloc))
+} Linker.provisional
+
+/// Commits the deletion of the record at `/sys/plans` of the plan `hash` through a View acting for `principal` in `session`, under `key`, giving `block` with its `confirmed` record, or failed with the store's code.
+fn confirmed_plan(
+    hash: ident::HashValue,
+    commit: ident::CommitId,
+    take principal: ident::Principal,
+    session: ident::SessionId,
+    take key: text::String,
+    take block: Block,
+    tree: store::service::View,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
+    var reply_block = block
+    let acting = match first attempt await tree.acting(take principal, session, alloc) {
+        Ok(view) => view
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => {
+            reply_block.verdict = Verdict.Failed
+            mut reply_block.records.push(Failure.of(failed.code().as_str(), subject: "confirm", alloc).record(alloc))
+            return reply_block
+        }
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Delete(path: plan_path(hash, alloc)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: Some(take key), plan: Some(hash), intent: None)
+    match first attempt await acting.commit(take transaction, typed: true, alloc) {
+        Ok(_) => {
+            var record = Record.of("confirmed", alloc)
+            mut record.subject(Dyn[Render].view(commit))
+            mut record.hash("plan", value: hash)
+            mut reply_block.records.push(take record)
+        }
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => {
+            reply_block.verdict = Verdict.Failed
+            mut reply_block.records.push(Failure.of(failed.code().as_str(), subject: "confirm", alloc).record(alloc))
+        }
+    }
+    return reply_block
+} confirmed_plan
