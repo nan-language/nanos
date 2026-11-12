@@ -151,21 +151,26 @@ pub fn Port.of(handle: PortHandle) -> Option[Port[P]] {
 
 /// Posts the one-way call `call`, waiting for credit, and returns once it is in the instance's intake.
 pub fn Port.post(self, take call: sys::Encoded) fails PortError[Never] uses wait {
-    let reached = match self.reach(call.bytes.view()) {
+    try await self.handle.post(sys::Wire[P].hash(), take call)
+} Port.post
+
+/// Posts the one-way call `call` of the protocol of hash `hash` through this handle, waiting for credit, and returns once it is in the instance's intake.
+pub fn PortHandle.post(self, hash: sys::ProtocolHash, take call: sys::Encoded) fails PortError[Never] uses wait {
+    let reached = match self.reach(hash, encoded: call.bytes.view()) {
         Ok(reached) => reached
         Err(Refusal.Revoked) => fail PortError.Revoked
         Err(Refusal.Stopped) => fail PortError.Stopped
     }
     let lease = try await Lease.acquire(reached.credits, request: false, alloc: reached.alloc)
     let header = Header.sent(request: false, capabilities: call.handles.len() > 0)
-    let sent = attempt await reached.intake.send(Call(hash: sys::Wire[P].hash(), encoded: take call, reply: None, lease: take lease, header: header))
+    let sent = attempt await reached.intake.send(Call(hash: hash, encoded: take call, reply: None, lease: take lease, header: header))
     match sent {
         Ok(_) => {
         }
         Err(task::SendError.Closed) => fail PortError.Stopped
         Err(task::SendError.Cancelled(cancelled)) => fail cancelled
     }
-} Port.post
+} PortHandle.post
 
 /// Posts the one-way call `call` when the port has a message's credit left, giving whether it did, once it is in the instance's intake.
 pub fn Port.offer(self, take call: sys::Encoded) -> bool fails PortError[Never] uses wait {
@@ -193,7 +198,26 @@ pub fn Port.offer(self, take call: sys::Encoded) -> bool fails PortError[Never] 
 
 /// Calls the request `call`, waiting for credit, and gives its reply, which `reply` decodes.
 pub fn Port.call[R: Send, E: Send](self, take call: sys::Encoded, reply: sys::Reply[R, E], alloc: mem::Alloc) -> R fails PortError[E] uses wait {
-    let reached = match self.reach(call.bytes.view()) {
+    let encoded = match first attempt await self.handle.request(sys::Wire[P].hash(), take call, alloc) {
+        Ok(answered) => answered
+        Err(PortError.Cancelled(cancelled)) => fail cancelled
+        Err(PortError.Revoked) => fail PortError.Revoked
+        Err(PortError.Stopped) => fail PortError.Stopped
+        Err(PortError.ServerStopped) => fail PortError.ServerStopped
+        Err(PortError.Reset) => fail PortError.Reset
+        Err(PortError.Unplugged) => fail PortError.Unplugged
+        Err(_) => fail PortError.Malformed
+    }
+    return match attempt reply.decode(Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc) {
+        Ok(result) => result
+        Err(sys::CallError.Failed(failure)) => fail PortError.Failed(take failure)
+        else => fail PortError.Malformed
+    }
+} Port.call
+
+/// Calls the request `call` of the protocol of hash `hash` through this handle, waiting for credit, and gives the encoding of its reply; a handle whose instance serves no protocol of that hash refuses it as revoked.
+pub fn PortHandle.request(self, hash: sys::ProtocolHash, take call: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails PortError[Never] uses wait {
+    let reached = match self.reach(hash, encoded: call.bytes.view()) {
         Ok(reached) => reached
         Err(Refusal.Revoked) => fail PortError.Revoked
         Err(Refusal.Stopped) => fail PortError.Stopped
@@ -201,7 +225,7 @@ pub fn Port.call[R: Send, E: Send](self, take call: sys::Encoded, reply: sys::Re
     let lease = try await Lease.acquire(reached.credits, request: true, alloc)
     let task::Channel(sender: answer, receiver: answers) = task::Channel[Answer].bounded(1, alloc)
     let header = Header.sent(request: true, capabilities: call.handles.len() > 0)
-    let sent = attempt await reached.intake.send(Call(hash: sys::Wire[P].hash(), encoded: take call, reply: Some(take answer), lease: take lease, header: header))
+    let sent = attempt await reached.intake.send(Call(hash: hash, encoded: take call, reply: Some(take answer), lease: take lease, header: header))
     match sent {
         Ok(_) => {
         }
@@ -212,7 +236,7 @@ pub fn Port.call[R: Send, E: Send](self, take call: sys::Encoded, reply: sys::Re
     let Some(answered) = try await mut receiver.receive() else {
         fail PortError.ServerStopped
     }
-    let encoded = match answered {
+    return match answered {
         Answer.Replied(encoded) => encoded
         Answer.Malformed => fail PortError.Malformed
         Answer.Stopped => fail PortError.Stopped
@@ -220,17 +244,18 @@ pub fn Port.call[R: Send, E: Send](self, take call: sys::Encoded, reply: sys::Re
         Answer.Reset => fail PortError.Reset
         Answer.Unplugged => fail PortError.Unplugged
     }
-    return match attempt reply.decode(Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc) {
-        Ok(result) => result
-        Err(sys::CallError.Failed(failure)) => fail PortError.Failed(take failure)
-        else => fail PortError.Malformed
-    }
-} Port.call
+} PortHandle.request
 
 /// What a call `encoded` through this port needs, refused when the port is stale or lacks its operation, or when the instance takes no calls.
 fn Port.reach(self, encoded: Slice[u8]) -> Result[Reached, Refusal] {
-    let reached = sys::reach(self.handle, body: fn(state: Route, record: u8) -> Result[Reached, Refusal] {
-        if not allows(state.operations, encoded) {
+    return self.handle.reach(sys::Wire[P].hash(), encoded)
+} Port.reach
+
+/// What a call `encoded` of the protocol of hash `hash` through this handle needs, refused when the handle is stale, its instance serves no protocol of that hash or it lacks the call's operation, or when the instance takes no calls.
+fn PortHandle.reach(self, hash: sys::ProtocolHash, encoded: Slice[u8]) -> Result[Reached, Refusal] {
+    let reached = sys::reach(self, body: fn(state: Route, record: u8) -> Result[Reached, Refusal] {
+        let served = state.protocols.own == hash or state.protocols.serves == Some(hash)
+        if not served or not allows(state.operations, encoded) {
             return Err(Refusal.Revoked)
         }
         if not state.gate.is_open() {
@@ -242,7 +267,7 @@ fn Port.reach(self, encoded: Slice[u8]) -> Result[Reached, Refusal] {
         return Err(Refusal.Revoked)
     }
     return outcome
-} Port.reach
+} PortHandle.reach
 
 /// Whether `operations` holds the operation whose call `encoded` is, every operation when `None`: a call's encoding is a `mem::wire` variant keyed by its operation's name, after the name's length in one byte.
 fn allows(operations: Option[mem::Set[text::String]], encoded: Slice[u8]) -> bool {
