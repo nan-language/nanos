@@ -24,6 +24,6 @@ Alternatives rejected:
 ## Consequences
 
 - `call`, `redeliver` and `restore-checkpoint` steps, forked runs, deliveries and the outbox wait for operation classes and typed schemas in protocol schemas, held outputs a stepper shows, and a recording clock.
-- A plan needing an approval ends its `apply` with `policy.approval-required` until approvals exist; timed plans wait too.
+- A plan needing an approval ends its `apply` with `policy.approval-required` until approvals exist, and a timed plan applies only while the `link` that scheduled it runs.
 - Values of records holding identifiers are written as construction literals naming each identifier's fields, or as JSON.
 - A specification's changes other than `stopped` reach no running instance, and an activation is no forked run.

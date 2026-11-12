@@ -337,12 +337,27 @@ fn Linker.apply(
     }
     let session = ident::SessionId(boot: self.boot(), number: self.running[at].session)
     let slot = self.running[at].slot
-    let Some(applying) = self.applying_work(plan_at, number, session, alloc) else {
+    let scheduled = match request.flag("when") {
+        Some(written) => match scheduled_time(written, now: env.wall.now(env.clock)) {
+            Some(time) => Some(time)
+            None => {
+                let block = self.running[at].failed(Failure.of("request.invalid-flag", subject: "--when", alloc).expecting("an RFC 3339 UTC time or +<n>s", found: written, alloc), alloc)
+                mut self.respond(at, take block, mut env, mut cx)
+                return
+            }
+        }
+        None => None
+    }
+    let Some(applying) = self.applying_work(plan_at, number, session, scheduled, alloc) else {
         let block = self.running[at].failed(Failure.of("store.corrupt", subject: "plan", alloc), alloc)
         mut self.respond(at, take block, mut env, mut cx)
         return
     }
-    self.plans[plan_at].state = PlanState.Applying
+    self.plans[plan_at].state = match scheduled {
+        Some(_) => PlanState.Scheduled
+        None => PlanState.Applying
+    }
+    self.plans[plan_at].until = scheduled
     self.plans[plan_at].applying = Some(number)
     mut self.announce(plan_at, mut env, mut cx)
     let tree = env.tree
@@ -393,12 +408,13 @@ fn Linker.applying(mut self, request: Request, at: usize, alloc: mem::Alloc) -> 
     return Ok(plan_at)
 } Linker.applying
 
-/// What applying the plan kept at `plan_at` for the `apply` numbered `number` in `session` needs.
+/// What applying the plan kept at `plan_at` for the `apply` numbered `number` in `session` needs, at the wall time `scheduled` when it is timed.
 fn Linker.applying_work(
     self,
     plan_at: usize,
     number: u64,
     session: ident::SessionId,
+    scheduled: Option[ident::WallTime],
     alloc: mem::Alloc,
     ) -> Option[Applying] {
     let held = self.plans[plan_at]
@@ -415,7 +431,7 @@ fn Linker.applying_work(
         Some(text) => text::String.of(text.as_str(), alloc)
         None => text::String.empty(alloc)
     }
-    return Some(Applying(number: number, hash: held.hash, plan: take plan, session: session, spans: take spans, subjects: take subjects, key: take key))
+    return Some(Applying(number: number, hash: held.hash, plan: take plan, session: session, spans: take spans, subjects: take subjects, key: take key, scheduled: scheduled))
 } Linker.applying_work
 
 /// Follows the plan the `apply` numbered `number` applies: a committed span moves it into its health window, and its end gives the `apply` its final block.
@@ -623,3 +639,133 @@ fn confirmed_plan(
     }
     return reply_block
 } confirmed_plan
+
+/// Answers the `cancel` running at `at` when `named` names a plan the link keeps: a plan of the session's principal awaiting approval or scheduled ends `failed` with `plan.cancelled`, its scheduled apply ending, and a keyed task deletes its records at `/sys/schedule` and `/sys/plans` before the answer; any other fails with `request.not-cancellable`; false when it names no plan kept.
+fn Linker.cancel_plan(
+    mut self,
+    named: Str,
+    at: usize,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) -> bool {
+    let alloc = env.alloc
+    let Ok(plan_at) = self.plan_named(named, alloc) else {
+        return false
+    }
+    let session = self.running[at].session
+    let owned = match self.sessions.position(fn(each: Session) => each.number == session) {
+        Some(session_at) => self.sessions[session_at].principal == self.plans[plan_at].plan.principal
+        None => false
+    }
+    let state = self.plans[plan_at].state
+    if not owned or (state != PlanState.AwaitingApproval and state != PlanState.Scheduled) {
+        let block = self.running[at].failed(Failure.of("request.not-cancellable", subject: named, alloc).expecting("a plan of the session's principal awaiting approval or scheduled", found: named, alloc), alloc)
+        mut self.respond(at, take block, mut env, mut cx)
+        return true
+    }
+    self.plans[plan_at].state = PlanState.Failed
+    self.plans[plan_at].code = Some(text::String.of("plan.cancelled", alloc))
+    self.plans[plan_at].ended_ns = Some(now_ns(env.clock))
+    self.plans[plan_at].until = None
+    mut self.announce(plan_at, mut env, mut cx)
+    let hash = self.plans[plan_at].hash
+    let cancel_number = self.running[at].number
+    let slot = self.running[at].slot
+    let principal = ident::Principal(text: self.plans[plan_at].plan.principal.text)
+    let acting_session = ident::SessionId(boot: self.boot(), number: session)
+    var block = self.running[at].block(Verdict.Ok, alloc)
+    var record = Record.of("cancelled", alloc)
+    mut record.words(named)
+    mut block.records.push(take record)
+    match self.plans[plan_at].applying {
+        Some(applying) => {
+            self.plans[plan_at].applying = None
+            match self.running.position(fn(each: Running) => each.number == applying) {
+                Some(apply_at) => {
+                    mut cx.cancel(key: ANSWERING + self.running[apply_at].slot)
+                    let final_block = self.final_block(plan_at, at: apply_at, alloc)
+                    mut self.respond(apply_at, block: take final_block, mut env, mut cx)
+                }
+                None => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    let tree = env.tree
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take principal, take block](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let answered = try await unscheduled(hash, take principal, session: acting_session, take block, tree, alloc)
+        discard attempt await out.responded(number: cancel_number, block: take answered)
+    })
+    return true
+} Linker.cancel_plan
+
+/// Deletes the records at `/sys/schedule` and `/sys/plans` of the plan `hash` through a View acting for `principal` in `session`, giving `block`, or failed with the store's code.
+fn unscheduled(
+    hash: ident::HashValue,
+    take principal: ident::Principal,
+    session: ident::SessionId,
+    take block: Block,
+    tree: store::service::View,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
+    var reply_block = block
+    let acting = match first attempt await tree.acting(take principal, session, alloc) {
+        Ok(view) => view
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => {
+            reply_block.verdict = Verdict.Failed
+            mut reply_block.records.push(Failure.of(failed.code().as_str(), subject: "cancel", alloc).record(alloc))
+            return reply_block
+        }
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    for path in take scheduling_paths(hash, alloc) {
+        match try await node_at(acting, path: path.text.as_str(), alloc) {
+            Ok(Some(_)) => mut writes.push(store::Write.Delete(path: take path))
+            else => {
+            }
+        }
+    }
+    if writes.len() == 0 {
+        return reply_block
+    }
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: Some(hash), intent: None)
+    match first attempt await acting.commit(take transaction, typed: true, alloc) {
+        Ok(_) => {
+        }
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => {
+            reply_block.verdict = Verdict.Failed
+            mut reply_block.records.push(Failure.of(failed.code().as_str(), subject: "cancel", alloc).record(alloc))
+        }
+    }
+    return reply_block
+} unscheduled
+
+/// The wall time `--when` writes: RFC 3339 UTC, or `+<n>s` from `now`.
+fn scheduled_time(written: Str, now: ident::WallTime) -> Option[ident::WallTime] {
+    if written.starts_with("+") and written.ends_with("s") and written.byte_len() > 2 {
+        let Some(amount) = written.slice_bytes(1, end: written.byte_len() - 1) else {
+            return None
+        }
+        let Some(seconds) = number_of(amount) else {
+            return None
+        }
+        let Some(delay) = i64.checked_fit(seconds) else {
+            return None
+        }
+        return Some(ident::WallTime(utc_ns: now.utc_ns.saturating_add(delay.saturating_mul(1_000_000_000)), uncertainty_ns: now.uncertainty_ns))
+    }
+    return ident::WallTime.parse(written)
+} scheduled_time
+
+test timed_plans_take_utc_times_or_seconds_from_now for scheduled_time {
+    let now = ident::WallTime(utc_ns: 1_000_000_000_000, uncertainty_ns: 5)
+    let later = scheduled_time("+30s", now)
+    let utc = scheduled_time("2026-10-29T12:00:00Z", now)
+    let wrong = scheduled_time("+30m", now)
+    expect later == Some(ident::WallTime(utc_ns: 1_030_000_000_000, uncertainty_ns: 5))
+    expect utc.is_some() and wrong.is_none()
+} timed_plans_take_utc_times_or_seconds_from_now
