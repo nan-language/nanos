@@ -1,0 +1,189 @@
+//! Forks: copies of an instance the runner runs for previews, each started, or resumed from a checkpoint, in a domain of its own on a world of substitutes reading the configuration record and the store of a branch, then probed once for its health; their keyed tasks never run and their messages never enter an intake.
+
+/// Runs a fork of the instance `driver` holds as `forking` asks, from a task of `s`, telling `done` what it saw; an instance whose component may hold a resource is never forked.
+fn Shared.fork(
+    self,
+    mut driver: Driver,
+    take forking: os::Forking,
+    take done: task::Sender[Result[os::Outcome, os::ControlError]],
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    if not self.components.forkable(driver.spec.component.as_str()) {
+        discard attempt await done.send(Ok(os::Outcome.Forked(None)))
+        return
+    }
+    let alloc = self.config.alloc
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::InstanceSpec].encode(driver.spec, out: mut bytes)
+    let Ok(spec) = attempt mem::wire::Codec[os::InstanceSpec].decode(Untrusted.of(bytes.view()), alloc) else {
+        discard attempt await done.send(Err(os::ControlError.Invalid))
+        return
+    }
+    let moniker = ident::Moniker(text: driver.moniker.text)
+    var state: Option[store::service::View] = None
+    if forking.resumed and spec.durability.class == os::DurabilityClass.Checkpointed {
+        let directory = self.directory.share()
+        state = await when directory => directory.state_view(mut driver.minted, moniker: ident::Moniker(text: moniker.text), principal: ident::Principal(text: spec.principal.text), alloc)
+    }
+    let header = os::Header.of_work(cause: driver.changed_by, slot: driver.slot)
+    let forks = Forks(components: self.components, config: self.config, directory: self.directory.share(), withheld: self.withheld)
+    discard s.spawn(fn[take forks, take spec, take moniker, take forking, take done]() fails task::Cancelled uses wait limits stack 32_768 {
+        let seen = try await forks.run(take spec, take moniker, take forking, state, header)
+        discard attempt await done.send(Ok(os::Outcome.Forked(Some(take seen))))
+    })
+} Shared.fork
+
+/// What running forks draws on: the components, the runner's configuration, the directory worlds draw on, and the revoked capabilities.
+struct Forks[C: Components and Copy and Send] {
+    components: C
+    config: Config
+    directory: task::Cown[Directory]
+    withheld: Withheld
+} Forks
+
+/// What a fork of the instance `moniker` under `spec` saw, run as `forking` asks under `header`, its checkpoint read through its View of `/state` `state`.
+fn Forks.run(
+    self,
+    take spec: os::InstanceSpec,
+    take moniker: ident::Moniker,
+    take forking: os::Forking,
+    state: Option[store::service::View],
+    header: os::Header,
+    ) -> os::Forked fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    var restore: Option[os::Checkpoint] = None
+    match state {
+        Some(view) => {
+            match try await restored_from(view, moniker: ident::Moniker(text: moniker.text), numbered: forking.checkpoint, alloc) {
+                Ok(found) => {
+                    restore = found
+                }
+                Err(code) => return unbuilt(code)
+            }
+        }
+        None => {
+        }
+    }
+    var minted = Minted.none(alloc)
+    defer take minted.close()
+    let config = try await self.configuration(spec, moniker: ident::Moniker(text: moniker.text), branch: forking.branch.as_str(), mut minted)
+    let budget = self.config.pool.split(usize.widen(spec.budget.limit))
+    defer take budget.close()
+    let account = self.config.exec.split_on(self.config.share(spec.share), alloc: budget.alloc())
+    defer take account.close()
+    let task::Channel(sender: intake, receiver: _) = task::Channel[os::Call].bounded(1, alloc)
+    let task::Channel(sender: orders, receiver: _) = task::Channel[os::Order].bounded(1, alloc)
+    let task::Channel(sender: logs, receiver: _) = task::Channel[journal::Logged].bounded(1, alloc)
+    let request = Request(moniker: ident::Moniker(text: moniker.text), cell: budget.alloc(), exec: account.executor(), clock: self.config.clock, random: self.config.random, withheld: self.withheld, orders: take orders, logs: take logs, forking: Some(Substitutes(intake: take intake, branch: text::String.of(forking.branch.as_str(), alloc))), alloc: alloc)
+    let directory = self.directory.share()
+    let built = await when directory => directory.world(spec, mut minted, request)
+    return match built {
+        Some(world) => try await self.domain(component: spec.component.as_str(), take world, take restore, take config, exec: account.executor(), alloc: budget.alloc(), header)
+        None => unbuilt(text::Fixed[32].of("instance.env-incomplete"))
+    }
+} Forks.run
+
+/// Runs the fork of an instance of `component` on `world` in a domain of its own, restoring `restore` with the configuration record `config`, and gives what it saw: its report, or its trap.
+fn Forks.domain(
+    self,
+    component: Str,
+    take world: nanos::World,
+    take restore: Option[os::Checkpoint],
+    take config: Option[Untrusted[mem::Bytes]],
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    header: os::Header,
+    ) -> os::Forked fails task::Cancelled uses wait {
+    let held = self.config.alloc
+    let task::Channel(sender: reporting, receiver: reported) = task::Channel[os::Forked].bounded(1, alloc: held)
+    let task::Channel(sender: _, receiver: delivered) = task::Channel[Delivery].bounded(1, alloc: held)
+    let task::Channel(sender: reports, receiver: _) = task::Channel[Input].bounded(1, alloc: held)
+    let task::Channel(sender: marks, receiver: _) = task::Channel[Mark].bounded(1, alloc: held)
+    let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: held)
+    let serving = Serving(deliveries: take delivered, reports: take reports, marks: take marks, incarnation: 0, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: 0, keeping: None, restore: take restore, config: take config, forking: Some(take reporting))
+    let components = self.components
+    let path = text::String.of(component, alloc: held)
+    let ran = attempt await abandoner.contents().run_sized(fn[take path, take world, take serving]() -> Ended fails task::Cancelled uses wait limits stack 131_072 {
+        var given = Some(Launched(component: take path, world: take world, serving: take serving))
+        return try await sys::run_headed(header.carried(), body: fn[mut given]() -> Ended fails task::Cancelled uses wait {
+            let Some(Launched(component: launched, world: built, serving: served)) = mut given.extract() else {
+                return Ended.Stopped
+            }
+            return try await components.serve(launched.as_str(), world: take built, serving: take served)
+        })
+    }, stack: INSTANCE_STACK, exec, alloc)
+    let outcome = match ran {
+        Ok(result) => result
+        Err(cancelled) => fail cancelled
+    }
+    match first outcome {
+        Ok(Ended.Stopped) => {
+            var receiver = reported
+            let Some(seen) = try await mut receiver.receive() else {
+                return unbuilt(text::Fixed[32].of("instance.env-incomplete"))
+            }
+            return seen
+        }
+        Ok(Ended.CheckpointUndecodable) => return unbuilt(text::Fixed[32].of("instance.checkpoint-undecodable"))
+        Ok(_) => return unbuilt(text::Fixed[32].of("instance.env-incomplete"))
+        Err(trap) => {
+            var kind = text::String.empty(held)
+            mut kind.write(Dyn[Render].view(trap.kind()), budget: 64)
+            var report = text::String.empty(held)
+            mut report.write(Dyn[Render].view(trap), budget: 1_024)
+            return os::Forked(spawns: 0, sent: 0, fault: Some(os::ForkFault.Trap(kind: take kind, report: take report)))
+        }
+    }
+} Forks.domain
+
+/// What a fork that could not be built for the reason `code` saw.
+fn unbuilt(code: text::Fixed[32]) -> os::Forked {
+    return os::Forked(spawns: 0, sent: 0, fault: Some(os::ForkFault.Unbuilt(code: code)))
+} unbuilt
+
+/// The checkpoint of the instance `moniker` a fork resumes from: the one `numbered` names, or its latest when `None`, none when it keeps none; the code of the failure to read it.
+fn restored_from(view: store::service::View, moniker: ident::Moniker, numbered: Option[u64], alloc: mem::Alloc) -> Result[Option[os::Checkpoint], text::Fixed[32]] fails task::Cancelled uses wait {
+    var number = numbered.value_or(0)
+    if numbered.is_none() {
+        number = match first attempt await last_number(view, dir: state_dir(ident::Moniker(text: moniker.text), name: "checkpoint", alloc), keep: CHECKPOINTS, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => return Err(failed.code())
+        }
+        if number == 0 {
+            return Ok(None)
+        }
+    }
+    return match try await read_checkpoint(view, moniker, number, alloc) {
+        Ok(found) => Ok(Some(take found))
+        Err(failure) => Err(failure.code())
+    }
+} restored_from
+
+/// The configuration record of the instance `moniker` under `spec` on the branch `branch`, through a View of `/sys/config` of that branch whose root entry `minted` keeps; `None` when its component takes none, the branch holds none for it or `store` does not answer.
+fn Forks.configuration(
+    self,
+    spec: os::InstanceSpec,
+    take moniker: ident::Moniker,
+    branch: Str,
+    mut minted: Minted,
+    ) -> Option[Untrusted[mem::Bytes]] fails task::Cancelled uses wait {
+    if not self.components.configured(spec.component.as_str()) {
+        return None
+    }
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let principal = ident::Principal(text: spec.principal.text)
+    let found = await when directory => directory.branch_config_view(mut minted, moniker: ident::Moniker(text: moniker.text), take principal, branch, alloc)
+    let Some(view) = found else {
+        return None
+    }
+    let Some(path) = ident::Path(text: text::String.of("/", alloc)).child(moniker.text.as_bytes(), alloc) else {
+        return None
+    }
+    return match first attempt await view.get(take path, at: None, alloc) {
+        Ok(read) => read.value
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} Forks.configuration

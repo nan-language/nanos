@@ -19,7 +19,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `acpi/` | The `acpi` package: the ACPI tables NaN OS reads |
 | `crypto/` | The `crypto` package: XChaCha20-Poly1305 sealing and BLAKE3 key derivation on secret values |
 | `os/` | The `os` package: the records instances and the core share, message headers, and the capability kinds `Port`, `Control`, `Live` and `Callers` |
-| `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints and dead letters |
+| `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints, dead letters and forks |
 | `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |
 | `devices/` | The `devices` package: the device protocols and `fat`'s, the `drivers` registry, the AML evaluator, partition tables, volume views and the device manager |
 | `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries |

@@ -19,7 +19,7 @@ struct Assessed {
     store_bytes: u64
 } Assessed
 
-/// Computes the effect set of the steps `stepped` applied to the preview branch `branch` from `base`, has `oversight` decide the plan, and keeps the plan.
+/// Computes the effect set of the steps `stepped` applied to the preview branch `branch` from `base`, running a fork of each instance they start or restart through `control`, has `oversight` decide the plan, and keeps the plan.
 pub fn effects_of(
     asked: Planning,
     main: store::service::View,
@@ -27,6 +27,7 @@ pub fn effects_of(
     branch: Str,
     base: ident::CommitId,
     take stepped: mem::List[Stepped],
+    control: os::Control,
     oversight: os::Port[policy::Oversight],
     alloc: mem::Alloc,
     ) -> Preview fails task::Cancelled uses wait {
@@ -47,7 +48,11 @@ pub fn effects_of(
             }
         }
     }
-    let Assessed(effects: effects, widenings: widenings, deliveries: deliveries, subjects: subjects, reads: reads, store_bytes: store_bytes) = assess(asked, stepped, activations, alloc)
+    let Runs(faults: faults, declared: declared) = match try await forked_runs(activations, stepped, control, branch, alloc) {
+        Ok(found) => found
+        Err(failure) => return Preview.Failed(take failure)
+    }
+    let Assessed(effects: effects, widenings: widenings, deliveries: deliveries, subjects: subjects, reads: reads, store_bytes: store_bytes) = assess(asked, stepped, activations, declared, alloc)
     let Some(decided_subjects) = duplicate(subjects, alloc) else {
         return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
     }
@@ -72,7 +77,7 @@ pub fn effects_of(
     let Some(spans) = spans_of(stepped, effects, activations, alloc) else {
         return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
     }
-    let effect_set = EffectSet(base: base, branch: text::String.of("main", alloc), steps: take effects, delta: take changes, activations: take activations, widenings: take widenings, deliveries: take deliveries, faults: mem::List.empty(alloc), approvals: take approvals, cuts: take cuts, taint: labels_of(asked.taint, alloc), costs: Costs(cpu_ns: 0, memory_bytes: 0, store_bytes: store_bytes, energy_mj: 0))
+    let effect_set = EffectSet(base: base, branch: text::String.of("main", alloc), steps: take effects, delta: take changes, activations: take activations, widenings: take widenings, deliveries: take deliveries, faults: take faults, approvals: take approvals, cuts: take cuts, taint: labels_of(asked.taint, alloc), costs: Costs(cpu_ns: 0, memory_bytes: 0, store_bytes: store_bytes, energy_mj: 0))
     var plan = Plan(principal: ident::Principal(text: asked.principal.text), steps: texts_of(asked.steps, alloc), options: PlanOptions(intent: text_copy(asked.options.intent, alloc), confirm_within_s: confirm_within_s, health_s: asked.options.health_s), effects: take effect_set, inputs: RecordedInputs(reads: take reads, live: mem::List.empty(alloc), values: mem::List.empty(alloc)))
     let hash = mut plan.hashed(alloc)
     let records = effect_records(plan, hash, lines, alloc)
@@ -109,8 +114,14 @@ fn observe(
     return Ok(Observed(lines: take lines, activations: take activations))
 } observe
 
-/// What the steps `stepped` of `asked` give, `activations` being the activations they make: a command takes the class it declares, and a span ends after a point of no return and before a redelivery to an instance an earlier step of the span activates.
-fn assess(asked: Planning, stepped: mem::List[Stepped], activations: mem::List[Activation], alloc: mem::Alloc) -> Assessed {
+/// What the steps `stepped` of `asked` give, `activations` being the activations they make, those of the steps `declared` observed by no fork: a step's basis is `Declared` when one of its activations is, and for a redelivery, whose class its operation declares; a span ends after a point of no return and before a redelivery to an instance an earlier step of the span activates.
+fn assess(
+    asked: Planning,
+    stepped: mem::List[Stepped],
+    activations: mem::List[Activation],
+    declared: mem::List[u32],
+    alloc: mem::Alloc,
+    ) -> Assessed {
     var assessed = Assessed(effects: mem::List.empty(alloc), widenings: mem::List.empty(alloc), deliveries: mem::List.empty(alloc), subjects: mem::List.empty(alloc), reads: mem::List.empty(alloc), store_bytes: 0)
     var span: u32 = 1
     var activated = mem::List[ident::Moniker].empty(alloc)
@@ -120,12 +131,15 @@ fn assess(asked: Planning, stepped: mem::List[Stepped], activations: mem::List[A
         let activates = activations.position(fn(activation: Activation) => activation.step == each.step).is_some()
         var class = class_of(written.step, activates)
         var basis = Basis.Observed
+        if declared.position(fn(step: u32) => step == each.step).is_some() {
+            basis = Basis.Declared
+        }
         match each.command {
             Some(commanded) => {
                 class = commanded.class
-                basis = Basis.Declared
                 match commanded.delivery(issuer: asked.principal, alloc) {
                     Some(delivery) => {
+                        basis = Basis.Declared
                         if activated.position(fn(moniker: ident::Moniker) => moniker == commanded.moniker).is_some() {
                             closing = true
                         }
@@ -605,7 +619,7 @@ fn plan_summary(effects: EffectSet, hash: ident::HashValue, alloc: mem::Alloc) -
     return summary
 } plan_summary
 
-/// The `widening`, `delivery`, `approval`, `cut` and `cost` records of an effect set.
+/// The `widening`, `delivery`, `fault`, `approval`, `cut` and `cost` records of an effect set.
 fn decision_records(effects: EffectSet, alloc: mem::Alloc) -> mem::List[Record] {
     var records = mem::List[Record].empty(alloc)
     for widening in effects.widenings {
@@ -617,6 +631,14 @@ fn decision_records(effects: EffectSet, alloc: mem::Alloc) -> mem::List[Record] 
     }
     for delivery in effects.deliveries {
         mut records.push(delivery_record(delivery, alloc))
+    }
+    for fault in effects.faults {
+        var record = Record.of("fault", alloc)
+        mut record.subject(Dyn[Render].view(fault.moniker))
+        mut record.field("step", value: Dyn[Render].view(fault.step))
+        mut record.field("kind", value: Dyn[Render].view(fault.kind))
+        mut record.text("report", value: fault.report.as_str(), alloc)
+        mut records.push(take record)
     }
     for approval in effects.approvals {
         var record = Record.of("approval", alloc)

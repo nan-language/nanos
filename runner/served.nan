@@ -1,6 +1,6 @@
 //! The task of an instance's domain: it builds the Env, starts or restores the component, serves the calls its driver delivers, one at a time, keeps its checkpoints, and hands its driver the replies the component gives postponed requests.
 
-/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, and the instance's configuration record.
+/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, the instance's configuration record, and for a fork where it tells what its run saw.
 pub open struct Serving {
     deliveries: task::Receiver[Delivery]
     reports: task::Sender[Input]
@@ -12,6 +12,7 @@ pub open struct Serving {
     keeping: Option[Keeping]
     restore: Option[os::Checkpoint]
     config: Option[Untrusted[mem::Bytes]]
+    forking: Option[task::Sender[os::Forked]]
 } Serving
 
 /// What a driver delivers to its instance's domain: a call with its header, the time without a message after which its component is suspended, never when 0, or the order to stop once the handler running returns.
@@ -92,7 +93,10 @@ pub fn Driven.run(
     take peers: mem::List[sys::ProtocolSchema],
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, config: _) = serving
+    if serving.forking.is_some() {
+        return try await Driven[S, Env, P].forked(take env, exec, alloc, take serving, release)
+    }
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, config: _, forking: _) = serving
     let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
@@ -162,6 +166,50 @@ pub fn Driven.run(
     release(take ended)
     return Ended.Stopped
 } Driven.run
+
+/// Runs a fork of an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, then probes its health once, telling `serving` how many keyed tasks its handlers spawned and messages they sent it, none of which runs, and whether it is unhealthy; then ends it, handing its Env to `release`.
+fn Driven.forked(
+    take env: Env,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    take serving: Serving,
+    release: fn(take ended: Env) limits stack 8_192,
+    ) -> Ended fails task::Cancelled uses wait {
+    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, config: _, forking: forking) = serving
+    let Some(reporting) = forking else {
+        release(take env)
+        return Ended.Stopped
+    }
+    let Some(Begun(stepper: begun, reason: reason, restored: _)) = try Driven[S, Env, P].begin(take env, take restore, exec, alloc, release) else {
+        return Ended.CheckpointUndecodable
+    }
+    var stepper = begun
+    defer take stepper.abandon()
+    mut stepper.resumed(reason)
+    var spawns: u32 = 0
+    loop {
+        let Some(_) = mut stepper.take_held() else {
+            break
+        }
+        spawns = spawns.saturating_add(1)
+    }
+    var sent: u32 = 0
+    loop {
+        let Some(_) = mut stepper.take_sent() else {
+            break
+        }
+        sent = sent.saturating_add(1)
+    }
+    let fault: Option[os::ForkFault] = match mut stepper.health() {
+        sys::HealthReply.Healthy => None
+        sys::HealthReply.Unhealthy(why) => Some(os::ForkFault.Unhealthy(reason: text::String.of(why.as_str(), alloc)))
+    }
+    discard attempt await reporting.send(os::Forked(spawns: spawns, sent: sent, fault: take fault))
+    undefer stepper
+    let sys::Stopped(state: _, env: ended) = try await take stepper.end()
+    release(take ended)
+    return Ended.Stopped
+} Driven.forked
 
 /// A component's stepper, the reason its `resume` is called with, and the number of the checkpoint it was restored from.
 linear struct Begun[S, Env: Any, P: Any] {

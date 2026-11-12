@@ -1,6 +1,6 @@
 # 0066. Changes through the link
 
-Status: accepted
+Status: superseded by 0068
 
 ## Context
 

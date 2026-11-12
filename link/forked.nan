@@ -1,0 +1,65 @@
+//! Forked runs: each activation of a preview that starts or restarts an instance, run on a fork of the instance with the preview branch's configuration and store, then probed for its health; an instance that may hold a resource is never forked, and the step activating it is then declared.
+
+/// What the forked runs of a preview's activations saw: the faults of their runs, and the steps whose activations no fork observed.
+pub closed struct Runs derives Encode {
+    pub faults: mem::List[Fault]
+    pub declared: mem::List[u32]
+} Runs
+
+/// Runs, through `control`, a fork of the instance of each activation of `activations` that starts or restarts it, on the preview branch `branch`: a start runs fresh, and a restart resumes from the checkpoint a `restore-checkpoint` step of `stepped` names, or from the latest.
+pub fn forked_runs(
+    activations: mem::List[Activation],
+    stepped: mem::List[Stepped],
+    control: os::Control,
+    branch: Str,
+    alloc: mem::Alloc,
+    ) -> Result[Runs, Failure] fails task::Cancelled uses wait {
+    var seen_runs = Runs(faults: mem::List.empty(alloc), declared: mem::List.empty(alloc))
+    for activation in activations {
+        if activation.kind == ActivationKind.Stop {
+            continue
+        }
+        let forking = os::Forking(branch: text::String.of(branch, alloc), resumed: activation.kind != ActivationKind.Start, checkpoint: restored_number(stepped, step: activation.step))
+        let seen = match first attempt await control.fork(ident::Moniker(text: activation.moniker.text), take forking, alloc) {
+            Ok(found) => found
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: activation.moniker.text.as_str(), alloc))
+        }
+        let Some(forked) = seen else {
+            mut seen_runs.declared.push(activation.step)
+            continue
+        }
+        let Some(fault) = forked.fault else {
+            continue
+        }
+        mut seen_runs.faults.push(fault_of(activation, take fault, alloc))
+    }
+    return Ok(take seen_runs)
+} forked_runs
+
+/// The checkpoint the `restore-checkpoint` step numbered `step` of `stepped` names, `None` for any other step.
+fn restored_number(stepped: mem::List[Stepped], step: u32) -> Option[u64] {
+    for each in stepped {
+        if each.step != step {
+            continue
+        }
+        let Some(commanded) = each.command else {
+            return None
+        }
+        return match commanded.command {
+            Command.Restore(number: number) => Some(number)
+            else => None
+        }
+    }
+    return None
+} restored_number
+
+/// The fault of the forked run of `activation`: a trap with its report, or an `Unhealthy` reply, or a fork that could not be built, with its reason.
+fn fault_of(activation: Activation, take fault: os::ForkFault, alloc: mem::Alloc) -> Fault {
+    let moniker = ident::Moniker(text: activation.moniker.text)
+    return match fault {
+        os::ForkFault.Trap(kind: _, report: report) => Fault(moniker: take moniker, step: activation.step, kind: FaultKind.Trap, report: take report)
+        os::ForkFault.Unhealthy(reason: reason) => Fault(moniker: take moniker, step: activation.step, kind: FaultKind.Unhealthy, report: take reason)
+        os::ForkFault.Unbuilt(code: code) => Fault(moniker: take moniker, step: activation.step, kind: FaultKind.Unhealthy, report: text::String.of(code.as_str(), alloc))
+    }
+} fault_of
