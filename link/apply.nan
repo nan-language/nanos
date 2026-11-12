@@ -1,10 +1,16 @@
-//! Apply: a previewed plan's spans committed in order through a View acting for its principal, each validated against the plan's read set, its activations awaited, its health window watched with revert by blame, and a provisional span's confirmation awaited.
+//! Apply: a previewed plan's spans committed in order through a View acting for its principal, each validated against the plan's read set, its commands below the point of no return carried out, its activations awaited, its health window watched with revert by blame, a provisional span's confirmation awaited, and its irreversible commands delivered through the outbox.
 
 /// How long an activation may take to converge before its health window starts anyway.
 const CONVERGE_MS: u64 = 30_000
 
 /// How often an apply looks at the instances it activated and at the confirmation of a provisional span.
 const POLL_MS: u64 = 250
+
+/// The attempts an outbox delivery makes in all while its target is restarting.
+const DELIVERY_ATTEMPTS: u32 = 5
+
+/// How long an outbox delivery waits before its next attempt.
+const RETRY_MS: u64 = 1_000
 
 /// What applying a plan needs: the request applying it, its hash and record, the principal and session previewing it, the work of its spans, the subjects the policy decides, the request key it applies under, and the wall time it is scheduled at when timed.
 pub closed struct Applying derives Encode {
@@ -18,9 +24,10 @@ pub closed struct Applying derives Encode {
     pub scheduled: Option[ident::WallTime]
 } Applying
 
-/// How an apply goes on: a span committed, its health window or confirmation running until `until`; or the plan ended in `state`, with the code of its failure.
+/// How an apply goes on: a span committed, its health window or confirmation running until `until`; an outbox entry delivered or failed; or the plan ended in `state`, with the code of its failure.
 pub closed enum Moved derives Encode {
     Committed(span: u32, commit: ident::CommitId, until: Option[ident::WallTime])
+    Delivered(entry: text::String)
     Ended(state: PlanState, code: Option[text::String])
 } Moved
 
@@ -30,17 +37,18 @@ pub closed struct Clocks derives Copy {
     pub wall: ident::Wall
 } Clocks
 
-/// Applies the plan `applying` names through `tree`, the policy deciding it again through `oversight`, telling `out` of each span it commits and of its end.
+/// Applies the plan `applying` names through `tree`, carrying out its commands through `control`, the policy deciding it again through `oversight`, telling `out` of each span it commits, each outbox entry it delivers, and its end.
 pub fn apply_plan(
     take applying: Applying,
     tree: store::service::View,
+    control: os::Control,
     oversight: os::Port[policy::Oversight],
     clocks: Clocks,
     out: sys::Outbox[LinkSession],
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
     let number = applying.number
-    let outcome = try await applied(applying, tree, oversight, clocks, out, alloc)
+    let outcome = try await applied(applying, tree, control, oversight, clocks, out, alloc)
     discard attempt await out.plan_moved(number, moved: take outcome)
 } apply_plan
 
@@ -48,6 +56,7 @@ pub fn apply_plan(
 fn applied(
     applying: Applying,
     tree: store::service::View,
+    control: os::Control,
     oversight: os::Port[policy::Oversight],
     clocks: Clocks,
     out: sys::Outbox[LinkSession],
@@ -98,39 +107,228 @@ fn applied(
             Err(code) => return finish_as(PlanState.Failed, code: code.as_str(), alloc)
         }
         mut commits.push(commit)
-        let watched = span.activations.position(fn(activation: Activation) => activation.kind != ActivationKind.Stop).is_some()
-        let health_s = match watched {
-            true => applying.plan.options.health_s
-            false => 0
-        }
-        let confirm_s = applying.plan.options.confirm_within_s.value_or(0)
-        let window_s = match health_s > confirm_s {
-            true => health_s
-            false => confirm_s
-        }
-        let started = clocks.wall.now(clocks.clock)
-        var until: Option[ident::WallTime] = None
-        if window_s > 0 {
-            until = Some(ident::WallTime(utc_ns: started.utc_ns.saturating_add(i64.widen(window_s) * 1_000_000_000), uncertainty_ns: started.uncertainty_ns))
-        }
-        discard attempt await out.plan_moved(applying.number, moved: Moved.Committed(span: span.span, commit: commit, until: until))
-        try await converged(span.activations, commit, tree: acting, clocks, alloc)
-        if health_s > 0 and not try await healthy(span.activations, window_s: health_s, tree: acting, clocks, alloc) {
-            return try await reverted(commit, acting, code: "plan.unhealthy", alloc)
-        }
-        if confirm_s > 0 and not try await confirmed(applying.hash, within_s: confirm_s, tree: acting, clocks, alloc) {
-            return try await reverted(commit, acting, code: "plan.unconfirmed", alloc)
+        match try await committed_span(applying, span, commit, acting, control, clocks, out, alloc) {
+            Some(ended) => return ended
+            None => {
+            }
         }
     }
     return Moved.Ended(state: PlanState.Applied, code: None)
 } applied
+
+/// Follows the span `span` of `applying` once `commit` committed it: tells `out` of the commit and the end of its window, carries out its commands below the point of no return through `control`, awaits its activations, watches its health window and awaits its confirmation, then delivers its outbox; the end of the plan when one of them ends it.
+fn committed_span(
+    applying: Applying,
+    span: SpanWork,
+    commit: ident::CommitId,
+    acting: store::service::View,
+    control: os::Control,
+    clocks: Clocks,
+    out: sys::Outbox[LinkSession],
+    alloc: mem::Alloc,
+    ) -> Option[Moved] fails task::Cancelled uses wait {
+    let watched = span.activations.position(fn(activation: Activation) => activation.kind != ActivationKind.Stop).is_some()
+    let health_s = match watched {
+        true => applying.plan.options.health_s
+        false => 0
+    }
+    let confirm_s = applying.plan.options.confirm_within_s.value_or(0)
+    let window_s = match health_s > confirm_s {
+        true => health_s
+        false => confirm_s
+    }
+    let started = clocks.wall.now(clocks.clock)
+    var until: Option[ident::WallTime] = None
+    if window_s > 0 {
+        until = Some(ident::WallTime(utc_ns: started.utc_ns.saturating_add(i64.widen(window_s) * 1_000_000_000), uncertainty_ns: started.uncertainty_ns))
+    }
+    discard attempt await out.plan_moved(applying.number, moved: Moved.Committed(span: span.span, commit: commit, until: until))
+    for commanded in span.commands {
+        if commanded.class.is_irreversible() {
+            continue
+        }
+        match try await carried_out(commanded, control, alloc) {
+            Some(code) => return Some(finish_as(PlanState.Failed, code: code.as_str(), alloc))
+            None => {
+            }
+        }
+    }
+    try await converged(tree_activations(span, alloc), commit, tree: acting, clocks, alloc)
+    if health_s > 0 and not try await healthy(span.activations, window_s: health_s, tree: acting, clocks, alloc) {
+        return Some(try await reverted(applying, span, commit, acting, code: "plan.unhealthy", alloc))
+    }
+    if confirm_s > 0 and not try await confirmed(applying.hash, within_s: confirm_s, tree: acting, clocks, alloc) {
+        return Some(try await reverted(applying, span, commit, acting, code: "plan.unconfirmed", alloc))
+    }
+    return match try await deliver_outbox(applying, span, control, acting, clocks, out, alloc) {
+        Some(code) => Some(finish_as(PlanState.Failed, code: code.as_str(), alloc))
+        None => None
+    }
+} committed_span
+
+/// The activations of `span` its tree steps make, which `supervisor` carries out.
+fn tree_activations(span: SpanWork, alloc: mem::Alloc) -> mem::List[Activation] {
+    var activations = mem::List[Activation].empty(alloc)
+    for activation in span.activations {
+        if span.commands.position(fn(commanded: InstanceStep) => commanded.step == activation.step).is_some() {
+            continue
+        }
+        mut activations.push(Activation(moniker: ident::Moniker(text: activation.moniker.text), step: activation.step, kind: activation.kind, migration: activation.migration, pause_ms: activation.pause_ms))
+    }
+    return activations
+} tree_activations
+
+/// The irreversible commands of `span`, whose outbox entries its commit adds, in order.
+fn outbox_of(span: SpanWork, alloc: mem::Alloc) -> mem::List[InstanceStep] {
+    var entries = mem::List[InstanceStep].empty(alloc)
+    for commanded in span.commands {
+        if not commanded.class.is_irreversible() {
+            continue
+        }
+        let Some(copy) = duplicate(commanded, alloc) else {
+            continue
+        }
+        mut entries.push(take copy)
+    }
+    return entries
+} outbox_of
+
+/// `<plan short hash>-<span>-<n>`, the id of the outbox entry of the n-th irreversible delivery of span `span`.
+pub fn entry_id(hash: ident::HashValue, span: u32, n: usize, alloc: mem::Alloc) -> text::String {
+    var id = text::String.of(hash.short_form().as_str(), alloc)
+    mut id.push('-')
+    mut id.write(Dyn[Render].view(span), budget: 12)
+    mut id.push('-')
+    mut id.write(Dyn[Render].view(n), budget: 12)
+    return id
+} entry_id
+
+/// The write of the outbox entry of `commanded`, the n-th irreversible delivery of span `span` of `applying`, in `status` after `attempts` attempts.
+fn entry_write(
+    applying: Applying,
+    span: u32,
+    n: usize,
+    commanded: InstanceStep,
+    status: DeliveryStatus,
+    attempts: u32,
+    alloc: mem::Alloc,
+    ) -> Option[store::Write] {
+    let Some(delivery) = commanded.delivery(issuer: applying.plan.principal, alloc) else {
+        return None
+    }
+    var key = text::String.of(applying.key.as_str(), alloc)
+    mut key.push('.')
+    mut key.write(Dyn[Render].view(span), budget: 12)
+    mut key.push('.')
+    mut key.write(Dyn[Render].view(n), budget: 12)
+    var payload = mem::Bytes.empty(alloc)
+    mut payload.append(commanded.message.view())
+    let entry = OutboxEntry(plan: applying.hash, span: span, delivery: take delivery, key: take key, payload: take payload, status: status, attempts: attempts, reply: None)
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[OutboxEntry].encode(entry, out: mut bytes)
+    var path = text::String.of("/sys/outbox/", alloc)
+    mut path.append(entry_id(applying.hash, span, n, alloc).as_str())
+    return Some(store::Write.Put(path: ident::Path(text: take path), value: store::Value.Record(type: store::TypeRef.of("link::OutboxEntry", schema: mem::wire::Codec[OutboxEntry].schema_hash(), alloc), bytes: take bytes, secret: false)))
+} entry_write
+
+/// The writes setting the outbox entries `entries` of span `span` of `applying` in `status`, from the n-th on.
+fn entries_in(
+    applying: Applying,
+    span: u32,
+    entries: mem::List[InstanceStep],
+    from: usize,
+    status: DeliveryStatus,
+    alloc: mem::Alloc,
+    ) -> mem::List[store::Write] {
+    var writes = mem::List[store::Write].empty(alloc)
+    for at in from..<entries.len() {
+        match entry_write(applying, span, n: at + 1, commanded: entries[at], status, attempts: 0, alloc) {
+            Some(write) => mut writes.push(take write)
+            None => {
+            }
+        }
+    }
+    return writes
+} entries_in
+
+/// Commits `writes` of the plan `applying` through `acting`, giving the store's code when that fails.
+fn commit_writes(applying: Applying, take writes: mem::List[store::Write], acting: store::service::View, alloc: mem::Alloc) -> Option[text::String] fails task::Cancelled uses wait {
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: Some(applying.hash), intent: None)
+    return match first attempt await acting.commit(take transaction, typed: true, alloc) {
+        Ok(_) => None
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Some(text::String.of(failed.code().as_str(), alloc))
+    }
+} commit_writes
+
+/// Delivers the outbox entries of `span` in order through `control` once one commit sets them `Delivering`, each retried while its target is restarting, at most `DELIVERY_ATTEMPTS` attempts in all: a delivered entry becomes `Delivered`, and the first that fails `Failed` with the later ones `Cancelled`, the plan then failing with `plan.delivery-failed`. `out` hears of each entry delivered or failed; the store's code when a commit fails.
+fn deliver_outbox(
+    applying: Applying,
+    span: SpanWork,
+    control: os::Control,
+    acting: store::service::View,
+    clocks: Clocks,
+    out: sys::Outbox[LinkSession],
+    alloc: mem::Alloc,
+    ) -> Option[text::String] fails task::Cancelled uses wait {
+    let entries = outbox_of(span, alloc)
+    if entries.len() == 0 {
+        return None
+    }
+    match try await commit_writes(applying, writes: entries_in(applying, span: span.span, entries, from: 0, status: DeliveryStatus.Delivering, alloc), acting, alloc) {
+        Some(code) => return Some(take code)
+        None => {
+        }
+    }
+    for at in 0..<entries.len() {
+        var attempts: u32 = 0
+        var failure: Option[text::Fixed[32]] = None
+        while attempts < DELIVERY_ATTEMPTS {
+            attempts += 1
+            failure = try await carried_out(commanded: entries[at], control, alloc)
+            let restarting = match failure {
+                Some(code) => code.as_str() == "port.stopped"
+                None => false
+            }
+            if not restarting {
+                break
+            }
+            try await clocks.clock.sleep(RETRY_MS)
+        }
+        let status = match failure {
+            Some(_) => DeliveryStatus.Failed
+            None => DeliveryStatus.Delivered
+        }
+        var writes = mem::List[store::Write].empty(alloc)
+        match entry_write(applying, span: span.span, n: at + 1, commanded: entries[at], status, attempts, alloc) {
+            Some(write) => mut writes.push(take write)
+            None => {
+            }
+        }
+        if failure.is_some() {
+            for write in take entries_in(applying, span: span.span, entries, from: at + 1, status: DeliveryStatus.Cancelled, alloc) {
+                mut writes.push(take write)
+            }
+        }
+        match try await commit_writes(applying, take writes, acting, alloc) {
+            Some(code) => return Some(take code)
+            None => {
+            }
+        }
+        discard attempt await out.plan_moved(applying.number, moved: Moved.Delivered(entry: entry_id(applying.hash, span: span.span, n: at + 1, alloc)))
+        if failure.is_some() {
+            return Some(text::String.of("plan.delivery-failed", alloc))
+        }
+    }
+    return None
+} deliver_outbox
 
 /// The end of an apply in `state` with the code `code`.
 fn finish_as(state: PlanState, code: Str, alloc: mem::Alloc) -> Moved {
     return Moved.Ended(state: state, code: Some(text::String.of(code, alloc)))
 } finish_as
 
-/// Commits the span `span` of `applying` through `acting`, the span commits `earlier` before it, under the request key `<key>.<span>`: its writes, the plan's record when the span is provisional, and the plan's reads, each at its recorded commit or at the commit of the earlier span that wrote it; `plan.stale` when one changed since the preview.
+/// Commits the span `span` of `applying` through `acting`, the span commits `earlier` before it, under the request key `<key>.<span>`: its writes, a `Held` outbox entry per irreversible command, the plan's record when the span is provisional, and the plan's reads, each at its recorded commit or at the commit of the earlier span that wrote it; `plan.stale` when one changed since the preview.
 fn commit_span(
     applying: Applying,
     span: SpanWork,
@@ -146,6 +344,9 @@ fn commit_span(
         for path in take scheduling_paths(applying.hash, alloc) {
             mut all.push(store::Write.Delete(path: take path))
         }
+    }
+    for write in take entries_in(applying, span: span.span, entries: outbox_of(span, alloc), from: 0, status: DeliveryStatus.Held, alloc) {
+        mut all.push(take write)
     }
     if applying.plan.options.confirm_within_s.is_some() {
         var bytes = mem::Bytes.empty(alloc)
@@ -304,13 +505,30 @@ fn confirmed(
     }
 } confirmed
 
-/// Reverts the span commit `commit` as revert by blame does, the plan ending `reverted` with `code`, or `failed` with `conflict.revert` when a later commit changed what it restores.
-fn reverted(commit: ident::CommitId, acting: store::service::View, code: Str, alloc: mem::Alloc) -> Moved fails task::Cancelled uses wait {
-    return match first attempt await acting.revert(commit, dry_run: false, alloc) {
-        Ok(_) => finish_as(PlanState.Reverted, code, alloc)
+/// Reverts the commit `commit` of the span `span` of `applying` as revert by blame does, its outbox entries then `Cancelled`, the plan ending `reverted` with `code`, or `failed` with `conflict.revert` when a later commit changed what it restores.
+fn reverted(
+    applying: Applying,
+    span: SpanWork,
+    commit: ident::CommitId,
+    acting: store::service::View,
+    code: Str,
+    alloc: mem::Alloc,
+    ) -> Moved fails task::Cancelled uses wait {
+    match first attempt await acting.revert(commit, dry_run: false, alloc) {
+        Ok(_) => {
+        }
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-        Err(failed) => finish_as(PlanState.Failed, code: failed.code().as_str(), alloc)
+        Err(failed) => return finish_as(PlanState.Failed, code: failed.code().as_str(), alloc)
     }
+    let cancelled = entries_in(applying, span: span.span, entries: outbox_of(span, alloc), from: 0, status: DeliveryStatus.Cancelled, alloc)
+    if cancelled.len() > 0 {
+        match try await commit_writes(applying, writes: take cancelled, acting, alloc) {
+            Some(failed) => return finish_as(PlanState.Failed, code: failed.as_str(), alloc)
+            None => {
+            }
+        }
+    }
+    return finish_as(PlanState.Reverted, code, alloc)
 } reverted
 
 /// Reverts, as revert by blame does, each span commit whose plan's record at `/sys/plans` awaits its confirmation: the apply awaiting it ended with `link`'s restart.

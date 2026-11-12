@@ -108,9 +108,10 @@ fn Linker.preview_steps(
         }
     }
     let tree = env.tree
+    let control = env.control
     let oversight = env.oversight
     mut cx.spawn(key: ANSWERING + slot, run: fn[take planned](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 131_072 {
-        let outcome = try await preview(take planned, tree, oversight, alloc)
+        let outcome = try await preview(take planned, tree, control, oversight, alloc)
         discard attempt await out.previewed(number, take outcome)
     })
     mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
@@ -224,12 +225,47 @@ fn Linker.announce(mut self, at: usize, mut env: Env, mut cx: sys::Cx[LinkSessio
         None => None
     }
     let event = PlanEvent(plan: held.hash, state: held.state, span: held.span, commit: commit, entry: None, code: take code)
-    let record = LivePlan(state: held.state, span: held.span, commits: take commits, until: held.until, deliveries: mem::List.empty(alloc), as_of: now_ns(env.clock))
+    let record = LivePlan(state: held.state, span: held.span, commits: take commits, until: held.until, deliveries: outbox_entries(held, alloc), as_of: now_ns(env.clock))
     let hash = held.hash
     let kind = held.state.event_kind()
     mut self.notify(Notice.Plan(kind: kind, event: take event), mut env, mut cx)
     mut self.notify(Notice.PlanLive(plan: hash, record: take record), mut env, mut cx)
 } Linker.announce
+
+/// The ids of the outbox entries of the spans the plan `held` committed.
+fn outbox_entries(held: KeptPlan, alloc: mem::Alloc) -> mem::List[text::String] {
+    var entries = mem::List[text::String].empty(alloc)
+    for span in held.spans {
+        if usize.widen(span.span) > held.commits.len() {
+            break
+        }
+        var n: usize = 0
+        for commanded in span.commands {
+            if commanded.class.is_irreversible() {
+                n += 1
+                mut entries.push(entry_id(held.hash, span: span.span, n, alloc))
+            }
+        }
+    }
+    return entries
+} outbox_entries
+
+/// Emits `plan.delivered` for the outbox entry `entry` of the plan kept at `at`.
+fn Linker.announce_delivery(
+    mut self,
+    at: usize,
+    take entry: text::String,
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    let held = self.plans[at]
+    var commit: Option[ident::CommitId] = None
+    for each in held.commits {
+        commit = Some(each)
+    }
+    let event = PlanEvent(plan: held.hash, state: held.state, span: held.span, commit: commit, entry: Some(take entry), code: None)
+    mut self.notify(Notice.Plan(kind: text::Fixed[32].of("plan.delivered"), event: take event), mut env, mut cx)
+} Linker.announce_delivery
 
 /// Forgets the plans kept past `PlanConfig.keep_s` since their preview while previewed, or since their end once ended, withdrawing their records at `/live/plans`.
 fn Linker.forget_plans(mut self, now: u64, mut env: Env, mut cx: sys::Cx[LinkSession]) {
@@ -352,10 +388,11 @@ fn Linker.apply(
     self.plans[plan_at].applying = Some(number)
     mut self.announce(plan_at, mut env, mut cx)
     let tree = env.tree
+    let control = env.control
     let oversight = env.oversight
     let clocks = Clocks(clock: env.clock, wall: env.wall)
     mut cx.spawn(key: ANSWERING + slot, run: fn[take applying](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 65_536 {
-        try await apply_plan(take applying, tree, oversight, clocks, out, alloc)
+        try await apply_plan(take applying, tree, control, oversight, clocks, out, alloc)
     })
     mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
 } Linker.apply
@@ -445,6 +482,7 @@ fn Linker.plan_moved(
             self.plans[plan_at].until = until
             mut self.announce(plan_at, mut env, mut cx)
         }
+        Moved.Delivered(entry: entry) => mut self.announce_delivery(plan_at, take entry, mut env, mut cx)
         Moved.Ended(state: state, code: code) => {
             self.plans[plan_at].state = state
             self.plans[plan_at].code = code

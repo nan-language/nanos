@@ -1,0 +1,141 @@
+//! Commands: the work of `redeliver` and `restore-checkpoint` steps, which the runner carries out through the link's `Control` once their span commits, and the deliveries they make.
+
+/// What a step has the runner do to an instance once its span commits.
+pub closed enum Command derives Encode {
+    /// Delivers the instance's dead letter `seq` again.
+    Redeliver(seq: u64)
+    /// Restarts the instance from a copy of its checkpoint `number`.
+    Restore(number: u64)
+} Command
+
+/// A step's command to an instance: its step, the instance and the bundle it runs, the command, the operation a redelivery reaches with the message it sends again, and its class, the operation's declared class for a redelivery.
+pub closed struct InstanceStep derives Encode {
+    pub step: u32
+    pub moniker: ident::Moniker
+    pub code: ident::HashValue
+    pub command: Command
+    pub operation: text::String
+    pub message: mem::Bytes
+    pub class: Reversibility
+} InstanceStep
+
+/// The command the step `written`, numbered `step`, makes, read through `view` and `control`: `auth.denied` unless `holding` lets its principal message the instance, or restart it, at the UTC time `now_utc`; `instance.no-dead-letter`, `instance.dead-letter-empty` and `instance.no-checkpoint` for what the instance does not keep.
+pub fn command_of(
+    written: Written,
+    step: u32,
+    view: store::service::View,
+    control: os::Control,
+    holding: Holding,
+    now_utc: i64,
+    alloc: mem::Alloc,
+    ) -> Result[InstanceStep, Failure] fails task::Cancelled uses wait {
+    let moniker = match written.step {
+        Step.Redeliver(moniker: named, seq: _) or Step.RestoreCheckpoint(moniker: named, number: _) => ident::Moniker(text: named.text)
+        else => return Err(Failure.of("request.invalid-operand", subject: written.text.as_str(), alloc).expecting("a redeliver or restore-checkpoint step", found: written.text.as_str(), alloc))
+    }
+    let described = match first attempt await control.describe(ident::Moniker(text: moniker.text), alloc) {
+        Ok(found) => found
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(os::ControlError.Missing) => return Err(Failure.of("request.unknown-name", subject: moniker.text.as_str(), alloc).expecting("an instance's moniker", found: moniker.text.as_str(), alloc))
+        Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: moniker.text.as_str(), alloc))
+    }
+    let os::Described(schema: schema, bundle: bundle) = described
+    let Step.Redeliver(moniker: _, seq: seq) = written.step else {
+        let Step.RestoreCheckpoint(moniker: _, number: number) = written.step else {
+            return Err(Failure.of("request.invalid-operand", subject: written.text.as_str(), alloc))
+        }
+        if not holding.controls(moniker, right: os::Right.Lifecycle, now_utc) {
+            return Err(denied(moniker.text.as_str(), right: "instance.lifecycle", alloc))
+        }
+        let checkpoint_node = try await kept_node(view, moniker, dir: "checkpoint", number, alloc)
+        if checkpoint_node.is_none() {
+            return Err(Failure.of("instance.no-checkpoint", subject: written.text.as_str(), alloc))
+        }
+        return Ok(InstanceStep(step: step, moniker: take moniker, code: bundle, command: Command.Restore(number: number), operation: text::String.empty(alloc), message: mem::Bytes.empty(alloc), class: Reversibility.Restorable))
+    }
+    let Some(node) = try await kept_node(view, moniker, dir: "dead", number: seq, alloc) else {
+        return Err(Failure.of("instance.no-dead-letter", subject: written.text.as_str(), alloc))
+    }
+    let Some(raw) = node.value else {
+        return Err(Failure.of("instance.no-dead-letter", subject: written.text.as_str(), alloc))
+    }
+    let letter = match attempt mem::wire::Codec[os::DeadLetter].decode(raw.view(), alloc) {
+        Ok(found) => found
+        Err(_) => return Err(Failure.of("store.corrupt", subject: written.text.as_str(), alloc))
+    }
+    let os::DeadLetter(seq: _, incarnation: _, time: _, header: _, sender: _, operation: operation, message: message, kind: _, report: _, redeliveries: _) = letter
+    let Some(sent) = message else {
+        return Err(Failure.of("instance.dead-letter-empty", subject: written.text.as_str(), alloc))
+    }
+    if not holding.calls(moniker, operation: operation.as_str(), now_utc) {
+        return Err(denied(target_of(moniker, operation: operation.as_str(), alloc).as_str(), right: "port", alloc))
+    }
+    let Some(declared) = schema.operations.position(fn(each: sys::OperationSchema) => each.name.as_str() == operation.as_str()) else {
+        return Err(Failure.of("request.unknown-name", subject: operation.as_str(), alloc).expecting("an operation of the instance's protocol", found: operation.as_str(), alloc))
+    }
+    let class = declared_class(schema.operations[declared].class)
+    return Ok(InstanceStep(step: step, moniker: take moniker, code: bundle, command: Command.Redeliver(seq: seq), operation: take operation, message: take sent, class: class))
+} command_of
+
+/// The node `/state/<moniker>/<dir>/<number>` through `view`, `None` when the instance does not keep it.
+fn kept_node(
+    view: store::service::View,
+    moniker: ident::Moniker,
+    dir: Str,
+    number: u64,
+    alloc: mem::Alloc,
+    ) -> Option[store::Node] fails task::Cancelled uses wait {
+    var path = text::String.of("/state/", alloc)
+    mut path.append(moniker.text.as_str())
+    mut path.push('/')
+    mut path.append(dir)
+    mut path.push('/')
+    mut path.write(Dyn[Render].view(number), budget: 24)
+    return match try await node_at(view, path: path.as_str(), alloc) {
+        Ok(found) => found
+        Err(_) => None
+    }
+} kept_node
+
+/// `<moniker>.<operation>`, the target of a delivery.
+pub fn target_of(moniker: ident::Moniker, operation: Str, alloc: mem::Alloc) -> text::String {
+    var target = text::String.of(moniker.text.as_str(), alloc)
+    mut target.push('.')
+    mut target.append(operation)
+    return target
+} target_of
+
+/// The class an operation's limits clause states.
+fn declared_class(class: sys::Reversibility) -> Reversibility {
+    return match class {
+        sys::Reversibility.Traceless => Reversibility.None
+        sys::Reversibility.Recorded => Reversibility.Recorded
+        sys::Reversibility.Restorable => Reversibility.Restorable
+        sys::Reversibility.Irreversible(emit: emit, actuate: actuate, erase: erase, spend: spend) => Reversibility.Irreversible(kinds: IrreversibleKinds(emit: emit, actuate: actuate, erase: erase, spend: spend))
+    }
+} declared_class
+
+/// The delivery a redelivery makes, which `issuer` makes; none for a restore.
+pub fn InstanceStep.delivery(self, issuer: ident::Principal, alloc: mem::Alloc) -> Option[Delivery] {
+    let Command.Redeliver(seq: _) = self.command else {
+        return None
+    }
+    return Some(Delivery(step: self.step, kind: DeliveryKind.Message, issuer: ident::Principal(text: issuer.text), target: target_of(self.moniker, operation: self.operation.as_str(), alloc), code: Some(self.code), destination: text::String.empty(alloc), size_bytes: u64.widen(self.message.len()), blake3: ident::HashValue.of_content(self.message.view()), class: self.class))
+} InstanceStep.delivery
+
+/// Has the runner carry out the command of `commanded` through `control`: the code of its failure, `None` once the dead letter is in the instance's intake or the restored instance runs.
+pub fn carried_out(commanded: InstanceStep, control: os::Control, alloc: mem::Alloc) -> Option[text::Fixed[32]] fails task::Cancelled uses wait {
+    return match commanded.command {
+        Command.Redeliver(seq: seq) => match first attempt await control.redeliver(ident::Moniker(text: commanded.moniker.text), seq, alloc) {
+            Ok(_) => None
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => Some(failed.code())
+        }
+        Command.Restore(number: number) => match first attempt await control.restore(ident::Moniker(text: commanded.moniker.text), number, alloc) {
+            Ok(os::Lifecycle.Failed) => Some(text::Fixed[32].of("instance.failed"))
+            Ok(_) => None
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => Some(failed.code())
+        }
+    }
+} carried_out

@@ -62,7 +62,7 @@ enum Restoring {
     Unreadable
 } Restoring
 
-/// What `/state` gives the start of the instance `driver` runs.
+/// What `/state` gives the start of the instance `driver` runs: a copy of the checkpoint a restore read, added as its latest, or its latest.
 fn Shared.restoring(self, mut driver: Driver) -> Restoring fails task::Cancelled uses wait {
     if driver.spec.durability.class != os::DurabilityClass.Checkpointed {
         return Restoring.Fresh(keeping: None)
@@ -75,6 +75,16 @@ fn Shared.restoring(self, mut driver: Driver) -> Restoring fails task::Cancelled
     }
     try await keep_state(view, moniker: ident::Moniker(text: driver.moniker.text), alloc)
     let keeping = Keeping(view: view, moniker: driver.moniker.text, epoch_ms: u64.widen(driver.spec.durability.epoch_s.value_or(1)) * 1_000, max_bytes: driver.spec.durability.max_bytes, bundle: driver.spec.bundle, wall: self.config.wall, clock: self.config.clock, header: self.config.work(), alloc: alloc)
+    match mut driver.restoring.extract() {
+        Some(saved) => {
+            return match try await keeping.copy(take saved) {
+                Some(copy) => Restoring.From(keeping: keeping, checkpoint: take copy)
+                None => Restoring.Unreadable
+            }
+        }
+        None => {
+        }
+    }
     let dir = keeping.dir(name: "checkpoint")
     let number = match first attempt await last_number(view, dir: ident::Path(text: text::String.of(dir.text.as_str(), alloc)), keep: CHECKPOINTS, alloc) {
         Ok(found) => found
@@ -102,14 +112,14 @@ fn Shared.restoring(self, mut driver: Driver) -> Restoring fails task::Cancelled
     return Restoring.From(keeping: keeping, checkpoint: take saved)
 } Shared.restoring
 
-/// Writes `letter` as the next dead letter of the instance `moniker`, numbered after those `/<moniker>/dead` of `view` keeps, unless `view` cannot be read; the instance's `/state` subtree no longer expires when `keep`.
+/// Writes `letter` as the next dead letter of the instance `moniker`, numbered after those `/<moniker>/dead` of `view` keeps, and gives its number, unless `view` cannot be read or the commit fails; the instance's `/state` subtree no longer expires when `keep`.
 fn write_dead(
     take letter: os::DeadLetter,
     view: store::service::View,
     moniker: ident::Moniker,
     keep: bool,
     alloc: mem::Alloc,
-    ) fails task::Cancelled uses wait {
+    ) -> Option[u64] fails task::Cancelled uses wait {
     if keep {
         try await keep_state(view, moniker, alloc)
     }
@@ -117,15 +127,82 @@ fn write_dead(
     let last = match first attempt await last_number(view, dir: ident::Path(text: text::String.of(dead.text.as_str(), alloc)), keep: DEAD_LETTERS, alloc) {
         Ok(found) => found
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => return
+        Err(_) => return None
     }
     var held = letter
     held.seq = last + 1
     var bytes = mem::Bytes.empty(alloc)
     mem::wire::Codec[os::DeadLetter].encode(held, out: mut bytes)
     let type = store::TypeRef.of(DEAD_LETTER_TYPE, schema: mem::wire::Codec[os::DeadLetter].schema_hash(), alloc)
-    discard try await add_kept(view, dir: take dead, take type, take bytes, keep: DEAD_LETTERS, alloc)
+    return match try await add_kept(view, dir: take dead, take type, take bytes, keep: DEAD_LETTERS, alloc) {
+        Some(_) => None
+        None => Some(held.seq)
+    }
 } write_dead
+
+/// The value of the child `number` of the dir `dir` of the instance `moniker` in its View of `/state`, `None` when it is not kept.
+fn kept_value(
+    view: store::service::View,
+    moniker: ident::Moniker,
+    dir: Str,
+    number: u64,
+    alloc: mem::Alloc,
+    ) -> Option[Untrusted[mem::Bytes]] fails task::Cancelled uses wait {
+    let Some(path) = state_dir(moniker, name: dir, alloc).child(store::decimal_name(number, alloc).view(), alloc) else {
+        return None
+    }
+    return match first attempt await view.get(take path, at: None, alloc) {
+        Ok(found) => found.value
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} kept_value
+
+/// The dead letter `seq` of the instance `moniker`, `instance.no-dead-letter` when it is not kept.
+fn read_dead(view: store::service::View, moniker: ident::Moniker, seq: u64, alloc: mem::Alloc) -> Result[os::DeadLetter, os::ControlError] fails task::Cancelled uses wait {
+    let Some(value) = try await kept_value(view, moniker, dir: "dead", number: seq, alloc) else {
+        return Err(os::ControlError.NoDeadLetter)
+    }
+    return match attempt mem::wire::Codec[os::DeadLetter].decode(value.view(), alloc) {
+        Ok(letter) => Ok(take letter)
+        Err(_) => Err(os::ControlError.NoDeadLetter)
+    }
+} read_dead
+
+/// The checkpoint `number` of the instance `moniker`, `instance.no-checkpoint` when it is not kept.
+fn read_checkpoint(view: store::service::View, moniker: ident::Moniker, number: u64, alloc: mem::Alloc) -> Result[os::Checkpoint, os::ControlError] fails task::Cancelled uses wait {
+    let Some(value) = try await kept_value(view, moniker, dir: "checkpoint", number, alloc) else {
+        return Err(os::ControlError.NoCheckpoint)
+    }
+    return match attempt mem::wire::Codec[os::Checkpoint].decode(value.view(), alloc) {
+        Ok(found) => Ok(take found)
+        Err(_) => Err(os::ControlError.NoCheckpoint)
+    }
+} read_checkpoint
+
+/// Adds the redelivery `noted` holds to the redeliveries of its dead letter of the instance `moniker`, unless the letter is no longer kept.
+fn note_redelivery(view: store::service::View, moniker: ident::Moniker, take noted: Noted, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Noted(seq: seq, redelivery: redelivery) = noted
+    let read = try await read_dead(view, moniker: ident::Moniker(text: moniker.text), seq, alloc)
+    let Ok(letter) = read else {
+        return
+    }
+    var updated = letter
+    mut updated.redeliveries.push(take redelivery)
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::DeadLetter].encode(updated, out: mut bytes)
+    let Some(path) = state_dir(moniker, name: "dead", alloc).child(store::decimal_name(seq, alloc).view(), alloc) else {
+        return
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: take path, value: store::Value.Record(type: store::TypeRef.of(DEAD_LETTER_TYPE, schema: mem::wire::Codec[os::DeadLetter].schema_hash(), alloc), bytes: take bytes, secret: false)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+    match first attempt await view.commit(take transaction, typed: true, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} note_redelivery
 
 /// The subtree of the instance `moniker` in a View of `/state`.
 fn state_root(moniker: ident::Moniker, alloc: mem::Alloc) -> ident::Path {
@@ -236,6 +313,26 @@ fn Keeping.write(self, take state: mem::Bytes, schema: mem::wire::SchemaHash, in
     let type = store::TypeRef.of(CHECKPOINT_TYPE, schema: mem::wire::Codec[os::Checkpoint].schema_hash(), alloc)
     return try await add_kept(self.view, take dir, take type, take bytes, keep: CHECKPOINTS, alloc)
 } Keeping.write
+
+/// Adds a copy of `saved` as the instance's next checkpoint and gives it, `None` when that fails.
+fn Keeping.copy(self, take saved: os::Checkpoint) -> Option[os::Checkpoint] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let dir = self.dir(name: "checkpoint")
+    let last = match first attempt await last_number(self.view, dir: ident::Path(text: text::String.of(dir.text.as_str(), alloc)), keep: CHECKPOINTS, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    var copy = saved
+    copy.number = last + 1
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::Checkpoint].encode(copy, out: mut bytes)
+    let type = store::TypeRef.of(CHECKPOINT_TYPE, schema: mem::wire::Codec[os::Checkpoint].schema_hash(), alloc)
+    return match try await add_kept(self.view, take dir, take type, take bytes, keep: CHECKPOINTS, alloc) {
+        Some(_) => None
+        None => Some(take copy)
+    }
+} Keeping.copy
 
 /// The highest number among the children of the numbered dir `dir`, which keeps at most `keep`, 0 when it holds none or does not exist.
 fn last_number(view: store::service::View, take dir: ident::Path, keep: u32, alloc: mem::Alloc) -> u64 fails store::service::ViewError uses wait {

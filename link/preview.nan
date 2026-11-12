@@ -1,4 +1,4 @@
-//! Previews: a plan's tree steps applied, one commit each, to a preview branch forked from the head of `main` through a View acting for the plan's principal in its session; its effect set computed and decided by the policy; the branch deleted at the end.
+//! Previews: a plan's tree steps applied, one commit each, to a preview branch forked from the head of `main` through a View acting for the plan's principal in its session, and the commands of its other steps read; its effect set computed and decided by the policy; the branch deleted at the end.
 
 /// A session open when a preview starts: its id, its principal and the instances on its transport's path.
 pub closed struct OpenSession derives Encode {
@@ -21,12 +21,13 @@ pub closed struct Planning derives Encode {
     pub now_utc: i64
 } Planning
 
-/// The part of a plan one commit applies: its number, its writes in order, the nodes they read, and the instances it activates.
+/// The part of a plan one commit applies: its number, its writes in order, the nodes they read, the instances it activates, and the commands the runner carries out once it commits.
 pub closed struct SpanWork derives Encode {
     pub span: u32
     pub writes: mem::List[store::Write]
     pub reads: mem::List[NodeRead]
     pub activations: mem::List[Activation]
+    pub commands: mem::List[InstanceStep]
 } SpanWork
 
 /// A plan a preview kept: its hash, its record, the work of its spans, the subjects the policy decides, and the records printing its effect set.
@@ -44,16 +45,23 @@ pub closed enum Preview derives Encode {
     Failed(Failure)
 } Preview
 
-/// A step applied to the preview branch: its number, the commits before and after it, and what it made.
+/// A step previewed: its number, the commits of the preview branch before and after it, what it made of the tree, and the command it makes.
 pub closed struct Stepped derives Encode {
     pub step: u32
     pub before: ident::CommitId
     pub after: ident::CommitId
     pub made: Made
+    pub command: Option[InstanceStep]
 } Stepped
 
-/// Previews the plan `asked` writes through `tree`, deciding it with `oversight`.
-pub fn preview(take asked: Planning, tree: store::service::View, oversight: os::Port[policy::Oversight], alloc: mem::Alloc) -> Preview fails task::Cancelled uses wait {
+/// Previews the plan `asked` writes through `tree`, describing the instances its commands name through `control`, deciding it with `oversight`.
+pub fn preview(
+    take asked: Planning,
+    tree: store::service::View,
+    control: os::Control,
+    oversight: os::Port[policy::Oversight],
+    alloc: mem::Alloc,
+    ) -> Preview fails task::Cancelled uses wait {
     let acting = match first attempt await tree.acting(ident::Principal(text: asked.principal.text), session: asked.session, origins: labels_of(asked.taint, alloc), alloc) {
         Ok(view) => view
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
@@ -65,7 +73,7 @@ pub fn preview(take asked: Planning, tree: store::service::View, oversight: os::
         Err(failed) => return Preview.Failed(Failure.of(failed.code().as_str(), subject: "main", alloc))
     }
     let store::service::Branched(branch: branch, view: forked) = branched
-    let outcome = try await preview_on(asked, main: acting, forked, branch: branch.name.as_str(), base: branch.head, oversight, alloc)
+    let outcome = try await preview_on(asked, main: acting, forked, branch: branch.name.as_str(), base: branch.head, control, oversight, alloc)
     match attempt await acting.delete_branch(text::String.of(branch.name.as_str(), alloc), alloc) {
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         else => {
@@ -74,13 +82,14 @@ pub fn preview(take asked: Planning, tree: store::service::View, oversight: os::
     return outcome
 } preview
 
-/// Applies each step of `asked` to the preview branch `branch` through `forked`, its head at `base`, then computes the plan's effect set.
+/// Applies each tree step of `asked` to the preview branch `branch` through `forked`, its head at `base`, and reads the command of each other step through `main` and `control`, then computes the plan's effect set.
 fn preview_on(
     asked: Planning,
     main: store::service::View,
     forked: store::service::View,
     branch: Str,
     base: ident::CommitId,
+    control: os::Control,
     oversight: os::Port[policy::Oversight],
     alloc: mem::Alloc,
     ) -> Preview fails task::Cancelled uses wait {
@@ -89,6 +98,18 @@ fn preview_on(
     var index: u32 = 0
     for written in asked.steps {
         index += 1
+        match written.step {
+            Step.Redeliver(moniker: _, seq: _) or Step.RestoreCheckpoint(moniker: _, number: _) => {
+                let commanded = match try await command_of(written, step: index, view: main, control, holding: asked.holding, now_utc: asked.now_utc, alloc) {
+                    Ok(found) => found
+                    Err(failure) => return Preview.Failed(take failure)
+                }
+                mut stepped.push(Stepped(step: index, before: head, after: head, made: Made(writes: mem::List.empty(alloc), reads: mem::List.empty(alloc)), command: Some(take commanded)))
+                continue
+            }
+            else => {
+            }
+        }
         let made = match try await materialize(written, view: forked, holding: asked.holding, now_utc: asked.now_utc, json: asked.json, base, alloc) {
             Ok(found) => found
             Err(failure) => return Preview.Failed(take failure)
@@ -105,7 +126,7 @@ fn preview_on(
                 Err(failed) => return Preview.Failed(Failure.of(failed.code().as_str(), subject: written.text.as_str(), alloc))
             }
         }
-        mut stepped.push(Stepped(step: index, before: head, after: after, made: take made))
+        mut stepped.push(Stepped(step: index, before: head, after: after, made: take made, command: None))
         head = after
     }
     return try await effects_of(asked, main, forked, branch, base, take stepped, oversight, alloc)

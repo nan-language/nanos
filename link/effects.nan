@@ -1,4 +1,4 @@
-//! Effect sets: the delta a preview's steps leave on its branch with the fields each change differs in, the instances they activate, each step's class and span, the sessions they can cut, the authority they widen, the policy's decision, the costs, and the records printing them.
+//! Effect sets: the delta a preview's steps leave on its branch with the fields each change differs in, the instances they activate, each step's class, basis and span, the deliveries their commands make, the sessions they can cut, the authority they widen, the policy's decision, the costs, and the records printing them.
 
 /// The intake pause a restart is expected to take, in milliseconds.
 const RESTART_PAUSE_MS: u32 = 2
@@ -9,10 +9,11 @@ struct Observed {
     activations: mem::List[Activation]
 } Observed
 
-/// What the steps of a preview give: their effects, the authority they widen, the subjects the policy decides, the nodes they read and the bytes they write.
+/// What the steps of a preview give: their effects, the authority they widen, the deliveries their commands make, the subjects the policy decides, the nodes they read and the bytes they write.
 struct Assessed {
     effects: mem::List[StepEffect]
     widenings: mem::List[Widening]
+    deliveries: mem::List[Delivery]
     subjects: mem::List[policy::Subject]
     reads: mem::List[NodeRead]
     store_bytes: u64
@@ -37,8 +38,16 @@ pub fn effects_of(
         Ok(found) => found
         Err(failure) => return Preview.Failed(take failure)
     }
-    let Observed(lines: lines, activations: activations) = observed
-    let Assessed(effects: effects, widenings: widenings, subjects: subjects, reads: reads, store_bytes: store_bytes) = assess(asked, stepped, activations, alloc)
+    let Observed(lines: lines, activations: changed) = observed
+    var activations = changed
+    for each in stepped {
+        match each.command {
+            Some(InstanceStep(step: step, moniker: moniker, code: _, command: Command.Restore(number: _), operation: _, message: _, class: _)) => mut activations.push(Activation(moniker: ident::Moniker(text: moniker.text), step: step, kind: ActivationKind.Restart, migration: None, pause_ms: RESTART_PAUSE_MS))
+            else => {
+            }
+        }
+    }
+    let Assessed(effects: effects, widenings: widenings, deliveries: deliveries, subjects: subjects, reads: reads, store_bytes: store_bytes) = assess(asked, stepped, activations, alloc)
     let Some(decided_subjects) = duplicate(subjects, alloc) else {
         return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
     }
@@ -60,21 +69,13 @@ pub fn effects_of(
             }
         }
     }
-    let Some(span_activations) = duplicate(activations, alloc) else {
+    let Some(spans) = spans_of(stepped, effects, activations, alloc) else {
         return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
     }
-    let Some(span_reads) = duplicate(reads, alloc) else {
-        return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
-    }
-    let Some(writes) = span_writes(stepped, alloc) else {
-        return Preview.Failed(Failure.of("store.corrupt", subject: "plan", alloc))
-    }
-    let effect_set = EffectSet(base: base, branch: text::String.of("main", alloc), steps: take effects, delta: take changes, activations: take activations, widenings: take widenings, deliveries: mem::List.empty(alloc), faults: mem::List.empty(alloc), approvals: take approvals, cuts: take cuts, taint: labels_of(asked.taint, alloc), costs: Costs(cpu_ns: 0, memory_bytes: 0, store_bytes: store_bytes, energy_mj: 0))
+    let effect_set = EffectSet(base: base, branch: text::String.of("main", alloc), steps: take effects, delta: take changes, activations: take activations, widenings: take widenings, deliveries: take deliveries, faults: mem::List.empty(alloc), approvals: take approvals, cuts: take cuts, taint: labels_of(asked.taint, alloc), costs: Costs(cpu_ns: 0, memory_bytes: 0, store_bytes: store_bytes, energy_mj: 0))
     var plan = Plan(principal: ident::Principal(text: asked.principal.text), steps: texts_of(asked.steps, alloc), options: PlanOptions(intent: text_copy(asked.options.intent, alloc), confirm_within_s: confirm_within_s, health_s: asked.options.health_s), effects: take effect_set, inputs: RecordedInputs(reads: take reads, live: mem::List.empty(alloc), values: mem::List.empty(alloc)))
     let hash = mut plan.hashed(alloc)
     let records = effect_records(plan, hash, lines, alloc)
-    var spans = mem::List[SpanWork].empty(alloc)
-    mut spans.push(SpanWork(span: 1, writes: take writes, reads: take span_reads, activations: take span_activations))
     return Preview.Kept(Previewed(hash: hash, plan: take plan, spans: take spans, subjects: take subjects, records: take records))
 } effects_of
 
@@ -108,16 +109,49 @@ fn observe(
     return Ok(Observed(lines: take lines, activations: take activations))
 } observe
 
-/// What the steps `stepped` of `asked` give, `activations` being the activations their changes make.
+/// What the steps `stepped` of `asked` give, `activations` being the activations they make: a command takes the class it declares, and a span ends after a point of no return and before a redelivery to an instance an earlier step of the span activates.
 fn assess(asked: Planning, stepped: mem::List[Stepped], activations: mem::List[Activation], alloc: mem::Alloc) -> Assessed {
-    var assessed = Assessed(effects: mem::List.empty(alloc), widenings: mem::List.empty(alloc), subjects: mem::List.empty(alloc), reads: mem::List.empty(alloc), store_bytes: 0)
+    var assessed = Assessed(effects: mem::List.empty(alloc), widenings: mem::List.empty(alloc), deliveries: mem::List.empty(alloc), subjects: mem::List.empty(alloc), reads: mem::List.empty(alloc), store_bytes: 0)
+    var span: u32 = 1
+    var activated = mem::List[ident::Moniker].empty(alloc)
+    var closing = false
     for each in stepped {
         let written = asked.steps[usize.widen(each.step) - 1]
         let activates = activations.position(fn(activation: Activation) => activation.step == each.step).is_some()
-        let class = class_of(written.step, activates)
-        mut assessed.effects.push(StepEffect(step: each.step, span: 1, class: class, basis: Basis.Observed, reply: None))
+        var class = class_of(written.step, activates)
+        var basis = Basis.Observed
+        match each.command {
+            Some(commanded) => {
+                class = commanded.class
+                basis = Basis.Declared
+                match commanded.delivery(issuer: asked.principal, alloc) {
+                    Some(delivery) => {
+                        if activated.position(fn(moniker: ident::Moniker) => moniker == commanded.moniker).is_some() {
+                            closing = true
+                        }
+                        mut assessed.deliveries.push(take delivery)
+                    }
+                    None => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        if closing {
+            span += 1
+            activated = mem::List.empty(alloc)
+            closing = false
+        }
+        mut assessed.effects.push(StepEffect(step: each.step, span: span, class: class, basis: basis, reply: None))
+        for activation in activations {
+            if activation.step == each.step {
+                mut activated.push(ident::Moniker(text: activation.moniker.text))
+            }
+        }
+        closing = class.is_irreversible()
         let widened = widenings_of(each, alloc)
-        mut assessed.subjects.push(subject_of(asked, written, made: each.made, class, widens: widened.len() > 0, alloc))
+        mut assessed.subjects.push(subject_of(asked, written, stepped: each, class, widens: widened.len() > 0, alloc))
         for widening in take widened {
             mut assessed.widenings.push(take widening)
         }
@@ -131,19 +165,44 @@ fn assess(asked: Planning, stepped: mem::List[Stepped], activations: mem::List[A
     return assessed
 } assess
 
-/// The writes of every step of `stepped`, in order, `None` when one does not copy.
-fn span_writes(stepped: mem::List[Stepped], alloc: mem::Alloc) -> Option[mem::List[store::Write]] {
-    var writes = mem::List[store::Write].empty(alloc)
-    for each in stepped {
-        let Some(copies) = duplicate(each.made.writes, alloc) else {
+/// The work of each span the steps `stepped` fall into by their effects `effects`: the writes of its steps in order, the nodes they read, the instances they activate among `activations`, and their commands; `None` when one does not copy.
+fn spans_of(stepped: mem::List[Stepped], effects: mem::List[StepEffect], activations: mem::List[Activation], alloc: mem::Alloc) -> Option[mem::List[SpanWork]] {
+    var spans = mem::List[SpanWork].empty(alloc)
+    for at in 0..<stepped.len() {
+        let each = stepped[at]
+        if spans.len() < usize.widen(effects[at].span) {
+            mut spans.push(SpanWork(span: effects[at].span, writes: mem::List.empty(alloc), reads: mem::List.empty(alloc), activations: mem::List.empty(alloc), commands: mem::List.empty(alloc)))
+        }
+        let last = spans.len() - 1
+        let Some(writes) = duplicate(each.made.writes, alloc) else {
             return None
         }
-        for write in take copies {
-            mut writes.push(take write)
+        for write in take writes {
+            mut spans[last].writes.push(take write)
+        }
+        for read in each.made.reads {
+            if spans[last].reads.position(fn(known: NodeRead) => known.path == read.path).is_none() {
+                mut spans[last].reads.push(NodeRead(path: ident::Path(text: text::String.of(read.path.text.as_str(), alloc)), commit: read.commit))
+            }
+        }
+        for activation in activations {
+            if activation.step == each.step {
+                mut spans[last].activations.push(Activation(moniker: ident::Moniker(text: activation.moniker.text), step: activation.step, kind: activation.kind, migration: activation.migration, pause_ms: activation.pause_ms))
+            }
+        }
+        match each.command {
+            Some(commanded) => {
+                let Some(copy) = duplicate(commanded, alloc) else {
+                    return None
+                }
+                mut spans[last].commands.push(take copy)
+            }
+            None => {
+            }
         }
     }
-    return Some(take writes)
-} span_writes
+    return Some(take spans)
+} spans_of
 
 /// The canonical texts of `steps`.
 fn texts_of(steps: mem::List[Written], alloc: mem::Alloc) -> mem::List[text::String] {
@@ -348,11 +407,11 @@ fn widenings_of(stepped: Stepped, alloc: mem::Alloc) -> mem::List[Widening] {
     return widenings
 } widenings_of
 
-/// The subject the policy decides for the step `written` of class `class`, which makes `made` and widens authority when `widens`.
+/// The subject the policy decides for the step `written`, previewed as `stepped`, of class `class`, which widens authority when `widens`.
 fn subject_of(
     asked: Planning,
     written: Written,
-    made: Made,
+    stepped: Stepped,
     class: Reversibility,
     widens: bool,
     alloc: mem::Alloc,
@@ -361,23 +420,48 @@ fn subject_of(
     var kind = text::String.of("step.", alloc)
     mut kind.append(part_of(written.text.as_str(), start: 0, end: written.text.as_str().find(" ").value_or(written.text.byte_len()), alloc).as_str())
     mut operations.push(take kind)
-    var reversibility = text::String.of("reversibility.", alloc)
-    mut reversibility.write(Dyn[Render].view(class), budget: 64)
-    mut operations.push(take reversibility)
+    for name in take class_names(class, alloc) {
+        mut operations.push(take name)
+    }
     if widens {
         mut operations.push(text::String.of("widening", alloc))
     }
     var objects = mem::List[text::String].empty(alloc)
-    for write in made.writes {
+    for write in stepped.made.writes {
         mut objects.push(written_path(write, alloc))
     }
     match written.step {
-        Step.Start(moniker: moniker) or Step.Stop(moniker: moniker) => mut objects.push(text::String.of(moniker.text.as_str(), alloc))
+        Step.Start(moniker: moniker) or Step.Stop(moniker: moniker) or Step.Redeliver(moniker: moniker, seq: _) or Step.RestoreCheckpoint(moniker: moniker, number: _) => mut objects.push(text::String.of(moniker.text.as_str(), alloc))
         else => {
         }
     }
     return policy::Subject(principal: ident::Principal(text: asked.principal.text), operations: take operations, objects: take objects, provenance: None, tainted: asked.taint.len() > 0, destinations: mem::List.empty(alloc), rule_of_two: false, exceeds: mem::List.empty(alloc), ask_caveat: false)
 } subject_of
+
+/// The operation names of the class `class`: `reversibility.<class>`, or `irreversible` and `irreversible.<kind>` per kind.
+fn class_names(class: Reversibility, alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    let Reversibility.Irreversible(kinds: kinds) = class else {
+        var name = text::String.of("reversibility.", alloc)
+        mut name.write(Dyn[Render].view(class), budget: 64)
+        mut names.push(take name)
+        return names
+    }
+    mut names.push(text::String.of("irreversible", alloc))
+    if kinds.emit {
+        mut names.push(text::String.of("irreversible.emit", alloc))
+    }
+    if kinds.actuate {
+        mut names.push(text::String.of("irreversible.actuate", alloc))
+    }
+    if kinds.erase {
+        mut names.push(text::String.of("irreversible.erase", alloc))
+    }
+    if kinds.spend {
+        mut names.push(text::String.of("irreversible.spend", alloc))
+    }
+    return names
+} class_names
 
 /// The approvals the policy's decision of `subjects` requires through `oversight`, at the plan's apply when `at_apply`: `policy.denied` naming the deciding rules for `Deny`, an `ask` for each asking rule, and a `notify` for `Notify`.
 pub fn decided(take subjects: mem::List[policy::Subject], at_apply: bool, oversight: os::Port[policy::Oversight], alloc: mem::Alloc) -> Result[mem::List[ApprovalNeed], Failure] fails task::Cancelled uses wait {
@@ -521,7 +605,7 @@ fn plan_summary(effects: EffectSet, hash: ident::HashValue, alloc: mem::Alloc) -
     return summary
 } plan_summary
 
-/// The `widening`, `approval`, `cut` and `cost` records of an effect set.
+/// The `widening`, `delivery`, `approval`, `cut` and `cost` records of an effect set.
 fn decision_records(effects: EffectSet, alloc: mem::Alloc) -> mem::List[Record] {
     var records = mem::List[Record].empty(alloc)
     for widening in effects.widenings {
@@ -530,6 +614,9 @@ fn decision_records(effects: EffectSet, alloc: mem::Alloc) -> mem::List[Record] 
         mut record.field("step", value: Dyn[Render].view(widening.step))
         mut record.text("authority", value: widening.authority.as_str(), alloc)
         mut records.push(take record)
+    }
+    for delivery in effects.deliveries {
+        mut records.push(delivery_record(delivery, alloc))
     }
     for approval in effects.approvals {
         var record = Record.of("approval", alloc)
@@ -556,6 +643,27 @@ fn decision_records(effects: EffectSet, alloc: mem::Alloc) -> mem::List[Record] 
     mut records.push(take cost)
     return records
 } decision_records
+
+/// `delivery <step>, kind, issuer, target, code, destination, size_bytes, blake3, class`, without the fields it leaves empty.
+fn delivery_record(delivery: Delivery, alloc: mem::Alloc) -> Record {
+    var record = Record.of("delivery", alloc)
+    mut record.subject(Dyn[Render].view(delivery.step))
+    mut record.field("kind", value: Dyn[Render].view(delivery.kind))
+    mut record.field("issuer", value: Dyn[Render].view(delivery.issuer))
+    mut record.text("target", value: delivery.target.as_str(), alloc)
+    match delivery.code {
+        Some(code) => mut record.field("code", value: Dyn[Render].view(code))
+        None => {
+        }
+    }
+    if delivery.destination.byte_len() > 0 {
+        mut record.text("destination", value: delivery.destination.as_str(), alloc)
+    }
+    mut record.field("size_bytes", value: Dyn[Render].view(delivery.size_bytes))
+    mut record.hash("blake3", value: delivery.blake3)
+    mut record.field("class", value: Dyn[Render].view(delivery.class))
+    return record
+} delivery_record
 
 /// A node holding `value`, a record of type `type` last written by the commit `version`, for tests.
 fn record_node(

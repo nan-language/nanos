@@ -23,9 +23,13 @@ enum Input {
     Lingered(incarnation: u64)
     Revoke(grants: mem::Set[u64], done: task::Sender[Unit])
     Trace(until_ns: Option[u64])
+    /// The dead letter `seq` read for its redelivery under the cause `cause`, and where the order's outcome goes.
+    Letter(seq: u64, cause: u64, letter: Result[os::DeadLetter, os::ControlError], done: task::Sender[Result[os::Outcome, os::ControlError]])
+    /// The checkpoint read for a restore under the cause `cause`, and where the order's outcome goes.
+    Restoring(cause: u64, checkpoint: Result[os::Checkpoint, os::ControlError], done: task::Sender[Result[os::Outcome, os::ControlError]])
 } Input
 
-/// An instance as its driver holds it, `intake` the length of `queue` for readers of its gauge, `cause` the start cause of its latest incarnation, `changed_by` the cause of the order, trap or call that last changed its lifecycle, under which its next start cause opens, `traced_until` the monotonic time until which its handler calls are traced, `suspended` while its component is, `suspend_ms` the time without a message after which it is, and what it publishes of it; causes as a header holds them.
+/// An instance as its driver holds it, `restoring` the checkpoint its next start restores a copy of, `intake` the length of `queue` for readers of its gauge, `cause` the start cause of its latest incarnation, `changed_by` the cause of the order, trap or call that last changed its lifecycle, under which its next start cause opens, `traced_until` the monotonic time until which its handler calls are traced, `suspended` while its component is, `suspend_ms` the time without a message after which it is, and what it publishes of it; causes as a header holds them.
 linear struct Driver {
     moniker: ident::Moniker
     slot: u32
@@ -53,6 +57,7 @@ linear struct Driver {
     suspend_ms: Option[u32]
     suspended: bool
     showing: Showing
+    restoring: Option[os::Checkpoint]
     alloc: mem::Alloc
 } Driver
 
@@ -64,13 +69,14 @@ struct Domain {
     next_id: u64
 } Domain
 
-/// A call waiting in the instance's intake since the monotonic time `since_ns`.
+/// A call waiting in the instance's intake since the monotonic time `since_ns`, the message of the dead letter `redelivery` when it delivers one again.
 struct Queued {
     call: os::Call
     since_ns: u64
+    redelivery: Option[u64]
 } Queued
 
-/// A call delivered to the running domain: its number, where its reply goes, its credit, its header, its encoding when it holds at most `MOST_DEAD_BYTES`, which a dead letter keeps when its handler call is abandoned, and for a traced call the span its handler call starts.
+/// A call delivered to the running domain: its number, where its reply goes, its credit, its header, its encoding when it holds at most `MOST_DEAD_BYTES`, which a dead letter keeps when its handler call is abandoned, for a traced call the span its handler call starts, and the dead letter it delivers again.
 struct Outstanding {
     id: u64
     reply: Option[task::Sender[os::Answer]]
@@ -78,6 +84,7 @@ struct Outstanding {
     header: os::Header
     message: Option[mem::Bytes]
     span: Option[Span]
+    redelivery: Option[u64]
 } Outstanding
 
 /// What follows the stop of the running incarnation.
@@ -128,7 +135,7 @@ fn Driver.of(
     take gate: os::Gate,
     alloc: mem::Alloc,
     ) -> Driver {
-    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, traps: 0, started_ns: 0, queue: mem::List.empty(alloc), intake: mem::Shared.of(core::atomic::AtomicU32.of(0), alloc), domain: None, then: Then.Stop, abandonment: Abandonment.Inside, cause: 0, changed_by: 0, traced_until: None, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false, showing: Showing.none(), alloc: alloc)
+    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, traps: 0, started_ns: 0, queue: mem::List.empty(alloc), intake: mem::Shared.of(core::atomic::AtomicU32.of(0), alloc), domain: None, then: Then.Stop, abandonment: Abandonment.Inside, cause: 0, changed_by: 0, traced_until: None, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false, showing: Showing.none(), restoring: None, alloc: alloc)
 } Driver.of
 
 /// Carries out the lifecycle of the instance `driver` holds, as its inputs come, until they end or the instance, deleted, has stopped, left the directory and had its capabilities revoked; the tasks of its incarnations run in the driver's own scope.
@@ -206,7 +213,7 @@ fn Shared.take_input[J: Journal](
                 return
             }
             let cause = call.header.cause
-            mut driver.queue.push(Queued(call: take call, since_ns: now_ns))
+            mut driver.queue.push(Queued(call: take call, since_ns: now_ns, redelivery: None))
             driver.counted()
             if driver.lifecycle == Some(os::Lifecycle.Hibernated) {
                 driver.changed_by = cause
@@ -225,7 +232,11 @@ fn Shared.take_input[J: Journal](
             if ending {
                 self.linger(s, inputs: sender.split(), incarnation)
             } else {
-                try await mut driver.report(take report, journal, now_ns)
+                match try await mut driver.report(take report, journal, now_ns) {
+                    Some(noted) => try await self.note(mut driver, take noted, s)
+                    None => {
+                    }
+                }
             }
         }
         Input.Ended(incarnation: incarnation, outcome: outcome) => {
@@ -258,8 +269,163 @@ fn Shared.take_input[J: Journal](
         Input.Trace(until_ns: until) => {
             driver.traced_until = until
         }
+        Input.Letter(seq: seq, cause: ordering, letter: letter, done: done) => try await self.redeliver(mut driver, seq, cause: ordering, take letter, take done, now_ns, sender, journal, s)
+        Input.Restoring(cause: ordering, checkpoint: read, done: done) => try await self.restore(mut driver, cause: ordering, take read, take done, sender, journal, s)
     }
 } Shared.take_input
+
+/// A port to the instance of `driver` with the credit `credit`, revoked when the instance is deleted.
+fn Shared.ordered_port(self, mut driver: Driver, credit: os::Credit) -> Result[os::Outcome, os::ControlError] fails task::Cancelled uses wait {
+    let moniker = ident::Moniker(text: driver.moniker.text)
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let minted = await when directory => directory.mint(moniker, credit, alloc)
+    match minted {
+        Some(port) => {
+            let handle = port.handle()
+            mut driver.minted.ordered.push(take port)
+            return Ok(os::Outcome.Port(handle))
+        }
+        None => return Err(os::ControlError.Missing)
+    }
+} Shared.ordered_port
+
+/// The protocol schema the instance of `driver` serves and the bundle it runs.
+fn Shared.described(self, driver: Driver) -> Result[os::Outcome, os::ControlError] {
+    return match self.components.schema(driver.spec.component.as_str(), alloc: self.config.alloc) {
+        Some(schema) => Ok(os::Outcome.Described(os::Described(schema: take schema, bundle: driver.spec.bundle)))
+        None => Err(os::ControlError.Missing)
+    }
+} Shared.described
+
+/// Restarts the instance from a copy of the checkpoint `read` gives, read for a restore of the cause `cause`, once it has stopped, telling `done` once it runs or fails, or why it cannot.
+fn Shared.restore[J: Journal](
+    self,
+    mut driver: Driver,
+    cause: u64,
+    take read: Result[os::Checkpoint, os::ControlError],
+    take done: task::Sender[Result[os::Outcome, os::ControlError]],
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    let saved = match read {
+        Ok(found) => found
+        Err(failure) => {
+            discard attempt await done.send(Err(take failure))
+            return
+        }
+    }
+    driver.changed_by = cause
+    driver.restoring = Some(take saved)
+    mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
+    try await self.stop(mut driver, then: Then.Restart, journal)
+    if driver.lifecycle == Some(os::Lifecycle.Failed) or driver.lifecycle == Some(os::Lifecycle.Stopped) or driver.lifecycle.is_none() {
+        try await self.create_or_start(mut driver, sender, journal, s)
+    }
+} Shared.restore
+
+/// Appends the message of the dead letter `letter` read as the instance's dead letter `seq` to its intake under the cause `cause`, flagged redelivered and noted on the letter once handled, starting a hibernated instance; tells `done` once it is queued, or why it is not.
+fn Shared.redeliver[J: Journal](
+    self,
+    mut driver: Driver,
+    seq: u64,
+    cause: u64,
+    take letter: Result[os::DeadLetter, os::ControlError],
+    take done: task::Sender[Result[os::Outcome, os::ControlError]],
+    now_ns: u64,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    let read = match letter {
+        Ok(found) => found
+        Err(failure) => {
+            discard attempt await done.send(Err(take failure))
+            return
+        }
+    }
+    let Some(message) = read.message else {
+        discard attempt await done.send(Err(os::ControlError.DeadLetterEmpty))
+        return
+    }
+    let Some(protocols) = self.components.protocols(driver.spec.component.as_str()) else {
+        discard attempt await done.send(Err(os::ControlError.Missing))
+        return
+    }
+    if not driver.takes_calls() {
+        discard attempt await done.send(Err(os::ControlError.Stopped))
+        return
+    }
+    let alloc = self.config.alloc
+    var encoded = sys::Encoded.empty(alloc)
+    mut encoded.bytes.append(message.view())
+    mut driver.queue.push(Queued(call: os::Call(hash: protocols.own, encoded: take encoded, reply: None, lease: os::Lease.free(alloc), header: os::Header.redelivered(cause)), since_ns: now_ns, redelivery: Some(seq)))
+    driver.counted()
+    if driver.lifecycle == Some(os::Lifecycle.Hibernated) {
+        driver.changed_by = cause
+        try await self.start(mut driver, sender, journal, s)
+    }
+    try await mut driver.deliver(now_ns)
+    discard attempt await done.send(Ok(os::Outcome.Done))
+} Shared.redeliver
+
+/// Notes `noted` on its dead letter from a task of `s`, through the instance's View of `/state`.
+fn Shared.note(self, mut driver: Driver, take noted: Noted, s: task::Scope) fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let moniker = ident::Moniker(text: driver.moniker.text)
+    let minted = await when directory => directory.state_view(mut driver.minted, moniker: ident::Moniker(text: moniker.text), principal: ident::Principal(text: driver.spec.principal.text), alloc)
+    let Some(view) = minted else {
+        return
+    }
+    discard s.spawn(fn[take noted, take moniker]() fails task::Cancelled uses wait limits stack 32_768 {
+        try await note_redelivery(view, moniker, take noted, alloc)
+    })
+} Shared.note
+
+/// Reads, from a task of `s`, the dead letter `seq` or the checkpoint `number` of the instance through its View of `/state` for an order of the cause `cause`, handing what it read to the driver through `sender` with `done`; a checkpoint of an instance keeping none is `instance.volatile`.
+fn Shared.read_state(
+    self,
+    mut driver: Driver,
+    take reading: Reading,
+    cause: u64,
+    take done: task::Sender[Result[os::Outcome, os::ControlError]],
+    sender: task::Sender[Input],
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    let checkpointed = driver.spec.durability.class == os::DurabilityClass.Checkpointed
+    match first reading {
+        Reading.Checkpoint(number: _) if not checkpointed => {
+            discard attempt await done.send(Err(os::ControlError.Volatile))
+            return
+        }
+        else => {
+        }
+    }
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let moniker = ident::Moniker(text: driver.moniker.text)
+    let minted = await when directory => directory.state_view(mut driver.minted, moniker: ident::Moniker(text: moniker.text), principal: ident::Principal(text: driver.spec.principal.text), alloc)
+    let Some(view) = minted else {
+        discard attempt await done.send(Err(os::ControlError.Missing))
+        return
+    }
+    let inputs = sender.split()
+    discard s.spawn(fn[take reading, take moniker, take done, take inputs]() fails task::Cancelled uses wait limits stack 32_768 {
+        let input = match reading {
+            Reading.Letter(seq: seq) => Input.Letter(seq: seq, cause: cause, letter: try await read_dead(view, moniker, seq, alloc), done: take done)
+            Reading.Checkpoint(number: number) => Input.Restoring(cause: cause, checkpoint: try await read_checkpoint(view, moniker, number, alloc), done: take done)
+        }
+        discard attempt await inputs.send(take input)
+    })
+} Shared.read_state
+
+/// What an order reads of an instance's `/state`: its dead letter `seq`, or its checkpoint `number`.
+enum Reading {
+    Letter(seq: u64)
+    Checkpoint(number: u64)
+} Reading
 
 /// Carries out a `Control` order.
 fn Shared.order[J: Journal](
@@ -287,20 +453,8 @@ fn Shared.order[J: Journal](
             discard attempt await done.send(take answer)
         }
         os::Action.Port(credit: credit) => {
-            let moniker = ident::Moniker(text: driver.moniker.text)
-            let alloc = self.config.alloc
-            let directory = self.directory.share()
-            let minted = await when directory => directory.mint(moniker, credit, alloc)
-            match minted {
-                Some(port) => {
-                    let handle = port.handle()
-                    mut driver.minted.ordered.push(take port)
-                    discard attempt await done.send(Ok(os::Outcome.Port(handle)))
-                }
-                None => {
-                    discard attempt await done.send(Err(os::ControlError.Missing))
-                }
-            }
+            let minted = try await self.ordered_port(mut driver, credit)
+            discard attempt await done.send(take minted)
         }
         os::Action.Delete(unplugged: unplugged) => {
             driver.deleting = Some(take done)
@@ -326,6 +480,11 @@ fn Shared.order[J: Journal](
             }
             discard attempt await done.send(Ok(os::Outcome.Done))
         }
+        os::Action.Describe => {
+            discard attempt await done.send(self.described(driver))
+        }
+        os::Action.Redeliver(seq: seq) => try await self.read_state(mut driver, reading: Reading.Letter(seq: seq), cause, take done, sender, s)
+        os::Action.Restore(number: number) => try await self.read_state(mut driver, reading: Reading.Checkpoint(number: number), cause, take done, sender, s)
         os::Action.Start => {
             mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
             try await self.create_or_start(mut driver, sender, journal, s)
@@ -704,18 +863,25 @@ fn Driver.handled_message(self) -> Option[Handled] {
         return None
     }
     let Some(kept) = outstanding.message else {
-        return Some(Handled(header: outstanding.header, message: None))
+        return Some(Handled(header: outstanding.header, message: None, redelivery: outstanding.redelivery))
     }
     var message = mem::Bytes.empty(self.alloc)
     mut message.append(kept.view())
-    return Some(Handled(header: outstanding.header, message: Some(take message)))
+    return Some(Handled(header: outstanding.header, message: Some(take message), redelivery: outstanding.redelivery))
 } Driver.handled_message
 
-/// The call a handler call was handling: its header, and its encoding when kept.
+/// The call a handler call was handling: its header, its encoding when kept, and the dead letter it delivered again.
 struct Handled {
     header: os::Header
     message: Option[mem::Bytes]
+    redelivery: Option[u64]
 } Handled
+
+/// The outcome of the delivery again of the dead letter `seq`.
+struct Noted {
+    seq: u64
+    redelivery: os::Redelivery
+} Noted
 
 /// The name of the operation `message` calls, empty when it was not kept.
 fn operation_in(message: Option[mem::Bytes], alloc: mem::Alloc) -> text::String {
@@ -752,7 +918,7 @@ fn Driver.running_span(self, now_ns: u64) -> Option[Span] {
     return Some(span)
 } Driver.running_span
 
-/// Records the call `handled`, which the handler call of the incarnation `trap` abandoned was handling, as the instance's next dead letter with the call's header, written from a task of `s` through the instance's View of `/state`.
+/// Records the call `handled`, which the handler call of the incarnation `trap` abandoned was handling, as the instance's next dead letter with the call's header, written from a task of `s` through the instance's View of `/state`; a dead letter it delivered again notes that it became this one.
 fn Shared.record_dead(
     self,
     mut driver: Driver,
@@ -760,7 +926,7 @@ fn Shared.record_dead(
     take handled: Handled,
     s: task::Scope,
     ) fails task::Cancelled uses wait {
-    let Handled(header: header, message: message) = handled
+    let Handled(header: header, message: message, redelivery: redelivery) = handled
     let alloc = self.config.alloc
     var bytes = Array[u8, 24].filled(0)
     let carried = header.to_bits()
@@ -782,7 +948,14 @@ fn Shared.record_dead(
     }
     let keep = driver.deleting.is_none()
     discard s.spawn(fn[take letter, take moniker]() fails task::Cancelled uses wait limits stack 32_768 {
-        try await write_dead(take letter, view, moniker, keep, alloc)
+        let written = try await write_dead(take letter, view, moniker: ident::Moniker(text: moniker.text), keep, alloc)
+        let Some(original) = redelivery else {
+            return
+        }
+        let Some(seq) = written else {
+            return
+        }
+        try await note_redelivery(view, moniker, noted: Noted(seq: original, redelivery: os::Redelivery(cause: header.named_cause(), outcome: os::Redelivered.Dead(seq: seq))), alloc)
     })
 } Shared.record_dead
 
@@ -858,8 +1031,9 @@ fn Driver.stopped[J: Journal](mut self, journal: J, abandoned: bool) {
     journal.record(self.slot, cause: self.changed_by, event: Event.Stopped(abandoned: abandoned))
 } Driver.stopped
 
-/// Handles what the domain reports at `now_ns`: that it runs, that it took a call, a request's answer, that its component was suspended or woken, or that a checkpoint failed.
-fn Driver.report[J: Journal](mut self, take report: Report, journal: J, now_ns: u64) fails task::Cancelled uses wait {
+/// Handles what the domain reports at `now_ns`: that it runs, that it took a call, a request's answer, that its component was suspended or woken, or that a checkpoint failed; gives the outcome of a dead letter delivered again once taken.
+fn Driver.report[J: Journal](mut self, take report: Report, journal: J, now_ns: u64) -> Option[Noted] fails task::Cancelled uses wait {
+    var noted: Option[Noted] = None
     match report {
         Report.Running(checkpoint: restored) => {
             if self.lifecycle == Some(os::Lifecycle.Starting) {
@@ -872,7 +1046,16 @@ fn Driver.report[J: Journal](mut self, take report: Report, journal: J, now_ns: 
         Report.Taken(id: id) => {
             let taken = mut self.take_outstanding(id, request: false, journal, now_ns)
             match taken {
-                Some(outstanding) => try await take outstanding.lease.release()
+                Some(outstanding) => {
+                    match outstanding.redelivery {
+                        Some(seq) => {
+                            noted = Some(Noted(seq: seq, redelivery: os::Redelivery(cause: outstanding.header.named_cause(), outcome: os::Redelivered.Handled)))
+                        }
+                        None => {
+                        }
+                    }
+                    try await take outstanding.lease.release()
+                }
                 None => {
                 }
             }
@@ -916,6 +1099,7 @@ fn Driver.report[J: Journal](mut self, take report: Report, journal: J, now_ns: 
     }
     try await mut self.deliver(now_ns)
     try await mut self.settle()
+    return noted
 } Driver.report
 
 /// The outstanding call `id` when its handler call ends at `now_ns`, recording its span when traced: a one-way call once taken, a request once answered or postponed.
@@ -978,7 +1162,7 @@ fn Driver.deliver(mut self, now_ns: u64) fails task::Cancelled uses wait {
         self.domain = Some(take current)
         return
     }
-    let Queued(call: call, since_ns: since_ns) = mut self.queue.remove(0)
+    let Queued(call: call, since_ns: since_ns, redelivery: redelivery) = mut self.queue.remove(0)
     let os::Call(hash: hash, encoded: encoded, reply: reply, lease: lease, header: header) = call
     self.counted()
     let id = current.next_id
@@ -994,7 +1178,7 @@ fn Driver.deliver(mut self, now_ns: u64) fails task::Cancelled uses wait {
     if header.traced() or self.traced(now_ns) {
         span = Some(Span(cause: header.cause, start_ns: now_ns, wait_ns: now_ns.saturating_sub(since_ns), run_ns: 0, sender: header.sender, operation: operation_name(encoded.bytes.view(), alloc: self.alloc), trapped: None))
     }
-    current.outstanding = Some(Outstanding(id: id, reply: take reply, lease: take lease, header: header, message: take message, span: span))
+    current.outstanding = Some(Outstanding(id: id, reply: take reply, lease: take lease, header: header, message: take message, span: span, redelivery: redelivery))
     let deliveries = current.deliveries.split()
     self.domain = Some(take current)
     discard attempt await deliveries.send(Delivery.Call(id: id, hash: hash, encoded: take encoded, request: request, header: header))
@@ -1054,7 +1238,7 @@ fn stop_outstanding(take ended: Outstanding, ending: Ending) fails task::Cancell
 /// Drops the queued one-way calls and fails the queued requests with `port.server-stopped`.
 fn Driver.refuse_queued(mut self) fails task::Cancelled uses wait {
     while self.queue.len() > 0 {
-        let Queued(call: call, since_ns: _) = mut self.queue.remove(0)
+        let Queued(call: call, since_ns: _, redelivery: _) = mut self.queue.remove(0)
         try await refuse(take call, answer: os::Answer.ServerStopped)
     }
     self.counted()
@@ -1123,7 +1307,7 @@ fn Driver.trigger(self) {
 
 /// Releases what the driver holds once its inputs have ended.
 fn Driver.abandon(take self) {
-    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, traps: _, started_ns: _, queue: _, intake: _, domain: _, then: _, abandonment: _, cause: _, changed_by: _, traced_until: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _, showing: _, alloc: _) = self
+    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, traps: _, started_ns: _, queue: _, intake: _, domain: _, then: _, abandonment: _, cause: _, changed_by: _, traced_until: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _, showing: _, restoring: _, alloc: _) = self
     gate.set(open: false)
     take minted.close()
 } Driver.abandon
