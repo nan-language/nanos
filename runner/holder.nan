@@ -6,12 +6,13 @@ const HOLDER_ORDERS: usize = 8
 /// The request number a replayed call is served under.
 const REPLAYED_REQUEST: u64 = 0xFFFF_FFFF_FFFF_FFFF
 
-/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`; a pause, told to `done`; the end of the pause; a hibernation; a replay of `call` under `header`, the component's Views of `main` reaching the branch `branch` through `redirect` and its clock and random source serving `recorded` through `tape` meanwhile, which the holder reports; the release of what replays keep but those `kept` names; the release of the first message or keyed task `kept` names; and the drop of what replays keep.
+/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`; a pause, told to `done`; the end of the pause; a hibernation, only of an idle component when `idle`; a call of its `pressure` with `level`; a replay of `call` under `header`, the component's Views of `main` reaching the branch `branch` through `redirect` and its clock and random source serving `recorded` through `tape` meanwhile, which the holder reports; the release of what replays keep but those `kept` names; the release of the first message or keyed task `kept` names; and the drop of what replays keep.
 enum HolderOrder {
     Snapshot(reply: task::Sender[os::StateCopy])
     Pause(done: task::Sender[Result[os::Outcome, os::ControlError]])
     Resume
-    Hibernate
+    Hibernate(idle: bool)
+    Pressure(level: u8)
     Replay(call: os::ForkCall, header: os::Header, branch: text::String, redirect: store::service::Redirect, recorded: os::Recorded, tape: Tape)
     Release(kept: mem::List[os::Kept], done: task::Sender[Result[os::Outcome, os::ControlError]])
     Deliver(kept: os::Kept, done: task::Sender[Result[os::Outcome, os::ControlError]])
@@ -93,10 +94,29 @@ fn HolderOrder.refuse(take self) fails task::Cancelled uses wait {
 fn Orders.next(self) -> Option[HolderOrder] {
     return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[HolderOrder] limits notrap {
         return self.queue.contents().with(t, body: fn(mut queue: mem::Bounded[HolderOrder, HOLDER_ORDERS]) -> Option[HolderOrder] limits notrap, terminates, noalloc {
-            return mut queue.pop()
+            return take_first(mut queue)
         })
     })
 } Orders.next
+
+/// The element of `queue` pushed first, taken from it, the others keeping their order.
+fn take_first[T, N: usize where N > 0](mut queue: mem::Bounded[T, N]) -> Option[T] limits notrap, terminates, noalloc {
+    var reversed = mem::Bounded[T, N].empty()
+    for _ in 0..<N {
+        let Some(last) = mut queue.pop() else {
+            break
+        }
+        discard attempt mut reversed.try_push(take last)
+    }
+    let oldest = mut reversed.pop()
+    for _ in 0..<N {
+        let Some(next) = mut reversed.pop() else {
+            break
+        }
+        discard attempt mut queue.try_push(take next)
+    }
+    return oldest
+} take_first
 
 /// Waits until an order is given.
 fn Orders.wait(self) fails task::Cancelled uses wait {
@@ -108,22 +128,23 @@ fn Holding.none(alloc: mem::Alloc) -> Holding[P] {
     return Holding(paused: false, aside: mem::List.empty(alloc), sent: mem::List.empty(alloc), tasks: mem::List.empty(alloc))
 } Holding.none
 
-/// Carries out every order waiting for the holder of `stepper`, its component quiescent, telling the driver through `telling` what each replay gave; the messages it posts again go from tasks of `s`, once their delay has passed. Gives whether a hibernation is ordered, which the holder carries out before the orders after it.
+/// Carries out every order waiting for the holder of `stepper`, its component quiescent, telling the driver through `telling` what each replay gave; the messages it posts again go from tasks of `s`, once their delay has passed. Gives, when a hibernation is ordered, whether only an idle component takes it; the holder carries it out before the orders after it.
 fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
     mut stepper: sys::Stepper[S, Env, P],
     orders: Orders,
     mut holding: Holding[P],
     telling: Telling,
     s: task::Scope,
-    ) -> bool fails task::Cancelled uses wait {
+    ) -> Option[bool] fails task::Cancelled uses wait {
     let clock = telling.clock
     let alloc = telling.alloc
     loop {
         let Some(order) = orders.next() else {
-            return false
+            return None
         }
         match order {
-            HolderOrder.Hibernate => return true
+            HolderOrder.Hibernate(idle: only_idle) => return Some(only_idle)
+            HolderOrder.Pressure(level: level) => mut stepper.pressure(level)
             HolderOrder.Snapshot(reply: reply) => {
                 discard attempt await reply.send(state_copy(stepper, alloc))
             }

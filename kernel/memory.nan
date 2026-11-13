@@ -1,18 +1,20 @@
-//! The memory keeper: the core's task holding the frame allocator and the pool's cells, which carves the regions of reserved instances and reads the counters of the memory summary.
+//! The memory keeper: the core's task holding the frame allocator and the pool's cells, which carves the regions of reserved instances, reads the counters of the memory summary and settles the pool's pressure level.
 
-/// What the memory keeper takes: a reserved instance's request for a region of `bytes`, whose store goes to `done`, `None` when no free range holds one; or a reading of its counters.
+/// What the memory keeper takes: a reserved instance's request for a region of `bytes`, whose store goes to `done`, `None` when no free range holds one; a reading of its counters; the pool's pressure level, settled now; or that level once it differs from `seen`. Each request settles the level.
 enum MemoryRequest {
     Reserve(bytes: u64, done: task::Sender[Option[mem::Heap]])
     Read(done: task::Sender[frames::Reading])
+    Settle(done: task::Sender[u8])
+    Changed(seen: u8, done: task::Sender[u8])
 } MemoryRequest
 
-/// The runner's reservations, asking the memory keeper for their regions.
+/// The runner's memory, asking the memory keeper for reserved regions and the pool's pressure level.
 struct Reserver {
     requests: task::Sender[MemoryRequest]
     alloc: mem::Alloc
 } Reserver
 
-impl Reserver: runner::Reservations
+impl Reserver: runner::Memory
 
 /// Where the board reads the memory keeper's counters.
 struct Counters {
@@ -35,6 +37,30 @@ fn Reserver.reserve(self, bytes: u64) -> Option[mem::Heap] fails task::Cancelled
 /// Another handle on the same memory keeper.
 fn Counters.share(self) -> Counters = Counters(requests: self.requests.split(), alloc: self.alloc)
 
+fn Reserver.settle(self) -> u8 fails task::Cancelled uses wait {
+    let task::Channel(sender: done, receiver: outcome) = task::Channel[u8].bounded(1, alloc: self.alloc)
+    if not try await ask(self.requests, request: MemoryRequest.Settle(done: take done)) {
+        return 0
+    }
+    var receiver = outcome
+    let Some(level) = try await mut receiver.receive() else {
+        return 0
+    }
+    return level
+} Reserver.settle
+
+fn Reserver.changed(self, seen: u8) -> u8 fails task::Cancelled uses wait {
+    let task::Channel(sender: done, receiver: outcome) = task::Channel[u8].bounded(1, alloc: self.alloc)
+    if not try await ask(self.requests, request: MemoryRequest.Changed(seen: seen, done: take done)) {
+        return seen
+    }
+    var receiver = outcome
+    let Some(level) = try await mut receiver.receive() else {
+        return seen
+    }
+    return level
+} Reserver.changed
+
 /// The counters as the memory keeper reads them now, `None` once it no longer runs.
 fn Counters.read(self) -> Option[frames::Reading] fails task::Cancelled uses wait {
     let task::Channel(sender: done, receiver: outcome) = task::Channel[frames::Reading].bounded(1, alloc: self.alloc)
@@ -54,11 +80,26 @@ fn ask(requests: task::Sender[MemoryRequest], take request: MemoryRequest) -> bo
     }
 } ask
 
-/// Carves the region of each reservation `requests` brings from `frames`, under a store of its own, and answers each reading with the counters of `frames` and the pool's `cells` beside the start's `fixed` parts, for as long as requests come.
-fn keep_memory(mut frames: frames::Frames, mut cells: frames::PoolCells, fixed: frames::Fixed, mut requests: task::Receiver[MemoryRequest]) fails task::Cancelled uses wait {
+/// Carves the region of each reservation `requests` brings from `frames`, under a store of its own, and answers each reading with the counters of `frames` and the pool's `cells` beside the start's `fixed` parts, for as long as requests come; settles the pool's level at each request, answering the requests waiting for it to change once it has.
+fn keep_memory(
+    mut frames: frames::Frames,
+    mut cells: frames::PoolCells,
+    fixed: frames::Fixed,
+    mut requests: task::Receiver[MemoryRequest],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var waiting = mem::List[task::Sender[u8]].empty(alloc)
     loop {
         let Some(request) = try await mut requests.receive() else {
             return
+        }
+        let before = cells.pressure.level
+        let level = mut cells.settle()
+        if level != before {
+            while waiting.len() > 0 {
+                let waiter = mut waiting.remove(0)
+                discard attempt await waiter.send(level)
+            }
         }
         match request {
             MemoryRequest.Reserve(bytes: bytes, done: done) => {
@@ -70,6 +111,16 @@ fn keep_memory(mut frames: frames::Frames, mut cells: frames::PoolCells, fixed: 
             }
             MemoryRequest.Read(done: done) => {
                 discard attempt await done.send(mut cells.reading(fixed, frames))
+            }
+            MemoryRequest.Settle(done: done) => {
+                discard attempt await done.send(level)
+            }
+            MemoryRequest.Changed(seen: seen, done: done) => {
+                if seen != level {
+                    discard attempt await done.send(level)
+                } else {
+                    mut waiting.push(take done)
+                }
             }
         }
     }

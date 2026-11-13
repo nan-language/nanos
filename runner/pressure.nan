@@ -1,0 +1,136 @@
+//! Pressure: what the runner does as the pressure level of the pool its instances draw from rises.
+
+/// The level from which hibernation memory drops its images and idle instances hibernate.
+const RECLAIMING: u8 = 3
+
+/// The highest level, at which starts are refused.
+const TOP_LEVEL: u8 = 4
+
+/// What a reclaim asks the drivers: the hibernation images they keep, or the instances that may hibernate for pressure.
+enum Asking derives Copy, Eq {
+    Images
+    Idle
+} Asking
+
+/// What the pool's pressure has a driver do: have its holder call `pressure` with the `level` the pool rose through; answer what a reclaim asks of it, its `index`th, through `reply`; drop the hibernation image hibernation memory keeps; or hibernate the instance if it is idle, `done` hearing its lifecycle then.
+enum Pressing {
+    Level(level: u8)
+    Ask(asking: Asking, index: usize, reply: task::Sender[Option[Ranked]])
+    DropImage
+    Reclaim(done: task::Sender[Result[os::Outcome, os::ControlError]])
+} Pressing
+
+/// A driver's answer to a reclaim: its place among the drivers asked, and the monotonic time ranking it, the earliest first.
+struct Ranked derives Copy {
+    index: usize
+    ns: u64
+} Ranked
+
+/// Follows the pool's pressure level for the drivers `routes` reaches: at each rise, the holder of each running instance calls `pressure` with each level risen through, in order; at level 3 or more, reclaims memory.
+fn Shared.relieve(self, routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]]) fails task::Cancelled uses wait {
+    var seen: u8 = 0
+    loop {
+        let level = try await self.memory.changed(seen)
+        let alloc = self.config.alloc
+        let drivers = await when routes => routed(routes, alloc)
+        var step = seen
+        while step < level {
+            step += 1
+            for driver in drivers {
+                try await told(driver.inputs, input: Input.Pressed(Pressing.Level(level: step)))
+            }
+        }
+        seen = level
+        if level >= RECLAIMING {
+            try await self.reclaim(drivers)
+        }
+    }
+} Shared.relieve
+
+/// Drops the hibernation images the drivers keep, oldest first, then hibernates their idle checkpointed instances, least recently messaged first, until the pool's level falls below 3.
+fn Shared.reclaim(self, drivers: mem::List[Routed]) fails task::Cancelled uses wait {
+    for kept in try await self.ranked(drivers, asking: Asking.Images) {
+        try await told(drivers[kept.index].inputs, input: Input.Pressed(Pressing.DropImage))
+        if try await self.memory.settle() < RECLAIMING {
+            return
+        }
+    }
+    for candidate in try await self.ranked(drivers, asking: Asking.Idle) {
+        let task::Channel(sender: done, receiver: outcome) = task::Channel[Result[os::Outcome, os::ControlError]].bounded(1, alloc: self.config.alloc)
+        try await told(drivers[candidate.index].inputs, input: Input.Pressed(Pressing.Reclaim(done: take done)))
+        var receiver = outcome
+        discard try await mut receiver.receive()
+        if try await self.memory.settle() < RECLAIMING {
+            return
+        }
+    }
+} Shared.reclaim
+
+/// The drivers that answer `asking`, the earliest first.
+fn Shared.ranked(self, drivers: mem::List[Routed], asking: Asking) -> mem::List[Ranked] fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    let task::Channel(sender: answers, receiver: answered) = task::Channel[Option[Ranked]].bounded(drivers.len().max(1), alloc)
+    for index in 0..<drivers.len() {
+        try await told(drivers[index].inputs, input: Input.Pressed(Pressing.Ask(asking: asking, index: index, reply: answers.split())))
+    }
+    discard answers
+    var ranked = mem::List[Ranked].empty(alloc)
+    var receiver = answered
+    loop {
+        let Some(reply) = try await mut receiver.receive() else {
+            break
+        }
+        match reply {
+            Some(answer) => mut ranked.push(answer)
+            None => {
+            }
+        }
+    }
+    mut ranked.sort_by(fn(left: Ranked, right: Ranked) => left.ns.cmp(right.ns))
+    return ranked
+} Shared.ranked
+
+/// Gives `input` to a driver, which may have ended.
+fn told(inputs: task::Sender[Input], take input: Input) fails task::Cancelled uses wait {
+    match attempt await inputs.send(take input) {
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} told
+
+/// Does what the pool's pressure has the driver do.
+fn Driver.pressed(mut self, take pressing: Pressing) fails task::Cancelled uses wait {
+    match pressing {
+        Pressing.Level(level: level) => {
+            if self.lifecycle == Some(os::Lifecycle.Running) and not self.paused {
+                try await self.hold_order(HolderOrder.Pressure(level: level))
+            }
+        }
+        Pressing.Ask(asking: asking, index: index, reply: reply) => {
+            discard attempt await reply.send(self.rank(asking, index))
+        }
+        Pressing.DropImage => {
+            self.image = None
+        }
+        Pressing.Reclaim(done: done) => try await mut self.order_hibernation(take done, only_idle: true)
+    }
+} Driver.pressed
+
+/// How the driver answers a reclaim asking `asking` as the driver `index`: with the time its image was kept, or, for an idle running checkpointed instance that pressure has not passed over, the time it was last messaged.
+fn Driver.rank(self, asking: Asking, index: usize) -> Option[Ranked] {
+    if asking == Asking.Images {
+        return match self.image {
+            Some(_) => Some(Ranked(index: index, ns: self.hibernated_ns))
+            None => None
+        }
+    }
+    let calling = match self.domain {
+        Some(domain) => domain.outstanding.is_some()
+        None => true
+    }
+    if self.lifecycle != Some(os::Lifecycle.Running) or self.spec.durability.class != os::DurabilityClass.Checkpointed or calling or self.queue.len() > 0 or self.paused or self.hibernating.is_some() or self.passed_over {
+        return None
+    }
+    return Some(Ranked(index: index, ns: self.messaged_ns))
+} Driver.rank

@@ -14,11 +14,15 @@ pub interface Components {
     fn serve(self, component: Str, take world: nanos::World, take serving: Serving) -> Ended fails task::Cancelled uses wait
 } Components
 
-/// Where reserved instances take the memory set aside for them.
-pub interface Reservations {
+/// Where instances take their memory: the regions set aside for reserved instances, and the pressure level of the pool the cells of the others split from.
+pub interface Memory {
     /// A store over a region of at least `bytes` set aside for the rest of the boot, `None` when no free range holds one.
     fn reserve(self, bytes: u64) -> Option[mem::Heap] fails task::Cancelled uses wait
-} Reservations
+    /// The pool's pressure level, settled on what the pool has drawn now.
+    fn settle(self) -> u8 fails task::Cancelled uses wait
+    /// The pool's pressure level once it differs from `seen`.
+    fn changed(self, seen: u8) -> u8 fails task::Cancelled uses wait
+} Memory
 
 /// Where the runner records events, each with the slot of its instance, 0 for the core's, and the cause of the work it tells of as a header holds it, 0 for the core's own; where it opens the start causes of incarnations and records the spans of handler calls; and the instance each slot names.
 pub interface Journal {
@@ -148,12 +152,12 @@ fn ask(revocations: task::Sender[Revocation], grant: u64, reason: Reason, alloc:
     return revoked
 } ask
 
-/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them, as work of the boot's system cause, `body`'s included: each has a driver carrying out its lifecycle and publishing its record through `postings` and the gauge of its running incarnation through `gauges`, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes. The handler calls of the instances each set `tracings` gives names are traced, each until it expires.
-pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Reservations and Send, T: Send, E: Send](
+/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them, as work of the boot's system cause, `body`'s included: each has a driver carrying out its lifecycle and publishing its record through `postings` and the gauge of its running incarnation through `gauges`, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes. The handler calls of the instances each set `tracings` gives names are traced, each until it expires. Each rise of the pressure level of the pool `memory` tells relieves it.
+pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Memory and Send, T: Send, E: Send](
     take known: Known,
     components: C,
     journal: J,
-    take reservations: R,
+    take memory: R,
     config: Config,
     postings: task::Sender[os::Posting],
     logs: task::Sender[journal::Logged],
@@ -185,7 +189,7 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Reservations
     let reached = directory.share()
     let routes = task::Cown.of(mem::Map[ident::Moniker, task::Sender[Input]].empty(alloc), alloc)
     let traced = task::Cown.of(mem::List[journal::TracedInstance].empty(alloc), alloc)
-    let shared = Shared[C, R](components: components, reservations: take reservations, config: config, directory: take directory, orders: orders.split(), withheld: withheld, postings: postings.split(), logs: logs.split(), gauges: gauges.share(), traced: traced.share())
+    let shared = Shared[C, R](components: components, memory: take memory, config: config, directory: take directory, orders: orders.split(), withheld: withheld, postings: postings.split(), logs: logs.split(), gauges: gauges.share(), traced: traced.share())
     let core = os::MintedControl.of(orders, grant: None, prefix: None, alloc)
     defer take core.close()
     var result: Option[T] = None
@@ -209,6 +213,10 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Reservations
             let tracing_set = traced.share()
             discard s.spawn(fn[take tracing_in, take tracing_routes, take tracing_set]() fails task::Cancelled uses wait limits stack 16_384 {
                 try await trace(take tracing_in, routes: tracing_routes, traced: tracing_set, config)
+            })
+            let relieved = routes.share()
+            discard s.spawn(fn[take relieved]() fails task::Cancelled uses wait limits stack 16_384 {
+                try await shared.relieve(routes: relieved)
             })
             let timed = reached.share()
             let expiries = revocations.split()

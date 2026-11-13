@@ -58,8 +58,8 @@ fn KeptImage.checkpoint(
     return Some(os::Checkpoint(number: 0, incarnation: incarnation, bundle: bundle, schema: self.schema, time: time, state: take state))
 } KeptImage.checkpoint
 
-/// Orders the hibernation of the instance, its outcome going to `done`: `instance.volatile` when it keeps no checkpoints, `instance.not-running` unless it runs, unpaused and with no hibernation under way; otherwise its holder hibernates it once no call is outstanding, no call reaching it meanwhile.
-fn Driver.order_hibernation(mut self, take done: task::Sender[Result[os::Outcome, os::ControlError]]) fails task::Cancelled uses wait {
+/// Orders the hibernation of the instance, its outcome going to `done`: `instance.volatile` when it keeps no checkpoints, `instance.not-running` unless it runs, unpaused and with no hibernation under way; otherwise its holder hibernates it once no call is outstanding, no call reaching it meanwhile, unless it is not idle when `only_idle`.
+fn Driver.order_hibernation(mut self, take done: task::Sender[Result[os::Outcome, os::ControlError]], only_idle: bool) fails task::Cancelled uses wait {
     if self.spec.durability.class != os::DurabilityClass.Checkpointed {
         discard attempt await done.send(Err(os::ControlError.Volatile))
         return
@@ -70,6 +70,7 @@ fn Driver.order_hibernation(mut self, take done: task::Sender[Result[os::Outcome
     }
     self.hibernating = Some(take done)
     self.hibernation_ordered = false
+    self.hibernation_idle = only_idle
     try await mut self.hibernate_holder()
 } Driver.order_hibernation
 
@@ -85,10 +86,10 @@ fn Driver.hibernate_holder(mut self) fails task::Cancelled uses wait {
         return
     }
     self.hibernation_ordered = true
-    try await self.hold_order(HolderOrder.Hibernate)
+    try await self.hold_order(HolderOrder.Hibernate(idle: self.hibernation_idle))
 } Driver.hibernate_holder
 
-/// Takes the outcome of the hibernation its holder carried out: with an image, keeps it in hibernation memory, which compresses it, and the messages it waits for, and records `instance.hibernated` with the image's bytes; the domain then ends. Without one, the instance serves on, its intake resuming at `now_ns`, and the order hears that it still runs.
+/// Takes the outcome of the hibernation its holder carried out: with an image, keeps it in hibernation memory, which compresses it, while the pool's pressure level is below 3, and the messages it waits for, and records `instance.hibernated` with the image's bytes; the domain then ends. Without one, the instance serves on, its intake resuming at `now_ns`, pressure passing it over after a hibernation for pressure, and the order hears that it still runs.
 fn Shared.hibernated[J: Journal](
     self,
     mut driver: Driver,
@@ -97,6 +98,7 @@ fn Shared.hibernated[J: Journal](
     now_ns: u64,
     ) fails task::Cancelled uses wait {
     let Some(Image(state: state, schema: schema, delayed: delayed)) = outcome else {
+        driver.passed_over = driver.hibernation_idle
         driver.hibernation_ordered = false
         match mut driver.hibernating.extract() {
             Some(done) => {
@@ -108,7 +110,10 @@ fn Shared.hibernated[J: Journal](
         try await mut driver.deliver(now_ns)
         return
     }
-    driver.image = KeptImage.of(state.view(), schema, cell: self.config.hibernation, scratch: self.config.alloc)
+    if try await self.memory.settle() < RECLAIMING {
+        driver.image = KeptImage.of(state.view(), schema, cell: self.config.hibernation, scratch: self.config.alloc)
+        driver.hibernated_ns = now_ns
+    }
     driver.hibernated = true
     for message in take delayed {
         delay(mut driver.delayed, take message)
