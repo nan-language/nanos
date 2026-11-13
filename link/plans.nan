@@ -1,6 +1,6 @@
 //! Plans: the `plan` verb previewing plans from keyed tasks, the plans the link keeps by their hash, their lifecycle states, events and records at `/live/plans`.
 
-/// A plan the link keeps: its hash, its record, the work of its spans, the subjects the policy decides, the session that previewed it, its state, the span it reached, the commits of its spans, the replies to the requests of its call steps, the end of the running health window or confirmation wait, the request key and the request number it applies under, the code it ended with, and when it was previewed and ended in monotonic time.
+/// A plan the link keeps: its hash, its record, the work of its spans, the subjects the policy decides, the session that previewed it, its state, the span it reached, the commits of its spans, the replies to the requests of its call steps, the outbox entries that ended, the end of the running health window or confirmation wait, the request key and the request number it applies under, the code it ended with, and when it was previewed and ended in monotonic time.
 pub closed struct KeptPlan derives Encode {
     pub hash: ident::HashValue
     pub plan: Plan
@@ -11,6 +11,7 @@ pub closed struct KeptPlan derives Encode {
     pub span: u32
     pub commits: mem::List[ident::CommitId]
     pub replies: mem::List[StepReply]
+    pub ended: mem::List[EndedEntry]
     pub until: Option[ident::WallTime]
     pub key: Option[text::String]
     pub applying: Option[u64]
@@ -18,6 +19,12 @@ pub closed struct KeptPlan derives Encode {
     pub previewed_ns: u64
     pub ended_ns: Option[u64]
 } KeptPlan
+
+/// An outbox entry of a plan and the status it ended in.
+pub closed struct EndedEntry derives Encode {
+    pub entry: text::String
+    pub status: DeliveryStatus
+} EndedEntry
 
 /// The encoding of the reply to the request of a call step.
 pub closed struct StepReply derives Encode {
@@ -238,7 +245,7 @@ fn Linker.previewed(
     let now = now_ns(env.clock)
     mut self.forget_plans(now, mut env, mut cx)
     if self.plans.position(fn(each: KeptPlan) => each.hash == hash).is_none() {
-        mut self.plans.push(KeptPlan(hash: hash, plan: take plan, spans: take spans, subjects: take subjects, session: session, state: PlanState.Previewed, span: 0, commits: mem::List.empty(alloc), replies: mem::List.empty(alloc), until: None, key: None, applying: None, code: None, previewed_ns: now, ended_ns: None))
+        mut self.plans.push(KeptPlan(hash: hash, plan: take plan, spans: take spans, subjects: take subjects, session: session, state: PlanState.Previewed, span: 0, commits: mem::List.empty(alloc), replies: mem::List.empty(alloc), ended: mem::List.empty(alloc), until: None, key: None, applying: None, code: None, previewed_ns: now, ended_ns: None))
         mut self.announce(self.plans.len() - 1, mut env, mut cx)
     }
     if not calling {
@@ -553,7 +560,12 @@ fn Linker.plan_moved(
             mut self.announce(plan_at, mut env, mut cx)
         }
         Moved.Replied(step: step, reply: reply) => mut self.plans[plan_at].replies.push(StepReply(step: step, reply: take reply))
-        Moved.Delivered(entry: entry) => mut self.announce_delivery(plan_at, take entry, mut env, mut cx)
+        Moved.Delivered(entry: entry, status: status) => {
+            if status != DeliveryStatus.Cancelled {
+                mut self.announce_delivery(plan_at, entry: text::String.of(entry.as_str(), alloc), mut env, mut cx)
+            }
+            mut self.plans[plan_at].ended.push(EndedEntry(entry: take entry, status: status))
+        }
         Moved.Ended(state: state, code: code) => {
             self.plans[plan_at].state = state
             self.plans[plan_at].code = code
@@ -572,7 +584,7 @@ fn Linker.plan_moved(
     }
 } Linker.plan_moved
 
-/// The final block of the request running at `at` for the plan kept at `plan_at`: for a `call`, a `reply <step>, value` record per reply to its requests; a `span <n>, commit` record per span committed and `plan <hash>, state`, failed with the plan's code unless it applied.
+/// The final block of the request running at `at` for the plan kept at `plan_at`: for a `call`, a `reply <step>, value` record per reply to its requests; a `span <n>, commit` record per span committed, a `delivery <entry>, status` record per outbox entry that ended, and `plan <hash>, state`, failed with the plan's code unless it applied.
 fn Linker.final_block(self, plan_at: usize, at: usize, alloc: mem::Alloc) -> Block {
     let held = self.plans[plan_at]
     let verdict = match held.state == PlanState.Applied {
@@ -605,6 +617,12 @@ fn Linker.final_block(self, plan_at: usize, at: usize, alloc: mem::Alloc) -> Blo
         mut record.field("commit", value: Dyn[Render].view(commit))
         mut block.records.push(take record)
         span += 1
+    }
+    for ended in held.ended {
+        var record = Record.of("delivery", alloc)
+        mut record.subject(Dyn[Render].view(Rendered(text: text::String.of(ended.entry.as_str(), alloc))))
+        mut record.field("status", value: Dyn[Render].view(ended.status))
+        mut block.records.push(take record)
     }
     var summary = Record.of("plan", alloc)
     mut summary.subject(Dyn[Render].view(held.hash))

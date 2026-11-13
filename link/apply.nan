@@ -24,11 +24,11 @@ pub closed struct Applying derives Encode {
     pub scheduled: Option[ident::WallTime]
 } Applying
 
-/// How an apply goes on: a span committed, its health window or confirmation running until `until`; the encoding of the reply to the request of a call step; an outbox entry delivered or failed; or the plan ended in `state`, with the code of its failure.
+/// How an apply goes on: a span committed, its health window or confirmation running until `until`; the encoding of the reply to the request of a call step; an outbox entry ended `Delivered`, `Failed` or `Cancelled`; or the plan ended in `state`, with the code of its failure.
 pub closed enum Moved derives Encode {
     Committed(span: u32, commit: ident::CommitId, until: Option[ident::WallTime])
     Replied(step: u32, reply: mem::Bytes)
-    Delivered(entry: text::String)
+    Delivered(entry: text::String, status: DeliveryStatus)
     Ended(state: PlanState, code: Option[text::String])
 } Moved
 
@@ -159,10 +159,10 @@ fn committed_span(
     }
     try await converged(tree_activations(span, alloc), commit, tree: acting, clocks, alloc)
     if health_s > 0 and not try await healthy(span.activations, window_s: health_s, tree: acting, clocks, alloc) {
-        return Some(try await reverted(applying, span, commit, acting, code: "plan.unhealthy", alloc))
+        return Some(try await reverted(applying, span, commit, acting, code: "plan.unhealthy", out, alloc))
     }
     if confirm_s > 0 and not try await confirmed(applying.hash, within_s: confirm_s, tree: acting, clocks, alloc) {
-        return Some(try await reverted(applying, span, commit, acting, code: "plan.unconfirmed", alloc))
+        return Some(try await reverted(applying, span, commit, acting, code: "plan.unconfirmed", out, alloc))
     }
     return match try await deliver_outbox(applying, span, control, acting, clocks, out, alloc) {
         Some(code) => Some(finish_as(PlanState.Failed, code: code.as_str(), alloc))
@@ -330,8 +330,9 @@ fn deliver_outbox(
             None => {
             }
         }
-        discard attempt await out.plan_moved(applying.number, moved: Moved.Delivered(entry: entry_id(applying.hash, span: span.span, n: at + 1, alloc)))
+        discard attempt await out.plan_moved(applying.number, moved: Moved.Delivered(entry: entry_id(applying.hash, span: span.span, n: at + 1, alloc), status: status))
         if failed {
+            try await told_cancelled(applying, span: span.span, from: at + 2, through: entries.len(), out, alloc)
             return Some(text::String.of("plan.delivery-failed", alloc))
         }
     }
@@ -542,13 +543,14 @@ fn confirmed(
     }
 } confirmed
 
-/// Reverts the commit `commit` of the span `span` of `applying` as revert by blame does, its outbox entries then `Cancelled`, the plan ending `reverted` with `code`, or `failed` with `conflict.revert` when a later commit changed what it restores.
+/// Reverts the commit `commit` of the span `span` of `applying` as revert by blame does, its outbox entries then `Cancelled`, which `out` hears of, the plan ending `reverted` with `code`, or `failed` with `conflict.revert` when a later commit changed what it restores.
 fn reverted(
     applying: Applying,
     span: SpanWork,
     commit: ident::CommitId,
     acting: store::service::View,
     code: Str,
+    out: sys::Outbox[LinkSession],
     alloc: mem::Alloc,
     ) -> Moved fails task::Cancelled uses wait {
     match first attempt await acting.revert(commit, dry_run: false, alloc) {
@@ -557,16 +559,34 @@ fn reverted(
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(failed) => return finish_as(PlanState.Failed, code: failed.code().as_str(), alloc)
     }
-    let cancelled = entries_in(applying, span: span.span, entries: outbox_of(span, alloc), from: 0, status: DeliveryStatus.Cancelled, alloc)
+    let entries = outbox_of(span, alloc)
+    let cancelled = entries_in(applying, span: span.span, entries, from: 0, status: DeliveryStatus.Cancelled, alloc)
     if cancelled.len() > 0 {
         match try await commit_writes(applying, writes: take cancelled, acting, alloc) {
             Some(failed) => return finish_as(PlanState.Failed, code: failed.as_str(), alloc)
             None => {
             }
         }
+        try await told_cancelled(applying, span: span.span, from: 1, through: entries.len(), out, alloc)
     }
     return finish_as(PlanState.Reverted, code, alloc)
 } reverted
+
+/// Tells `out` that the outbox entries `from` to `through` of span `span` of `applying` ended `Cancelled`.
+fn told_cancelled(
+    applying: Applying,
+    span: u32,
+    from: usize,
+    through: usize,
+    out: sys::Outbox[LinkSession],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var n = from
+    while n <= through {
+        discard attempt await out.plan_moved(applying.number, moved: Moved.Delivered(entry: entry_id(applying.hash, span, n, alloc), status: DeliveryStatus.Cancelled))
+        n += 1
+    }
+} told_cancelled
 
 /// Reverts, as revert by blame does, the commit that last wrote each plan's record at `/sys/plans`, a span commit awaiting its confirmation or a timed plan's schedule, whose apply ended with `link`'s restart; gives the event of each such plan's failure with `plan.interrupted`.
 pub fn recover_plans(tree: store::service::View, alloc: mem::Alloc) -> mem::List[PlanEvent] fails task::Cancelled uses wait {
