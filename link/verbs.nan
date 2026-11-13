@@ -9,9 +9,14 @@ const READ_ENTRIES: u32 = 4_096
 /// The bytes of a blob's `piece`.
 const PIECE_BYTES: u64 = 4_096
 
-
 /// The block answering `request`, read through `tree` within the session's budget `budget` for the principal `reader`.
-pub fn answer(request: Request, tree: store::service::View, budget: os::SessionBudget, reader: ident::Principal, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+pub fn answer(
+    request: Request,
+    tree: store::service::View,
+    budget: os::SessionBudget,
+    reader: ident::Principal,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
     let verb = request.verb.as_str()
     let operand = first_operand(request, alloc)
     return match verb {
@@ -206,21 +211,41 @@ fn instance_record(name: Str, tree: store::service::View, alloc: mem::Alloc) -> 
     return Some(take record)
 } instance_record
 
-/// `get <path> [--at <commit>]`: the node at `path`, as a `node`, `dir`, `stream` or `blob` record, the verdict line naming `operand`.
-fn get(request: Request, path: Str, operand: Str, tree: store::service::View, budget: os::SessionBudget, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+/// `get <path> [--at <commit or branch>]`: the node at `path`, as of the commit or at the head of the branch, as a `node`, `dir`, `stream` or `blob` record, the verdict line naming `operand`.
+fn get(
+    request: Request,
+    path: Str,
+    operand: Str,
+    tree: store::service::View,
+    budget: os::SessionBudget,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
     let id = request.id.as_str()
     let verb = request.verb.as_str()
     let Some(named) = path_of(path, alloc) else {
         return failed_block(id, verb, operand, failure: Failure.of("request.invalid-operand", subject: path, alloc).expecting("a path", found: path, alloc), alloc)
     }
-    let at = match request.flag("at") {
-        Some(written) => match ident::CommitId.of_text(written) {
-            Some(commit) => Some(commit)
-            None => return failed_block(id, verb, operand, failure: Failure.of("request.invalid-flag", subject: written, alloc).expecting("a commit #<n>", found: written, alloc), alloc)
+    var at: Option[ident::CommitId] = None
+    var view = tree
+    match request.flag("at") {
+        Some(written) => {
+            match ident::CommitId.of_text(written) {
+                Some(commit) => {
+                    at = Some(commit)
+                }
+                None => {
+                    view = match first attempt await tree.on_branch(text::String.of(written, alloc), alloc) {
+                        Ok(store::service::Branched(branch: _, view: reached)) => reached
+                        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+                        Err(failed) => return failed_block(id, verb, operand, failure: Failure.of(failed.code().as_str(), subject: written, alloc).expecting("a commit #<n> or a branch", found: written, alloc), alloc)
+                    }
+                }
+            }
         }
-        None => None
+        None => {
+        }
     }
-    let node = match first attempt await tree.get(take named, at, alloc) {
+    let node = match first attempt await view.get(take named, at, alloc) {
         Ok(found) => found
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(failed) => return failed_block(id, verb, operand, failure: Failure.of(failed.code().as_str(), subject: path, alloc), alloc)
@@ -229,10 +254,10 @@ fn get(request: Request, path: Str, operand: Str, tree: store::service::View, bu
     match node.kind {
         store::NodeKind.Record => mut block.records.push(node_record(node, alloc))
         store::NodeKind.Stream => mut block.records.push(stream_record(node, alloc))
-        store::NodeKind.Blob => try await blob_pieces(mut block, node, tree, at, cut: request_cut(request, budget, alloc), alloc)
+        store::NodeKind.Blob => try await blob_pieces(mut block, node, tree: view, at, cut: request_cut(request, budget, alloc), alloc)
         store::NodeKind.Dir => {
             mut block.records.push(dir_record(node, alloc))
-            for entry in try await entries_of(tree, path: node.path, alloc) {
+            for entry in try await entries_of(view, path: node.path, alloc) {
                 mut block.records.push(entry_record(entry, alloc))
             }
         }
@@ -261,7 +286,7 @@ fn Record.value(mut self, value: Str, origins: mem::List[ident::OriginLabel], al
     for label in origins {
         mut labels.push(ident::OriginLabel(text: label.text))
     }
-    mut self.envelope("value", labels: labels, content: value, alloc)
+    mut self.envelope("value", labels, content: value, alloc)
 } Record.value
 
 /// The header of the `node` record of `node`.
@@ -348,7 +373,14 @@ fn blob_record(node: store::Node, alloc: mem::Alloc) -> Record {
 } blob_record
 
 /// The `blob` record of the blob `node` and its `piece` records, read as of `at`: a piece for each 4 KiB from its offset, in an envelope of the blob's origins, as text when UTF-8 and else as base64; only the pieces the cut `cut` may show are read, the others counted as elided.
-fn blob_pieces(mut block: Block, node: store::Node, tree: store::service::View, at: Option[ident::CommitId], cut: Cut, alloc: mem::Alloc) fails task::Cancelled uses wait {
+fn blob_pieces(
+    mut block: Block,
+    node: store::Node,
+    tree: store::service::View,
+    at: Option[ident::CommitId],
+    cut: Cut,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
     let pieces = (node.size + PIECE_BYTES - 1) / PIECE_BYTES
     var from: u64 = 0
     if cut.skip > 0 {
@@ -496,7 +528,13 @@ struct Bounds derives Copy {
 } Bounds
 
 /// `find <query>`: the rows of the query's path that its condition keeps, in its order, at most its limit, with its fields.
-fn find(request: Request, query: Str, tree: store::service::View, budget: os::SessionBudget, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+fn find(
+    request: Request,
+    query: Str,
+    tree: store::service::View,
+    budget: os::SessionBudget,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
     let id = request.id.as_str()
     let verb = request.verb.as_str()
     let Some(parsed) = Query.parse(query, alloc) else {
@@ -638,7 +676,13 @@ fn bounded(bounds: Bounds, comparison: Comparison) -> Bounds {
 } bounded
 
 /// The `budget.query` failure of a query whose rows pass the session's query budget, with the fix narrowing a stream to its latest records.
-fn over_budget(query: Query, node: store::Node, scanned: u64, budget: os::SessionBudget, alloc: mem::Alloc) -> Failure {
+fn over_budget(
+    query: Query,
+    node: store::Node,
+    scanned: u64,
+    budget: os::SessionBudget,
+    alloc: mem::Alloc,
+    ) -> Failure {
     var expected = text::String.of("at most ", alloc)
     mut expected.write(Dyn[Render].view(budget.query_records), budget: 24)
     mut expected.append(" records")
@@ -657,7 +701,13 @@ fn over_budget(query: Query, node: store::Node, scanned: u64, budget: os::Sessio
 } over_budget
 
 /// The records of the stream `node` from `bounds.low` to `bounds.high`, each an `event` record for `/journal/events` and a `row` otherwise, and the bytes their values take, reading stopping once they pass `most_bytes`.
-fn stream_rows(tree: store::service::View, node: store::Node, bounds: Bounds, most_bytes: u64, alloc: mem::Alloc) -> Scanned fails task::Cancelled uses wait {
+fn stream_rows(
+    tree: store::service::View,
+    node: store::Node,
+    bounds: Bounds,
+    most_bytes: u64,
+    alloc: mem::Alloc,
+    ) -> Scanned fails task::Cancelled uses wait {
     var rows = mem::List[Row].empty(alloc)
     var bytes: u64 = 0
     let events = node.path.text.as_str() == "/journal/events"

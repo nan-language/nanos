@@ -58,7 +58,7 @@ fn applied(
     out: sys::Outbox[LinkSession],
     alloc: mem::Alloc,
     ) -> Moved fails task::Cancelled uses wait {
-    let acting = match first attempt await tree.acting(ident::Principal(text: applying.plan.principal.text), session: applying.session, origins: labels_of(applying.plan.effects.taint, alloc), alloc) {
+    let acting = match first attempt await acting_on(tree, branch: applying.plan.effects.branch.as_str(), principal: ident::Principal(text: applying.plan.principal.text), session: applying.session, origins: labels_of(applying.plan.effects.taint, alloc), alloc) {
         Ok(view) => view
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(failed) => return finish_as(PlanState.Failed, code: failed.code().as_str(), alloc)
@@ -244,14 +244,7 @@ pub fn commit_span(
     }
     var reads = mem::List[store::Read].empty(alloc)
     for read in span.reads {
-        let version = match latest_writer(applying, path: read.path, before: span.span) {
-            Some(at) => store::Version.Commit(earlier[at])
-            None => match read.commit.number {
-                0 => store::Version.Absent
-                else => store::Version.Commit(read.commit)
-            }
-        }
-        mut reads.push(store::Read(path: ident::Path(text: text::String.of(read.path.text.as_str(), alloc)), version: take version, scope: store::Scope.Node))
+        mut reads.push(store::Read(path: ident::Path(text: text::String.of(read.path.text.as_str(), alloc)), version: expected_version(applying, read, span: span.span, earlier), scope: store::Scope.Node))
     }
     var key = text::String.of(applying.key.as_str(), alloc)
     mut key.push('.')
@@ -268,6 +261,39 @@ pub fn commit_span(
         Err(failed) => Err(text::String.of(failed.code().as_str(), alloc))
     }
 } commit_span
+
+/// The code `plan.stale` when a node of the read set of `applying`, as `acting` reads it, is not at the version the span numbered `span` expects after the span commits `earlier`, or the code of the failing read.
+pub fn stale_read(
+    applying: Applying,
+    span: u32,
+    earlier: mem::List[ident::CommitId],
+    acting: store::service::View,
+    alloc: mem::Alloc,
+    ) -> Option[text::String] fails task::Cancelled uses wait {
+    for read in applying.plan.inputs.reads {
+        let found = match first attempt await acting.get(ident::Path(text: text::String.of(read.path.text.as_str(), alloc)), at: None, alloc) {
+            Ok(node) => store::Version.Commit(node.version)
+            Err(store::service::ViewError.Failed(store::service::Failure.NotFound)) => store::Version.Absent
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => return Some(text::String.of(failed.code().as_str(), alloc))
+        }
+        if found != expected_version(applying, read, span, earlier) {
+            return Some(text::String.of("plan.stale", alloc))
+        }
+    }
+    return None
+} stale_read
+
+/// The version the node `read` of the read set of `applying` has when the span numbered `span` commits after the span commits `earlier`: the commit of the latest earlier span writing it, else its recorded commit, or none for `#0`.
+fn expected_version(applying: Applying, read: NodeRead, span: u32, earlier: mem::List[ident::CommitId]) -> store::Version {
+    return match latest_writer(applying, path: read.path, before: span) {
+        Some(at) => store::Version.Commit(earlier[at])
+        None => match read.commit.number {
+            0 => store::Version.Absent
+            else => store::Version.Commit(read.commit)
+        }
+    }
+} expected_version
 
 /// The index among the spans of `applying` of the latest span before the span numbered `before` that writes `path`.
 fn latest_writer(applying: Applying, path: ident::Path, before: u32) -> Option[usize] {
@@ -427,18 +453,73 @@ fn reverted(
     return finish_as(PlanState.Reverted, code, alloc)
 } reverted
 
-/// Reverts, as revert by blame does, the commit that last wrote each plan's record at `/sys/plans`, a span commit awaiting its confirmation or a timed plan's schedule, whose apply ended with `link`'s restart; gives the event of each such plan's failure with `plan.interrupted`.
+/// Reverts, as revert by blame does, on the running branch through `tree` and on each other branch but preview and job branches, the commit that last wrote each plan's record at `/sys/plans`, a span commit awaiting its confirmation or a timed plan's schedule, whose apply ended with `link`'s restart; gives the event of each such plan's failure with `plan.interrupted`.
 pub fn recover_plans(tree: store::service::View, alloc: mem::Alloc) -> mem::List[PlanEvent] fails task::Cancelled uses wait {
     var interrupted = mem::List[PlanEvent].empty(alloc)
-    let listing = match first attempt await tree.list(ident::Path(text: text::String.of("/sys/plans", alloc)), after: None, limit: 256, alloc) {
+    try await recovered_on(tree, mut interrupted, alloc)
+    let branches = try await other_branches(tree, alloc)
+    for name in take branches {
+        match first attempt await tree.on_branch(take name, alloc) {
+            Ok(store::service::Branched(branch: _, view: reached)) => try await recovered_on(reached, mut interrupted, alloc)
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => {
+            }
+        }
+    }
+    return interrupted
+} recover_plans
+
+/// The names of the branches `/history/branches` lists through `tree`, but the running branch and preview and job branches.
+fn other_branches(tree: store::service::View, alloc: mem::Alloc) -> mem::List[text::String] fails task::Cancelled uses wait {
+    var names = mem::List[text::String].empty(alloc)
+    var prefixes = mem::List[text::String].empty(alloc)
+    mut prefixes.push(text::String.empty(alloc))
+    while prefixes.len() > 0 {
+        let prefix = mut prefixes.remove(0)
+        var path = text::String.of("/history/branches", alloc)
+        if prefix.byte_len() > 0 {
+            mut path.push('/')
+            mut path.append(prefix.as_str())
+        }
+        let listing = match first attempt await tree.list(ident::Path(text: take path), after: None, limit: 256, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => continue
+        }
+        for entry in listing.entries {
+            var name = text::String.of(prefix.as_str(), alloc)
+            if name.byte_len() > 0 {
+                mut name.push('/')
+            }
+            mut name.append(entry.name.as_str())
+            match entry.kind {
+                store::NodeKind.Dir => {
+                    if name.as_str() != "preview" and name.as_str() != "job" {
+                        mut prefixes.push(take name)
+                    }
+                }
+                else => {
+                    if name.as_str() != RUNNING_BRANCH {
+                        mut names.push(take name)
+                    }
+                }
+            }
+        }
+    }
+    return names
+} other_branches
+
+/// Reverts through `view` the commit that last wrote each plan's record at `/sys/plans` of its branch, adding the event of each such plan's failure with `plan.interrupted` to `interrupted`.
+fn recovered_on(view: store::service::View, mut interrupted: mem::List[PlanEvent], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let listing = match first attempt await view.list(ident::Path(text: text::String.of("/sys/plans", alloc)), after: None, limit: 256, alloc) {
         Ok(found) => found
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => return interrupted
+        Err(_) => return
     }
     for entry in listing.entries {
         var path = text::String.of("/sys/plans/", alloc)
         mut path.append(entry.name.as_str())
-        let writers = match first attempt await tree.history(ident::Path(text: take path), before: None, limit: 1, alloc) {
+        let writers = match first attempt await view.history(ident::Path(text: take path), before: None, limit: 1, alloc) {
             Ok(found) => found
             Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
             Err(_) => continue
@@ -449,15 +530,14 @@ pub fn recover_plans(tree: store::service::View, alloc: mem::Alloc) -> mem::List
         let Some(plan) = written.plan else {
             continue
         }
-        match attempt await tree.revert(written.number, dry_run: false, alloc) {
+        match attempt await view.revert(written.number, dry_run: false, alloc) {
             Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
             else => {
             }
         }
         mut interrupted.push(PlanEvent(plan: plan, state: PlanState.Failed, span: span_of_key(written.key), commit: Some(written.number), entry: None, code: Some(text::String.of("plan.interrupted", alloc))))
     }
-    return interrupted
-} recover_plans
+} recovered_on
 
 /// The span a commit of a plan's apply commits under the request key `<key>.<span>`, 0 for none.
 fn span_of_key(key: Option[text::String]) -> u32 {

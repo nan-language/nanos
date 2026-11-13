@@ -1,4 +1,4 @@
-//! The Views of branches and of sessions: the store mints a View of each branch a request creates, holding its root entry until the branch is deleted, and Views acting for the principals of sessions, holding the root entries of the latest.
+//! The Views of branches and of sessions: the store mints a View of each branch a request creates, holding its root entry until the branch is deleted, and Views of existing branches and Views acting for the principals of sessions, holding the root entries of the latest.
 
 /// A branch a request created, and a View of it with the requesting View's subtree and rights.
 pub closed struct Branched {
@@ -22,23 +22,24 @@ struct ActingReply derives Render, Encode {
     view: u64
 } ActingReply
 
-/// The most root entries of Views acting for sessions the store holds; the least recently used gives way.
-const MOST_ACTING: usize = 64
+/// The most root entries of Views of existing branches and of Views acting for sessions the store holds; the least recently used gives way.
+const MOST_HELD: usize = 64
 
-/// A branch's name and the root entry of its Views, and for Views acting for a session's principal, their subtree, that principal and that session.
+/// A branch's name and the root entry of its Views, and for Views of an existing branch or acting for a session's principal, whom they are held for.
 linear struct BranchRoot {
     name: text::String
     root: MintedView
-    acting: Option[ActingFor]
+    holder: Option[Holder]
 } BranchRoot
 
-/// The subtree, principal and session the Views of a root entry act for, and the origin labels they stamp.
-struct ActingFor derives Eq {
+/// The subtree, principal, instance or session and origin labels of the Views of a root entry.
+struct Holder derives Eq {
     prefix: ident::Path
     principal: ident::Principal
-    session: ident::SessionId
+    instance: Option[ident::Moniker]
+    session: Option[ident::SessionId]
     origins: mem::List[ident::OriginLabel]
-} ActingFor
+} Holder
 
 /// The root entries of the Views of the branches requests created.
 linear struct BranchRoots {
@@ -71,11 +72,11 @@ fn BranchRoots.mint(mut self, scope: Scoped, name: Str, alloc: mem::Alloc) -> Vi
     }
     let root = MintedView.of_writer(store: scope.store, prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), branch: name, principal: ident::Principal(text: scope.principal.text), take instance, session: scope.session, origins: labels_of(scope.origins, alloc), alloc)
     let view = root.mint(Rights.from_bits(scope.rights))
-    mut self.roots.push(BranchRoot(name: text::String.of(name, alloc), root: take root, acting: None))
+    mut self.roots.push(BranchRoot(name: text::String.of(name, alloc), root: take root, holder: None))
     return view
 } BranchRoots.mint
 
-/// A View of the subtree, branch and rights of `scope` acting for `principal` in `session` and stamping `origins`, from the root entry held for them, made when none is, the least recently used acting root entry giving way beyond `MOST_ACTING`.
+/// A View of the subtree, branch and rights of `scope` acting for `principal` in `session` and stamping `origins`.
 fn BranchRoots.acting(
     mut self,
     scope: Scoped,
@@ -84,14 +85,35 @@ fn BranchRoots.acting(
     take origins: mem::List[ident::OriginLabel],
     alloc: mem::Alloc,
     ) -> View {
-    let wanted = ActingFor(prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), principal: take principal, session: session, origins: take origins)
+    let wanted = Holder(prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), principal: take principal, instance: None, session: Some(session), origins: take origins)
+    return mut self.held(scope, take wanted, name: scope.branch.as_str(), alloc)
+} BranchRoots.acting
+
+/// A View of the existing branch `name` with the subtree, rights, principal, instance or session and origin labels of `scope`.
+fn BranchRoots.on_branch(mut self, scope: Scoped, name: Str, alloc: mem::Alloc) -> View {
+    let instance = match scope.instance {
+        Some(moniker) => Some(ident::Moniker(text: moniker.text))
+        None => None
+    }
+    let wanted = Holder(prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), principal: ident::Principal(text: scope.principal.text), instance: take instance, session: scope.session, origins: labels_of(scope.origins, alloc))
+    return mut self.held(scope, take wanted, name, alloc)
+} BranchRoots.on_branch
+
+/// A View of the branch `name` with the rights of `scope`, held for `wanted`, from the root entry held for them, made when none is, the least recently used held root entry giving way beyond `MOST_HELD`.
+fn BranchRoots.held(
+    mut self,
+    scope: Scoped,
+    take wanted: Holder,
+    name: Str,
+    alloc: mem::Alloc,
+    ) -> View {
     let rights = Rights.from_bits(scope.rights)
     var held: usize = 0
     var oldest: Option[usize] = None
     for at in 0..<self.roots.len() {
-        match self.roots[at].acting {
-            Some(acting) => {
-                if acting == wanted and self.roots[at].name == scope.branch {
+        match self.roots[at].holder {
+            Some(holder) => {
+                if holder == wanted and self.roots[at].name.as_str() == name {
                     let kept = mut self.roots.remove(at)
                     let view = kept.root.mint(rights)
                     mut self.roots.push(take kept)
@@ -107,25 +129,34 @@ fn BranchRoots.acting(
         }
     }
     match first oldest {
-        Some(at) if held >= MOST_ACTING => {
-            let BranchRoot(name: _, root: gone, acting: _) = mut self.roots.remove(at)
+        Some(at) if held >= MOST_HELD => {
+            let BranchRoot(name: _, root: gone, holder: _) = mut self.roots.remove(at)
             take gone.close()
         }
         else => {
         }
     }
-    let root = MintedView.of_writer(store: scope.store, prefix: ident::Path(text: text::String.of(scope.prefix.text.as_str(), alloc)), branch: scope.branch.as_str(), principal: ident::Principal(text: wanted.principal.text), instance: None, session: Some(session), origins: labels_of(wanted.origins, alloc), alloc)
+    let root = wanted.root(store: scope.store, branch: name, alloc)
     let view = root.mint(rights)
-    mut self.roots.push(BranchRoot(name: text::String.of(scope.branch.as_str(), alloc), root: take root, acting: Some(take wanted)))
+    mut self.roots.push(BranchRoot(name: text::String.of(name, alloc), root: take root, holder: Some(take wanted)))
     return view
-} BranchRoots.acting
+} BranchRoots.held
+
+/// A root entry of Views of `branch` through the store's port `store` held for this holder.
+fn Holder.root(self, store: os::PortHandle, branch: Str, alloc: mem::Alloc) -> MintedView {
+    let instance = match self.instance {
+        Some(moniker) => Some(ident::Moniker(text: moniker.text))
+        None => None
+    }
+    return MintedView.of_writer(store: store, prefix: ident::Path(text: text::String.of(self.prefix.text.as_str(), alloc)), branch, principal: ident::Principal(text: self.principal.text), take instance, session: self.session, origins: labels_of(self.origins, alloc), alloc)
+} Holder.root
 
 /// Revokes the Views of the branch `name`.
 fn BranchRoots.revoke(mut self, name: Str) {
     var at: usize = 0
     while at < self.roots.len() {
         if self.roots[at].name.as_str() == name {
-            let BranchRoot(name: _, root: root, acting: _) = mut self.roots.remove(at)
+            let BranchRoot(name: _, root: root, holder: _) = mut self.roots.remove(at)
             take root.close()
         } else {
             at += 1
@@ -137,7 +168,7 @@ fn BranchRoots.revoke(mut self, name: Str) {
 fn BranchRoots.close(take self) {
     let BranchRoots(roots: roots) = self
     for held in take roots {
-        let BranchRoot(name: _, root: root, acting: _) = held
+        let BranchRoot(name: _, root: root, holder: _) = held
         take root.close()
     }
 } BranchRoots.close
@@ -204,5 +235,26 @@ test acting_views_stamp_their_session_and_origins_and_the_oldest_gives_way for B
         discard mut roots.acting(scope, principal: ident::Principal(text: text::Fixed[64].of("owner")), session: ident::SessionId(boot: 2, number: 100 + number), origins: mem::List.empty(alloc), alloc)
     }
     let evicted = earliest.scoped(alloc).is_none()
-    expect roots.roots.len() == MOST_ACTING and evicted
+    expect roots.roots.len() == MOST_HELD and evicted
 } acting_views_stamp_their_session_and_origins_and_the_oldest_gives_way
+
+test views_of_existing_branches_keep_their_holder_and_rights for BranchRoots.on_branch {
+    let alloc = testing::world().alloc
+    var views = TestViews.of(branch: "main", alloc)
+    defer take views.close()
+    var roots = BranchRoots.empty(alloc)
+    defer take roots.close()
+    let Some(scope) = views.root.mint(Rights.reading()).scoped(alloc) else {
+        expect false
+        return
+    }
+    discard mut roots.on_branch(scope, name: "feature", alloc)
+    let again = mut roots.on_branch(scope, name: "feature", alloc)
+    let Some(reached) = again.scoped(alloc) else {
+        expect false
+        return
+    }
+    expect reached.branch.as_str() == "feature" and reached.prefix.text.as_str() == "/data" and reached.principal.text.as_str() == "owner"
+    expect Rights.from_bits(reached.rights).read and not Rights.from_bits(reached.rights).write
+    expect roots.roots.len() == 1
+} views_of_existing_branches_keep_their_holder_and_rights

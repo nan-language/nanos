@@ -100,7 +100,7 @@ fn Linker.undone_plan(self, request: Request, alloc: mem::Alloc) -> Option[ident
     }
 } Linker.undone_plan
 
-/// The inverse steps of the commit or the kept plan `request` names.
+/// The inverse steps of the commit or the kept plan `request` names: for a plan, the reverts of its span commits whose steps changed a node, newest first.
 fn Linker.inverse_steps(self, request: Request, alloc: mem::Alloc) -> Result[mem::List[Written], Failure] {
     let operand = match request.operands.get(0) {
         Some(word) => text::String.of(word.as_str(), alloc)
@@ -114,13 +114,16 @@ fn Linker.inverse_steps(self, request: Request, alloc: mem::Alloc) -> Result[mem
                 Ok(found) => found
                 Err(failure) => return Err(take failure)
             }
-            for commit in self.plans[plan_at].commits {
-                mut commits.insert(0, value: commit)
+            let held = self.plans[plan_at]
+            for at in 0..<held.commits.len() {
+                if held.plan.effects.changes_span(span: u32.saturate(at + 1)) {
+                    mut commits.insert(0, value: held.commits[at])
+                }
             }
         }
     }
     if commits.len() == 0 {
-        return Err(Failure.of("request.invalid-operand", subject: operand.as_str(), alloc).expecting("a commit, or a plan that committed", found: operand.as_str(), alloc))
+        return Err(Failure.of("request.invalid-operand", subject: operand.as_str(), alloc).expecting("a commit, or a plan whose span commits changed a node", found: operand.as_str(), alloc))
     }
     var steps = mem::List[Written].empty(alloc)
     for commit in commits {
@@ -151,7 +154,7 @@ fn Linker.preview_steps(
     let session = self.running[at].session
     let slot = self.running[at].slot
     let asked = match steps {
-        Ok(found) => self.planning(request, steps: take found, session, now_utc: now_utc_ns(env.wall, clock: env.clock), alloc)
+        Ok(found) => self.planning(request, steps: take found, session, undone, now_utc: now_utc_ns(env.wall, clock: env.clock), alloc)
         Err(failure) => Err(take failure)
     }
     let planned = match asked {
@@ -194,21 +197,40 @@ fn irreversible_added(take outcome: Preview, undone: ident::HashValue, tree: sto
     }
 } irreversible_added
 
-/// What the preview of `steps` for `request` in the session numbered `session` needs: the steps and the request's options, the session's principal and what it holds, its taint, and the sessions open; refused without a session, with options of the wrong form, or while the principal's sessions run their most previews.
+/// What the preview of `steps` for `request` in the session numbered `session` needs: the steps and the request's options, on the branch of the plan `undone` for its inverse, the session's principal and what it holds, its taint, and the sessions open; refused without a session, with options of the wrong form, with a step its branch cannot hold, or while the principal's sessions run their most previews.
 fn Linker.planning(
     self,
     request: Request,
     take steps: mem::List[Written],
     session: u64,
+    undone: Option[ident::HashValue],
     now_utc: i64,
     alloc: mem::Alloc,
     ) -> Result[Planning, Failure] {
     let Some(at) = self.sessions.position(fn(each: Session) => each.number == session) else {
         return Err(Failure.of("auth.denied", subject: request.verb.as_str(), alloc).expecting("a session", found: "none", alloc))
     }
-    let options = match options_of(request, plans: self.config.plans, alloc) {
+    var options = match options_of(request, plans: self.config.plans, alloc) {
         Ok(found) => found
         Err(failure) => return Err(take failure)
+    }
+    match undone {
+        Some(hash) => {
+            match self.plans.position(fn(each: KeptPlan) => each.hash == hash) {
+                Some(inverted) => {
+                    options.branch = text::String.of(self.plans[inverted].plan.effects.branch.as_str(), alloc)
+                }
+                None => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    match misplaced(steps, branch: options.branch.as_str(), alloc) {
+        Some(failure) => return Err(take failure)
+        None => {
+        }
     }
     let principal = self.sessions[at].principal
     var previewing: u32 = 0
@@ -759,8 +781,9 @@ fn Linker.confirm(
     let tree = env.tree
     let acting_session = ident::SessionId(boot: self.boot(), number: session)
     let origins = self.taint_of(principal, alloc)
-    mut cx.spawn(key: ANSWERING + slot, run: fn[take key, take principal, take origins, take block](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
-        let answered = try await confirmed_plan(hash, commit, take principal, session: acting_session, take origins, take key, take block, tree, alloc)
+    let branch = text::String.of(self.plans[plan_at].plan.effects.branch.as_str(), alloc)
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take key, take principal, take origins, take branch, take block](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let answered = try await confirmed_plan(hash, commit, take principal, session: acting_session, take origins, branch: branch.as_str(), take key, take block, tree, alloc)
         discard attempt await out.responded(number, block: take answered)
     })
     mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
@@ -789,20 +812,21 @@ fn Linker.provisional(self, request: Request, session: u64, alloc: mem::Alloc) -
     return Err(Failure.of("plan.not-provisional", subject: operand.as_str(), alloc))
 } Linker.provisional
 
-/// Commits the deletion of the record at `/sys/plans` of the plan `hash` through a View acting for `principal` in `session` with the origin labels `origins`, under `key`, giving `block` with its `confirmed` record, or failed with the store's code.
+/// Commits the deletion of the record at `/sys/plans` of the plan `hash` on its branch `branch` through a View acting for `principal` in `session` with the origin labels `origins`, under `key`, giving `block` with its `confirmed` record, or failed with the store's code.
 fn confirmed_plan(
     hash: ident::HashValue,
     commit: ident::CommitId,
     take principal: ident::Principal,
     session: ident::SessionId,
     take origins: mem::List[ident::OriginLabel],
+    branch: Str,
     take key: text::String,
     take block: Block,
     tree: store::service::View,
     alloc: mem::Alloc,
     ) -> Block fails task::Cancelled uses wait {
     var reply_block = block
-    let acting = match first attempt await tree.acting(take principal, session, take origins, alloc) {
+    let acting = match first attempt await acting_on(tree, branch, take principal, session, take origins, alloc) {
         Ok(view) => view
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(failed) => {
@@ -885,25 +909,27 @@ fn Linker.cancel_plan(
     }
     let tree = env.tree
     let origins = self.taint_of(principal, alloc)
-    mut cx.spawn(key: ANSWERING + slot, run: fn[take principal, take origins, take block](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
-        let answered = try await unscheduled(hash, take principal, session: acting_session, take origins, take block, tree, alloc)
+    let branch = text::String.of(self.plans[plan_at].plan.effects.branch.as_str(), alloc)
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take principal, take origins, take branch, take block](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let answered = try await unscheduled(hash, take principal, session: acting_session, take origins, branch: branch.as_str(), take block, tree, alloc)
         discard attempt await out.responded(number: cancel_number, block: take answered)
     })
     return true
 } Linker.cancel_plan
 
-/// Deletes the records at `/sys/schedule` and `/sys/plans` of the plan `hash` through a View acting for `principal` in `session` with the origin labels `origins`, giving `block`, or failed with the store's code.
+/// Deletes the records at `/sys/schedule` and `/sys/plans` of the plan `hash` on its branch `branch` through a View acting for `principal` in `session` with the origin labels `origins`, giving `block`, or failed with the store's code.
 fn unscheduled(
     hash: ident::HashValue,
     take principal: ident::Principal,
     session: ident::SessionId,
     take origins: mem::List[ident::OriginLabel],
+    branch: Str,
     take block: Block,
     tree: store::service::View,
     alloc: mem::Alloc,
     ) -> Block fails task::Cancelled uses wait {
     var reply_block = block
-    let acting = match first attempt await tree.acting(take principal, session, take origins, alloc) {
+    let acting = match first attempt await acting_on(tree, branch, take principal, session, take origins, alloc) {
         Ok(view) => view
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(failed) => {
