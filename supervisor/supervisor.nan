@@ -6,6 +6,9 @@ const STARTING: u64 = 1
 /// The key of the keyed task reconciling the instances with the desired state.
 const RECONCILING: u64 = 2
 
+/// The key of the keyed task answering a request, plus its number.
+const ANSWERING: u64 = 0x1_0000_0000
+
 /// The base instances `supervisor` starts after itself, one step per line, those of a step in parallel: chapter 20's start order, the lazy ones last. A moniker a step names again is restarted, and one without a specification is passed over.
 const START_ORDER: Str = "devices\nfat\nkeys\nstore\nkeys journal\npolicy\nboot\nnet link console\nadmission clock power infer\n"
 
@@ -20,13 +23,32 @@ pub protocol Supervisor {
     pub fn stop(moniker: ident::Moniker) limits restorable
     /// Restarts the instance `moniker`.
     pub fn restart(moniker: ident::Moniker) limits restorable
+    /// Hibernates the running checkpointed instance `moniker`: its state becomes a hibernation image and its memory is freed until a message, a due `after` message or `wake` revives it.
+    pub fn hibernate(moniker: ident::Moniker) fails SupervisorFailure limits restorable
+    /// Revives the hibernated instance `moniker`.
+    pub fn wake(moniker: ident::Moniker) limits restorable
     /// A commit changed the desired state below a subscription's prefix.
     pub fn changed(subscription: u64, commit: ident::CommitId, paths: mem::List[ident::Path], more: u64) limits traceless
     pub fn appended(subscription: u64, path: ident::Path, seq: u64) limits traceless
     /// The store could not tell of `commits` commits.
     pub fn lost(subscription: u64, commits: u64) limits traceless
     fn reconciled(listed: mem::List[ident::Moniker]) limits traceless
+    /// The request `request` ended with `reply`.
+    fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Supervisor
+
+/// Why an operation on an instance failed: it keeps no checkpoints, or it does not run.
+pub closed enum SupervisorFailure derives Eq, Render, Encode {
+    Volatile
+    NotRunning
+} SupervisorFailure
+
+/// What the runner does to an instance for the supervisor.
+enum Carried derives Copy, Eq {
+    Stop
+    Restart
+    Wake
+} Carried
 
 pub closed struct Env {
     pub control: os::Control
@@ -84,7 +106,7 @@ pub fn Supervision.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut
 
 pub fn Supervision.stop(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
     let Some(view) = env.tree else {
-        carry_out(mut cx, control: env.control, take moniker, restart: false, reached: None, alloc: env.alloc)
+        carry_out(mut cx, control: env.control, take moniker, order: Carried.Stop, reached: None, alloc: env.alloc)
         return
     }
     let alloc = env.alloc
@@ -94,8 +116,43 @@ pub fn Supervision.stop(mut self, take moniker: ident::Moniker, mut env: Env, mu
 } Supervision.stop
 
 pub fn Supervision.restart(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
-    carry_out(mut cx, control: env.control, take moniker, restart: true, reached: None, alloc: env.alloc)
+    carry_out(mut cx, control: env.control, take moniker, order: Carried.Restart, reached: None, alloc: env.alloc)
 } Supervision.restart
+
+/// Has the runner hibernate the instance `moniker` from a keyed task, which answers the request once it hibernated or still runs; the failure returned is the one a postponed request drops.
+pub fn Supervision.hibernate(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) fails SupervisorFailure {
+    let control = env.control
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail SupervisorFailure.NotRunning
+    }
+    mut cx.spawn(key: ANSWERING + request, run: fn[take moniker](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
+        let outcome: Result[Unit, SupervisorFailure] = match first attempt await control.hibernate(take moniker, alloc) {
+            Ok(_) => Ok(Unit)
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            Err(os::ControlError.Volatile) => Err(SupervisorFailure.Volatile)
+            Err(_) => Err(SupervisorFailure.NotRunning)
+        }
+        var reply = sys::Encoded.empty(alloc)
+        mem::wire::Codec[Result[Unit, SupervisorFailure]].encode(outcome, out: mut reply.bytes)
+        discard attempt await out.answered(request, take reply)
+    })
+    fail SupervisorFailure.NotRunning
+} Supervision.hibernate
+
+pub fn Supervision.wake(mut self, take moniker: ident::Moniker, mut env: Env, mut cx: sys::Cx[Supervisor]) {
+    carry_out(mut cx, control: env.control, take moniker, order: Carried.Wake, reached: None, alloc: env.alloc)
+} Supervision.wake
+
+fn Supervision.answered(
+    mut self,
+    take request: u64,
+    take reply: sys::Encoded,
+    mut env: Env,
+    mut cx: sys::Cx[Supervisor],
+    ) {
+    discard attempt mut cx.reply(request, reply)
+} Supervision.answered
 
 /// Reconciles the instances a commit's desired state names: a pass over every specification, and a restart of each instance whose configuration record it changed.
 pub fn Supervision.changed(
@@ -111,7 +168,7 @@ pub fn Supervision.changed(
         let Some(moniker) = configured(path, alloc: env.alloc) else {
             continue
         }
-        carry_out(mut cx, control: env.control, take moniker, restart: true, reached: Some(commit.number), alloc: env.alloc)
+        carry_out(mut cx, control: env.control, take moniker, order: Carried.Restart, reached: Some(commit.number), alloc: env.alloc)
     }
     mut self.reconcile(mut env, mut cx)
 } Supervision.changed
@@ -178,19 +235,20 @@ fn keyed(moniker: ident::Moniker) -> u64 {
     return key | 0x8000_0000_0000_0000
 } keyed
 
-/// Has the runner stop, or restart when `restart`, the instance `moniker` from a keyed task of its own, which a later order for the same instance does not cancel, then tells it the commit of the desired value it brought the instance to, when `reached` names one.
+/// Has the runner carry out `order` on the instance `moniker` from a keyed task of its own, which a later order for the same instance does not cancel, then tells it the commit of the desired value it brought the instance to, when `reached` names one.
 fn carry_out(
     mut cx: sys::Cx[Supervisor],
     control: os::Control,
     take moniker: ident::Moniker,
-    restart: bool,
+    order: Carried,
     reached: Option[u64],
     alloc: mem::Alloc,
     ) {
     mut cx.spawn(key: keyed(moniker), run: fn[take moniker](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 16_384 {
-        let ordered = match restart {
-            false => attempt await control.stop(ident::Moniker(text: moniker.text), alloc)
-            true => attempt await control.restart(ident::Moniker(text: moniker.text), alloc)
+        let ordered = match order {
+            Carried.Stop => attempt await control.stop(ident::Moniker(text: moniker.text), alloc)
+            Carried.Restart => attempt await control.restart(ident::Moniker(text: moniker.text), alloc)
+            Carried.Wake => attempt await control.wake(ident::Moniker(text: moniker.text), alloc)
         }
         try settled(take ordered)
         let Some(commit) = reached else {

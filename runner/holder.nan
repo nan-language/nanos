@@ -6,11 +6,12 @@ const HOLDER_ORDERS: usize = 8
 /// The request number a replayed call is served under.
 const REPLAYED_REQUEST: u64 = 0xFFFF_FFFF_FFFF_FFFF
 
-/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`; a pause, told to `done`; the end of the pause; a replay of `call` under `header`, the component's Views of `main` reaching the branch `branch` through `redirect` and its clock and random source serving `recorded` through `tape` meanwhile, which the holder reports; the release of what replays keep but those `kept` names; the release of the first message or keyed task `kept` names; and the drop of what replays keep.
+/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`; a pause, told to `done`; the end of the pause; a hibernation; a replay of `call` under `header`, the component's Views of `main` reaching the branch `branch` through `redirect` and its clock and random source serving `recorded` through `tape` meanwhile, which the holder reports; the release of what replays keep but those `kept` names; the release of the first message or keyed task `kept` names; and the drop of what replays keep.
 enum HolderOrder {
     Snapshot(reply: task::Sender[os::StateCopy])
     Pause(done: task::Sender[Result[os::Outcome, os::ControlError]])
     Resume
+    Hibernate
     Replay(call: os::ForkCall, header: os::Header, branch: text::String, redirect: store::service::Redirect, recorded: os::Recorded, tape: Tape)
     Release(kept: mem::List[os::Kept], done: task::Sender[Result[os::Outcome, os::ControlError]])
     Deliver(kept: os::Kept, done: task::Sender[Result[os::Outcome, os::ControlError]])
@@ -107,22 +108,22 @@ fn Holding.none(alloc: mem::Alloc) -> Holding[P] {
     return Holding(paused: false, aside: mem::List.empty(alloc), sent: mem::List.empty(alloc), tasks: mem::List.empty(alloc))
 } Holding.none
 
-/// Carries out every order waiting for the holder of `stepper`, its component quiescent, telling the driver through `reports` what each replay gave; the messages it posts again go from tasks of `s`, once their delay has passed by `clock`.
+/// Carries out every order waiting for the holder of `stepper`, its component quiescent, telling the driver through `telling` what each replay gave; the messages it posts again go from tasks of `s`, once their delay has passed. Gives whether a hibernation is ordered, which the holder carries out before the orders after it.
 fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
     mut stepper: sys::Stepper[S, Env, P],
     orders: Orders,
     mut holding: Holding[P],
-    reports: task::Sender[Input],
-    incarnation: u64,
-    clock: sys::Clock,
+    telling: Telling,
     s: task::Scope,
-    alloc: mem::Alloc,
-    ) fails task::Cancelled uses wait {
+    ) -> bool fails task::Cancelled uses wait {
+    let clock = telling.clock
+    let alloc = telling.alloc
     loop {
         let Some(order) = orders.next() else {
-            return
+            return false
         }
         match order {
+            HolderOrder.Hibernate => return true
             HolderOrder.Snapshot(reply: reply) => {
                 discard attempt await reply.send(state_copy(stepper, alloc))
             }
@@ -146,7 +147,7 @@ fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
                 tape.replay(recorded)
                 let outcome = try await replayed(mut stepper, take call, header, branch: branch.as_str(), redirect, mut holding, s, alloc)
                 tape.pass()
-                try await tell(reports, incarnation, report: Report.Replayed(outcome: take outcome))
+                try await telling.tell(report: Report.Replayed(outcome: take outcome))
             }
             HolderOrder.Release(kept: kept, done: done) => {
                 mut holding.release(mut stepper, kept, clock, s, alloc)
@@ -280,7 +281,14 @@ fn Holding.keep_tasks[S, Env: Any](mut self, stepper: sys::Stepper[S, Env, P], a
 } Holding.keep_tasks
 
 /// Releases what replays keep but one message or keyed task per name of `kept`: posts the messages again from tasks of `s` and starts the keyed tasks.
-fn Holding.release[S, Env: Any](mut self, mut stepper: sys::Stepper[S, Env, P], kept: mem::List[os::Kept], clock: sys::Clock, s: task::Scope, alloc: mem::Alloc) {
+fn Holding.release[S, Env: Any](
+    mut self,
+    mut stepper: sys::Stepper[S, Env, P],
+    kept: mem::List[os::Kept],
+    clock: sys::Clock,
+    s: task::Scope,
+    alloc: mem::Alloc,
+    ) {
     var names = mem::List[os::Kept].empty(alloc)
     for name in kept {
         mut names.push(name)
@@ -313,7 +321,13 @@ fn Holding.release[S, Env: Any](mut self, mut stepper: sys::Stepper[S, Env, P], 
 } Holding.release
 
 /// Releases the first message or keyed task replays keep that `kept` names: posts the message again from a task of `s`, or starts the keyed task; whether one was kept.
-fn Holding.deliver[S, Env: Any](mut self, mut stepper: sys::Stepper[S, Env, P], kept: os::Kept, clock: sys::Clock, s: task::Scope) -> bool {
+fn Holding.deliver[S, Env: Any](
+    mut self,
+    mut stepper: sys::Stepper[S, Env, P],
+    kept: os::Kept,
+    clock: sys::Clock,
+    s: task::Scope,
+    ) -> bool {
     if kept.task {
         if self.tasks.len() == 0 {
             return false

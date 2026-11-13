@@ -1,0 +1,239 @@
+//! The LZ4 block format: blocks of sequences, each literals copied as they are and a match copied from earlier output.
+
+/// The shortest match a sequence copies.
+const MIN_MATCH: usize = 4
+
+/// The bytes at the end of a block that only literals hold.
+const LAST_LITERALS: usize = 5
+
+/// The bytes at the end of a block within which no match starts.
+const MATCH_START_LIMIT: usize = 12
+
+/// The farthest back a match copies from.
+const MAX_OFFSET: usize = 65_535
+
+/// The nibble of a token whose length continues in the bytes after it.
+const LONG: usize = 15
+
+const HASH_BITS: u32 = 12
+
+/// The positions the compressor remembers, by the hash of the four bytes at each.
+const SLOTS: usize = 4_096
+
+/// The LZ4 block of `input`, drawn through `alloc`, or `None` when it would take `limit` bytes or more; the table of positions the compressor remembers is drawn through `scratch`.
+pkg fn compress(input: Slice[u8], limit: usize, alloc: mem::Alloc, scratch: mem::Alloc) -> Option[mem::Bytes] fails mem::OutOfMemory {
+    var table = mem::List[usize].empty(scratch)
+    try mut table.try_reserve(SLOTS)
+    for _ in 0..<SLOTS {
+        try mut table.try_push(0)
+    }
+    var block = mem::Bytes.empty(alloc)
+    let length = input.len()
+    var anchor: usize = 0
+    var at: usize = 0
+    while length > MATCH_START_LIMIT and at < length - MATCH_START_LIMIT {
+        let quad = input.u32_le(at)
+        let slot = hash(quad)
+        let remembered = table[slot]
+        table[slot] = at + 1
+        if remembered == 0 or at - (remembered - 1) > MAX_OFFSET or input.u32_le(remembered - 1) != quad {
+            at += 1
+            continue
+        }
+        let from = remembered - 1
+        var matched = MIN_MATCH
+        while at + matched < length - LAST_LITERALS and input[from + matched] == input[at + matched] {
+            matched += 1
+        }
+        let Some(head) = input.prefix(at) else {
+            return None
+        }
+        let Some(pending) = head.split_at(anchor) else {
+            return None
+        }
+        try write_sequence(mut block, literals: pending.tail, offset: at - from, matched)
+        if block.len() >= limit {
+            return None
+        }
+        at += matched
+        anchor = at
+    }
+    let Some(rest) = input.split_at(anchor) else {
+        return None
+    }
+    try write_literals(mut block, literals: rest.tail)
+    if block.len() >= limit {
+        return None
+    }
+    return Some(take block)
+} compress
+
+/// The `length` bytes the LZ4 block `block` holds, drawn through `alloc`; `None` when the block is malformed or holds another length.
+pkg fn decompress(block: Slice[u8], length: usize, alloc: mem::Alloc) -> Option[mem::Bytes] fails mem::OutOfMemory {
+    var out = mem::Bytes.empty(alloc)
+    try mut out.try_reserve(length)
+    var at: usize = 0
+    loop {
+        if at >= block.len() {
+            return None
+        }
+        let token = usize.widen(block[at])
+        at += 1
+        let Some(literals) = read_length(block, mut at, nibble: token >> 4, bound: length) else {
+            return None
+        }
+        let Some(ahead) = block.split_at(at) else {
+            return None
+        }
+        let Some(copied) = ahead.tail.prefix(literals) else {
+            return None
+        }
+        if out.len() + literals > length {
+            return None
+        }
+        try mut out.try_append(copied)
+        at += literals
+        if at == block.len() {
+            break
+        }
+        if at + 2 > block.len() {
+            return None
+        }
+        let offset = usize.widen(block.u16_le(at))
+        at += 2
+        let Some(extra) = read_length(block, mut at, nibble: token & LONG, bound: length) else {
+            return None
+        }
+        let matched = extra + MIN_MATCH
+        if offset == 0 or offset > out.len() or out.len() + matched > length {
+            return None
+        }
+        let from = out.len() - offset
+        for index in 0..<matched {
+            let byte = out[from + index]
+            try mut out.try_push(byte)
+        }
+    }
+    if out.len() != length {
+        return None
+    }
+    return Some(take out)
+} decompress
+
+/// The slot of the table remembering the position of the four bytes `quad`.
+fn hash(quad: u32) -> usize = usize.widen(quad.wrapping_mul(2_654_435_761) >> (32 - HASH_BITS))
+
+/// The length a token's `nibble` starts, continued by the bytes of `block` from `at` when it is 15, `at` moving past them; `None` when they run past the block or the length passes `bound`.
+fn read_length(block: Slice[u8], mut at: usize, nibble: usize, bound: usize) -> Option[usize] {
+    var total = nibble
+    if nibble != LONG {
+        return Some(total)
+    }
+    loop {
+        if at >= block.len() or total > bound {
+            return None
+        }
+        let byte = block[at]
+        at += 1
+        total += usize.widen(byte)
+        if byte != 255 {
+            return Some(total)
+        }
+    }
+} read_length
+
+/// Appends a sequence copying `literals`, then `matched` bytes from `offset` back.
+fn write_sequence(mut block: mem::Bytes, literals: Slice[u8], offset: usize, matched: usize) fails mem::OutOfMemory {
+    let extra = matched - MIN_MATCH
+    try mut block.try_push(u8.truncate((nibble_of(literals.len()) << 4) | nibble_of(extra)))
+    try write_length(mut block, length: literals.len())
+    try mut block.try_append(literals)
+    try mut block.try_push(u8.truncate(offset))
+    try mut block.try_push(u8.truncate(offset >> 8))
+    try write_length(mut block, length: extra)
+} write_sequence
+
+/// Appends the last sequence of a block, copying `literals` alone.
+fn write_literals(mut block: mem::Bytes, literals: Slice[u8]) fails mem::OutOfMemory {
+    try mut block.try_push(u8.truncate(nibble_of(literals.len()) << 4))
+    try write_length(mut block, length: literals.len())
+    try mut block.try_append(literals)
+} write_literals
+
+/// The nibble of a token for a length.
+fn nibble_of(length: usize) -> usize {
+    if length >= LONG {
+        return LONG
+    }
+    return length
+} nibble_of
+
+/// Appends the bytes continuing a length of 15 or more past its token's nibble.
+fn write_length(mut block: mem::Bytes, length: usize) fails mem::OutOfMemory {
+    if length < LONG {
+        return
+    }
+    var left = length - LONG
+    while left >= 255 {
+        try mut block.try_push(255)
+        left -= 255
+    }
+    try mut block.try_push(u8.truncate(left))
+} write_length
+
+/// Bytes the length of `count` copies of `pattern`.
+fn repeated(pattern: Slice[u8], count: usize, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    for _ in 0..<count {
+        mut bytes.append(pattern)
+    }
+    return bytes
+} repeated
+
+/// Blocks are those of LZ4's reference compressor: a run of one byte, then a pattern repeated past the longest token nibble.
+test blocks_match_the_reference_format for compress {
+    let alloc = testing::world().alloc
+    let run = repeated(b"a", count: 20, alloc)
+    let Some(block) = try compress(run.view(), limit: 20, alloc, scratch: alloc) else {
+        expect false
+        return
+    }
+    expect block.view() == b"\x1A\x61\x01\x00\x50aaaaa"
+    let pattern = repeated(b"abcdefgh", count: 8, alloc)
+    let Some(patterned) = try compress(pattern.view(), limit: 64, alloc, scratch: alloc) else {
+        expect false
+        return
+    }
+    expect patterned.view() == b"\x8Fabcdefgh\x08\x00\x20\x50defgh"
+} blocks_match_the_reference_format
+
+test blocks_give_back_what_they_hold for decompress {
+    let alloc = testing::world().alloc
+    var mixed = repeated(b"state of an instance, ", count: 300, alloc)
+    for index in 0u32..<200 {
+        mut mixed.push(u8.truncate(index * 7))
+    }
+    mut mixed.append(repeated(b"z", count: 70_000, alloc).view())
+    let Some(block) = try compress(mixed.view(), limit: mixed.len(), alloc, scratch: alloc) else {
+        expect false
+        return
+    }
+    expect block.len() < mixed.len() / 10
+    let shorter = try decompress(block.view(), length: mixed.len() - 1, alloc)
+    expect shorter.is_none()
+    let Some(back) = try decompress(block.view(), length: mixed.len(), alloc) else {
+        expect false
+        return
+    }
+    expect back.view() == mixed.view()
+} blocks_give_back_what_they_hold
+
+/// A block that would not be shorter than its input is not given, and a malformed block gives nothing.
+test only_shorter_blocks_are_given for compress {
+    let alloc = testing::world().alloc
+    let short = try compress(b"tiny", limit: 4, alloc, scratch: alloc)
+    expect short.is_none()
+    let far = try decompress(b"\x10a\x02\x00", length: 5, alloc)
+    let cut = try decompress(b"\xF0", length: 15, alloc)
+    expect far.is_none() and cut.is_none()
+} only_shorter_blocks_are_given

@@ -55,26 +55,36 @@ fn Directory.state_view(
     return Some(view)
 } Directory.state_view
 
-/// What `/state` gives the start of an instance: no checkpoint to restore, with the keeping of checkpoints for a checkpointed instance that has none, and without for a volatile one or when `store` has no specification or takes no calls; the latest checkpoint, with the keeping of later ones; or a latest checkpoint that cannot be read.
+/// What `/state` gives the start of an instance: no checkpoint to restore, with the keeping of checkpoints for a checkpointed instance that has none, and without for a volatile one or when `store` has no specification or takes no calls; the latest checkpoint, with the keeping of later ones; the checkpoint a revival's hibernation image stands for, with the keeping of later ones when `store` takes calls; or a latest checkpoint or image that cannot be read.
 enum Restoring {
     Fresh(keeping: Option[Keeping])
     From(keeping: Keeping, checkpoint: os::Checkpoint)
+    Revived(keeping: Option[Keeping], checkpoint: os::Checkpoint)
     Unreadable
 } Restoring
 
-/// What `/state` gives the start of the instance `driver` runs: a copy of the checkpoint a restore read, added as its latest, or its latest.
-fn Shared.restoring(self, mut driver: Driver) -> Restoring fails task::Cancelled uses wait {
+/// What the start of the instance `driver` runs restores: for a `revival`, its hibernation image when hibernation memory keeps it; otherwise from `/state`, a copy of the checkpoint a restore read, added as its latest, or its latest, which also stands as an image hibernation memory does not keep.
+fn Shared.restoring(self, mut driver: Driver, revival: bool) -> Restoring fails task::Cancelled uses wait {
     if driver.spec.durability.class != os::DurabilityClass.Checkpointed {
         return Restoring.Fresh(keeping: None)
     }
     let alloc = self.config.alloc
-    let directory = self.directory.share()
-    let state = await when directory => directory.state_view(mut driver.minted, moniker: ident::Moniker(text: driver.moniker.text), principal: ident::Principal(text: driver.spec.principal.text), alloc)
-    let Some(view) = state else {
+    let kept = try await self.keeping(mut driver)
+    if revival {
+        match mut driver.image.extract() {
+            Some(image) => {
+                return match image.checkpoint(driver.incarnation, bundle: driver.spec.bundle, time: self.config.wall.now(self.config.clock), alloc) {
+                    Some(saved) => Restoring.Revived(keeping: kept, checkpoint: take saved)
+                    None => Restoring.Unreadable
+                }
+            }
+            None => {
+            }
+        }
+    }
+    let Some(keeping) = kept else {
         return Restoring.Fresh(keeping: None)
     }
-    try await keep_state(view, moniker: ident::Moniker(text: driver.moniker.text), alloc)
-    let keeping = Keeping(view: view, moniker: driver.moniker.text, epoch_ms: u64.widen(driver.spec.durability.epoch_s.value_or(1)) * 1_000, max_bytes: driver.spec.durability.max_bytes, bundle: driver.spec.bundle, wall: self.config.wall, clock: self.config.clock, header: self.config.work(), alloc: alloc)
     match mut driver.restoring.extract() {
         Some(saved) => {
             return match try await keeping.copy(take saved) {
@@ -85,6 +95,7 @@ fn Shared.restoring(self, mut driver: Driver) -> Restoring fails task::Cancelled
         None => {
         }
     }
+    let view = keeping.view
     let dir = keeping.dir(name: "checkpoint")
     let number = match first attempt await last_number(view, dir: ident::Path(text: text::String.of(dir.text.as_str(), alloc)), keep: CHECKPOINTS, alloc) {
         Ok(found) => found
@@ -111,6 +122,18 @@ fn Shared.restoring(self, mut driver: Driver) -> Restoring fails task::Cancelled
     }
     return Restoring.From(keeping: keeping, checkpoint: take saved)
 } Shared.restoring
+
+/// How the holder of the checkpointed instance `driver` runs keeps its checkpoints, its `/state` subtree no longer expiring; `None` when `store` has no specification.
+fn Shared.keeping(self, mut driver: Driver) -> Option[Keeping] fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let state = await when directory => directory.state_view(mut driver.minted, moniker: ident::Moniker(text: driver.moniker.text), principal: ident::Principal(text: driver.spec.principal.text), alloc)
+    let Some(view) = state else {
+        return None
+    }
+    try await keep_state(view, moniker: ident::Moniker(text: driver.moniker.text), alloc)
+    return Some(Keeping(view: view, moniker: driver.moniker.text, epoch_ms: u64.widen(driver.spec.durability.epoch_s.value_or(1)) * 1_000, max_bytes: driver.spec.durability.max_bytes, bundle: driver.spec.bundle, wall: self.config.wall, clock: self.config.clock, header: self.config.work(), alloc: alloc))
+} Shared.keeping
 
 /// Writes `letter` as the next dead letter of the instance `moniker`, numbered after those `/<moniker>/dead` of `view` keeps, and gives its number, unless `view` cannot be read or the commit fails; the instance's `/state` subtree no longer expires when `keep`.
 fn write_dead(

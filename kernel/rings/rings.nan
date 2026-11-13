@@ -93,13 +93,19 @@ pkg fn Rings.principals(self) -> journal::Principals {
 } Rings.principals
 
 /// Opens the start cause of the incarnation `incarnation` of the instance `moniker` of slot `slot` under the cause `parent`, noting its principal and writing its record, and gives it, traced when `parent` is; causes as a header holds them.
-pkg fn Rings.open(self, slot: u32, moniker: ident::Moniker, incarnation: u64, parent: u64) -> u64 {
+pkg fn Rings.open(
+    self,
+    slot: u32,
+    moniker: ident::Moniker,
+    incarnation: u64,
+    parent: u64,
+    ) -> u64 {
     let count = self.causes.contents().fetch_add(1).value_or(0) + 1
     let opened = ident::Cause.counted(self.boot, count)
     var principal = text::Fixed[64].of("inst.")
     mut principal.append(moniker.text.as_str())
     self.opened.note(opened, principal: ident::Principal(text: principal))
-    let cause = os::Header.of_work(cause: parent, slot: slot).child(opened)
+    let cause = os::Header.of_work(cause: parent, slot).child(opened)
     var subject = Array[u8, 32].filled(0)
     for at in 0..<8usize {
         subject[at] = u8.truncate(incarnation >> u32.truncate(8 * at))
@@ -360,7 +366,7 @@ fn Ring.due_at(self) -> Option[u64] limits notrap, terminates, noalloc {
     return Some(self.records[self.oldest].time.saturating_add(DUE_NS))
 } Ring.due_at
 
-/// The continuation of an event that has more payload than its record holds: the reason of an `auth.revoked`, the checkpoint an `instance.started` restored, the code of an `instance.checkpoint-failed`, the trap kind of an `instance.trapped`.
+/// The continuation of an event that has more payload than its record holds: the reason of an `auth.revoked`, the checkpoint an `instance.started` restored or its revival, the code of an `instance.checkpoint-failed`, the trap kind of an `instance.trapped`.
 fn continuation_of(event: runner::Event) -> Option[journal::RingRecord] {
     var payload = Array[u8, 32].filled(0)
     match event {
@@ -370,12 +376,15 @@ fn continuation_of(event: runner::Event) -> Option[journal::RingRecord] {
                 runner::Reason.Expiry => 1
             }
         }
-        runner::Event.Started(incarnation: _, checkpoint: Some(number)) => {
+        runner::Event.Started(incarnation: _, from: journal::StartedFrom.Checkpoint(number: number)) => {
             var at: usize = 0
             while at < 8 {
                 payload[at] = u8.truncate(number >> u32.truncate(8 * at))
                 at += 1
             }
+        }
+        runner::Event.Started(incarnation: _, from: journal::StartedFrom.Revival) => {
+            payload[journal::REVIVAL_MARK] = 1
         }
         runner::Event.CheckpointFailed(code: code, bytes: _) => {
             var at: usize = 0
@@ -415,11 +424,14 @@ pkg fn push_decimal[N: usize where N > 0](mut text: text::Fixed[N], value: u64) 
     }
 } push_decimal
 
-/// What the continuation of a record of kind `kind` adds: the reason of an `auth.revoked`, the bus path of a device event, the checkpoint an `instance.started` restored, the boot counter of a `boot.started`, the code of an `instance.checkpoint-failed`, an `instance.trapped` or a `boot.candidate-failed`.
+/// What the continuation of a record of kind `kind` adds: the reason of an `auth.revoked`, the bus path of a device event, the checkpoint an `instance.started` restored or its revival, the boot counter of a `boot.started`, the code of an `instance.checkpoint-failed`, an `instance.trapped` or a `boot.candidate-failed`.
 pkg fn detail(kind: u16, continuation: journal::RingRecord) -> text::Fixed[40] {
     if kind == journal::STARTED {
-        var restored = text::Fixed[40].of("checkpoint ")
         let bytes = continuation.to_bits()
+        if bytes[journal::REVIVAL_MARK] != 0 {
+            return text::Fixed[40].of("revival")
+        }
+        var restored = text::Fixed[40].of("checkpoint ")
         var number: u64 = 0
         var at: usize = 0
         while at < 8 {
@@ -507,7 +519,7 @@ pkg fn elapsed(clock: sys::Clock) -> u64 {
 /// The index of an event's kind in the kernel image's kind table.
 fn kind_of(event: runner::Event) -> u16 {
     return match event {
-        runner::Event.Started(incarnation: _, checkpoint: _) => journal::STARTED
+        runner::Event.Started(incarnation: _, from: _) => journal::STARTED
         runner::Event.Stopped(abandoned: _) => journal::STOPPED
         runner::Event.Trapped(incarnation: _, kind: _, limit: _) => journal::TRAPPED
         runner::Event.Failed(restarts: _) => journal::FAILED
@@ -515,13 +527,15 @@ fn kind_of(event: runner::Event) -> u16 {
         runner::Event.Integrity(incarnation: _) => journal::INTEGRITY
         runner::Event.Revoked(grant: _, reason: _) => journal::REVOKED
         runner::Event.CheckpointFailed(code: _, bytes: _) => journal::CHECKPOINT_FAILED
+        runner::Event.Hibernated(bytes: _) => journal::HIBERNATED
     }
 } kind_of
 
 /// An event's severity: 0 for `debug` up to 5 for `critical`.
 fn severity_of(event: runner::Event) -> u8 {
     return match event {
-        runner::Event.Started(incarnation: _, checkpoint: _) or runner::Event.Stopped(abandoned: _) => 1
+        runner::Event.Hibernated(bytes: _) => 0
+        runner::Event.Started(incarnation: _, from: _) or runner::Event.Stopped(abandoned: _) => 1
         runner::Event.Revoked(grant: _, reason: _) => 2
         runner::Event.SlowHandler(ns: _) or runner::Event.CheckpointFailed(code: _, bytes: _) => 3
         runner::Event.Trapped(incarnation: _, kind: _, limit: _) or runner::Event.Failed(restarts: _) => 4
@@ -532,7 +546,7 @@ fn severity_of(event: runner::Event) -> u8 {
 /// The first 8 bytes of an event's payload.
 fn argument_of(event: runner::Event) -> u64 {
     return match event {
-        runner::Event.Started(incarnation: incarnation, checkpoint: _) => incarnation
+        runner::Event.Started(incarnation: incarnation, from: _) => incarnation
         runner::Event.Stopped(abandoned: true) => 1
         runner::Event.Stopped(abandoned: false) => 0
         runner::Event.Trapped(incarnation: incarnation, kind: _, limit: _) => incarnation
@@ -541,6 +555,7 @@ fn argument_of(event: runner::Event) -> u64 {
         runner::Event.Integrity(incarnation: incarnation) => incarnation
         runner::Event.Revoked(grant: grant, reason: _) => grant
         runner::Event.CheckpointFailed(code: _, bytes: bytes) => bytes
+        runner::Event.Hibernated(bytes: bytes) => bytes
     }
 } argument_of
 
@@ -582,7 +597,7 @@ test rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_o
     let alloc = world.alloc
     let cpus = hw::cpu_count()
     let rings = Rings.of(cpus, clock: world.clock, boot: 1, alloc)
-    rings.record(slot: 1, cause: 0, event: runner::Event.Started(incarnation: 1, checkpoint: None))
+    rings.record(slot: 1, cause: 0, event: runner::Event.Started(incarnation: 1, from: journal::StartedFrom.Start))
     let early = try await task::within(world.clock, ms: 500, body: fn() -> u32 fails task::Cancelled uses wait {
         return try await rings.due(world.exec)
     })
@@ -593,7 +608,7 @@ test rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_o
     expect lost == 0 and records.len() == 1 and records[0].source == 1
     let quarters = (RING_RECORDS / 4) * usize.widen(cpus)
     for _ in 0..<quarters {
-        rings.record(slot: 2, cause: 0, event: runner::Event.Started(incarnation: 1, checkpoint: None))
+        rings.record(slot: 2, cause: 0, event: runner::Event.Started(incarnation: 1, from: journal::StartedFrom.Start))
     }
     let quarter = try await task::within(world.clock, ms: 100, body: fn() -> u32 fails task::Cancelled uses wait {
         return try await rings.due(world.exec)
@@ -616,12 +631,17 @@ test rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_o
 } rings_fall_due_a_quarter_full_on_critical_records_or_a_second_after_their_oldest
 
 test continuations_name_the_checkpoint_restored_and_the_code_of_a_failed_one for detail {
-    expect continuation_of(runner::Event.Started(incarnation: 4, checkpoint: None)).is_none()
-    let Some(restored) = continuation_of(runner::Event.Started(incarnation: 4, checkpoint: Some(1_234))) else {
+    expect continuation_of(runner::Event.Started(incarnation: 4, from: journal::StartedFrom.Start)).is_none()
+    let Some(restored) = continuation_of(runner::Event.Started(incarnation: 4, from: journal::StartedFrom.Checkpoint(number: 1_234))) else {
         expect false
         return
     }
     expect detail(kind: journal::STARTED, continuation: restored).as_str() == "checkpoint 1234"
+    let Some(revived) = continuation_of(runner::Event.Started(incarnation: 4, from: journal::StartedFrom.Revival)) else {
+        expect false
+        return
+    }
+    expect detail(kind: journal::STARTED, continuation: revived).as_str() == "revival"
     let Some(too_large) = continuation_of(runner::Event.CheckpointFailed(code: text::Fixed[32].of("instance.checkpoint-too-large"), bytes: 9)) else {
         expect false
         return

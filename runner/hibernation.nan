@@ -1,0 +1,275 @@
+//! Hibernation: the image an instance leaves when its domain is freed, kept in hibernation memory, the messages it sent itself that wait for their delay, and its revival.
+
+/// What a hibernation takes of an instance: the encoding of its state, of schema `schema`, and the messages its handlers sent it that wait for their delay.
+struct Image {
+    state: mem::Bytes
+    schema: ident::HashValue
+    delayed: mem::List[Delayed]
+} Image
+
+/// A message an instance's handler sent it, which enters its intake at the monotonic time `due_ns`: an encoded call of the protocol of hash `hash` under `header`.
+struct Delayed {
+    hash: sys::ProtocolHash
+    encoded: sys::Encoded
+    header: os::Header
+    due_ns: u64
+} Delayed
+
+/// A hibernation image kept in hibernation memory: the state's encoding of `length` bytes and schema `schema`, in the LZ4 block format when `compressed`.
+struct KeptImage {
+    bytes: mem::Bytes
+    compressed: bool
+    length: usize
+    schema: ident::HashValue
+} KeptImage
+
+/// The image of the state encoded as `state`, of schema `schema`, kept through the hibernation cell `cell`: compressed when that shrinks it, its compressor's table drawn through `scratch`; `None` when the cell has no room for it.
+fn KeptImage.of(state: Slice[u8], schema: ident::HashValue, cell: mem::Alloc, scratch: mem::Alloc) -> Option[KeptImage] {
+    match attempt lz4::compress(state, limit: state.len(), alloc: cell, scratch) {
+        Ok(Some(block)) => return Some(KeptImage(bytes: take block, compressed: true, length: state.len(), schema: schema))
+        Ok(None) => {
+        }
+        Err(_) => return None
+    }
+    var bytes = mem::Bytes.empty(cell)
+    if (attempt mut bytes.try_append(state)).is_err() {
+        return None
+    }
+    return Some(KeptImage(bytes: take bytes, compressed: false, length: state.len(), schema: schema))
+} KeptImage.of
+
+/// The checkpoint the image stands for, of the incarnation `incarnation` of the bundle `bundle` at `time`, its state drawn through `alloc`; `None` when it does not decompress.
+fn KeptImage.checkpoint(
+    self,
+    incarnation: u64,
+    bundle: ident::HashValue,
+    time: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Option[os::Checkpoint] {
+    var state = mem::Bytes.empty(alloc)
+    if self.compressed {
+        let Ok(Some(found)) = attempt lz4::decompress(self.bytes.view(), length: self.length, alloc) else {
+            return None
+        }
+        state = found
+    } else {
+        mut state.append(self.bytes.view())
+    }
+    return Some(os::Checkpoint(number: 0, incarnation: incarnation, bundle: bundle, schema: self.schema, time: time, state: take state))
+} KeptImage.checkpoint
+
+/// Orders the hibernation of the instance, its outcome going to `done`: `instance.volatile` when it keeps no checkpoints, `instance.not-running` unless it runs, unpaused and with no hibernation under way; otherwise its holder hibernates it once no call is outstanding, no call reaching it meanwhile.
+fn Driver.order_hibernation(mut self, take done: task::Sender[Result[os::Outcome, os::ControlError]]) fails task::Cancelled uses wait {
+    if self.spec.durability.class != os::DurabilityClass.Checkpointed {
+        discard attempt await done.send(Err(os::ControlError.Volatile))
+        return
+    }
+    if self.lifecycle != Some(os::Lifecycle.Running) or self.paused or self.hibernating.is_some() {
+        discard attempt await done.send(Err(os::ControlError.NotRunning))
+        return
+    }
+    self.hibernating = Some(take done)
+    self.hibernation_ordered = false
+    try await mut self.hibernate_holder()
+} Driver.order_hibernation
+
+/// Hands the hibernation waiting to the holder of the running domain once no call is outstanding.
+fn Driver.hibernate_holder(mut self) fails task::Cancelled uses wait {
+    if self.hibernation_ordered or self.hibernating.is_none() {
+        return
+    }
+    let Some(domain) = self.domain else {
+        return
+    }
+    if domain.outstanding.is_some() {
+        return
+    }
+    self.hibernation_ordered = true
+    try await self.hold_order(HolderOrder.Hibernate)
+} Driver.hibernate_holder
+
+/// Takes the outcome of the hibernation its holder carried out: with an image, keeps it in hibernation memory, which compresses it, and the messages it waits for, and records `instance.hibernated` with the image's bytes; the domain then ends. Without one, the instance serves on, its intake resuming at `now_ns`, and the order hears that it still runs.
+fn Shared.hibernated[J: Journal](
+    self,
+    mut driver: Driver,
+    take outcome: Option[Image],
+    journal: J,
+    now_ns: u64,
+    ) fails task::Cancelled uses wait {
+    let Some(Image(state: state, schema: schema, delayed: delayed)) = outcome else {
+        driver.hibernation_ordered = false
+        match mut driver.hibernating.extract() {
+            Some(done) => {
+                discard attempt await done.send(Ok(os::Outcome.Lifecycle(os::Lifecycle.Running)))
+            }
+            None => {
+            }
+        }
+        try await mut driver.deliver(now_ns)
+        return
+    }
+    driver.image = KeptImage.of(state.view(), schema, cell: self.config.hibernation, scratch: self.config.alloc)
+    driver.hibernated = true
+    for message in take delayed {
+        delay(mut driver.delayed, take message)
+    }
+    journal.record(driver.slot, cause: driver.changed_by, event: Event.Hibernated(bytes: u64.widen(state.len())))
+} Shared.hibernated
+
+/// Adds `message` to `delayed`, kept in the order its messages fall due.
+fn delay(mut delayed: mem::List[Delayed], take message: Delayed) {
+    var at = delayed.len()
+    while at > 0 and delayed[at - 1].due_ns > message.due_ns {
+        at -= 1
+    }
+    mut delayed.insert(at, value: take message)
+} delay
+
+/// Leaves the domain of the incarnation whose hibernation took its image: the instance is `hibernated`, its postponed requests waiting for its revival; the order hears it, and the messages it waits for revive it as they fall due, at once when calls wait in its intake.
+fn Shared.slept[J: Journal](
+    self,
+    mut driver: Driver,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    discard mut driver.domain.extract()
+    driver.hibernation_ordered = false
+    driver.lifecycle = Some(os::Lifecycle.Hibernated)
+    match mut driver.hibernating.extract() {
+        Some(done) => {
+            discard attempt await done.send(Ok(os::Outcome.Lifecycle(os::Lifecycle.Hibernated)))
+        }
+        None => {
+        }
+    }
+    self.arm_due(mut driver, s, inputs: sender.split())
+    if driver.queue.len() > 0 {
+        try await self.start(mut driver, sender, journal, s)
+    }
+} Shared.slept
+
+/// Has a task of `s` tell the driver, through `inputs`, when the first message the instance waits for falls due; the tasks armed before no longer count.
+fn Shared.arm_due(self, mut driver: Driver, s: task::Scope, take inputs: task::Sender[Input]) {
+    driver.due_armed += 1
+    let Some(earliest) = driver.delayed.get(0) else {
+        return
+    }
+    let due_ns = earliest.due_ns
+    let armed = driver.due_armed
+    let clock = self.config.clock
+    discard s.spawn(fn[take inputs]() fails task::Cancelled uses wait limits stack 8_192 {
+        let left = due_ns.saturating_sub(now(clock))
+        if left > 0 {
+            try await clock.sleep_ns(left)
+        }
+        discard attempt await inputs.send(Input.Due(armed: armed))
+    })
+} Shared.arm_due
+
+/// Moves the messages the instance waits for that fall due by `now_ns` into its intake, reviving it when it hibernates, then arms the next.
+fn Shared.fall_due[J: Journal](
+    self,
+    mut driver: Driver,
+    now_ns: u64,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    while driver.delayed.len() > 0 and driver.delayed[0].due_ns <= now_ns {
+        let Delayed(hash: hash, encoded: encoded, header: header, due_ns: due_ns) = mut driver.delayed.remove(0)
+        mut driver.queue.push(Queued(call: os::Call(hash: hash, encoded: take encoded, reply: None, lease: os::Lease.free(self.config.alloc), header: header), since_ns: due_ns, redelivery: None))
+        driver.changed_by = header.cause
+    }
+    driver.counted()
+    self.arm_due(mut driver, s, inputs: sender.split())
+    if driver.lifecycle == Some(os::Lifecycle.Hibernated) and driver.queue.len() > 0 {
+        try await self.start(mut driver, sender, journal, s)
+    }
+    try await mut driver.deliver(now_ns)
+} Shared.fall_due
+
+/// Revives the hibernated instance, `done` hearing its lifecycle once it runs or fails; the lifecycle of an instance that does not hibernate at once.
+fn Shared.wake[J: Journal](
+    self,
+    mut driver: Driver,
+    take done: task::Sender[Result[os::Outcome, os::ControlError]],
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    if driver.lifecycle != Some(os::Lifecycle.Hibernated) {
+        try await driver.tell_lifecycle(take done)
+        return
+    }
+    mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
+    try await self.start(mut driver, sender, journal, s)
+} Shared.wake
+
+/// Drops what a hibernation left the instance: its image and the messages it waits for, which no restart or stop keeps.
+fn Driver.forget_hibernation(mut self) {
+    self.image = None
+    self.hibernated = false
+    mut self.delayed.truncate(0)
+    self.due_armed += 1
+} Driver.forget_hibernation
+
+/// A one-way `note` falling due at `due_ns`.
+fn note_due(due_ns: u64, alloc: mem::Alloc) -> Delayed {
+    var encoded = sys::Encoded.empty(alloc)
+    sys::Wire[Counter].note(mut encoded, amount: u32.truncate(due_ns))
+    return Delayed(hash: sys::Wire[Counter].hash(), encoded: take encoded, header: os::Header.of_work(cause: 0, slot: 0), due_ns: due_ns)
+} note_due
+
+test delayed_messages_wait_in_the_order_they_fall_due for delay {
+    let alloc = testing::world().alloc
+    var delayed = mem::List[Delayed].empty(alloc)
+    delay(mut delayed, message: note_due(due_ns: 30, alloc))
+    delay(mut delayed, message: note_due(due_ns: 10, alloc))
+    delay(mut delayed, message: note_due(due_ns: 20, alloc))
+    delay(mut delayed, message: note_due(due_ns: 20, alloc))
+    expect delayed.len() == 4 and delayed[0].due_ns == 10 and delayed[1].due_ns == 20 and delayed[3].due_ns == 30
+} delayed_messages_wait_in_the_order_they_fall_due
+
+/// The state kept is given back whether compression shrank it or not, and none is kept through a cell without room for it.
+test kept_images_give_back_their_state for KeptImage.checkpoint {
+    let alloc = testing::world().alloc
+    var bundle = Array[u8, 33].filled(0)
+    bundle[0] = 0x01
+    let schema = ident::HashValue(bytes: bundle)
+    var state = mem::Bytes.empty(alloc)
+    for index in 0u32..<20_000 {
+        mut state.push(u8.truncate(index % 7))
+    }
+    let Some(compressed) = KeptImage.of(state.view(), schema, cell: alloc, scratch: alloc) else {
+        expect false
+        return
+    }
+    let Some(saved) = compressed.checkpoint(3, bundle: schema, time: ident::WallTime.unknown(), alloc) else {
+        expect false
+        return
+    }
+    expect compressed.compressed and compressed.bytes.len() < state.len() / 10
+    expect saved.incarnation == 3 and saved.schema == schema and saved.state.view() == state.view()
+    let Some(raw) = KeptImage.of(b"short", schema, cell: alloc, scratch: alloc) else {
+        expect false
+        return
+    }
+    let Some(again) = raw.checkpoint(3, bundle: schema, time: ident::WallTime.unknown(), alloc) else {
+        expect false
+        return
+    }
+    expect not raw.compressed and again.state.view() == b"short"
+    var scattered = mem::Bytes.empty(alloc)
+    var word: u32 = 1
+    for _ in 0u32..<100_000 {
+        word = word ^ (word << 13)
+        word = word ^ (word >> 17)
+        word = word ^ (word << 5)
+        mut scattered.push(u8.truncate(word))
+    }
+    let cell = alloc.split(65_536)
+    let unkept = KeptImage.of(scattered.view(), schema, cell: cell.alloc(), scratch: alloc)
+    take cell.close()
+    expect unkept.is_none()
+} kept_images_give_back_their_state

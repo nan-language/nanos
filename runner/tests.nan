@@ -191,12 +191,12 @@ fn Counts.of(alloc: mem::Alloc) -> Counts {
 
 fn Counts.record(self, slot: u32, cause: u64, event: Event) {
     match event {
-        Event.Started(incarnation: _, checkpoint: _) => self.start_cause.contents().store(cause)
+        Event.Started(incarnation: _, from: _) => self.start_cause.contents().store(cause)
         else => {
         }
     }
     let count = match event {
-        Event.Started(incarnation: _, checkpoint: _) => self.started.share()
+        Event.Started(incarnation: _, from: _) => self.started.share()
         Event.Stopped(abandoned: _) => self.stopped.share()
         Event.Trapped(incarnation: _, kind: _, limit: _) => self.trapped.share()
         Event.Failed(restarts: _) => self.failed.share()
@@ -206,7 +206,13 @@ fn Counts.record(self, slot: u32, cause: u64, event: Event) {
     discard count.contents().fetch_add(1)
 } Counts.record
 
-fn Counts.open(self, slot: u32, moniker: ident::Moniker, incarnation: u64, parent: u64) -> u64 {
+fn Counts.open(
+    self,
+    slot: u32,
+    moniker: ident::Moniker,
+    incarnation: u64,
+    parent: u64,
+    ) -> u64 {
     self.parent.contents().store(parent)
     return OPENED + self.opened.contents().fetch_add(1).value_or(0)
 } Counts.open
@@ -241,7 +247,7 @@ fn configured(world: host::World) -> Config {
     classes[1] = 2
     classes[2] = 3
     classes[3] = 4
-    return Config(exec: world.exec, pool: world.alloc, alloc: world.alloc, clock: world.clock, wall: ident::Wall(at: ident::WallTime(utc_ns: NOON_NS, uncertainty_ns: 1_000_000_000), since_ns: 0), random: world.random, classes: classes, system: ident::Cause.of(1, number: 1))
+    return Config(exec: world.exec, pool: world.alloc, hibernation: world.alloc, alloc: world.alloc, clock: world.clock, wall: ident::Wall(at: ident::WallTime(utc_ns: NOON_NS, uncertainty_ns: 1_000_000_000), since_ns: 0), random: world.random, classes: classes, system: ident::Cause.of(1, number: 1))
 } configured
 
 /// One tally named `tally`, whose specification `adjust` changes, and no grant.
@@ -1264,3 +1270,56 @@ test worlds_claim_devices_and_wire_roles_once_assigned for Directory.world {
     }
     expect named_path.as_str() == "pci/0000.00.03.0"
 } worlds_claim_devices_and_wire_roles_once_assigned
+
+fn keeps_checkpoints(mut spec: os::InstanceSpec) {
+    spec.durability.class = os::DurabilityClass.Checkpointed
+} keeps_checkpoints
+
+/// The outcomes of hibernating the tally before it starts and once it runs, then the total a call gives after it.
+fn hibernated(core: Core, alloc: mem::Alloc) -> Array[u64, 3] fails Failure uses wait {
+    let early = attempt await core.control.hibernate(named("tally"), alloc)
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    discard try await add(port, amount: 4, alloc)
+    let running = attempt await core.control.hibernate(named("tally"), alloc)
+    var seen = Array[u64, 3].filled(0)
+    seen[0] = outcome_code(early)
+    seen[1] = outcome_code(running)
+    seen[2] = try await add(port, amount: 1, alloc)
+    return seen
+} hibernated
+
+/// 1 for `instance.volatile`, 2 for `instance.not-running`, 3 for `running`, 4 for `hibernated`, 0 for any other outcome.
+fn outcome_code(outcome: Result[os::Lifecycle, os::ControlError]) -> u64 {
+    return match outcome {
+        Err(os::ControlError.Volatile) => 1
+        Err(os::ControlError.NotRunning) => 2
+        Ok(os::Lifecycle.Running) => 3
+        Ok(os::Lifecycle.Hibernated) => 4
+        else => 0
+    }
+} outcome_code
+
+/// A volatile tally never hibernates; a checkpointed one hibernates only running, and without a store keeping its checkpoints its hibernation ends with the tally serving on.
+test hibernation_needs_a_running_instance_whose_checkpoints_are_kept for Driver.order_hibernation {
+    let world = testing::world()
+    let volatile = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: Counts.of(world.alloc), reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[u64, 3] fails Failure uses wait {
+        return try await hibernated(core, alloc: world.alloc)
+    })
+    let kept = try await run(one_tally(world.alloc, adjust: keeps_checkpoints), components: Tallies(), journal: Counts.of(world.alloc), reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[u64, 3] fails Failure uses wait {
+        return try await hibernated(core, alloc: world.alloc)
+    })
+    var refused = Array[u64, 3].filled(1)
+    refused[2] = 5
+    var served = Array[u64, 3].filled(2)
+    served[1] = 3
+    served[2] = 5
+    expect volatile == Some(refused)
+    expect kept == Some(served)
+} hibernation_needs_a_running_instance_whose_checkpoints_are_kept

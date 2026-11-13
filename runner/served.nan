@@ -1,6 +1,6 @@
 //! The task of an instance's domain: it builds the Env, starts or restores the component, serves the calls its driver delivers, one at a time, keeps its checkpoints, and hands its driver the replies the component gives postponed requests.
 
-/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, the instance's configuration record, and for a fork what it runs and where it tells what it saw.
+/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, which its hibernation image gives a revival, the instance's configuration record, and for a fork what it runs and where it tells what it saw.
 pub open struct Serving {
     deliveries: task::Receiver[Delivery]
     reports: task::Sender[Input]
@@ -11,6 +11,7 @@ pub open struct Serving {
     suspend_ms: u32
     keeping: Option[Keeping]
     restore: Option[os::Checkpoint]
+    revival: bool
     config: Option[Untrusted[mem::Bytes]]
     forking: Option[ForkRun]
 } Serving
@@ -31,9 +32,10 @@ enum Delivery {
     Stop
 } Delivery
 
-/// What the task of an instance's domain tells its driver.
+/// What the task of an instance's domain tells its driver: among others, how a hibernation it was ordered ended, with the image it took or none when the instance serves on.
 enum Report {
-    Running(checkpoint: Option[u64])
+    Running(from: journal::StartedFrom)
+    Hibernation(image: Option[Image])
     Taken(id: u64)
     Postponed(id: u64)
     Answered(id: u64, answer: os::Answer)
@@ -53,9 +55,10 @@ enum Mark {
     Ended
 } Mark
 
-/// How an instance's domain ended other than by abandonment: stopped, without an Env, unhealthy at its start, or with a latest checkpoint that does not decode.
+/// How an instance's domain ended other than by abandonment: stopped, hibernated, without an Env, unhealthy at its start, or with a latest checkpoint that does not decode.
 pub closed enum Ended derives Copy, Eq {
     Stopped
+    Hibernated
     EnvIncomplete
     Unhealthy
     CheckpointUndecodable
@@ -94,7 +97,7 @@ pub fn Served.run(take world: nanos::World, take serving: Serving) -> Ended fail
     })
 } Served.run
 
-/// Runs an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, ends it at once when its health is not `Healthy`, then serves what `serving` delivers, P's calls and those of the protocols whose schemas `peers` holds, until it is told to stop, letting the handler running return and handling every message that waits, keeps a checkpoint of the component when it is dirty, and ends it, handing its Env to `release`. The replies its handlers give the requests they postponed go to the driver as they come. A component that has had no message for the time `serving` sets is suspended until its next message.
+/// Runs an instance on `env`: starts the component, resumes it from the checkpoint `serving` restores or revives it from its hibernation image, ends it at once when its health is not `Healthy`, then serves what `serving` delivers, P's calls and those of the protocols whose schemas `peers` holds. Told to stop, it lets the handler running return, handles every message that waits, keeps a checkpoint of the component when it is dirty, and ends it, handing its Env to `release`; ordered to hibernate, it ends it once it has the image. The replies its handlers give the requests they postponed go to the driver as they come. A component that has had no message for the time `serving` sets is suspended until its next message.
 pub fn Driven.run(
     take env: Env,
     exec: task::Executor,
@@ -106,7 +109,7 @@ pub fn Driven.run(
     if serving.forking.is_some() {
         return try await Driven[S, Env, P].forked(take env, exec, alloc, take serving, release)
     }
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, config: _, forking: _) = serving
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: revival, config: _, forking: _) = serving
     let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
@@ -126,20 +129,22 @@ pub fn Driven.run(
         Err(_) => {
         }
     }
-    mut stepper.resumed(reason)
+    mut stepper.resumed(resumed_for(reason, revival))
     discard mut stepper.start_keyed()
     match mut stepper.health() {
         sys::HealthReply.Healthy => {
         }
         sys::HealthReply.Unhealthy(_) => return Ended.Unhealthy
     }
-    try await tell(reports, incarnation, report: Report.Running(checkpoint: restored))
+    try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival)))
     let out = stepper.outbox()
     let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0)), alloc)
     let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
     let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
+    let telling = Telling(reports: reports.split(), marks: marks.split(), steps: steps.share(), finished: take finished, clock: clock, incarnation: incarnation, alloc: alloc)
     var given = Some(Given(deliveries: take deliveries, finishes: take finishes, peers: take peers))
-    let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given, mut due_at, mut holding](s: task::Scope) fails Stopping uses wait {
+    var image: Option[Image] = None
+    let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given, mut due_at, mut holding, mut image](s: task::Scope) fails Stopping uses wait {
         let Some(Given(deliveries: receiver, finishes: finishing, peers: known)) = mut given.extract() else {
             return
         }
@@ -156,30 +161,95 @@ pub fn Driven.run(
         discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
             try await hand_over(queued, signal: ringing, reports: answering, incarnation)
         })
-        try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), clock, reports, marks, steps, finished, incarnation, orders, mut holding, s, alloc)
+        image = Some(try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), orders, mut holding, telling, s))
+        s.cancel()
     })
     match looped {
-        Ok(_) => {
-        }
-        Err(Stopping.Asked) => {
-        }
         Err(Stopping.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
     }
-    let handled = try await call_handlers(mut stepper, marks, steps, finished, clock, kept: holding.tasks, alloc)
-    mut holding.drop_kept(mut stepper)
+    undefer stepper
+    return match mut image.extract() {
+        Some(taken) => try await Driven[S, Env, P].hibernate(take stepper, image: take taken, mut holding, orders, replies, telling, release)
+        None => try await Driven[S, Env, P].stop(take stepper, mut holding, keeping, dirty: due_at.is_some(), telling, release)
+    }
+} Driven.run
+
+/// Ends the component behind `stepper` once told to stop: handles every message that waits, drops what its replays keep, keeps a checkpoint of it when it is `dirty` or handled a message, and ends the stepper, cancelling its keyed tasks with acknowledgement and handing its Env to `release`.
+fn Driven.stop(
+    take stepper: sys::Stepper[S, Env, P],
+    mut holding: Holding[P],
+    keeping: Option[Keeping],
+    dirty: bool,
+    telling: Telling,
+    release: fn(take ended: Env) limits stack 8_192,
+    ) -> Ended fails task::Cancelled uses wait {
+    var ending = stepper
+    defer take ending.abandon()
+    let handled = try await call_handlers(mut ending, kept: holding.tasks, telling)
+    mut holding.drop_kept(mut ending)
     match first keeping {
-        Some(kept) if handled or due_at.is_some() => {
-            discard try await checkpoint(stepper, keeping: kept, reports, incarnation, alloc)
+        Some(kept) if handled or dirty => {
+            discard try await checkpoint(ending, keeping: kept, telling)
         }
         else => {
         }
     }
-    try await tell(reports, incarnation, report: Report.Ending)
-    undefer stepper
-    let sys::Stopped(state: _, env: ended) = try await take stepper.end()
+    try await telling.tell(report: Report.Ending)
+    undefer ending
+    let sys::Stopped(state: _, env: ended) = try await take ending.end()
     release(take ended)
     return Ended.Stopped
-} Driven.run
+} Driven.stop
+
+/// Ends the component behind `stepper` once a hibernation took its image: refuses the orders still waiting for its holder, drops what its replays keep and its held keyed tasks, hands the driver the replies and summaries `replies` queues and then `image`, and ends the stepper, cancelling its keyed tasks with acknowledgement and handing its Env to `release`.
+fn Driven.hibernate(
+    take stepper: sys::Stepper[S, Env, P],
+    take image: Image,
+    mut holding: Holding[P],
+    orders: Orders,
+    replies: mem::Shared[hw::SpinLock[mem::Bounded[Handed, QUEUED_REPLIES]]],
+    telling: Telling,
+    release: fn(take ended: Env) limits stack 8_192,
+    ) -> Ended fails task::Cancelled uses wait {
+    var ending = stepper
+    defer take ending.abandon()
+    loop {
+        let Some(order) = orders.next() else {
+            break
+        }
+        try await take order.refuse()
+    }
+    mut holding.drop_kept(mut ending)
+    while (mut ending.take_held()).is_some() {
+    }
+    try await hand_all(replies, reports: telling.reports, incarnation: telling.incarnation)
+    try await telling.tell(report: Report.Hibernation(image: Some(take image)))
+    undefer ending
+    let sys::Stopped(state: _, env: ended) = try await take ending.end()
+    release(take ended)
+    return Ended.Hibernated
+} Driven.hibernate
+
+/// The reason the component's `resume` is called with: `Revived` for a revival, else the one its start gave.
+fn resumed_for(reason: sys::ResumeReason, revival: bool) -> sys::ResumeReason {
+    if revival {
+        return sys::ResumeReason.Revived
+    }
+    return reason
+} resumed_for
+
+/// What a start began from: a revival, the checkpoint `restored` names, or the component's start.
+fn started_from(restored: Option[u64], revival: bool) -> journal::StartedFrom {
+    if revival {
+        return journal::StartedFrom.Revival
+    }
+    return match restored {
+        Some(number) => journal::StartedFrom.Checkpoint(number: number)
+        None => journal::StartedFrom.Start
+    }
+} started_from
 
 /// Runs a fork of an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, then handles once, one level deep, the call `serving` gives, or without one calls its `resume`, then probes its health once; tells `serving` the bytes of the state it resumed from, the reply to its call, the messages its handlers sent it and the classes of the keyed tasks they spawned, none of which runs, its state once it handled its call, the clock reads and random words its call's handler took through its tape, whether that handler called another instance, and whether it is unhealthy; then ends it, handing its Env to `release`.
 fn Driven.forked(
@@ -189,7 +259,7 @@ fn Driven.forked(
     take serving: Serving,
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
-    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, config: _, forking: forking) = serving
+    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, revival: _, config: _, forking: forking) = serving
     let Some(ForkRun(call: call, reporting: reporting, tape: tape, reaching: reaching)) = forking else {
         release(take env)
         return Ended.Stopped
@@ -267,26 +337,26 @@ fn Driven.begin(
     return Some(Begun(stepper: try sys::Stepper[S, Env, P].resume(take state, take env, exec, alloc), reason: sys::ResumeReason.Restored, restored: Some(saved.number)))
 } Driven.begin
 
-/// Holds the component: waits for its messages, suspending it after `quiet` without one, and calls their handlers, carrying out between them the orders `orders` gives it with what `holding` sets aside and keeps, and only those orders while it is paused; the tasks it posts messages from belong to `s`. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the component is idle.
+/// Holds the component until a hibernation takes its image, which it gives: waits for its messages, suspending it after `quiet` without one, and calls their handlers, carrying out between them the orders `orders` gives it with what `holding` sets aside and keeps, and only those orders while it is paused; the tasks it posts messages from belong to `s`. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the component is idle. A hibernation that takes no image is reported to the driver, and the component serves on.
 fn hold[S: Encode, Env: Any, P: sys::Protocol and Send](
     mut stepper: sys::Stepper[S, Env, P],
     keeping: Option[Keeping],
     mut due_at: Option[u64],
     syncing: core::atomic::AtomicBool,
     quiet: core::atomic::AtomicU64,
-    clock: sys::Clock,
-    reports: task::Sender[Input],
-    marks: task::Sender[Mark],
-    steps: mem::Shared[Steps],
-    finished: task::Sender[u64],
-    incarnation: u64,
     orders: Orders,
     mut holding: Holding[P],
+    telling: Telling,
     s: task::Scope,
-    alloc: mem::Alloc,
-    ) fails task::Cancelled uses wait {
+    ) -> Image fails task::Cancelled uses wait {
+    let clock = telling.clock
     loop {
-        try await carry_out(mut stepper, orders, mut holding, reports, incarnation, clock, s, alloc)
+        if try await carry_out(mut stepper, orders, mut holding, telling, s) {
+            match try await hibernation(mut stepper, keeping, mut due_at, kept: holding.tasks, telling) {
+                Some(image) => return image
+                None => try await telling.tell(report: Report.Hibernation(image: None))
+            }
+        }
         if holding.paused {
             try await orders.wait()
             continue
@@ -300,20 +370,63 @@ fn hold[S: Encode, Env: Any, P: sys::Protocol and Send](
                     try await stepper.incoming()
                 })
                 if arrived.is_none() and not try await stepper.ready() {
-                    due_at = match try await checkpoint(stepper, keeping: kept, reports, incarnation, alloc) {
+                    due_at = match try await checkpoint(stepper, keeping: kept, telling) {
                         true => None
                         false => epoch_after(keeping, clock)
                     }
                     continue
                 }
             }
-            else => try await idle(mut stepper, quiet, clock, reports, incarnation)
+            else => try await idle(mut stepper, quiet, telling)
         }
-        if try await call_handlers(mut stepper, marks, steps, finished, clock, kept: holding.tasks, alloc) and due_at.is_none() {
+        if try await call_handlers(mut stepper, kept: holding.tasks, telling) and due_at.is_none() {
             due_at = epoch_after(keeping, clock)
         }
     }
 } hold
+
+/// The hibernation image of the quiescent component behind `stepper`: calls the handlers of the messages waiting, keeps a checkpoint of its state when that is dirty, `due_at` then clearing, and encodes the state, giving it with the messages its handlers sent it that wait for their delay, which it takes from it; `None` without `keeping`, when the checkpoint failed or when the encoding passes the bytes `keeping` allows, the component then serving on as it was.
+fn hibernation[S: Encode, Env: Any, P: sys::Protocol and Send](
+    mut stepper: sys::Stepper[S, Env, P],
+    keeping: Option[Keeping],
+    mut due_at: Option[u64],
+    kept: mem::List[u64],
+    telling: Telling,
+    ) -> Option[Image] fails task::Cancelled uses wait {
+    let Some(keeper) = keeping else {
+        return None
+    }
+    if try await call_handlers(mut stepper, kept, telling) or due_at.is_some() {
+        if not try await checkpoint(stepper, keeping: keeper, telling) {
+            return None
+        }
+        due_at = None
+    }
+    var state = mem::Bytes.empty(telling.alloc)
+    mem::wire::Codec[S].encode(stepper.state(), out: mut state)
+    if u64.widen(state.len()) > keeper.max_bytes {
+        return None
+    }
+    return Some(Image(state: take state, schema: ident::HashValue(bytes: mem::wire::Codec[S].schema_hash().bytes), delayed: delayed_of(mut stepper, clock: telling.clock, alloc: telling.alloc)))
+} hibernation
+
+/// The messages the handlers of the component behind `stepper` sent it that wait for their delay, taken from it, each encoded with the monotonic time by `clock` at which it falls due.
+fn delayed_of[S, Env: Any, P: sys::Protocol and Send](mut stepper: sys::Stepper[S, Env, P], clock: sys::Clock, alloc: mem::Alloc) -> mem::List[Delayed] {
+    let now_ns = now(clock)
+    var delayed = mem::List[Delayed].empty(alloc)
+    loop {
+        let Some(sent) = mut stepper.take_sent() else {
+            return delayed
+        }
+        var encoded = sys::Encoded.empty(alloc)
+        discard sys::Wire[P].encode_any(sent.message, out: mut encoded)
+        let header = match sent.header {
+            Some(carried) => os::Header.from_bits(carried.bytes)
+            None => os::Header.current()
+        }
+        mut delayed.push(Delayed(hash: sys::Wire[P].hash(), encoded: take encoded, header: header, due_ns: now_ns.saturating_add(sent.delay_ns)))
+    }
+} delayed_of
 
 /// When a checkpoint of the component `keeping` keeps falls due once it is dirty from now: an epoch later, never without `keeping`.
 fn epoch_after(keeping: Option[Keeping], clock: sys::Clock) -> Option[u64] {
@@ -324,22 +437,32 @@ fn epoch_after(keeping: Option[Keeping], clock: sys::Clock) -> Option[u64] {
 } epoch_after
 
 /// Keeps the quiescent state of the component as its next checkpoint, telling the driver when that fails; whether it was kept.
-fn checkpoint[S: Encode, Env: Any, P: Any](
-    stepper: sys::Stepper[S, Env, P],
-    keeping: Keeping,
-    reports: task::Sender[Input],
-    incarnation: u64,
-    alloc: mem::Alloc,
-    ) -> bool fails task::Cancelled uses wait {
-    var bytes = mem::Bytes.empty(alloc)
+fn checkpoint[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], keeping: Keeping, telling: Telling) -> bool fails task::Cancelled uses wait {
+    var bytes = mem::Bytes.empty(telling.alloc)
     mem::wire::Codec[S].encode(stepper.state(), out: mut bytes)
     let encoded = u64.widen(bytes.len())
-    let Some(code) = try await keeping.keep(take bytes, schema: mem::wire::Codec[S].schema_hash(), incarnation) else {
+    let Some(code) = try await keeping.keep(take bytes, schema: mem::wire::Codec[S].schema_hash(), incarnation: telling.incarnation) else {
         return true
     }
-    try await tell(reports, incarnation, report: Report.CheckpointFailed(code: code, bytes: encoded))
+    try await telling.tell(report: Report.CheckpointFailed(code: code, bytes: encoded))
     return false
 } checkpoint
+
+/// What the holder of an instance's domain tells and counts through: the driver's inputs for the incarnation `incarnation`, the marks of its watch, the steps it counts for the dispatcher with the signal of those finished, the monotonic clock, and the allocator of the domain.
+struct Telling {
+    reports: task::Sender[Input]
+    marks: task::Sender[Mark]
+    steps: mem::Shared[Steps]
+    finished: task::Sender[u64]
+    clock: sys::Clock
+    incarnation: u64
+    alloc: mem::Alloc
+} Telling
+
+/// Tells the driver `report`.
+fn Telling.tell(self, take report: Report) fails task::Cancelled uses wait {
+    try await tell(self.reports, incarnation: self.incarnation, take report)
+} Telling.tell
 
 /// The steps of an instance's holder: how many it began and finished, and the count of finished steps the dispatcher waits for, 0 when it waits for none.
 struct Steps {
@@ -441,13 +564,8 @@ fn finish_step(steps: Steps, mut signals: task::Receiver[u64]) fails Stopping us
 } finish_step
 
 /// Waits until a message waits in the component's intake; once the component has had none for the time `quiet` holds, never when 0, suspends it until its next message and then wakes it, telling the driver of both.
-fn idle[S, Env: Any, P: Any](
-    mut stepper: sys::Stepper[S, Env, P],
-    quiet: core::atomic::AtomicU64,
-    clock: sys::Clock,
-    reports: task::Sender[Input],
-    incarnation: u64,
-    ) fails task::Cancelled uses wait {
+fn idle[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], quiet: core::atomic::AtomicU64, telling: Telling) fails task::Cancelled uses wait {
+    let clock = telling.clock
     loop {
         let ms = quiet.load()
         if ms == 0 {
@@ -465,32 +583,24 @@ fn idle[S, Env: Any, P: Any](
         }
     }
     mut stepper.suspend()
-    try await tell(reports, incarnation, report: Report.Suspended)
+    try await telling.tell(report: Report.Suspended)
     try await stepper.incoming()
     mut stepper.wake()
-    try await tell(reports, incarnation, report: Report.Woken)
+    try await telling.tell(report: Report.Woken)
 } idle
 
 /// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn but those `kept` names, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and returns whether it called any.
-fn call_handlers[S, Env: Any, P: Any](
-    mut stepper: sys::Stepper[S, Env, P],
-    marks: task::Sender[Mark],
-    steps: mem::Shared[Steps],
-    finished: task::Sender[u64],
-    clock: sys::Clock,
-    kept: mem::List[u64],
-    alloc: mem::Alloc,
-    ) -> bool fails task::Cancelled uses wait {
-    try await mark(marks, marked: Mark.Began)
-    let started = now(clock)
-    let counts = steps.contents()
+fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept: mem::List[u64], telling: Telling) -> bool fails task::Cancelled uses wait {
+    try await mark(telling.marks, marked: Mark.Began)
+    let started = now(telling.clock)
+    let counts = telling.steps.contents()
     var handled = false
     loop {
         discard counts.begun.fetch_add(1)
         let stepped = mut stepper.step()
         let done = counts.done.fetch_add(1).value_or(0) + 1
         if counts.wanted.compare_swap(expected: done, replacement: 0).is_ok() {
-            match attempt await finished.send(done) {
+            match attempt await telling.finished.send(done) {
                 Err(task::SendError.Cancelled(cancelled)) => fail cancelled
                 else => {
                 }
@@ -500,9 +610,9 @@ fn call_handlers[S, Env: Any, P: Any](
             break
         }
         handled = true
-        start_unkept(mut stepper, kept, alloc)
+        start_unkept(mut stepper, kept, alloc: telling.alloc)
     }
-    try await mark(marks, marked: Mark.Took(ns: now(clock).saturating_sub(started)))
+    try await mark(telling.marks, marked: Mark.Took(ns: now(telling.clock).saturating_sub(started)))
     return handled
 } call_handlers
 
@@ -663,20 +773,25 @@ pub fn Replier.put_resource(self, id: u64, take resource: sys::Held) fails sys::
 fn hand_over(replies: mem::Shared[hw::SpinLock[mem::Bounded[Handed, QUEUED_REPLIES]]], signal: mem::Shared[hw::Signal[Unit]], reports: task::Sender[Input], incarnation: u64) fails task::Cancelled uses wait {
     loop {
         try await signal.contents().wait()
-        loop {
-            let next = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Handed] limits notrap {
-                return replies.contents().with(t, body: fn(mut queue: mem::Bounded[Handed, QUEUED_REPLIES]) -> Option[Handed] limits notrap, terminates, noalloc {
-                    return mut queue.pop()
-                })
-            })
-            let Some(handed) = next else {
-                break
-            }
-            let report = match handed {
-                Handed.Reply(request: request, reply: reply) => Report.Answered(id: request, answer: os::Answer.Replied(take reply))
-                Handed.Summary(bytes: bytes) => Report.Published(summary: take bytes)
-            }
-            try await tell(reports, incarnation, take report)
-        }
+        try await hand_all(replies, reports, incarnation)
     }
 } hand_over
+
+/// Hands the driver every reply and summary `replies` queues.
+fn hand_all(replies: mem::Shared[hw::SpinLock[mem::Bounded[Handed, QUEUED_REPLIES]]], reports: task::Sender[Input], incarnation: u64) fails task::Cancelled uses wait {
+    loop {
+        let next = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Handed] limits notrap {
+            return replies.contents().with(t, body: fn(mut queue: mem::Bounded[Handed, QUEUED_REPLIES]) -> Option[Handed] limits notrap, terminates, noalloc {
+                return mut queue.pop()
+            })
+        })
+        let Some(handed) = next else {
+            return
+        }
+        let report = match handed {
+            Handed.Reply(request: request, reply: reply) => Report.Answered(id: request, answer: os::Answer.Replied(take reply))
+            Handed.Summary(bytes: bytes) => Report.Published(summary: take bytes)
+        }
+        try await tell(reports, incarnation, take report)
+    }
+} hand_all
