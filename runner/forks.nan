@@ -1,4 +1,4 @@
-//! Forks: copies of an instance the runner runs for previews, each started, or resumed from a checkpoint, in a domain of its own on a world of substitutes reading the configuration record and the store of a branch, then probed once for its health; their keyed tasks never run and their messages never enter an intake.
+//! Forks: copies of an instance the runner runs for previews, each in a domain of its own on a world of substitutes reading the configuration record and the store of a branch: started, resumed from a checkpoint, or from a copy of the instance's state that its holder takes at quiescence or an earlier fork ended with, then handling one call or resuming, then probed once for its health; their keyed tasks never run and their messages never enter an intake.
 
 /// Runs a fork of the instance `driver` holds as `forking` asks, from a task of `s`, telling `done` what it saw; an instance whose component may hold a resource is never forked.
 fn Shared.fork(
@@ -20,18 +20,57 @@ fn Shared.fork(
         return
     }
     let moniker = ident::Moniker(text: driver.moniker.text)
-    var state: Option[store::service::View] = None
-    if forking.resumed and spec.durability.class == os::DurabilityClass.Checkpointed {
-        let directory = self.directory.share()
-        state = await when directory => directory.state_view(mut driver.minted, moniker: ident::Moniker(text: moniker.text), principal: ident::Principal(text: spec.principal.text), alloc)
-    }
+    let os::Forking(branch: branch, from: from, call: call) = forking
+    let source = try await self.fork_source(mut driver, take from, checkpointed: spec.durability.class == os::DurabilityClass.Checkpointed)
     let header = os::Header.of_work(cause: driver.changed_by, slot: driver.slot)
     let forks = Forks(components: self.components, config: self.config, directory: self.directory.share(), withheld: self.withheld)
-    discard s.spawn(fn[take forks, take spec, take moniker, take forking, take done]() fails task::Cancelled uses wait limits stack 32_768 {
-        let seen = try await forks.run(take spec, take moniker, take forking, state, header)
+    discard s.spawn(fn[take forks, take spec, take moniker, take branch, take source, take call, take done]() fails task::Cancelled uses wait limits stack 32_768 {
+        let seen = try await forks.run(take spec, take moniker, branch: branch.as_str(), take source, take call, header)
         discard attempt await done.send(Ok(os::Outcome.Forked(Some(take seen))))
     })
 } Shared.fork
+
+/// Where a fork's state comes from: nowhere, its start running; a checkpoint, the latest when `number` is `None`, read through the instance's View of `/state`; the copy the instance's holder sends; or a copy given.
+enum Source {
+    Fresh
+    Kept(view: store::service::View, number: Option[u64])
+    Taken(copy: task::Receiver[os::StateCopy])
+    Given(copy: os::StateCopy)
+} Source
+
+/// Where a fork of the instance `driver` holds takes its state from, as `from` asks: a copy the running domain's holder takes at quiescence; or, for an instance `checkpointed` and while one does not run, its checkpoint; or the copy given.
+fn Shared.fork_source(self, mut driver: Driver, take from: os::ForkFrom, checkpointed: bool) -> Source fails task::Cancelled uses wait {
+    var number: Option[u64] = None
+    match from {
+        os::ForkFrom.Start => return Source.Fresh
+        os::ForkFrom.Copied(copy) => return Source.Given(copy: take copy)
+        os::ForkFrom.Checkpoint(number: numbered) => {
+            number = numbered
+        }
+        os::ForkFrom.Live => {
+            match first driver.domain {
+                Some(domain) if driver.lifecycle == Some(os::Lifecycle.Running) => {
+                    let task::Channel(sender: replying, receiver: replies) = task::Channel[os::StateCopy].bounded(1, alloc: self.config.alloc)
+                    let deliveries = domain.deliveries.split()
+                    discard attempt await deliveries.send(Delivery.Hold(order: HolderOrder.Snapshot(reply: take replying)))
+                    return Source.Taken(copy: take replies)
+                }
+                else => {
+                }
+            }
+        }
+    }
+    if not checkpointed {
+        return Source.Fresh
+    }
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let view = await when directory => directory.state_view(mut driver.minted, moniker: ident::Moniker(text: driver.moniker.text), principal: ident::Principal(text: driver.spec.principal.text), alloc)
+    return match view {
+        Some(found) => Source.Kept(view: found, number: number)
+        None => Source.Fresh
+    }
+} Shared.fork_source
 
 /// What running forks draws on: the components, the runner's configuration, the directory worlds draw on, and the revoked capabilities.
 struct Forks[C: Components and Copy and Send] {
@@ -41,32 +80,43 @@ struct Forks[C: Components and Copy and Send] {
     withheld: Withheld
 } Forks
 
-/// What a fork of the instance `moniker` under `spec` saw, run as `forking` asks under `header`, its checkpoint read through its View of `/state` `state`.
+/// What a fork of the instance `moniker` under `spec` saw, run on the branch `branch` from the state `source` gives, handling `call` once, under `header`.
 fn Forks.run(
     self,
     take spec: os::InstanceSpec,
     take moniker: ident::Moniker,
-    take forking: os::Forking,
-    state: Option[store::service::View],
+    branch: Str,
+    take source: Source,
+    take call: Option[os::ForkCall],
     header: os::Header,
     ) -> os::Forked fails task::Cancelled uses wait {
     let alloc = self.config.alloc
     var restore: Option[os::Checkpoint] = None
-    match state {
-        Some(view) => {
-            match try await restored_from(view, moniker: ident::Moniker(text: moniker.text), numbered: forking.checkpoint, alloc) {
+    match source {
+        Source.Fresh => {
+        }
+        Source.Kept(view: view, number: number) => {
+            match try await restored_from(view, moniker: ident::Moniker(text: moniker.text), numbered: number, alloc) {
                 Ok(found) => {
                     restore = found
                 }
-                Err(code) => return unbuilt(code)
+                Err(code) => return unbuilt(code, alloc)
             }
         }
-        None => {
+        Source.Taken(copy: copies) => {
+            var receiver = copies
+            let Some(copy) = try await mut receiver.receive() else {
+                return unbuilt(text::Fixed[32].of("instance.stopped"), alloc)
+            }
+            restore = Some(self.restoring(spec, take copy))
+        }
+        Source.Given(copy: copy) => {
+            restore = Some(self.restoring(spec, take copy))
         }
     }
     var minted = Minted.none(alloc)
     defer take minted.close()
-    let config = try await self.configuration(spec, moniker: ident::Moniker(text: moniker.text), branch: forking.branch.as_str(), mut minted)
+    let config = try await self.configuration(spec, moniker: ident::Moniker(text: moniker.text), branch, mut minted)
     let budget = self.config.pool.split(usize.widen(spec.budget.limit))
     defer take budget.close()
     let account = self.config.exec.split_on(self.config.share(spec.share), alloc: budget.alloc())
@@ -74,22 +124,29 @@ fn Forks.run(
     let task::Channel(sender: intake, receiver: _) = task::Channel[os::Call].bounded(1, alloc)
     let task::Channel(sender: orders, receiver: _) = task::Channel[os::Order].bounded(1, alloc)
     let task::Channel(sender: logs, receiver: _) = task::Channel[journal::Logged].bounded(1, alloc)
-    let request = Request(moniker: ident::Moniker(text: moniker.text), cell: budget.alloc(), exec: account.executor(), clock: self.config.clock, random: self.config.random, withheld: self.withheld, orders: take orders, logs: take logs, forking: Some(Substitutes(intake: take intake, branch: text::String.of(forking.branch.as_str(), alloc))), alloc: alloc)
+    let request = Request(moniker: ident::Moniker(text: moniker.text), cell: budget.alloc(), exec: account.executor(), clock: self.config.clock, random: self.config.random, withheld: self.withheld, orders: take orders, logs: take logs, forking: Some(Substitutes(intake: take intake, branch: text::String.of(branch, alloc))), alloc: alloc)
     let directory = self.directory.share()
     let built = await when directory => directory.world(spec, mut minted, request)
     return match built {
-        Some(world) => try await self.domain(component: spec.component.as_str(), take world, take restore, take config, exec: account.executor(), alloc: budget.alloc(), header)
-        None => unbuilt(text::Fixed[32].of("instance.env-incomplete"))
+        Some(world) => try await self.domain(component: spec.component.as_str(), take world, take restore, take config, take call, exec: account.executor(), alloc: budget.alloc(), header)
+        None => unbuilt(text::Fixed[32].of("instance.env-incomplete"), alloc)
     }
 } Forks.run
 
-/// Runs the fork of an instance of `component` on `world` in a domain of its own, restoring `restore` with the configuration record `config`, and gives what it saw: its report, or its trap.
+/// The checkpoint a fork of an instance under `spec` restores from `copy`, kept nowhere.
+fn Forks.restoring(self, spec: os::InstanceSpec, take copy: os::StateCopy) -> os::Checkpoint {
+    let os::StateCopy(schema: schema, state: state) = copy
+    return os::Checkpoint(number: 0, incarnation: 0, bundle: spec.bundle, schema: schema, time: self.config.wall.now(self.config.clock), state: take state)
+} Forks.restoring
+
+/// Runs the fork of an instance of `component` on `world` in a domain of its own, restoring `restore` with the configuration record `config` and handling `call` once, and gives what it saw: its report, or its trap.
 fn Forks.domain(
     self,
     component: Str,
     take world: nanos::World,
     take restore: Option[os::Checkpoint],
     take config: Option[Untrusted[mem::Bytes]],
+    take call: Option[os::ForkCall],
     exec: task::Executor,
     alloc: mem::Alloc,
     header: os::Header,
@@ -101,7 +158,7 @@ fn Forks.domain(
     let task::Channel(sender: reports, receiver: _) = task::Channel[Input].bounded(1, alloc: held)
     let task::Channel(sender: marks, receiver: _) = task::Channel[Mark].bounded(1, alloc: held)
     let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: held)
-    let serving = Serving(deliveries: take delivered, reports: take reports, marks: take marks, incarnation: 0, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: 0, keeping: None, restore: take restore, config: take config, forking: Some(take reporting))
+    let serving = Serving(deliveries: take delivered, reports: take reports, marks: take marks, incarnation: 0, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: 0, keeping: None, restore: take restore, config: take config, forking: Some(ForkRun(call: take call, reporting: take reporting)))
     let components = self.components
     let path = text::String.of(component, alloc: held)
     let ran = attempt await abandoner.contents().run_sized(fn[take path, take world, take serving]() -> Ended fails task::Cancelled uses wait limits stack 131_072 {
@@ -121,25 +178,25 @@ fn Forks.domain(
         Ok(Ended.Stopped) => {
             var receiver = reported
             let Some(seen) = try await mut receiver.receive() else {
-                return unbuilt(text::Fixed[32].of("instance.env-incomplete"))
+                return unbuilt(text::Fixed[32].of("instance.env-incomplete"), alloc: held)
             }
             return seen
         }
-        Ok(Ended.CheckpointUndecodable) => return unbuilt(text::Fixed[32].of("instance.checkpoint-undecodable"))
-        Ok(_) => return unbuilt(text::Fixed[32].of("instance.env-incomplete"))
+        Ok(Ended.CheckpointUndecodable) => return unbuilt(text::Fixed[32].of("instance.checkpoint-undecodable"), alloc: held)
+        Ok(_) => return unbuilt(text::Fixed[32].of("instance.env-incomplete"), alloc: held)
         Err(trap) => {
             var kind = text::String.empty(held)
             mut kind.write(Dyn[Render].view(trap.kind()), budget: 64)
             var report = text::String.empty(held)
             mut report.write(Dyn[Render].view(trap), budget: 1_024)
-            return os::Forked(state_bytes: state_bytes, spawns: 0, sent: 0, fault: Some(os::ForkFault.Trap(kind: take kind, report: take report)))
+            return os::Forked(state_bytes: state_bytes, reply: None, sent: mem::List.empty(held), spawns: mem::List.empty(held), state: None, fault: Some(os::ForkFault.Trap(kind: take kind, report: take report)))
         }
     }
 } Forks.domain
 
 /// What a fork that could not be built for the reason `code` saw.
-fn unbuilt(code: text::Fixed[32]) -> os::Forked {
-    return os::Forked(state_bytes: 0, spawns: 0, sent: 0, fault: Some(os::ForkFault.Unbuilt(code: code)))
+fn unbuilt(code: text::Fixed[32], alloc: mem::Alloc) -> os::Forked {
+    return os::Forked(state_bytes: 0, reply: None, sent: mem::List.empty(alloc), spawns: mem::List.empty(alloc), state: None, fault: Some(os::ForkFault.Unbuilt(code: code)))
 } unbuilt
 
 /// The checkpoint of the instance `moniker` a fork resumes from: the one `numbered` names, or its latest when `None`, none when it keeps none; the code of the failure to read it.
@@ -188,3 +245,76 @@ fn Forks.configuration(
         Err(_) => None
     }
 } Forks.configuration
+
+/// Handles `call` once on the fork's component behind `stepper`: a task of its own posts it through the stepper's outbox, waking the stepper when it cannot, and the stepper handles it; gives the encoding of the reply to a request.
+fn Driven.handled_once(mut stepper: sys::Stepper[S, Env, P], take call: os::ForkCall, exec: task::Executor, alloc: mem::Alloc) -> Option[mem::Bytes] fails task::Cancelled uses wait {
+    let out = stepper.outbox()
+    let waker = stepper.waker()
+    let task::Channel(sender: answering, receiver: answered) = task::Channel[Option[mem::Bytes]].bounded(1, alloc)
+    var given = Some(Posting(call: take call, answering: take answering))
+    try await task::scope(exec, body: fn[mut stepper, mut given](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(Posting(call: posted, answering: replying)) = mut given.extract() else {
+            return
+        }
+        discard s.spawn(fn[take posted, take replying]() fails task::Cancelled uses wait limits stack 40_960 {
+            let peers = mem::List[sys::ProtocolSchema].empty(alloc)
+            let handles = mem::List[sys::Handle].empty(alloc)
+            let served = attempt await sys::Wire[P].serve(out, request: 1, hash: posted.hash, peers: peers.view(), raw: Untrusted.of(posted.encoded.view()), handles: handles.view(), alloc)
+            if served.is_err() {
+                waker.wake()
+            }
+            let reply = match served {
+                Ok(Some(encoded)) => replied(take encoded)
+                else => None
+            }
+            discard attempt await replying.send(take reply)
+        })
+        try await stepper.incoming()
+        discard mut stepper.step()
+    })
+    var receiver = answered
+    return match try await mut receiver.receive() {
+        Some(reply) => reply
+        None => None
+    }
+} Driven.handled_once
+
+/// The bytes of `encoded`, the reply to a request, none for a one-way call, which has none.
+fn replied(take encoded: sys::Encoded) -> Option[mem::Bytes] {
+    if encoded.bytes.len() == 0 {
+        return None
+    }
+    return Some(take encoded.bytes)
+} replied
+
+/// The call a fork handles and where its reply goes.
+struct Posting {
+    call: os::ForkCall
+    answering: task::Sender[Option[mem::Bytes]]
+} Posting
+
+/// The messages the handlers of the component behind `stepper` sent it, taken from it, each with the operation it calls and the class that operation declares.
+fn held_outputs[S, Env: Any, P: sys::Protocol](mut stepper: sys::Stepper[S, Env, P], alloc: mem::Alloc) -> mem::List[os::HeldOutput] {
+    let operations = sys::Wire[P].operations(alloc)
+    var outputs = mem::List[os::HeldOutput].empty(alloc)
+    loop {
+        let Some(sent) = mut stepper.take_sent() else {
+            return outputs
+        }
+        let sys::Sent(message: message, header: _, delay_ns: delay_ns) = sent
+        var encoded = sys::Encoded.empty(alloc)
+        let number = sys::Wire[P].encode_any(message, out: mut encoded)
+        let operation = operations[usize.widen(number)]
+        mut outputs.push(os::HeldOutput(operation: text::String.of(operation.name.as_str(), alloc), class: operation.class, encoded: take encoded.bytes, delay_ns: delay_ns))
+    }
+} held_outputs
+
+/// The classes of the keyed tasks the handlers of the component behind `stepper` spawned, each cancelled before it starts.
+fn held_spawns[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], alloc: mem::Alloc) -> mem::List[sys::Reversibility] {
+    var classes = mem::List[sys::Reversibility].empty(alloc)
+    for held in stepper.held(alloc) {
+        mut classes.push(held.class)
+        discard mut stepper.drop_held(held.key)
+    }
+    return classes
+} held_spawns

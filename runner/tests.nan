@@ -16,6 +16,8 @@ protocol Counter {
     pub fn asleep() -> bool limits pure
     /// The cause of the handler call, as a header holds it.
     pub fn cause() -> u64 limits pure
+    /// Adds `amount`, notes it again a minute later and spawns a keyed task, giving the total.
+    pub fn echo(amount: u32) -> u64 limits recorded
 } Counter
 
 struct TallyEnv {
@@ -117,6 +119,14 @@ fn Tally.asleep(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> bool {
 fn Tally.cause(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 {
     return os::Header.current().cause
 } Tally.cause
+
+fn Tally.echo(mut self, take amount: u32, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 {
+    self.total += u64.widen(amount)
+    mut cx.after(ms: 60_000, send: Counter.note(amount: amount))
+    mut cx.spawn(key: 1, run: fn(out: sys::Outbox[Counter]) limits stack 4_096 {
+    })
+    return self.total
+} Tally.echo
 
 fn Tally.suspend(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) {
     self.suspended = true
@@ -434,7 +444,7 @@ fn describing(core: Core, alloc: mem::Alloc) -> bool fails Failure uses wait {
     }
     var bundle = Array[u8, 33].filled(0)
     bundle[0] = 0x01
-    return volatile and described.schema.hash == sys::Wire[Counter].hash() and described.schema.operations.len() == 7 and described.bundle == ident::HashValue(bytes: bundle)
+    return volatile and described.schema.hash == sys::Wire[Counter].hash() and described.schema.operations.len() == 8 and described.bundle == ident::HashValue(bytes: bundle)
 } describing
 
 test controls_describe_instances_and_restore_only_checkpointed_ones for Shared.described {
@@ -512,7 +522,7 @@ fn forked(core: Core, alloc: mem::Alloc) -> Option[os::Forked] fails Failure use
         fail Failure.Control(os::ControlError.Missing)
     }
     discard try await add(port, amount: 5, alloc)
-    let seen = try await core.control.fork(named("tally"), forking: os::Forking(branch: text::String.of("main", alloc), resumed: false, checkpoint: None), alloc)
+    let seen = try await core.control.fork(named("tally"), forking: os::Forking(branch: text::String.of("main", alloc), from: os::ForkFrom.Start, call: None), alloc)
     if try await add(port, amount: 0, alloc) != 5 {
         return None
     }
@@ -529,10 +539,51 @@ test forks_run_apart_from_their_instance for Shared.fork {
         expect false
         return
     }
-    expect forked_run.spawns == 0 and forked_run.sent == 0 and forked_run.fault.is_none()
+    expect forked_run.spawns.len() == 0 and forked_run.sent.len() == 0 and forked_run.fault.is_none()
     let started = counts.started.contents().load()
     expect started == 1
 } forks_run_apart_from_their_instance
+
+/// Adds 5 to the running tally, then has a fork of its state at quiescence handle `echo(2)` once; `None` unless the tally's own total stays 5.
+fn echoed(core: Core, alloc: mem::Alloc) -> Option[os::Forked] fails Failure uses wait {
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    discard try await add(port, amount: 5, alloc)
+    var call = sys::Encoded.empty(alloc)
+    discard sys::Wire[Counter].echo(mut call, amount: 2)
+    let forking = os::Forking(branch: text::String.of("main", alloc), from: os::ForkFrom.Live, call: Some(os::ForkCall(hash: sys::Wire[Counter].hash(), encoded: take call.bytes)))
+    let seen = try await core.control.fork(named("tally"), take forking, alloc)
+    if try await add(port, amount: 0, alloc) != 5 {
+        return None
+    }
+    return seen
+} echoed
+
+test forks_handle_one_call_on_a_copy_of_the_live_state for Shared.fork_source {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Option[os::Forked] fails Failure uses wait {
+        return try await echoed(core, alloc: world.alloc)
+    })
+    let Some(Some(forked_run)) = seen else {
+        expect false
+        return
+    }
+    let Some(reply) = forked_run.reply else {
+        expect false
+        return
+    }
+    let total = attempt mem::wire::Codec[Result[u64, Never]].decode(Untrusted.of(reply.view()), alloc: world.alloc)
+    expect total == Ok(Ok(7)) and forked_run.state.is_some() and forked_run.fault.is_none()
+    expect forked_run.sent.len() == 1 and forked_run.spawns.len() == 1
+    expect forked_run.sent[0].operation.as_str() == "note" and forked_run.sent[0].delay_ns > 0
+} forks_handle_one_call_on_a_copy_of_the_live_state
 
 /// Calls the tally across a trap: the call queued behind the trapping one reaches the restarted incarnation.
 fn restarted(core: Core, alloc: mem::Alloc) -> Array[u64, 2] fails Failure uses wait {

@@ -26,7 +26,7 @@ pub fn effects_of(
     forked: store::service::View,
     branch: Str,
     base: ident::CommitId,
-    take stepped: mem::List[Stepped],
+    mut stepped: mem::List[Stepped],
     control: os::Control,
     oversight: os::Port[policy::Oversight],
     alloc: mem::Alloc,
@@ -43,12 +43,12 @@ pub fn effects_of(
     var activations = changed
     for each in stepped {
         match each.command {
-            Some(InstanceStep(step: step, moniker: moniker, code: _, command: Command.Restore(number: _), operation: _, message: _, class: _)) => mut activations.push(Activation(moniker: ident::Moniker(text: moniker.text), step: step, kind: ActivationKind.Restart, migration: None, pause_ms: RESTART_PAUSE_MS))
+            Some(InstanceStep(step: step, moniker: moniker, code: _, command: Command.Restore(number: _), operation: _, message: _, class: _, foreseen: _)) => mut activations.push(Activation(moniker: ident::Moniker(text: moniker.text), step: step, kind: ActivationKind.Restart, migration: None, pause_ms: RESTART_PAUSE_MS))
             else => {
             }
         }
     }
-    let Runs(faults: faults, declared: declared, state_bytes: state_bytes) = match try await forked_runs(activations, stepped, control, branch, alloc) {
+    let Runs(faults: faults, declared: declared, state_bytes: state_bytes) = match try await forked_runs(activations, mut stepped, control, branch, alloc) {
         Ok(found) => found
         Err(failure) => return Preview.Failed(take failure)
     }
@@ -90,7 +90,7 @@ pub fn effects_of(
     let effect_set = EffectSet(base: base, branch: text::String.of("main", alloc), steps: take effects, delta: take changes, activations: take activations, widenings: take widenings, deliveries: take deliveries, faults: take faults, approvals: take approvals, cuts: take cuts, taint: labels_of(asked.taint, alloc), costs: Costs(cpu_ns: 0, memory_bytes: 0, store_bytes: store_bytes, energy_mj: 0))
     var plan = Plan(principal: ident::Principal(text: asked.principal.text), steps: texts_of(asked.steps, alloc), options: PlanOptions(intent: text_copy(asked.options.intent, alloc), confirm_within_s: confirm_within_s, health_s: asked.options.health_s), effects: take effect_set, inputs: RecordedInputs(reads: take reads, live: mem::List.empty(alloc), values: mem::List.empty(alloc)))
     let hash = mut plan.hashed(alloc)
-    let records = effect_records(plan, hash, lines, alloc)
+    let records = effect_records(plan, hash, lines, replies: reply_texts(stepped, alloc), alloc)
     return Preview.Kept(Previewed(hash: hash, plan: take plan, spans: take spans, subjects: take subjects, records: take records))
 } effects_of
 
@@ -138,7 +138,7 @@ fn observe(
     return Ok(Observed(lines: take lines, activations: take activations))
 } observe
 
-/// What the steps `stepped` of `asked` give, `activations` being the activations they make, those of the steps `declared` observed by no fork: a step's basis is `Declared` when one of its activations is, and for a call or a redelivery, whose class its operation declares; a span ends after a point of no return and before a call or a redelivery to an instance an earlier step of the span activates.
+/// What the steps `stepped` of `asked` give, `activations` being the activations they make, those of the steps `declared` observed by no fork: a step's basis is `Declared` when one of its activations is, and for a call or a redelivery no fork ran, whose class its operation declares; a span ends after a point of no return and before a call or a redelivery to an instance an earlier step of the span activates.
 fn assess(
     asked: Planning,
     stepped: mem::List[Stepped],
@@ -158,19 +158,17 @@ fn assess(
         if declared.position(fn(step: u32) => step == each.step).is_some() {
             basis = Basis.Declared
         }
+        var reply: Option[mem::Bytes] = None
         match each.command {
             Some(commanded) => {
-                class = commanded.class
-                match commanded.delivery(issuer: asked.principal, alloc) {
-                    Some(delivery) => {
-                        basis = Basis.Declared
-                        if activated.position(fn(moniker: ident::Moniker) => moniker == commanded.moniker).is_some() {
-                            closing = true
-                        }
-                        mut assessed.deliveries.push(take delivery)
-                    }
-                    None => {
-                    }
+                if commanded.messages() and activated.position(fn(moniker: ident::Moniker) => moniker == commanded.moniker).is_some() {
+                    closing = true
+                }
+                let CommandEffect(class: commanded_class, declared: from_declaration, reply: replied) = command_effect(commanded, issuer: asked.principal, deliveries: mut assessed.deliveries, alloc)
+                class = commanded_class
+                reply = replied
+                if from_declaration {
+                    basis = Basis.Declared
                 }
             }
             None => {
@@ -181,7 +179,7 @@ fn assess(
             activated = mem::List.empty(alloc)
             closing = false
         }
-        mut assessed.effects.push(StepEffect(step: each.step, span: span, class: class, basis: basis, reply: None))
+        mut assessed.effects.push(StepEffect(step: each.step, span: span, class: class, basis: basis, reply: take reply))
         for activation in activations {
             if activation.step == each.step {
                 mut activated.push(ident::Moniker(text: activation.moniker.text))
@@ -202,6 +200,68 @@ fn assess(
     }
     return assessed
 } assess
+
+/// The canonical rendering of the reply a forked run foresaw for each call step of `stepped`, in their order, `None` for any other step.
+fn reply_texts(stepped: mem::List[Stepped], alloc: mem::Alloc) -> mem::List[Option[text::String]] {
+    var texts = mem::List[Option[text::String]].empty(alloc)
+    for each in stepped {
+        mut texts.push(foreseen_reply(each, alloc))
+    }
+    return texts
+} reply_texts
+
+/// The canonical rendering of the reply a forked run foresaw for the call step `each`.
+fn foreseen_reply(each: Stepped, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(commanded) = each.command else {
+        return None
+    }
+    let Some(foreseen) = commanded.foreseen else {
+        return None
+    }
+    let Some(bytes) = foreseen.reply else {
+        return None
+    }
+    return commanded.reply_text(raw: Untrusted.of(bytes.view()), alloc)
+} foreseen_reply
+
+/// What a step's command gives its effect: its class, whether it comes from a declaration, and the encoding of the reply a forked run of a call foresaw.
+struct CommandEffect {
+    class: Reversibility
+    declared: bool
+    reply: Option[mem::Bytes]
+} CommandEffect
+
+/// What the command `commanded` gives its step's effect, adding its deliveries to `deliveries`: with a forked run of its message, the class that run foresaw, the reply to a call and the deliveries of what the handler held; without one, the class its operation declares and its own request, which `issuer` makes.
+fn command_effect(commanded: InstanceStep, issuer: ident::Principal, mut deliveries: mem::List[Delivery], alloc: mem::Alloc) -> CommandEffect {
+    let Some(foreseen) = commanded.foreseen else {
+        let request = commanded.delivery(issuer, alloc)
+        let delivered = request.is_some()
+        match request {
+            Some(delivery) => mut deliveries.push(take delivery)
+            None => {
+            }
+        }
+        return CommandEffect(class: commanded.class, declared: delivered, reply: None)
+    }
+    for delivery in take commanded.held_deliveries(alloc) {
+        mut deliveries.push(take delivery)
+    }
+    var reply: Option[mem::Bytes] = None
+    match commanded.command {
+        Command.Call(hash: _, reply: _) => {
+            match foreseen.reply {
+                Some(bytes) => {
+                    reply = Some(copied_bytes(bytes, alloc))
+                }
+                None => {
+                }
+            }
+        }
+        else => {
+        }
+    }
+    return CommandEffect(class: commanded.foreseen_class().value_or(commanded.class), declared: false, reply: take reply)
+} command_effect
 
 /// The work of each span the steps `stepped` fall into by their effects `effects`: the writes of its steps in order, the nodes they read, the instances they activate among `activations`, and their commands; `None` when one does not copy.
 fn spans_of(stepped: mem::List[Stepped], effects: mem::List[StepEffect], activations: mem::List[Activation], alloc: mem::Alloc) -> Option[mem::List[SpanWork]] {
@@ -580,17 +640,29 @@ fn bytes_written(writes: mem::List[store::Write]) -> u64 {
     return total
 } bytes_written
 
-/// The records printing the effect set of `plan`, whose hash is `hash`: a `plan` summary, then its `step`, `change` with each change's lines `lines`, `activation`, `widening`, `approval`, `cut` and `cost` records.
-pub fn effect_records(plan: Plan, hash: ident::HashValue, lines: mem::List[mem::List[text::String]], alloc: mem::Alloc) -> mem::List[Record] {
+/// The records printing the effect set of `plan`, whose hash is `hash`: a `plan` summary, then its `step` records, each with the rendering of its reply among `replies`, its `change` records with each change's lines `lines`, `activation`, `widening`, `approval`, `cut` and `cost` records.
+pub fn effect_records(
+    plan: Plan,
+    hash: ident::HashValue,
+    lines: mem::List[mem::List[text::String]],
+    replies: mem::List[Option[text::String]],
+    alloc: mem::Alloc,
+    ) -> mem::List[Record] {
     let effects = plan.effects
     var records = mem::List[Record].empty(alloc)
     mut records.push(plan_summary(effects, hash, alloc))
-    for step in effects.steps {
+    for at in 0..<effects.steps.len() {
+        let step = effects.steps[at]
         var record = Record.of("step", alloc)
         mut record.subject(Dyn[Render].view(step.step))
         mut record.field("span", value: Dyn[Render].view(step.span))
         mut record.field("class", value: Dyn[Render].view(step.class))
         mut record.field("basis", value: Dyn[Render].view(step.basis))
+        match replies.get(at) {
+            Some(Some(reply)) => mut record.rendered("reply", rendered: reply.as_str(), alloc)
+            else => {
+            }
+        }
         mut records.push(take record)
     }
     for at in 0..<effects.delta.len() {
@@ -797,7 +869,7 @@ test effect_sets_print_as_records_in_field_order for effect_records {
     mut changed.push(text::String.of("- batch: 0", alloc))
     mut changed.push(text::String.of("+ batch: 32", alloc))
     mut lines.push(take changed)
-    let records = effect_records(plan, hash, lines, alloc)
+    let records = effect_records(plan, hash, lines, replies: mem::List.empty(alloc), alloc)
     var block = Block.of(Verdict.Ok, id: "6", verb: "plan", operand: "[1 steps]", alloc)
     for record in take records {
         mut block.records.push(take record)

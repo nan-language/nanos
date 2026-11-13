@@ -1,0 +1,76 @@
+//! Holder orders: what the task of an instance's domain carries out between its handler calls on its driver's order, which the dispatcher queues before waking the stepper.
+
+/// The orders a holder's queue holds.
+const HOLDER_ORDERS: usize = 8
+
+/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`.
+enum HolderOrder {
+    Snapshot(reply: task::Sender[os::StateCopy])
+} HolderOrder
+
+/// The orders waiting for an instance's holder, and the waker of its stepper.
+struct Orders {
+    queue: mem::Shared[hw::SpinLock[mem::Bounded[HolderOrder, HOLDER_ORDERS]]]
+    waker: sys::Waker
+} Orders
+
+/// An empty queue of orders for the holder of the stepper `waker` wakes.
+fn Orders.of(waker: sys::Waker, alloc: mem::Alloc) -> Orders {
+    return Orders(queue: mem::Shared.of(hw::SpinLock.of(mem::Bounded[HolderOrder, HOLDER_ORDERS].empty()), alloc), waker: waker)
+} Orders.of
+
+/// The same queue.
+fn Orders.share(self) -> Orders {
+    return Orders(queue: self.queue.share(), waker: self.waker)
+} Orders.share
+
+/// Queues `order` and wakes the holder; whether the queue had room.
+fn Orders.give(self, take order: HolderOrder) -> bool {
+    var held = Some(take order)
+    let fitted = hw::without_irqs(fn[mut held](t: hw::IrqsDisabled) -> bool limits notrap {
+        return self.queue.contents().with(t, body: fn[mut held](mut queue: mem::Bounded[HolderOrder, HOLDER_ORDERS]) -> bool limits notrap, terminates, noalloc {
+            let Some(next) = mut held.extract() else {
+                return false
+            }
+            if queue.is_full() {
+                return false
+            }
+            mut queue.push(take next)
+            return true
+        })
+    })
+    if fitted {
+        self.waker.wake()
+    }
+    return fitted
+} Orders.give
+
+/// The order queued first, taken from the queue.
+fn Orders.next(self) -> Option[HolderOrder] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[HolderOrder] limits notrap {
+        return self.queue.contents().with(t, body: fn(mut queue: mem::Bounded[HolderOrder, HOLDER_ORDERS]) -> Option[HolderOrder] limits notrap, terminates, noalloc {
+            return mut queue.pop()
+        })
+    })
+} Orders.next
+
+/// Carries out every order waiting for the holder of `stepper`, its component quiescent.
+fn carry_out[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], orders: Orders, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    loop {
+        let Some(order) = orders.next() else {
+            return
+        }
+        match order {
+            HolderOrder.Snapshot(reply: reply) => {
+                discard attempt await reply.send(state_copy(stepper, alloc))
+            }
+        }
+    }
+} carry_out
+
+/// A copy of the state of the component behind `stepper`.
+fn state_copy[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], alloc: mem::Alloc) -> os::StateCopy {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[S].encode(stepper.state(), out: mut bytes)
+    return os::StateCopy(schema: ident::HashValue(bytes: mem::wire::Codec[S].schema_hash().bytes), state: take bytes)
+} state_copy

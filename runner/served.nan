@@ -1,6 +1,6 @@
 //! The task of an instance's domain: it builds the Env, starts or restores the component, serves the calls its driver delivers, one at a time, keeps its checkpoints, and hands its driver the replies the component gives postponed requests.
 
-/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, the instance's configuration record, and for a fork where it tells what its run saw.
+/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, the instance's configuration record, and for a fork what it runs and where it tells what it saw.
 pub open struct Serving {
     deliveries: task::Receiver[Delivery]
     reports: task::Sender[Input]
@@ -12,13 +12,20 @@ pub open struct Serving {
     keeping: Option[Keeping]
     restore: Option[os::Checkpoint]
     config: Option[Untrusted[mem::Bytes]]
-    forking: Option[task::Sender[os::Forked]]
+    forking: Option[ForkRun]
 } Serving
 
-/// What a driver delivers to its instance's domain: a call with its header, the time without a message after which its component is suspended, never when 0, or the order to stop once the handler running returns.
+/// What a fork's domain runs: the call it handles, or none for its start or resumption, and where it tells what its run saw.
+struct ForkRun {
+    call: Option[os::ForkCall]
+    reporting: task::Sender[os::Forked]
+} ForkRun
+
+/// What a driver delivers to its instance's domain: a call with its header, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns.
 enum Delivery {
     Call(id: u64, hash: sys::ProtocolHash, encoded: sys::Encoded, request: bool, header: os::Header)
     SuspendAfter(ms: u32)
+    Hold(order: HolderOrder)
     Stop
 } Delivery
 
@@ -109,6 +116,7 @@ pub fn Driven.run(
     var stepper = begun
     var due_at = epoch_after(keeping, clock)
     defer take stepper.abandon()
+    let orders = Orders.of(stepper.waker(), alloc)
     match attempt sys::Runner.served(replier.mint(0)) {
         Ok(runner) => mut stepper.attach(runner)
         Err(_) => {
@@ -134,8 +142,9 @@ pub fn Driven.run(
         let sending = reports.split()
         let counted = steps.share()
         let setting = quiet.share()
-        discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take known, take setting]() fails Stopping uses wait limits stack 40_960 {
-            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, peers: known, quiet: setting, alloc)
+        let ordering = orders.share()
+        discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take known, take setting, take ordering]() fails Stopping uses wait limits stack 40_960 {
+            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, peers: known, quiet: setting, orders: ordering, alloc)
         })
         let answering = reports.split()
         let queued = replies.share()
@@ -143,7 +152,7 @@ pub fn Driven.run(
         discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
             try await hand_over(queued, signal: ringing, reports: answering, incarnation)
         })
-        try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), clock, reports, marks, steps, finished, incarnation, alloc)
+        try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), clock, reports, marks, steps, finished, incarnation, orders, alloc)
     })
     match looped {
         Ok(_) => {
@@ -167,7 +176,7 @@ pub fn Driven.run(
     return Ended.Stopped
 } Driven.run
 
-/// Runs a fork of an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, then probes its health once, telling `serving` the bytes of the state it resumed from, how many keyed tasks its handlers spawned and messages they sent it, none of which runs, and whether it is unhealthy; then ends it, handing its Env to `release`.
+/// Runs a fork of an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, then handles once, one level deep, the call `serving` gives, or without one calls its `resume`, then probes its health once; tells `serving` the bytes of the state it resumed from, the reply to its call, the messages its handlers sent it and the classes of the keyed tasks they spawned, none of which runs, its state once it handled its call, and whether it is unhealthy; then ends it, handing its Env to `release`.
 fn Driven.forked(
     take env: Env,
     exec: task::Executor,
@@ -176,7 +185,7 @@ fn Driven.forked(
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
     let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, config: _, forking: forking) = serving
-    let Some(reporting) = forking else {
+    let Some(ForkRun(call: call, reporting: reporting)) = forking else {
         release(take env)
         return Ended.Stopped
     }
@@ -186,26 +195,24 @@ fn Driven.forked(
     }
     var stepper = begun
     defer take stepper.abandon()
-    mut stepper.resumed(reason)
-    var spawns: u32 = 0
-    loop {
-        let Some(_) = mut stepper.take_held() else {
-            break
+    var reply: Option[mem::Bytes] = None
+    var state: Option[os::StateCopy] = None
+    match call {
+        Some(given) => {
+            discard held_outputs(mut stepper, alloc)
+            discard held_spawns(mut stepper, alloc)
+            reply = try await Driven[S, Env, P].handled_once(mut stepper, call: take given, exec, alloc)
+            state = Some(state_copy(stepper, alloc))
         }
-        spawns = spawns.saturating_add(1)
+        None => mut stepper.resumed(reason)
     }
-    var sent: u32 = 0
-    loop {
-        let Some(_) = mut stepper.take_sent() else {
-            break
-        }
-        sent = sent.saturating_add(1)
-    }
+    let sent = held_outputs(mut stepper, alloc)
+    let spawns = held_spawns(mut stepper, alloc)
     let fault: Option[os::ForkFault] = match mut stepper.health() {
         sys::HealthReply.Healthy => None
         sys::HealthReply.Unhealthy(why) => Some(os::ForkFault.Unhealthy(reason: text::String.of(why.as_str(), alloc)))
     }
-    discard attempt await reporting.send(os::Forked(state_bytes: state_bytes, spawns: spawns, sent: sent, fault: take fault))
+    discard attempt await reporting.send(os::Forked(state_bytes: state_bytes, reply: take reply, sent: take sent, spawns: take spawns, state: take state, fault: take fault))
     undefer stepper
     let sys::Stopped(state: _, env: ended) = try await take stepper.end()
     release(take ended)
@@ -249,7 +256,7 @@ fn Driven.begin(
     return Some(Begun(stepper: try sys::Stepper[S, Env, P].resume(take state, take env, exec, alloc), reason: sys::ResumeReason.Restored, restored: Some(saved.number)))
 } Driven.begin
 
-/// Holds the component: waits for its messages, suspending it after `quiet` without one, and calls their handlers. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the component is idle.
+/// Holds the component: waits for its messages, suspending it after `quiet` without one, and calls their handlers, carrying out between them the orders `orders` gives it. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the component is idle.
 fn hold[S: Encode, Env: Any, P: Any](
     mut stepper: sys::Stepper[S, Env, P],
     keeping: Option[Keeping],
@@ -262,9 +269,11 @@ fn hold[S: Encode, Env: Any, P: Any](
     steps: mem::Shared[Steps],
     finished: task::Sender[u64],
     incarnation: u64,
+    orders: Orders,
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
     loop {
+        try await carry_out(stepper, orders, alloc)
         if syncing.swap(false) {
             due_at = Some(now(clock))
         }
@@ -329,7 +338,7 @@ struct Given {
     peers: mem::List[sys::ProtocolSchema]
 } Given
 
-/// Serves each call delivered through the protocol P, or one whose schema `peers` holds, on the component behind `out`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which the component is suspended.
+/// Serves each call delivered through the protocol P, or one whose schema `peers` holds, on the component behind `out`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which the component is suspended and handing each order for the holder to `orders`.
 fn dispatch[P: sys::Protocol and Send](
     out: sys::Outbox[P],
     take deliveries: task::Receiver[Delivery],
@@ -339,6 +348,7 @@ fn dispatch[P: sys::Protocol and Send](
     incarnation: u64,
     peers: mem::List[sys::ProtocolSchema],
     quiet: mem::Shared[core::atomic::AtomicU64],
+    orders: Orders,
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
     var receiver = deliveries
@@ -350,6 +360,9 @@ fn dispatch[P: sys::Protocol and Send](
         match delivery {
             Delivery.Call(id: id, hash: hash, encoded: encoded, request: request, header: header) => try await serve_call(out, id, hash, take encoded, request, header, steps, mut signals, reports, incarnation, peers, alloc)
             Delivery.SuspendAfter(ms: ms) => quiet.contents().store(u64.widen(ms))
+            Delivery.Hold(order: order) => {
+                discard orders.give(take order)
+            }
             Delivery.Stop => fail Stopping.Asked
         }
     }

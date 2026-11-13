@@ -4,13 +4,13 @@
 pub closed enum Command derives Encode {
     /// Calls an operation with the call the step's message encodes, through the protocol of hash `hash`: a request whose replies `reply` reads, or a one-way call when `None`.
     Call(hash: sys::ProtocolHash, reply: Option[mem::wire::NamedSchema])
-    /// Delivers the instance's dead letter `seq` again.
-    Redeliver(seq: u64)
+    /// Delivers the instance's dead letter `seq` again, a call of the protocol of hash `hash`.
+    Redeliver(seq: u64, hash: sys::ProtocolHash)
     /// Restarts the instance from a copy of its checkpoint `number`.
     Restore(number: u64)
 } Command
 
-/// A step's command to an instance: its step, the instance and the bundle it runs, the command, the operation a call or a redelivery reaches with the message it sends, and its class, the operation's declared class for those.
+/// A step's command to an instance: its step, the instance and the bundle it runs, the command, the operation a call or a redelivery reaches with the message it sends, its class, the operation's declared class for those, and what a forked run of its message foresaw.
 pub closed struct InstanceStep derives Encode {
     pub step: u32
     pub moniker: ident::Moniker
@@ -19,7 +19,15 @@ pub closed struct InstanceStep derives Encode {
     pub operation: text::String
     pub message: mem::Bytes
     pub class: Reversibility
+    pub foreseen: Option[Foreseen]
 } InstanceStep
+
+/// What a forked run of a step's message foresaw: the encoding of the reply to a call, the messages the handler sent the instance and the classes of the keyed tasks it spawned.
+pub closed struct Foreseen derives Encode {
+    pub reply: Option[mem::Bytes]
+    pub sent: mem::List[os::HeldOutput]
+    pub spawns: mem::List[sys::Reversibility]
+} Foreseen
 
 /// The command the step `written`, numbered `step`, makes, the instance it names described through `control` and its `/state` read through `view`; `request.unknown-name` for an instance `control` does not know.
 pub fn command_of(
@@ -86,7 +94,7 @@ fn call_command(
         Err(failure) => return Err(take failure)
     }
     let Named(step: step, text: _, moniker: moniker, code: code) = named
-    return Ok(InstanceStep(step: step, moniker: take moniker, code: code, command: Command.Call(hash: schema.hash, reply: reply_schema(declared, alloc)), operation: text::String.of(operation, alloc), message: take message, class: declared_class(declared.class)))
+    return Ok(InstanceStep(step: step, moniker: take moniker, code: code, command: Command.Call(hash: schema.hash, reply: reply_schema(declared, alloc)), operation: text::String.of(operation, alloc), message: take message, class: declared_class(declared.class), foreseen: None))
 } call_command
 
 /// The redelivery of the dead letter `seq` the step `named` makes, its operation of the protocol `schema`: `auth.denied` unless `holding` lets its principal call the operation at the UTC time `now_utc`; `instance.no-dead-letter` and `instance.dead-letter-empty` for a letter the instance does not keep or that holds no message.
@@ -121,7 +129,7 @@ fn redeliver_command(
     }
     let class = declared_class(schema.operations[declared].class)
     let Named(step: step, text: _, moniker: moniker, code: code) = named
-    return Ok(InstanceStep(step: step, moniker: take moniker, code: code, command: Command.Redeliver(seq: seq), operation: take operation, message: take sent, class: class))
+    return Ok(InstanceStep(step: step, moniker: take moniker, code: code, command: Command.Redeliver(seq: seq, hash: schema.hash), operation: take operation, message: take sent, class: class, foreseen: None))
 } redeliver_command
 
 /// The restore of the checkpoint `number` the step `named` makes: `auth.denied` unless `holding` lets its principal restart the instance at the UTC time `now_utc`, `instance.no-checkpoint` for a checkpoint the instance does not keep.
@@ -141,7 +149,7 @@ fn restore_command(
         return Err(Failure.of("instance.no-checkpoint", subject: named.text.as_str(), alloc))
     }
     let Named(step: step, text: _, moniker: moniker, code: code) = named
-    return Ok(InstanceStep(step: step, moniker: take moniker, code: code, command: Command.Restore(number: number), operation: text::String.empty(alloc), message: mem::Bytes.empty(alloc), class: Reversibility.Restorable))
+    return Ok(InstanceStep(step: step, moniker: take moniker, code: code, command: Command.Restore(number: number), operation: text::String.empty(alloc), message: mem::Bytes.empty(alloc), class: Reversibility.Restorable, foreseen: None))
 } restore_command
 
 /// The node `/state/<moniker>/<dir>/<number>` through `view`, `None` when the instance does not keep it.
@@ -192,6 +200,69 @@ pub fn InstanceStep.delivery(self, issuer: ident::Principal, alloc: mem::Alloc) 
     return Some(Delivery(step: self.step, kind: DeliveryKind.Message, issuer: ident::Principal(text: issuer.text), target: target_of(self.moniker, operation: self.operation.as_str(), alloc), code: Some(self.code), destination: text::String.empty(alloc), size_bytes: u64.widen(self.message.len()), blake3: ident::HashValue.of_content(self.message.view()), class: self.class))
 } InstanceStep.delivery
 
+/// Whether the step sends the instance a message: a call or a redelivery.
+pub fn InstanceStep.messages(self) -> bool {
+    return match self.command {
+        Command.Restore(number: _) => false
+        else => true
+    }
+} InstanceStep.messages
+
+/// The class a forked run of the step's message foresaw, `None` without one: the join of the classes of the messages the handler sent the instance and of the keyed tasks it spawned, `none` without either.
+pub fn InstanceStep.foreseen_class(self) -> Option[Reversibility] {
+    let Some(foreseen) = self.foreseen else {
+        return None
+    }
+    var class = Reversibility.None
+    for output in foreseen.sent {
+        class = class.join(declared_class(output.class))
+    }
+    for spawned in foreseen.spawns {
+        class = class.join(self.spawned_class(spawned))
+    }
+    return Some(class)
+} InstanceStep.foreseen_class
+
+/// The class of a keyed task of class `spawned` the handler of the step's operation spawns: joined with the class the operation declares, which bounds what its handler starts, as the calls a task makes through ports state no class.
+fn InstanceStep.spawned_class(self, spawned: sys::Reversibility) -> Reversibility = declared_class(spawned).join(self.class)
+
+/// The deliveries the instance makes, under its own principal `inst.<moniker>`, of the messages and keyed tasks a forked run of the step's message foresaw its handler holding, those of class above `none`.
+pub fn InstanceStep.held_deliveries(self, alloc: mem::Alloc) -> mem::List[Delivery] {
+    var deliveries = mem::List[Delivery].empty(alloc)
+    let Some(foreseen) = self.foreseen else {
+        return deliveries
+    }
+    var name = text::Fixed[64].of("inst.")
+    mut name.append(self.moniker.text.as_str())
+    let issuer = ident::Principal(text: name)
+    for output in foreseen.sent {
+        let class = declared_class(output.class)
+        if class == Reversibility.None {
+            continue
+        }
+        mut deliveries.push(Delivery(step: self.step, kind: DeliveryKind.Message, issuer: ident::Principal(text: issuer.text), target: target_of(self.moniker, operation: output.operation.as_str(), alloc), code: Some(self.code), destination: text::String.empty(alloc), size_bytes: u64.widen(output.encoded.len()), blake3: ident::HashValue.of_content(output.encoded.view()), class: class))
+    }
+    for spawned in foreseen.spawns {
+        let class = self.spawned_class(spawned)
+        if class == Reversibility.None {
+            continue
+        }
+        mut deliveries.push(Delivery(step: self.step, kind: DeliveryKind.Spawn, issuer: ident::Principal(text: issuer.text), target: target_of(self.moniker, operation: self.operation.as_str(), alloc), code: Some(self.code), destination: text::String.empty(alloc), size_bytes: 0, blake3: ident::HashValue.of_content(b""), class: class))
+    }
+    return deliveries
+} InstanceStep.held_deliveries
+
+/// The call a fork of the instance handles for the message of a call or a redelivery; `None` for a restore.
+pub fn InstanceStep.fork_call(self, alloc: mem::Alloc) -> Option[os::ForkCall] {
+    let hash = match self.command {
+        Command.Call(hash: hash, reply: _) or Command.Redeliver(seq: _, hash: hash) => hash
+        Command.Restore(number: _) => return None
+    }
+    var encoded = mem::Bytes.empty(alloc)
+    mut encoded.append(self.message.view())
+    return Some(os::ForkCall(hash: hash, encoded: take encoded))
+} InstanceStep.fork_call
+
 /// The canonical rendering of `raw`, the reply to the request a call step makes; `None` for any other step.
 pub fn InstanceStep.reply_text(self, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[text::String] {
     let Command.Call(hash: _, reply: Some(reply)) = self.command else {
@@ -216,7 +287,7 @@ pub fn carried_out(commanded: InstanceStep, control: os::Control, alloc: mem::Al
                 Err(failed) => Err(failed.code())
             }
         }
-        Command.Redeliver(seq: seq) => return match first attempt await control.redeliver(take moniker, seq, alloc) {
+        Command.Redeliver(seq: seq, hash: _) => return match first attempt await control.redeliver(take moniker, seq, alloc) {
             Ok(_) => Ok(None)
             Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
             Err(failed) => Err(failed.code())
