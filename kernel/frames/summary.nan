@@ -10,7 +10,7 @@ const HIBERNATION_SHARE: u64 = 16
 const CHUNK: u64 = 65_536
 
 /// The highest pressure level.
-const TOP_LEVEL: u8 = 4
+pkg const TOP_LEVEL: u8 = 4
 
 /// The parts of RAM the start fixes: usable memory, the kernel image, the boot heap, the core pool, and usable memory that no region, chunk or frame covers.
 pkg struct Fixed derives Copy, Eq {
@@ -27,15 +27,15 @@ pkg struct Pressure derives Copy, Eq {
     pkg level: u8 where level <= TOP_LEVEL
 } Pressure
 
-/// The cells the core splits from a node pool of `bytes`: its own, through which every draw from the pool goes, so that its charge is what the pool has drawn, and its hibernation cell, a sixteenth of the pool at most; and the pool's pressure.
+/// The cells the core splits from a pool of `bytes`: its own, through which every draw from the pool goes, so that its charge is what the pool has drawn, and for a node pool its hibernation cell, a sixteenth of the pool at most; and the pool's pressure.
 pkg linear struct PoolCells {
     pkg whole: mem::Budget
-    pkg hibernation: mem::Budget
+    hibernation: Option[mem::Budget]
     pkg bytes: u64
     pkg pressure: Pressure
 } PoolCells
 
-/// What the core's counters read at one moment: the fixed parts, the frames of page tables, the regions given to reserved instances, the free frames, of the pool its bytes, what it has drawn, what its hibernation cell holds and its pressure level, and the bytes of the store's blob cache, which the store's cell holds.
+/// What the core's counters read at one moment: the fixed parts, the frames of page tables, the regions given to reserved instances, the free frames, of the pools their bytes and what they have drawn, what the node pool's hibernation cell holds and the highest of their pressure levels, and the bytes of the store's blob cache, which the store's cell holds.
 pkg struct Reading derives Copy, Eq {
     pkg fixed: Fixed
     pkg page_tables: u64
@@ -60,29 +60,65 @@ fn Fixed.of(
     return Fixed(ram: ram, image: image, boot_heap: BOOT_HEAP, core: core, excluded: ram.saturating_sub(held))
 } Fixed.of
 
-/// The cells of the pool `pool`: one of its whole size, and below it the hibernation cell.
+/// The cells of the node pool `pool`: one of its whole size, and below it the hibernation cell.
 pkg fn PoolCells.of(pool: Pool) -> PoolCells {
     let whole = pool.heap.alloc().split(usize.widen(pool.bytes))
     let hibernation = whole.alloc().split(usize.widen(pool.bytes / HIBERNATION_SHARE / CHUNK * CHUNK))
-    return PoolCells(whole: take whole, hibernation: take hibernation, bytes: pool.bytes, pressure: Pressure.of(pool.bytes))
+    return PoolCells(whole: take whole, hibernation: Some(take hibernation), bytes: pool.bytes, pressure: Pressure.of(pool.bytes))
 } PoolCells.of
+
+/// The cell of the extra pool `pool`, of its whole size.
+pkg fn PoolCells.extra(pool: Pool) -> PoolCells {
+    return PoolCells(whole: pool.heap.alloc().split(usize.widen(pool.bytes)), hibernation: None, bytes: pool.bytes, pressure: Pressure.of(pool.bytes))
+} PoolCells.extra
+
+/// The allocator of the hibernation cell, a node pool's.
+pkg fn PoolCells.images(self) -> Option[mem::Alloc] {
+    return match self.hibernation {
+        Some(cell) => Some(cell.alloc())
+        None => None
+    }
+} PoolCells.images
+
+/// The memory the pool's root cell has not drawn.
+pkg fn PoolCells.free(self) -> u64 {
+    return self.bytes.saturating_sub(u64.widen(self.whole.charged()))
+} PoolCells.free
 
 /// Closes the cells.
 pkg fn PoolCells.close(take self) {
     let PoolCells(whole: whole, hibernation: hibernation, bytes: _, pressure: _) = self
-    take hibernation.close()
+    match hibernation {
+        Some(cell) => take cell.close()
+        None => {
+        }
+    }
     take whole.close()
 } PoolCells.close
 
 /// What `frames` and the pool's cells read now, the pool's level settled first.
 pkg fn PoolCells.reading(mut self, fixed: Fixed, frames: Frames) -> Reading {
     discard mut self.settle()
-    return Reading(fixed: fixed, page_tables: frames.table_bytes(), reserved_regions: frames.reserved_bytes(), free_frames: frames.free_bytes(), pool_bytes: self.bytes, pool_drawn: u64.widen(self.whole.charged()), hibernation: u64.widen(self.hibernation.charged()), level: self.pressure.level, blob_cache: 0)
+    let hibernation = match self.hibernation {
+        Some(cell) => u64.widen(cell.charged())
+        None => 0
+    }
+    return Reading(fixed: fixed, page_tables: frames.table_bytes(), reserved_regions: frames.reserved_bytes(), free_frames: frames.free_bytes(), pool_bytes: self.bytes, pool_drawn: u64.widen(self.whole.charged()), hibernation: hibernation, level: self.pressure.level, blob_cache: 0)
 } PoolCells.reading
+
+/// The reading with the pool `cells` added, its level settled first: its bytes and what it has drawn, and its level when it is the highest.
+pkg fn Reading.adding(self, mut cells: PoolCells) -> Reading {
+    let level = mut cells.settle()
+    var reading = self
+    reading.pool_bytes = reading.pool_bytes.saturating_add(cells.bytes)
+    reading.pool_drawn = reading.pool_drawn.saturating_add(u64.widen(cells.whole.charged()))
+    reading.level = reading.level.max(level)
+    return reading
+} Reading.adding
 
 /// Settles the pool's level on what it has drawn now, and gives it.
 pkg fn PoolCells.settle(mut self) -> u8 {
-    discard mut self.pressure.settle(free: self.bytes.saturating_sub(u64.widen(self.whole.charged())))
+    discard mut self.pressure.settle(free: self.free())
     return self.pressure.level
 } PoolCells.settle
 

@@ -1,20 +1,20 @@
-//! Pressure: what the runner does as the pressure level of the pool its instances draw from rises.
+//! Pressure: what the runner does as the pressure level of a pool its instances draw from rises.
 
-/// The level from which hibernation memory drops its images and idle instances hibernate.
+/// The level from which a pool's idle instances hibernate, and hibernation memory drops its images when the pool is the one holding them.
 const RECLAIMING: u8 = 3
 
-/// The highest level, at which starts are refused.
-const TOP_LEVEL: u8 = 4
+/// The pool whose hibernation cell keeps the hibernation images: the node pool.
+const IMAGES_POOL: u32 = 0
 
-/// What a reclaim asks the drivers: the hibernation images they keep, or the instances that may hibernate for pressure.
+/// What a reclaim asks the drivers: the hibernation images they keep, or the instances of a pool that may hibernate for pressure.
 enum Asking derives Copy, Eq {
     Images
-    Idle
+    Idle(pool: u32)
 } Asking
 
-/// What the pool's pressure has a driver do: have its holder call `pressure` with the `level` the pool rose through; answer what a reclaim asks of it, its `index`th, through `reply`; drop the hibernation image hibernation memory keeps; or hibernate the instance if it is idle, `done` hearing its lifecycle then.
+/// What a pool's pressure has a driver do: have its holder call `pressure` with the `level` the pool `pool` rose through; answer what a reclaim asks of it, its `index`th, through `reply`; drop the hibernation image hibernation memory keeps; or hibernate the instance if it is idle, `done` hearing its lifecycle then.
 enum Pressing {
-    Level(level: u8)
+    Level(pool: u32, level: u8)
     Ask(asking: Asking, index: usize, reply: task::Sender[Option[Ranked]])
     DropImage
     Reclaim(done: task::Sender[Result[os::Outcome, os::ControlError]])
@@ -26,41 +26,48 @@ struct Ranked derives Copy {
     ns: u64
 } Ranked
 
-/// Follows the pool's pressure level for the drivers `routes` reaches: at each rise, the holder of each running instance calls `pressure` with each level risen through, in order; at level 3 or more, reclaims memory.
+/// Follows the pressure level of each pool for the drivers `routes` reaches: at each rise of a pool's level, the holder of each running instance of that pool calls `pressure` with each level risen through, in order; at level 3 or more, reclaims the pool's memory.
 fn Shared.relieve(self, routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]]) fails task::Cancelled uses wait {
-    var seen: u8 = 0
+    let alloc = self.config.alloc
+    var seen = mem::List[u8].empty(alloc)
     loop {
-        let level = try await self.machine.changed(seen)
-        let alloc = self.config.alloc
+        let levels = try await self.machine.changed(seen)
         let drivers = await when routes => routed(routes, alloc)
-        var step = seen
-        while step < level {
-            step += 1
-            for driver in drivers {
-                try await told(driver.inputs, input: Input.Pressed(Pressing.Level(level: step)))
+        for index in 0..<levels.len() {
+            let pool = u32.truncate(u64.widen(index))
+            var step = seen.get(index).value_or(0)
+            while step < levels[index] {
+                step += 1
+                for driver in drivers {
+                    try await told(driver.inputs, input: Input.Pressed(Pressing.Level(pool: pool, level: step)))
+                }
             }
         }
-        seen = level
-        if level >= RECLAIMING {
-            try await self.reclaim(drivers)
+        seen = levels
+        for index in 0..<seen.len() {
+            if seen[index] >= RECLAIMING {
+                try await self.reclaim(drivers, pool: u32.truncate(u64.widen(index)))
+            }
         }
     }
 } Shared.relieve
 
-/// Drops the hibernation images the drivers keep, oldest first, then hibernates their idle checkpointed instances, least recently messaged first, until the pool's level falls below 3.
-fn Shared.reclaim(self, drivers: mem::List[Routed]) fails task::Cancelled uses wait {
-    for kept in try await self.ranked(drivers, asking: Asking.Images) {
-        try await told(drivers[kept.index].inputs, input: Input.Pressed(Pressing.DropImage))
-        if try await self.machine.settle() < RECLAIMING {
-            return
+/// Reclaims the memory of pool `pool` until its level falls below 3: drops the hibernation images the drivers keep, oldest first, when it holds them, then hibernates its idle checkpointed instances, least recently messaged first.
+fn Shared.reclaim(self, drivers: mem::List[Routed], pool: u32) fails task::Cancelled uses wait {
+    if pool == IMAGES_POOL {
+        for kept in try await self.ranked(drivers, asking: Asking.Images) {
+            try await told(drivers[kept.index].inputs, input: Input.Pressed(Pressing.DropImage))
+            if try await self.machine.settle(pool) < RECLAIMING {
+                return
+            }
         }
     }
-    for candidate in try await self.ranked(drivers, asking: Asking.Idle) {
+    for candidate in try await self.ranked(drivers, asking: Asking.Idle(pool: pool)) {
         let task::Channel(sender: done, receiver: outcome) = task::Channel[Result[os::Outcome, os::ControlError]].bounded(1, alloc: self.config.alloc)
         try await told(drivers[candidate.index].inputs, input: Input.Pressed(Pressing.Reclaim(done: take done)))
         var receiver = outcome
         discard try await mut receiver.receive()
-        if try await self.machine.settle() < RECLAIMING {
+        if try await self.machine.settle(pool) < RECLAIMING {
             return
         }
     }
@@ -99,11 +106,11 @@ fn told(inputs: task::Sender[Input], take input: Input) fails task::Cancelled us
     }
 } told
 
-/// Does what the pool's pressure has the driver do.
+/// Does what a pool's pressure has the driver do.
 fn Driver.pressed(mut self, take pressing: Pressing) fails task::Cancelled uses wait {
     match pressing {
-        Pressing.Level(level: level) => {
-            if self.lifecycle == Some(os::Lifecycle.Running) and not self.paused {
+        Pressing.Level(pool: pool, level: level) => {
+            if self.draws_from(pool) and self.lifecycle == Some(os::Lifecycle.Running) and not self.paused {
                 try await self.hold_order(HolderOrder.Pressure(level: level))
             }
         }
@@ -117,19 +124,25 @@ fn Driver.pressed(mut self, take pressing: Pressing) fails task::Cancelled uses 
     }
 } Driver.pressed
 
-/// How the driver answers a reclaim asking `asking` as the driver `index`: with the time its image was kept, or, for an idle running checkpointed instance that pressure has not passed over, the time it was last messaged.
+/// Whether the instance's cell draws from pool `pool`, which a reserved instance's never does.
+fn Driver.draws_from(self, pool: u32) -> bool = not self.spec.budget.reserved and self.pool == pool
+
+/// How the driver answers a reclaim asking `asking` as the driver `index`: with the time its image was kept, or, for an idle running checkpointed instance of the pool asked that pressure has not passed over, the time it was last messaged.
 fn Driver.rank(self, asking: Asking, index: usize) -> Option[Ranked] {
-    if asking == Asking.Images {
-        return match self.image {
-            Some(_) => Some(Ranked(index: index, ns: self.hibernated_ns))
-            None => None
+    let pool = match asking {
+        Asking.Images => {
+            return match self.image {
+                Some(_) => Some(Ranked(index: index, ns: self.hibernated_ns))
+                None => None
+            }
         }
+        Asking.Idle(pool: pool) => pool
     }
     let calling = match self.domain {
         Some(domain) => domain.outstanding.is_some()
         None => true
     }
-    if self.lifecycle != Some(os::Lifecycle.Running) or self.spec.durability.class != os::DurabilityClass.Checkpointed or calling or self.queue.len() > 0 or self.paused or self.hibernating.is_some() or self.passed_over {
+    if not self.draws_from(pool) or self.lifecycle != Some(os::Lifecycle.Running) or self.spec.durability.class != os::DurabilityClass.Checkpointed or calling or self.queue.len() > 0 or self.paused or self.hibernating.is_some() or self.passed_over {
         return None
     }
     return Some(Ranked(index: index, ns: self.messaged_ns))

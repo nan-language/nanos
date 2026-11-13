@@ -1,14 +1,36 @@
-//! The memory keeper: the core's task holding the frame allocator and the pool's cells, which carves the regions of reserved instances, reads the counters of the memory summary and settles the pool's pressure level; and the machine the runner takes, which asks it.
+//! The memory keeper: the core's task holding the frame allocator and the pools' cells, which carves the regions of reserved instances and of extra pools, names the pool each cell splits from, reads the counters of the memory summary and settles each pool's pressure level; and the machine the runner takes, which asks it.
 
-/// What the memory keeper takes: a reserved instance's request for a region of `bytes`, whose store goes to `done`, `None` when no free range holds one; a reading of its counters; the pool's pressure level, settled now; or that level once it differs from `seen`. Each request settles the level.
+/// The size of an extra pool.
+const EXTRA_POOL: u64 = 67_108_864
+
+/// What the memory keeper takes: a reserved instance's request for a region of `bytes`, whose store goes to `done`, `None` when no free range holds one; a reading of its counters; the pool the next cell splits from; the pressure level of pool `pool`, settled now; or each pool's level once they differ from `seen`. Each request settles every pool's level.
 enum MemoryRequest {
     Reserve(bytes: u64, done: task::Sender[Option[mem::Heap]])
     Read(done: task::Sender[frames::Reading])
-    Settle(done: task::Sender[u8])
-    Changed(seen: u8, done: task::Sender[u8])
+    Pool(done: task::Sender[Option[runner::Pooled]])
+    Settle(pool: u32, done: task::Sender[u8])
+    Changed(seen: mem::List[u8], done: task::Sender[mem::List[u8]])
 } MemoryRequest
 
-/// The machine the runner takes: the memory keeper, asked for reserved regions and the pool's pressure level, and the scheduler's state, which holds the power of a running CPU and takes each CPU's latency tolerance.
+/// The extra pools: the cells of each, numbered from 1 after the node pool, and the stores over their regions, which outlive the cells.
+linear struct Pools {
+    extras: mem::List[frames::PoolCells]
+    stores: mem::List[frames::Pool]
+} Pools
+
+/// A request waiting for the levels to differ from `seen`.
+struct Waiting {
+    seen: mem::List[u8]
+    done: task::Sender[mem::List[u8]]
+} Waiting
+
+/// What chooses a pool: its free memory and its pressure level.
+struct Room derives Copy, Eq {
+    free: u64
+    level: u8
+} Room
+
+/// The machine the runner takes: the memory keeper, asked for reserved regions, the pool each cell splits from and the pools' pressure levels, and the scheduler's state, which holds the power of a running CPU and takes each CPU's latency tolerance.
 struct Resources {
     requests: task::Sender[MemoryRequest]
     cpus: mem::Shared[sched::State]
@@ -46,9 +68,21 @@ fn Counters.share(self) -> Counters {
     return Counters(requests: self.requests.split(), blob_cache: self.blob_cache.share(), alloc: self.alloc)
 } Counters.share
 
-fn Resources.settle(self) -> u8 fails task::Cancelled uses wait {
+fn Resources.pool(self) -> Option[runner::Pooled] fails task::Cancelled uses wait {
+    let task::Channel(sender: done, receiver: outcome) = task::Channel[Option[runner::Pooled]].bounded(1, alloc: self.alloc)
+    if not try await ask(self.requests, request: MemoryRequest.Pool(done: take done)) {
+        return None
+    }
+    var receiver = outcome
+    let Some(pooled) = try await mut receiver.receive() else {
+        return None
+    }
+    return pooled
+} Resources.pool
+
+fn Resources.settle(self, pool: u32) -> u8 fails task::Cancelled uses wait {
     let task::Channel(sender: done, receiver: outcome) = task::Channel[u8].bounded(1, alloc: self.alloc)
-    if not try await ask(self.requests, request: MemoryRequest.Settle(done: take done)) {
+    if not try await ask(self.requests, request: MemoryRequest.Settle(pool: pool, done: take done)) {
         return 0
     }
     var receiver = outcome
@@ -58,17 +92,26 @@ fn Resources.settle(self) -> u8 fails task::Cancelled uses wait {
     return level
 } Resources.settle
 
-fn Resources.changed(self, seen: u8) -> u8 fails task::Cancelled uses wait {
-    let task::Channel(sender: done, receiver: outcome) = task::Channel[u8].bounded(1, alloc: self.alloc)
-    if not try await ask(self.requests, request: MemoryRequest.Changed(seen: seen, done: take done)) {
-        return seen
+fn Resources.changed(self, seen: mem::List[u8]) -> mem::List[u8] fails task::Cancelled uses wait {
+    let task::Channel(sender: done, receiver: outcome) = task::Channel[mem::List[u8]].bounded(1, alloc: self.alloc)
+    if not try await ask(self.requests, request: MemoryRequest.Changed(seen: levels_copy(seen, alloc: self.alloc), done: take done)) {
+        return levels_copy(seen, alloc: self.alloc)
     }
     var receiver = outcome
-    let Some(level) = try await mut receiver.receive() else {
-        return seen
+    let Some(levels) = try await mut receiver.receive() else {
+        return levels_copy(seen, alloc: self.alloc)
     }
-    return level
+    return levels
 } Resources.changed
+
+/// A copy of `levels`.
+fn levels_copy(levels: mem::List[u8], alloc: mem::Alloc) -> mem::List[u8] {
+    var copy = mem::List[u8].empty(alloc)
+    for level in levels {
+        mut copy.push(level)
+    }
+    return copy
+} levels_copy
 
 fn Resources.busy_mw(self) -> mem::Shared[core::atomic::AtomicU64] {
     return self.cpus.contents().busy_mw.share()
@@ -102,27 +145,31 @@ fn ask(requests: task::Sender[MemoryRequest], take request: MemoryRequest) -> bo
     }
 } ask
 
-/// Carves the region of each reservation `requests` brings from `frames`, under a store of its own, and answers each reading with the counters of `frames` and the pool's `cells` beside the start's `fixed` parts, for as long as requests come; settles the pool's level at each request, answering the requests waiting for it to change once it has.
+/// Carves the region of each reservation `requests` brings from `frames`, under a store of its own, answers each reading with the counters of `frames` and the pools beside the start's `fixed` parts, and names the pool each new cell splits from, for as long as requests come; at each request it settles the level of the node pool `node` and of each extra pool, making an extra pool of 64 MiB from `frames` when one has just reached the top level, and answers the requests waiting for the levels to change once they have.
 fn keep_memory(
     mut frames: frames::Frames,
-    mut cells: frames::PoolCells,
+    mut node: frames::PoolCells,
     fixed: frames::Fixed,
     mut requests: task::Receiver[MemoryRequest],
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
-    var waiting = mem::List[task::Sender[u8]].empty(alloc)
+    var pools = Pools(extras: mem::List.empty(alloc), stores: mem::List.empty(alloc))
+    defer take pools.close()
+    var waiting = mem::List[Waiting].empty(alloc)
     loop {
         let Some(request) = try await mut requests.receive() else {
             return
         }
-        let before = cells.pressure.level
-        let level = mut cells.settle()
-        if level != before {
-            while waiting.len() > 0 {
-                let waiter = mut waiting.remove(0)
-                discard attempt await waiter.send(level)
+        let levels = mut pools.settle(mut node, mut frames, alloc)
+        var still = mem::List[Waiting].empty(alloc)
+        for waiter in take waiting {
+            if waiter.seen.view() == levels.view() {
+                mut still.push(take waiter)
+            } else {
+                discard attempt await waiter.done.send(levels_copy(levels, alloc))
             }
         }
+        waiting = still
         match request {
             MemoryRequest.Reserve(bytes: bytes, done: done) => {
                 let store = match mut frames.reserve(bytes) {
@@ -132,18 +179,112 @@ fn keep_memory(
                 discard attempt await done.send(store)
             }
             MemoryRequest.Read(done: done) => {
-                discard attempt await done.send(mut cells.reading(fixed, frames))
+                discard attempt await done.send(mut pools.reading(mut node, fixed, frames))
             }
-            MemoryRequest.Settle(done: done) => {
-                discard attempt await done.send(level)
+            MemoryRequest.Pool(done: done) => {
+                discard attempt await done.send(pools.chosen(node, alloc))
+            }
+            MemoryRequest.Settle(pool: pool, done: done) => {
+                discard attempt await done.send(levels.get(usize.widen(pool)).value_or(0))
             }
             MemoryRequest.Changed(seen: seen, done: done) => {
-                if seen != level {
-                    discard attempt await done.send(level)
+                if seen.view() == levels.view() {
+                    mut waiting.push(Waiting(seen: take seen, done: take done))
                 } else {
-                    mut waiting.push(take done)
+                    discard attempt await done.send(levels_copy(levels, alloc))
                 }
             }
         }
     }
 } keep_memory
+
+/// Settles the level of the node pool `node` and of each extra pool, making an extra pool from `frames` when one has just reached the top level; gives the levels, by pool number.
+fn Pools.settle(mut self, mut node: frames::PoolCells, mut frames: frames::Frames, alloc: mem::Alloc) -> mem::List[u8] {
+    var levels = mem::List[u8].empty(alloc)
+    var topped = rose(mut node, into: mut levels)
+    for cells in mut self.extras {
+        topped = rose(mut cells, into: mut levels) or topped
+    }
+    if not topped {
+        return levels
+    }
+    let Some(made) = mut frames.pool(EXTRA_POOL) else {
+        return levels
+    }
+    mut self.extras.push(frames::PoolCells.extra(made))
+    mut self.stores.push(take made)
+    mut levels.push(0)
+    return levels
+} Pools.settle
+
+/// Settles the level of the pool `cells` and appends it to `into`; whether it has just reached the top level.
+fn rose(mut cells: frames::PoolCells, mut into: mem::List[u8]) -> bool {
+    let before = cells.pressure.level
+    let level = mut cells.settle()
+    mut into.push(level)
+    return level == frames::TOP_LEVEL and before < frames::TOP_LEVEL
+} rose
+
+/// What `frames` and the pools read now, the node pool `node` first, beside the start's `fixed` parts.
+fn Pools.reading(mut self, mut node: frames::PoolCells, fixed: frames::Fixed, frames: frames::Frames) -> frames::Reading {
+    var reading = mut node.reading(fixed, frames)
+    for cells in mut self.extras {
+        reading = reading.adding(mut cells)
+    }
+    return reading
+} Pools.reading
+
+/// The pool the next cell splits from, as `roomiest` chooses among the node pool `node` and the extra pools.
+fn Pools.chosen(self, node: frames::PoolCells, alloc: mem::Alloc) -> Option[runner::Pooled] {
+    var rooms = mem::List[Room].empty(alloc)
+    mut rooms.push(Room(free: node.free(), level: node.pressure.level))
+    for cells in self.extras {
+        mut rooms.push(Room(free: cells.free(), level: cells.pressure.level))
+    }
+    let Some(index) = roomiest(rooms.view()) else {
+        return None
+    }
+    let whole = match index {
+        0 => node.whole.alloc()
+        else => self.extras[index - 1].whole.alloc()
+    }
+    return Some(runner::Pooled(number: u32.truncate(u64.widen(index)), alloc: whole))
+} Pools.chosen
+
+/// Of the pools `rooms`, by number, those below the top level, the one with the most free memory, the lowest numbered on ties; `None` when every pool is at the top level.
+fn roomiest(rooms: Slice[Room]) -> Option[usize] {
+    var chosen: Option[usize] = None
+    for index in 0..<rooms.len() {
+        if rooms[index].level >= frames::TOP_LEVEL {
+            continue
+        }
+        let roomier = match chosen {
+            Some(best) => rooms[index].free > rooms[best].free
+            None => true
+        }
+        if roomier {
+            chosen = Some(index)
+        }
+    }
+    return chosen
+} roomiest
+
+/// Closes the extra pools' cells.
+fn Pools.close(take self) {
+    let Pools(extras: extras, stores: _) = self
+    for cells in take extras {
+        take cells.close()
+    }
+} Pools.close
+
+/// Cells split from the pool with the most free memory of those below the top level, the lowest numbered on ties, and from none when every pool is at it.
+test cells_split_from_the_roomiest_pool_below_the_top_level for roomiest {
+    var rooms = Array[Room, 3].filled(Room(free: 20, level: 1))
+    rooms[1] = Room(free: 30, level: 4)
+    expect roomiest(rooms.view()) == Some(0)
+    rooms[2] = Room(free: 25, level: 2)
+    expect roomiest(rooms.view()) == Some(2)
+    rooms[2] = Room(free: 25, level: 4)
+    rooms[0] = Room(free: 20, level: 4)
+    expect roomiest(rooms.view()).is_none()
+} cells_split_from_the_roomiest_pool_below_the_top_level
