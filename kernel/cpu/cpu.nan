@@ -8,6 +8,13 @@ const ARCH_CAPABILITIES: u32 = 0x10A
 
 const RDCL_NO: u64 = 1
 
+/// The MSRs of hardware-controlled performance states: their enable bit, the CPU's performance range and its request.
+const PM_ENABLE: u32 = 0x770
+
+const HWP_CAPABILITIES: u32 = 0x771
+
+const HWP_REQUEST: u32 = 0x774
+
 /// An x86-64 microarchitecture level of the System V psABI: the instruction-set extensions code of that level uses.
 pkg enum Level derives Copy, Eq, Ord {
     X86v1
@@ -23,6 +30,7 @@ pkg struct Features derives Copy, Eq {
     pkg invariant_tsc: bool
     pkg tsc_deadline: bool
     pkg mwait: bool
+    pkg hwp: bool
     pkg meltdown_immune: bool
     pkg x2apic: bool
     pkg level: Level
@@ -44,6 +52,7 @@ struct Leaves derives Copy, Eq {
     structured: hw::CpuidRegs
     extended: hw::CpuidRegs
     power: hw::CpuidRegs
+    thermal: hw::CpuidRegs
 } Leaves
 
 /// Reads the boot CPU's identification.
@@ -56,6 +65,7 @@ pkg fn Features.read(cpu: hw::Ring0) -> Features {
         structured: basic_leaf(cpu, max: basic.eax, leaf: 7),
         extended: extended_leaf(cpu, max: top, leaf: 0x8000_0001),
         power: extended_leaf(cpu, max: top, leaf: 0x8000_0007),
+        thermal: basic_leaf(cpu, max: basic.eax, leaf: 6),
     )
     var capabilities: u64 = 0
     if bit(leaves.structured.edx, at: 29) {
@@ -67,6 +77,7 @@ pkg fn Features.read(cpu: hw::Ring0) -> Features {
         invariant_tsc: bit(leaves.power.edx, at: 8),
         tsc_deadline: bit(leaves.features.ecx, at: 24),
         mwait: bit(leaves.features.ecx, at: 3),
+        hwp: bit(leaves.thermal.eax, at: 7) and bit(leaves.thermal.eax, at: 10),
         meltdown_immune: (capabilities & RDCL_NO) != 0 or vendor_of(leaves.basic, is: AMD) or vendor_of(leaves.basic, is: HYGON),
         x2apic: bit(leaves.features.ecx, at: 21),
         level: level(leaves),
@@ -74,6 +85,27 @@ pkg fn Features.read(cpu: hw::Ring0) -> Features {
         topology: topology_of(cpu, max: basic.eax),
     )
 } Features.read
+
+/// Hands this CPU's performance states to its hardware unless they are, on a CPU whose features have `hwp`.
+pkg fn enable_hwp(cpu: hw::Ring0) {
+    let enabled = trusted "CPUID leaf 6 enumerates hardware-controlled performance states, whose enable MSR this is" { cpu.read_msr(PM_ENABLE) }
+    if (enabled & 1) == 0 {
+        trusted "enabling hardware-controlled performance states hands the CPU's frequency to its hardware, which no other code sets" { cpu.write_msr(PM_ENABLE, value: 1) }
+    }
+} enable_hwp
+
+/// Has this CPU's hardware, its performance states enabled, choose among all of them with the energy-performance preference `preference`.
+pkg fn request_preference(cpu: hw::Ring0, preference: u8) {
+    let capabilities = trusted "CPUID leaf 6 enumerates hardware-controlled performance states, whose range MSR this is" { cpu.read_msr(HWP_CAPABILITIES) }
+    trusted "the request of hardware-controlled performance states sets only this CPU's frequency range and preference" { cpu.write_msr(HWP_REQUEST, value: performance_request(capabilities, preference)) }
+} request_preference
+
+/// The HWP request of the whole performance range the capabilities `capabilities` give, from the lowest, in their bits 31:24, to the highest, in their bits 7:0, with the preference `preference`.
+fn performance_request(capabilities: u64, preference: u8) -> u64 {
+    let highest = capabilities & 0xFF
+    let lowest = (capabilities >> 24) & 0xFF
+    return lowest | (highest << 8) | (u64.widen(preference) << 24)
+} performance_request
 
 /// Leaf `leaf` of the basic range, all zero beyond its highest leaf `max`.
 fn basic_leaf(cpu: hw::Ring0, max: u32, leaf: u32) -> hw::CpuidRegs {
@@ -218,6 +250,7 @@ fn qemu_max() -> Leaves {
         structured: regs(eax: 1, ebx: 0x219C_43A9, ecx: 0x8041_020C, edx: 0x10),
         extended: regs(eax: 0x663, ebx: 0, ecx: 0x177, edx: 0xEDD3_FBFD),
         power: regs(eax: 0, ebx: 0, ecx: 0, edx: 0),
+        thermal: regs(eax: 4, ebx: 0, ecx: 0, edx: 0),
     )
 } qemu_max
 
@@ -250,3 +283,8 @@ test cache_sharing_rounds_up_to_a_power_of_two for sharing_shift {
     expect sharing_shift(0xC163) == 2
     expect sharing_shift(0x3_C163) == 4
 } cache_sharing_rounds_up_to_a_power_of_two
+
+/// A request spans the CPU's lowest to highest performance, leaves the desired one to the hardware, and carries the preference.
+test requests_span_the_whole_range for performance_request {
+    expect performance_request(capabilities: 0x0108_1C2A, preference: 128) == 0x8000_2A01
+} requests_span_the_whole_range

@@ -1,4 +1,4 @@
-//! Run queues, CPU classes, wake placement, accounting, idle and idle states: the policy through which NaN's runtime runs the kernel's tasks.
+//! Run queues, CPU classes, wake placement, accounting, idle, idle states and energy-performance preferences: the policy through which NaN's runtime runs the kernel's tasks.
 
 /// The class of the root executor's share, and so of the core's tasks.
 const CORE: u8 = 0
@@ -56,7 +56,7 @@ pkg struct Place derives Copy, Eq {
     pkg node: u32
 } Place
 
-/// What the policy and the core's tasks share: each CPU's state behind its lock, where each CPU lies, the running CPU's number, the clock, the MWAIT states idle CPUs may enter, none without MWAIT, and the power of a running CPU in mW, which charges the energy of CPU time.
+/// What the policy and the core's tasks share: each CPU's state behind its lock, where each CPU lies, the running CPU's number, the clock, the MWAIT states idle CPUs may enter, none without MWAIT, the power of a running CPU in mW, which charges the energy of CPU time, the energy-performance preferences of `latency`, `normal` and `background` work in bits 7:0, 15:8 and 23:16, and on a machine with HWP the signal through which each CPU posts the preference it wants.
 pkg struct State {
     cpus: mem::List[hw::SpinLock[Cpu]]
     places: mem::List[Place]
@@ -65,6 +65,8 @@ pkg struct State {
     started: core::atomic::AtomicBool
     idle_states: mem::List[IdleState]
     pkg busy_mw: mem::Shared[core::atomic::AtomicU64]
+    pkg preferences: core::atomic::AtomicU32
+    wanting: mem::List[mem::Shared[hw::Signal[u8]]]
 } State
 
 /// The kernel's policy, whose hooks NaN's runtime calls with the CPU's interrupts disabled.
@@ -72,7 +74,7 @@ pkg struct Scheduler {
     state: mem::Shared[State]
 } Scheduler
 
-/// A CPU's run queue as the policy sees it, with the time it spent, whether it rests, since when and in which MWAIT state, none for HLT, the rests it left, the lengths of its last idle periods, each from its entry into an idle state to its return, the next taking slot `next_period`, the start of the one it is in, and its latency tolerance, none when unbounded.
+/// A CPU's run queue as the policy sees it, with the time it spent, whether it rests, since when and in which MWAIT state, none for HLT, the rests it left, the lengths of its last idle periods, each from its entry into an idle state to its return, the next taking slot `next_period`, the start of the one it is in, its latency tolerance, none when unbounded, the tasks of `latency`, `normal` and `background` work queued on it, and the energy-performance preference it last wanted.
 struct Cpu {
     started: bool
     idle: bool
@@ -90,6 +92,8 @@ struct Cpu {
     next_period: usize
     period_ns: u64
     tolerance_ns: Option[u64]
+    classes: Array[u32, 3]
+    preference: Option[u8]
 } Cpu
 
 /// The time a CPU spent on work of each class, core work counting all of its classes, and idle.
@@ -169,22 +173,56 @@ fn virtual_of(ns: u64, weight: u64) -> u64 {
     return ns.saturating_mul(UNIT_WEIGHT) / weight
 } virtual_of
 
-/// The state for `places.len()` CPUs, every CPU but the boot CPU not yet started, idle CPUs entering `idle_states` or halting, a running CPU's power that of the power settings by default.
-pkg fn State.of(take places: mem::List[Place], clock: sys::Clock, take idle_states: mem::List[IdleState], alloc: mem::Alloc) -> State {
+/// The state for `places.len()` CPUs, every CPU but the boot CPU not yet started, idle CPUs entering `idle_states` or halting, a running CPU's power and the preferences those of the power settings by default, each CPU posting the preference it wants when `hwp`.
+pkg fn State.of(
+    take places: mem::List[Place],
+    clock: sys::Clock,
+    take idle_states: mem::List[IdleState],
+    hwp: bool,
+    alloc: mem::Alloc,
+    ) -> State {
     var cpus = mem::List[hw::SpinLock[Cpu]].empty(alloc)
     for index in 0..<places.len() {
         var cpu = Cpu.fresh()
         cpu.started = index == 0
         mut cpus.push(hw::SpinLock.of(take cpu))
     }
-    let busy_mw = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(power::PowerConfig.default_of(alloc).busy_mw)), alloc)
-    return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), idle_states: take idle_states, busy_mw: take busy_mw)
+    var wanting = mem::List[mem::Shared[hw::Signal[u8]]].empty(alloc)
+    if hwp {
+        for _ in 0..<places.len() {
+            mut wanting.push(mem::Shared.of(hw::Signal[u8].empty(), alloc))
+        }
+    }
+    let defaults = power::PowerConfig.default_of(alloc)
+    let busy_mw = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(defaults.busy_mw)), alloc)
+    var chosen = Array[u8, 3].filled(defaults.preference_latency)
+    chosen[1] = defaults.preference_normal
+    chosen[2] = defaults.preference_background
+    let preferences = core::atomic::AtomicU32.of(pack(chosen))
+    return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), idle_states: take idle_states, busy_mw: take busy_mw, preferences: take preferences, wanting: take wanting)
 } State.of
+
+/// Applies the power settings: a running CPU's power `busy_mw`, and `preferences`, those of `latency`, `normal` and `background` work.
+pkg fn State.apply(self, busy_mw: u64, preferences: Array[u8, 3]) {
+    self.busy_mw.contents().store(busy_mw)
+    self.preferences.store(pack(preferences))
+} State.apply
+
+/// The signal through which CPU `cpu` posts the energy-performance preference it wants, none without HWP.
+pkg fn State.wanted_by(self, cpu: u32) -> Option[mem::Shared[hw::Signal[u8]]] {
+    return match self.wanting.get(usize.widen(cpu)) {
+        Some(signal) => Some(signal.share())
+        None => None
+    }
+} State.wanted_by
+
+/// `preferences` as the state holds them, in bits 7:0, 15:8 and 23:16.
+fn pack(preferences: Array[u8, 3]) -> u32 = u32.widen(preferences[0]) | (u32.widen(preferences[1]) << 8) | (u32.widen(preferences[2]) << 16)
 
 /// A CPU not started, running nothing.
 fn Cpu.fresh() -> Cpu {
     let nothing = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-    return Cpu(started: false, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, resting_in: None, wakeups: 0, periods: Array[u64, PERIODS].filled(0), next_period: 0, period_ns: 0, tolerance_ns: None)
+    return Cpu(started: false, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, resting_in: None, wakeups: 0, periods: Array[u64, PERIODS].filled(0), next_period: 0, period_ns: 0, tolerance_ns: None, classes: Array[u32, 3].filled(0), preference: None)
 } Cpu.fresh
 
 /// Marks CPU `cpu` started: it runs on the shared space with its features enabled, so work may go to it.
@@ -382,16 +420,55 @@ pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Optio
     return best
 } Scheduler.steal
 
+/// The slice of `task` as CPU `cpu` switches to it; when the preference the CPU wants changes, it posts the new one.
 pkg fn Scheduler.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
     let state = self.state.contents()
     let now = state.now()
+    let preferences = state.preferences.load()
     let Some(lock) = state.cpus.get(usize.widen(cpu)) else {
         return 0
     }
-    return lock.with(t, body: fn(mut current: Cpu) -> u64 limits notrap, terminates, noalloc {
-        return mut current.switch_to(task, now_ns: now)
+    let switched = lock.with(t, body: fn(mut current: Cpu) -> Switched limits notrap, terminates, noalloc {
+        let slice = mut current.switch_to(task, now_ns: now)
+        return Switched(slice: slice, wanted: mut current.prefer(preferences))
     })
+    match switched.wanted {
+        Some(preference) => {
+            match state.wanting.get(usize.widen(cpu)) {
+                Some(signal) => signal.contents().post(t, value: preference)
+                None => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    return switched.slice
 } Scheduler.slice
+
+/// What a switch gives: the slice, and the preference the CPU wants when it changed.
+struct Switched derives Copy {
+    slice: u64
+    wanted: Option[u8]
+} Switched
+
+/// The energy-performance preference this CPU wants under the preferences `preferences` of the three classes, the lowest of those of the classes it runs and has queued, when it differs from the one it wanted last, which it then becomes; `None` otherwise, or when it runs none of them.
+fn Cpu.prefer(mut self, preferences: u32) -> Option[u8] limits notrap, terminates, noalloc {
+    var wanted: Option[u8] = None
+    for index in 0..<3u32 {
+        let class = u8.truncate(index + 1)
+        let runs = self.classes[usize.widen(index)] > 0 or (self.running.active and self.running.class == class)
+        if runs {
+            let preference = u8.truncate(preferences >> (index * 8))
+            wanted = Some(wanted.value_or(preference).min(preference))
+        }
+    }
+    if wanted.is_none() or wanted == self.preference {
+        return None
+    }
+    self.preference = wanted
+    return wanted
+} Cpu.prefer
 
 /// The slack of a deadline `delay_ns` ahead by the class of the work arming it: 1% of the delay, from 50 µs to 100 ms, for `normal` work, 10% up to 1 s for `background` work, a window that never ends first for deferrable work, and none for the rest.
 pkg fn Scheduler.slack(self, t: hw::IrqsDisabled, task: hw::TaskView, delay_ns: u64) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
@@ -516,6 +593,13 @@ fn Cpu.enqueue(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, 
     self.queued = self.queued.saturating_add(1)
     self.idle = false
     let class = task.share.class
+    match class_index(class) {
+        Some(index) => {
+            self.classes[index % 3] = self.classes[index % 3].saturating_add(1)
+        }
+        None => {
+        }
+    }
     if binds(class) {
         self.bound = self.bound.saturating_add(1)
     }
@@ -572,6 +656,13 @@ fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap
     if binds(class) {
         self.bound = self.bound.saturating_sub(1)
     }
+    match class_index(class) {
+        Some(index) => {
+            self.classes[index % 3] = self.classes[index % 3].saturating_sub(1)
+        }
+        None => {
+        }
+    }
     self.idle = false
     self.running = Running(executor: task.executor, weight: u64.widen(task.share.weight), class: class, since_ns: now_ns, active: true)
     var floor = self.virtual_ns
@@ -604,10 +695,19 @@ fn Cpu.go_idle(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     self.idle = true
     self.queued = 0
     self.bound = 0
+    self.classes = Array[u32, 3].filled(0)
     for entity in mut self.entities {
         entity.ready = 0
     }
 } Cpu.go_idle
+
+/// The place of `latency`, `normal` and `background` work among a CPU's queued classes; `None` for core work.
+fn class_index(class: u8) -> Option[usize] limits notrap, terminates, noalloc {
+    if class == LATENCY or class == NORMAL or class == BACKGROUND {
+        return Some(usize.widen(class) - 1)
+    }
+    return None
+} class_index
 
 /// Counts the idle period the CPU leaves at `now_ns` among its last ones.
 fn Cpu.end_period(mut self, now_ns: u64) limits notrap, terminates, noalloc {
@@ -738,7 +838,7 @@ fn four_cpus(clock: sys::Clock, alloc: mem::Alloc) -> Scheduler {
     for cpu in 0u64..<4 {
         mut places.push(Place(package_id: 0, core: u32.truncate(cpu), cache: cpu / 2, node: 0))
     }
-    let state = mem::Shared.of(State.of(take places, clock, idle_states: mem::List.empty(alloc), alloc), alloc)
+    let state = mem::Shared.of(State.of(take places, clock, idle_states: mem::List.empty(alloc), hwp: false, alloc), alloc)
     for cpu in 1u32..<4 {
         state.contents().start(cpu)
     }
@@ -831,7 +931,7 @@ test idle_cpus_enter_the_deepest_state_their_rest_and_tolerance_allow for Schedu
     mut places.push(Place(package_id: 0, core: 0, cache: 0, node: 0))
     var states = mem::List[IdleState].empty(world.alloc)
     mut states.push(IdleState(hint: 0x20, exit_ns: 1_000))
-    let state = mem::Shared.of(State.of(take places, clock: world.clock, idle_states: take states, alloc: world.alloc), alloc: world.alloc)
+    let state = mem::Shared.of(State.of(take places, clock: world.clock, idle_states: take states, hwp: false, alloc: world.alloc), alloc: world.alloc)
     let policy = Scheduler.of(state.share())
     let far = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
         return policy.idle(t, cpu: 0, until_ns: Some(state.contents().now() + 1_000_000))
@@ -860,3 +960,25 @@ test idle_cpus_enter_the_deepest_state_their_rest_and_tolerance_allow for Schedu
     expect woken.predicted(now_ns: 0, until_ns: Some(1_000_000)) == Some(1_500)
     expect returning.predicted(now_ns: 12_000, until_ns: Some(1_000_000)) == Some(1_500)
 } idle_cpus_enter_the_deepest_state_their_rest_and_tolerance_allow
+
+/// With the default preferences, a CPU running `normal` work wants 128, once; `latency` work queued behind it brings 0, which running it keeps; after a rest, `background` work alone wants 255.
+test cpus_want_the_lowest_preference_of_the_classes_they_run for Cpu.prefer {
+    var chosen = Array[u8, 3].filled(0)
+    chosen[1] = 128
+    chosen[2] = 255
+    let preferences = pack(chosen)
+    var cpu = idle_cpu()
+    discard mut cpu.enqueue(view(executor: 1, class: NORMAL, weight: 100), now_ns: 0)
+    discard mut cpu.switch_to(view(executor: 1, class: NORMAL, weight: 100), now_ns: 0)
+    let running_normal = mut cpu.prefer(preferences)
+    let again = mut cpu.prefer(preferences)
+    discard mut cpu.enqueue(view(executor: 2, class: LATENCY, weight: 100), now_ns: 10)
+    let queued = mut cpu.prefer(preferences)
+    discard mut cpu.switch_to(view(executor: 2, class: LATENCY, weight: 100), now_ns: 20)
+    let running_latency = mut cpu.prefer(preferences)
+    mut cpu.go_idle(now_ns: 30)
+    discard mut cpu.enqueue(view(executor: 3, class: BACKGROUND, weight: 100), now_ns: 40)
+    discard mut cpu.switch_to(view(executor: 3, class: BACKGROUND, weight: 100), now_ns: 40)
+    let running_background = mut cpu.prefer(preferences)
+    expect running_normal == Some(128) and again.is_none() and queued == Some(0) and running_latency.is_none() and running_background == Some(255)
+} cpus_want_the_lowest_preference_of_the_classes_they_run

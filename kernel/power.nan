@@ -1,4 +1,4 @@
-//! Power off and reboot as the core carries them out, through the sandbox's exit port, and the power settings it applies.
+//! Power off and reboot as the core carries them out, through the sandbox's exit port, the power settings it applies, and the energy-performance preferences it writes on a machine with HWP.
 
 const EXIT_PORT: u16 = 0xF4
 
@@ -11,6 +11,50 @@ registers ExitPort {
     status: u8 at 0x0 write
 } ExitPort
 
+/// The time a CPU waits after writing its energy-performance preference before it writes another.
+const PREFERENCE_PACE_NS: u64 = 10_000_000
+
+/// Writes each CPU's energy-performance preference through `cpu`, on a machine with HWP, for as long as it runs.
+fn write_all_preferences(cpu: hw::Ring0, cpus: mem::Shared[sched::State], clock: sys::Clock, exec: task::Executor) fails task::Cancelled uses wait {
+    try await task::scope(exec, body: fn(s: task::Scope) {
+        for number in 0..<cpus.contents().count() {
+            let Some(wanted) = cpus.contents().wanted_by(number) else {
+                continue
+            }
+            discard s.spawn(fn[take wanted]() fails task::Cancelled uses wait limits stack 8_192 {
+                try await write_preferences(cpu, take wanted, number, clock, exec)
+            })
+        }
+    })
+} write_all_preferences
+
+/// Writes on CPU `number`, from a task pinned to it, each energy-performance preference the policy posts to `wanted` that differs from the one written, waiting 10 ms after each write; the CPU's performance states are handed to its hardware first.
+fn write_preferences(
+    cpu: hw::Ring0,
+    take wanted: mem::Shared[hw::Signal[u8]],
+    number: u32,
+    clock: sys::Clock,
+    exec: task::Executor,
+    ) fails task::Cancelled uses wait {
+    let account = exec.split(sched::pinned_share(number))
+    defer take account.close()
+    try await task::scope(account.executor(), body: fn[take wanted](s: task::Scope) {
+        let posted = wanted.share()
+        discard s.spawn(fn[take posted]() fails task::Cancelled uses wait limits stack 4_096 {
+            cpu::enable_hwp(cpu)
+            var written: Option[u8] = None
+            loop {
+                let preference = try await posted.contents().wait()
+                if written != Some(preference) {
+                    cpu::request_preference(cpu, preference)
+                    written = Some(preference)
+                    try await clock.sleep_ns(PREFERENCE_PACE_NS)
+                }
+            }
+        })
+    })
+} write_preferences
+
 /// Carries out each power off or reboot `orders` brings, and applies each setting of power to `cpus`, for as long as they come.
 fn switch_power(take orders: task::Receiver[power::Switching], cpus: mem::Shared[sched::State]) fails task::Cancelled uses wait {
     var receiver = orders
@@ -21,8 +65,8 @@ fn switch_power(take orders: task::Receiver[power::Switching], cpus: mem::Shared
         let status = match switching {
             power::Switching.Off => OFF
             power::Switching.Reboot => REBOOT
-            power::Switching.Apply(busy_mw: busy_mw) => {
-                cpus.contents().busy_mw.contents().store(busy_mw)
+            power::Switching.Apply(busy_mw: busy_mw, preferences: preferences) => {
+                cpus.contents().apply(busy_mw, preferences)
                 continue
             }
         }
@@ -32,17 +76,21 @@ fn switch_power(take orders: task::Receiver[power::Switching], cpus: mem::Shared
     }
 } switch_power
 
-/// Applying the power settings sets the power of a running CPU the core charges energy at.
+/// Applying the power settings sets the power of a running CPU the core charges energy at, and the energy-performance preference of each class.
 test settings_apply_to_the_cores_state for switch_power {
     let world = testing::world()
     var places = mem::List[sched::Place].empty(world.alloc)
     mut places.push(sched::Place(package_id: 0, core: 0, cache: 0, node: 0))
-    let cpus = mem::Shared.of(sched::State.of(take places, clock: world.clock, idle_states: mem::List.empty(world.alloc), alloc: world.alloc), alloc: world.alloc)
+    let cpus = mem::Shared.of(sched::State.of(take places, clock: world.clock, idle_states: mem::List.empty(world.alloc), hwp: false, alloc: world.alloc), alloc: world.alloc)
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[power::Switching].bounded(1, alloc: world.alloc)
     let before = cpus.contents().busy_mw.contents().load()
-    try await orders.send(power::Switching.Apply(busy_mw: 2_500))
+    var preferences = Array[u8, 3].filled(10)
+    preferences[1] = 20
+    preferences[2] = 30
+    try await orders.send(power::Switching.Apply(busy_mw: 2_500, preferences: preferences))
     discard orders
     try await switch_power(take ordered, cpus: cpus.share())
     let after = cpus.contents().busy_mw.contents().load()
-    expect before == 2_000 and after == 2_500
+    let applied = cpus.contents().preferences.load()
+    expect before == 2_000 and after == 2_500 and applied == 0x1E_140A
 } settings_apply_to_the_cores_state
