@@ -1,4 +1,4 @@
-//! Forked runs: each activation of a preview that starts or restarts an instance, run on a fork of the instance with the preview branch's configuration and store, and each call or redeliver step's message, run once on a fork of the instance's state, each probed for its health; an instance that may hold a resource is never forked, and the step naming it is then declared.
+//! Forked runs: each call or redeliver step's message, handled once at its turn among a preview's steps on a fork of the instance's state at quiescence, or of the state its fork for an earlier step ended with, the writes it makes to the preview branch being the step's; and each activation of a preview that starts or restarts an instance, run on a fork of the instance with the preview branch's configuration and store; each probed for its health. An instance that may hold a resource is never forked, and a step whose fork's handler read the clock, drew random values or called another instance, which a replay would not serve back, is declared as the step naming such an instance is.
 
 /// What the forked runs of a preview saw: the faults of their runs, the steps no fork observed, and the bytes of the states the forks started from.
 pub closed struct Runs derives Encode {
@@ -7,35 +7,181 @@ pub closed struct Runs derives Encode {
     pub state_bytes: u64
 } Runs
 
+/// What the forked runs of a preview's messages keep from one step to the next: what they saw, and the state each instance's latest fork ended with.
+struct MessageRuns {
+    runs: Runs
+    copies: mem::List[Copied]
+} MessageRuns
+
 /// The state a fork of an instance of the preview ended with, from which its next fork starts.
 struct Copied {
     moniker: ident::Moniker
     copy: os::StateCopy
 } Copied
 
-/// Runs, through `control`, on the preview branch `branch`, a fork of the instance of each activation of `activations` that starts or restarts it, then one of the instance each call or redeliver step of `stepped` messages, recording on the step's command what it foresaw.
-pub fn forked_runs(
-    activations: mem::List[Activation],
-    mut stepped: mem::List[Stepped],
-    control: os::Control,
-    branch: Str,
-    alloc: mem::Alloc,
-    ) -> Result[Runs, Failure] fails task::Cancelled uses wait {
-    var seen_runs = Runs(faults: mem::List.empty(alloc), declared: mem::List.empty(alloc), state_bytes: 0)
-    match try await activation_runs(activations, stepped, control, branch, mut seen_runs, alloc) {
-        Some(failure) => return Err(take failure)
-        None => {
-        }
-    }
-    match try await message_runs(mut stepped, control, branch, mut seen_runs, alloc) {
-        Some(failure) => return Err(take failure)
-        None => {
-        }
-    }
-    return Ok(take seen_runs)
-} forked_runs
+/// What the run of a step's message made of a branch: the commit its own writes start from, those writes, and the branch's head after the run.
+struct Ran {
+    before: ident::CommitId
+    writes: mem::List[store::Write]
+    after: ident::CommitId
+} Ran
 
-/// Runs a fork of the instance of each activation of `activations` that starts or restarts it, into `seen_runs`: a start runs fresh, and a restart resumes from the checkpoint a `restore-checkpoint` step of `stepped` names, or from the latest.
+/// No forked run seen yet.
+fn MessageRuns.none(alloc: mem::Alloc) -> MessageRuns {
+    return MessageRuns(runs: Runs(faults: mem::List.empty(alloc), declared: mem::List.empty(alloc), state_bytes: 0), copies: mem::List.empty(alloc))
+} MessageRuns.none
+
+/// Runs, through `control`, the message of the call or redeliver step `command` once on a fork of its instance on the preview branch `branch`, whose head is `head` through `view`: from the state the instance's latest fork in `forking` ended with, or from its state at quiescence. Records on `command` what the run foresaw, its writes included, and in `forking` what it saw; gives the writes and the branch's head after them. A run whose handler read the clock, drew random values or called another instance leaves the step declared, its writes none of the step's.
+fn message_run(
+    mut command: InstanceStep,
+    view: store::service::View,
+    branch: Str,
+    head: ident::CommitId,
+    control: os::Control,
+    mut forking: MessageRuns,
+    alloc: mem::Alloc,
+    ) -> Result[Ran, Failure] fails task::Cancelled uses wait {
+    let Some(call) = command.fork_call(alloc) else {
+        return Ok(Ran(before: head, writes: mem::List.empty(alloc), after: head))
+    }
+    let moniker = ident::Moniker(text: command.moniker.text)
+    let copied = forking.copies.position(fn(each: Copied) => each.moniker == moniker)
+    let from = match copied {
+        Some(found) => os::ForkFrom.Copied(os::StateCopy(schema: forking.copies[found].copy.schema, state: copied_bytes(forking.copies[found].copy.state, alloc)))
+        None => os::ForkFrom.Live
+    }
+    let requested = os::Forking(branch: text::String.of(branch, alloc), from: take from, call: Some(take call))
+    let seen = match first attempt await control.fork(ident::Moniker(text: moniker.text), forking: take requested, alloc) {
+        Ok(found) => found
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: moniker.text.as_str(), alloc))
+    }
+    let Some(forked) = seen else {
+        mut forking.runs.declared.push(command.step)
+        return Ok(Ran(before: head, writes: mem::List.empty(alloc), after: head))
+    }
+    let os::Forked(state_bytes: state_bytes, reply: reply, sent: sent, spawns: spawns, state: state, reached: reached, fault: fault) = forked
+    forking.runs.state_bytes = forking.runs.state_bytes.saturating_add(state_bytes)
+    match fault {
+        Some(found) => mut forking.runs.faults.push(fault_of(moniker, step: command.step, fault: take found, alloc))
+        None => {
+        }
+    }
+    match state {
+        Some(copy) => {
+            match copied {
+                Some(at) => {
+                    discard mut forking.copies.remove(at)
+                }
+                None => {
+                }
+            }
+            mut forking.copies.push(Copied(moniker: ident::Moniker(text: moniker.text), copy: take copy))
+        }
+        None => {
+        }
+    }
+    let ran = try await ran_on(view, branch, before: head, alloc)
+    let Ok(Ran(before: _, writes: writes, after: after)) = ran else {
+        return ran
+    }
+    if reached {
+        mut forking.runs.declared.push(command.step)
+        return Ok(Ran(before: after, writes: mem::List.empty(alloc), after: after))
+    }
+    let Some(foreseen_writes) = duplicate(writes, alloc) else {
+        return Err(Failure.of("store.corrupt", subject: branch, alloc))
+    }
+    command.foreseen = Some(Foreseen(reply: take reply, sent: take sent, spawns: take spawns, writes: take foreseen_writes))
+    return Ok(Ran(before: head, writes: take writes, after: after))
+} message_run
+
+/// What a run made of the branch `branch` through `view` since its commit `before`: the writes bringing it from there to its head, and that head.
+fn ran_on(view: store::service::View, branch: Str, before: ident::CommitId, alloc: mem::Alloc) -> Result[Ran, Failure] fails task::Cancelled uses wait {
+    let commits = match first attempt await view.history(ident::Path(text: text::String.of("/", alloc)), before: None, limit: 1, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: branch, alloc))
+    }
+    if commits.len() == 0 or commits[0].number == before {
+        return Ok(Ran(before: before, writes: mem::List.empty(alloc), after: before))
+    }
+    let after = commits[0].number
+    let from = store::Point.Commit(branch: text::String.of(branch, alloc), commit: before)
+    let to = store::Point.Commit(branch: text::String.of(branch, alloc), commit: after)
+    let edits = match first attempt await view.diff(take from, take to, path: ident::Path(text: text::String.of("/", alloc)), alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: branch, alloc))
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    for edit in edits {
+        let path = edit.path.text.as_str()
+        if edit.change == store::Change.Removed {
+            mut writes.push(store::Write.Delete(path: ident::Path(text: text::String.of(path, alloc))))
+            continue
+        }
+        let node = match try await node_as_of(view, path, at: Some(after), alloc) {
+            Ok(Some(found)) => found
+            Ok(None) => continue
+            Err(failure) => return Err(take failure)
+        }
+        match try await node_write(view, take node, before, alloc) {
+            Ok(Some(write)) => mut writes.push(take write)
+            Ok(None) => {
+            }
+            Err(failure) => return Err(take failure)
+        }
+    }
+    return Ok(Ran(before: before, writes: take writes, after: after))
+} ran_on
+
+/// The write making a node hold what `node` holds, through `view`: a put of a record or blob, an append of the entries a stream gained since the commit `before`, and none for a dir, which the writes below it make.
+fn node_write(view: store::service::View, take node: store::Node, before: ident::CommitId, alloc: mem::Alloc) -> Result[Option[store::Write], Failure] fails task::Cancelled uses wait {
+    let path = ident::Path(text: text::String.of(node.path.text.as_str(), alloc))
+    match node.kind {
+        store::NodeKind.Blob => return match node.hash {
+            Some(hash) => Ok(Some(store::Write.Put(path: take path, value: store::Value.Blob(hash))))
+            None => Ok(None)
+        }
+        store::NodeKind.Record => {
+            let Some(declared) = node.declared else {
+                return Ok(None)
+            }
+            let Some(raw) = node.value else {
+                return Ok(None)
+            }
+            return Ok(Some(store::Write.Put(path: take path, value: store::Value.Record(type: store::TypeRef(name: text::String.of(declared.name.as_str(), alloc), schema: declared.schema), bytes: copied_untrusted(raw.view(), alloc), secret: node.secret))))
+        }
+        store::NodeKind.Stream => {
+            let from = match try await node_as_of(view, path: node.path.text.as_str(), at: Some(before), alloc) {
+                Ok(Some(earlier)) => earlier.next
+                Ok(None) => 0
+                Err(failure) => return Err(take failure)
+            }
+            let read = match first attempt await view.read_stream(ident::Path(text: text::String.of(node.path.text.as_str(), alloc)), from, limit: u32.saturate(node.next.saturating_sub(from)), alloc) {
+                Ok(found) => found
+                Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+                Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: node.path.text.as_str(), alloc))
+            }
+            var entries = mem::List[mem::Bytes].empty(alloc)
+            for entry in read.entries {
+                mut entries.push(copied_bytes(entry.value, alloc))
+            }
+            return Ok(Some(store::Write.Append(path: take path, entries: take entries)))
+        }
+        store::NodeKind.Dir => return Ok(None)
+    }
+} node_write
+
+/// A copy of the bytes `raw` holds, which the store checks again as it writes them.
+validator fn copied_untrusted(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect())
+    return bytes
+} copied_untrusted
+
+/// Runs, through `control`, on the preview branch `branch`, a fork of the instance of each activation of `activations` that starts or restarts it, into `seen_runs`: a start runs fresh, and a restart resumes from the checkpoint a `restore-checkpoint` step of `stepped` names, or from the latest.
 fn activation_runs(
     activations: mem::List[Activation],
     stepped: mem::List[Stepped],
@@ -70,58 +216,6 @@ fn activation_runs(
     }
     return None
 } activation_runs
-
-/// Runs, into `seen_runs`, a fork of the instance each call or redeliver step of `stepped` messages, handling the step's message once: on a copy of the instance's state at quiescence, or of the state its fork for an earlier step ended with; records what it foresaw on the step's command.
-fn message_runs(
-    mut stepped: mem::List[Stepped],
-    control: os::Control,
-    branch: Str,
-    mut seen_runs: Runs,
-    alloc: mem::Alloc,
-    ) -> Option[Failure] fails task::Cancelled uses wait {
-    var copies = mem::List[Copied].empty(alloc)
-    for at in 0..<stepped.len() {
-        let Some(commanded) = mut stepped[at].command.extract() else {
-            continue
-        }
-        var command = commanded
-        let moniker = ident::Moniker(text: command.moniker.text)
-        let Some(call) = command.fork_call(alloc) else {
-            stepped[at].command = Some(take command)
-            continue
-        }
-        let from = match copies.position(fn(each: Copied) => each.moniker == moniker) {
-            Some(found) => os::ForkFrom.Copied(os::StateCopy(schema: copies[found].copy.schema, state: copied_bytes(copies[found].copy.state, alloc)))
-            None => os::ForkFrom.Live
-        }
-        let forking = os::Forking(branch: text::String.of(branch, alloc), from: take from, call: Some(take call))
-        let seen = match first attempt await control.fork(ident::Moniker(text: moniker.text), take forking, alloc) {
-            Ok(found) => found
-            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
-            Err(failed) => return Some(Failure.of(failed.code().as_str(), subject: moniker.text.as_str(), alloc))
-        }
-        match seen {
-            Some(forked) => {
-                let os::Forked(state_bytes: state_bytes, reply: reply, sent: sent, spawns: spawns, state: state, fault: fault) = forked
-                seen_runs.state_bytes = seen_runs.state_bytes.saturating_add(state_bytes)
-                match fault {
-                    Some(found) => mut seen_runs.faults.push(fault_of(moniker, step: command.step, fault: take found, alloc))
-                    None => {
-                    }
-                }
-                match state {
-                    Some(copy) => mut copies.push(Copied(moniker: ident::Moniker(text: moniker.text), copy: take copy))
-                    None => {
-                    }
-                }
-                command.foreseen = Some(Foreseen(reply: take reply, sent: take sent, spawns: take spawns))
-            }
-            None => mut seen_runs.declared.push(command.step)
-        }
-        stepped[at].command = Some(take command)
-    }
-    return None
-} message_runs
 
 /// A copy of `bytes`.
 fn copied_bytes(bytes: mem::Bytes, alloc: mem::Alloc) -> mem::Bytes {

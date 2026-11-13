@@ -122,7 +122,7 @@ Each failure prints the line `loader: <code> generation <n>` on the firmware con
     1. read `/nanos/gen/<n>/manifest` (`boot.manifest-unreadable`) and decode it (`boot.manifest-malformed`);
     2. find a key of its signer (`boot.signer-unknown`) with which one of its signatures verifies (`boot.signature-invalid`);
     3. check that its generation is n and, for a slot, the slot's (`boot.generation-mismatch`), at least the floor (`boot.below-floor`), and that its `min_loader` is at most the loader's version (`boot.loader-too-old`);
-    4. read `kernel.elf` and `genesis` (`boot.file-unreadable`) into the loader's boot heap (`boot.too-large`) and compare their blob ids with the manifest's (`boot.hash-mismatch`);
+    4. read `kernel.elf` and `genesis` (`boot.file-unreadable`) into a 64 MiB file heap the loader takes at the top of the highest range of free memory below 4 GiB that holds it (`boot.too-large`) and compare their blob ids with the manifest's (`boot.hash-mismatch`);
     5. validate the kernel image: an ELF64 executable for the architecture, with disjoint loadable segments inside the file and, on x86_64, a `XEN_ELFNOTE_PHYS32_ENTRY` note ([NaN 27 §Images](https://github.com/nan-language/nan/blob/main/docs/spec/27-program-model.md#images)) (`boot.image-malformed`), whose physical ranges lie in usable memory of the current memory map (`boot.placement`, requires [N31](22-nan.md#n31)).
 
     The `dev` candidate takes only sub-steps 4, for `/kernel.elf` alone, and 5. A failing candidate enters the handoff record's failures, up to four, and its slot becomes `bad` unless its code is `boot.manifest-unreadable`, `boot.file-unreadable` or `boot.loader-too-old`. With no candidate left, the loader prints `boot.none-bootable` and stops.
@@ -323,7 +323,7 @@ An owner request asks the loader to store a new owner record:
 | `boot.below-floor` | a generation is below the floor | [Loader](#loader) |
 | `boot.loader-too-old` | `min_loader` exceeds the loader's version | [Loader](#loader) |
 | `boot.file-unreadable` | a kernel image or genesis record is missing or unreadable | [Loader](#loader) |
-| `boot.too-large` | a file exceeds what the loader's boot heap holds | [Loader](#loader) |
+| `boot.too-large` | a file exceeds what the loader's file heap holds, or no free memory holds that heap | [Loader](#loader) |
 | `boot.hash-mismatch` | a file's blob id differs from its manifest's | [Loader](#loader) |
 | `boot.image-malformed` | a kernel image is no ELF64 executable the loader can start | [Loader](#loader) |
 | `boot.placement` | a loadable segment lies outside usable memory | [Loader](#loader) |

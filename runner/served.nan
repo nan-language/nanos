@@ -15,10 +15,11 @@ pub open struct Serving {
     forking: Option[ForkRun]
 } Serving
 
-/// What a fork's domain runs: the call it handles, or none for its start or resumption, and where it tells what its run saw.
+/// What a fork's domain runs: the call it handles, or none for its start or resumption, where it tells what its run saw, and the note its clock, random source and ports keep of their use.
 struct ForkRun {
     call: Option[os::ForkCall]
     reporting: task::Sender[os::Forked]
+    taken: mem::Shared[core::atomic::AtomicBool]
 } ForkRun
 
 /// What a driver delivers to its instance's domain: a call with its header, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns.
@@ -40,6 +41,7 @@ enum Report {
     Ending
     CheckpointFailed(code: text::Fixed[32], bytes: u64)
     Published(summary: mem::Bytes)
+    Replayed(outcome: Result[os::Replayed, os::ControlError])
 } Report
 
 /// What the watch of an incarnation takes: when its handlers run, which it bounds, their start, then how long they took; a reading of its gauge; and the end of its domain.
@@ -117,6 +119,7 @@ pub fn Driven.run(
     var due_at = epoch_after(keeping, clock)
     defer take stepper.abandon()
     let orders = Orders.of(stepper.waker(), alloc)
+    var holding = Holding[P].none(alloc)
     match attempt sys::Runner.served(replier.mint(0)) {
         Ok(runner) => mut stepper.attach(runner)
         Err(_) => {
@@ -135,7 +138,7 @@ pub fn Driven.run(
     let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
     let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
     var given = Some(Given(deliveries: take deliveries, finishes: take finishes, peers: take peers))
-    let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given, mut due_at](s: task::Scope) fails Stopping uses wait {
+    let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given, mut due_at, mut holding](s: task::Scope) fails Stopping uses wait {
         let Some(Given(deliveries: receiver, finishes: finishing, peers: known)) = mut given.extract() else {
             return
         }
@@ -152,7 +155,7 @@ pub fn Driven.run(
         discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
             try await hand_over(queued, signal: ringing, reports: answering, incarnation)
         })
-        try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), clock, reports, marks, steps, finished, incarnation, orders, alloc)
+        try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), clock, reports, marks, steps, finished, incarnation, orders, mut holding, s, alloc)
     })
     match looped {
         Ok(_) => {
@@ -161,7 +164,8 @@ pub fn Driven.run(
         }
         Err(Stopping.Cancelled(cancelled)) => fail cancelled
     }
-    let handled = try await call_handlers(mut stepper, marks, steps, finished, clock)
+    let handled = try await call_handlers(mut stepper, marks, steps, finished, clock, kept: holding.tasks, alloc)
+    mut holding.drop_kept(mut stepper)
     match first keeping {
         Some(kept) if handled or due_at.is_some() => {
             discard try await checkpoint(stepper, keeping: kept, reports, incarnation, alloc)
@@ -176,7 +180,7 @@ pub fn Driven.run(
     return Ended.Stopped
 } Driven.run
 
-/// Runs a fork of an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, then handles once, one level deep, the call `serving` gives, or without one calls its `resume`, then probes its health once; tells `serving` the bytes of the state it resumed from, the reply to its call, the messages its handlers sent it and the classes of the keyed tasks they spawned, none of which runs, its state once it handled its call, and whether it is unhealthy; then ends it, handing its Env to `release`.
+/// Runs a fork of an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, then handles once, one level deep, the call `serving` gives, or without one calls its `resume`, then probes its health once; tells `serving` the bytes of the state it resumed from, the reply to its call, the messages its handlers sent it and the classes of the keyed tasks they spawned, none of which runs, its state once it handled its call, whether its call's handler read the clock, drew random values or called another instance, and whether it is unhealthy; then ends it, handing its Env to `release`.
 fn Driven.forked(
     take env: Env,
     exec: task::Executor,
@@ -185,7 +189,7 @@ fn Driven.forked(
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
     let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, config: _, forking: forking) = serving
-    let Some(ForkRun(call: call, reporting: reporting)) = forking else {
+    let Some(ForkRun(call: call, reporting: reporting, taken: taken)) = forking else {
         release(take env)
         return Ended.Stopped
     }
@@ -197,11 +201,14 @@ fn Driven.forked(
     defer take stepper.abandon()
     var reply: Option[mem::Bytes] = None
     var state: Option[os::StateCopy] = None
+    var reached = false
     match call {
         Some(given) => {
             discard held_outputs(mut stepper, alloc)
             discard held_spawns(mut stepper, alloc)
+            taken.contents().store(false)
             reply = try await Driven[S, Env, P].handled_once(mut stepper, call: take given, exec, alloc)
+            reached = taken.contents().load()
             state = Some(state_copy(stepper, alloc))
         }
         None => mut stepper.resumed(reason)
@@ -212,7 +219,7 @@ fn Driven.forked(
         sys::HealthReply.Healthy => None
         sys::HealthReply.Unhealthy(why) => Some(os::ForkFault.Unhealthy(reason: text::String.of(why.as_str(), alloc)))
     }
-    discard attempt await reporting.send(os::Forked(state_bytes: state_bytes, reply: take reply, sent: take sent, spawns: take spawns, state: take state, fault: take fault))
+    discard attempt await reporting.send(os::Forked(state_bytes: state_bytes, reply: take reply, sent: take sent, spawns: take spawns, state: take state, reached: reached, fault: take fault))
     undefer stepper
     let sys::Stopped(state: _, env: ended) = try await take stepper.end()
     release(take ended)
@@ -256,8 +263,8 @@ fn Driven.begin(
     return Some(Begun(stepper: try sys::Stepper[S, Env, P].resume(take state, take env, exec, alloc), reason: sys::ResumeReason.Restored, restored: Some(saved.number)))
 } Driven.begin
 
-/// Holds the component: waits for its messages, suspending it after `quiet` without one, and calls their handlers, carrying out between them the orders `orders` gives it. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the component is idle.
-fn hold[S: Encode, Env: Any, P: Any](
+/// Holds the component: waits for its messages, suspending it after `quiet` without one, and calls their handlers, carrying out between them the orders `orders` gives it with what `holding` sets aside and keeps, and only those orders while it is paused; the tasks it posts messages from belong to `s`. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the component is idle.
+fn hold[S: Encode, Env: Any, P: sys::Protocol and Send](
     mut stepper: sys::Stepper[S, Env, P],
     keeping: Option[Keeping],
     mut due_at: Option[u64],
@@ -270,10 +277,16 @@ fn hold[S: Encode, Env: Any, P: Any](
     finished: task::Sender[u64],
     incarnation: u64,
     orders: Orders,
+    mut holding: Holding[P],
+    s: task::Scope,
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
     loop {
-        try await carry_out(stepper, orders, alloc)
+        try await carry_out(mut stepper, orders, mut holding, reports, incarnation, clock, s, alloc)
+        if holding.paused {
+            try await orders.wait()
+            continue
+        }
         if syncing.swap(false) {
             due_at = Some(now(clock))
         }
@@ -292,7 +305,7 @@ fn hold[S: Encode, Env: Any, P: Any](
             }
             else => try await idle(mut stepper, quiet, clock, reports, incarnation)
         }
-        if try await call_handlers(mut stepper, marks, steps, finished, clock) and due_at.is_none() {
+        if try await call_handlers(mut stepper, marks, steps, finished, clock, kept: holding.tasks, alloc) and due_at.is_none() {
             due_at = epoch_after(keeping, clock)
         }
     }
@@ -454,13 +467,15 @@ fn idle[S, Env: Any, P: Any](
     try await tell(reports, incarnation, report: Report.Woken)
 } idle
 
-/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and returns whether it called any.
+/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn but those `kept` names, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and returns whether it called any.
 fn call_handlers[S, Env: Any, P: Any](
     mut stepper: sys::Stepper[S, Env, P],
     marks: task::Sender[Mark],
     steps: mem::Shared[Steps],
     finished: task::Sender[u64],
     clock: sys::Clock,
+    kept: mem::List[u64],
+    alloc: mem::Alloc,
     ) -> bool fails task::Cancelled uses wait {
     try await mark(marks, marked: Mark.Began)
     let started = now(clock)
@@ -481,7 +496,7 @@ fn call_handlers[S, Env: Any, P: Any](
             break
         }
         handled = true
-        discard mut stepper.start_keyed()
+        start_unkept(mut stepper, kept, alloc)
     }
     try await mark(marks, marked: Mark.Took(ns: now(clock).saturating_sub(started)))
     return handled

@@ -555,9 +555,7 @@ fn echoed(core: Core, alloc: mem::Alloc) -> Option[os::Forked] fails Failure use
         fail Failure.Control(os::ControlError.Missing)
     }
     discard try await add(port, amount: 5, alloc)
-    var call = sys::Encoded.empty(alloc)
-    discard sys::Wire[Counter].echo(mut call, amount: 2)
-    let forking = os::Forking(branch: text::String.of("main", alloc), from: os::ForkFrom.Live, call: Some(os::ForkCall(hash: sys::Wire[Counter].hash(), encoded: take call.bytes)))
+    let forking = os::Forking(branch: text::String.of("main", alloc), from: os::ForkFrom.Live, call: Some(echo_call(alloc)))
     let seen = try await core.control.fork(named("tally"), take forking, alloc)
     if try await add(port, amount: 0, alloc) != 5 {
         return None
@@ -580,10 +578,78 @@ test forks_handle_one_call_on_a_copy_of_the_live_state for Shared.fork_source {
         return
     }
     let total = attempt mem::wire::Codec[Result[u64, Never]].decode(Untrusted.of(reply.view()), alloc: world.alloc)
-    expect total == Ok(Ok(7)) and forked_run.state.is_some() and forked_run.fault.is_none()
+    expect total == Ok(Ok(7)) and forked_run.state.is_some() and forked_run.fault.is_none() and not forked_run.reached
     expect forked_run.sent.len() == 1 and forked_run.spawns.len() == 1
     expect forked_run.sent[0].operation.as_str() == "note" and forked_run.sent[0].delay_ns > 0
 } forks_handle_one_call_on_a_copy_of_the_live_state
+
+/// What replaying `echo(2)` on the tally holding 5 gave: whether a replay was refused before the tally paused, the total it replied, the messages and keyed tasks it kept, the tally's total once it resumed, and whether delivering its keyed task once released and its note once dropped found nothing kept.
+struct Replays derives Copy, Eq {
+    refused: bool
+    replied: u64
+    sent: usize
+    spawns: usize
+    resumed: u64
+    released: bool
+    dropped: bool
+} Replays
+
+/// The encoding of `echo(2)` as a call a fork or a replay handles.
+fn echo_call(alloc: mem::Alloc) -> os::ForkCall {
+    var call = sys::Encoded.empty(alloc)
+    discard sys::Wire[Counter].echo(mut call, amount: 2)
+    return os::ForkCall(hash: sys::Wire[Counter].hash(), encoded: take call.bytes)
+} echo_call
+
+/// Replays `echo(2)` on the tally holding 5, once paused, then releases all it kept but its note, resumes it and drops the note.
+fn replay_echo(core: Core, alloc: mem::Alloc) -> Replays fails Failure uses wait {
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    discard try await add(port, amount: 5, alloc)
+    let refused = match attempt await core.control.replay(named("tally"), call: echo_call(alloc), redelivery: None, branch: text::String.of("preview/9", alloc), alloc) {
+        Err(os::ControlError.Invalid) => true
+        else => false
+    }
+    try await core.control.pause(named("tally"), alloc)
+    let given = try await core.control.replay(named("tally"), call: echo_call(alloc), redelivery: None, branch: text::String.of("preview/9", alloc), alloc)
+    let Some(reply) = given.reply else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    let total = match attempt mem::wire::Codec[Result[u64, Never]].decode(Untrusted.of(reply.view()), alloc) {
+        Ok(Ok(found)) => found
+        else => 0
+    }
+    var notes = mem::List[os::Kept].empty(alloc)
+    for output in given.sent {
+        mut notes.push(os::Kept(task: false, blake3: ident::HashValue.of_content(output.encoded.view())))
+    }
+    if notes.len() == 0 {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    let kept_note = notes[0]
+    try await core.control.release(named("tally"), kept: take notes, alloc)
+    try await core.control.resume(named("tally"), alloc)
+    let resumed = try await add(port, amount: 0, alloc)
+    let released = attempt await core.control.deliver(named("tally"), kept: os::Kept(task: true, blake3: ident::HashValue.of_content("".as_bytes())), alloc)
+    try await core.control.discard_kept(named("tally"), alloc)
+    let dropped = attempt await core.control.deliver(named("tally"), kept: kept_note, alloc)
+    return Replays(refused: refused, replied: total, sent: given.sent.len(), spawns: given.spawns.len(), resumed: resumed, released: released.is_err(), dropped: dropped.is_err())
+} replay_echo
+
+test paused_instances_replay_calls_keeping_what_they_send_until_released for Driver.replay {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, reservations: Spare(alloc: world.alloc, holds: true), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Replays fails Failure uses wait {
+        return try await replay_echo(core, alloc: world.alloc)
+    })
+    expect seen == Some(Replays(refused: true, replied: 7, sent: 1, spawns: 1, resumed: 7, released: true, dropped: true))
+} paused_instances_replay_calls_keeping_what_they_send_until_released
 
 /// Calls the tally across a trap: the call queued behind the trapping one reaches the restarted incarnation.
 fn restarted(core: Core, alloc: mem::Alloc) -> Array[u64, 2] fails Failure uses wait {

@@ -29,7 +29,7 @@ enum Input {
     Restoring(cause: u64, checkpoint: Result[os::Checkpoint, os::ControlError], done: task::Sender[Result[os::Outcome, os::ControlError]])
 } Input
 
-/// An instance as its driver holds it, `restoring` the checkpoint its next start restores a copy of, `intake` the length of `queue` for readers of its gauge, `cause` the start cause of its latest incarnation, `changed_by` the cause of the order, trap or call that last changed its lifecycle, under which its next start cause opens, `traced_until` the monotonic time until which its handler calls are traced, `suspended` while its component is, `suspend_ms` the time without a message after which it is, and what it publishes of it; causes as a header holds them.
+/// An instance as its driver holds it, `restoring` the checkpoint its next start restores a copy of, `intake` the length of `queue` for readers of its gauge, `cause` the start cause of its latest incarnation, `changed_by` the cause of the order, trap or call that last changed its lifecycle, under which its next start cause opens, `traced_until` the monotonic time until which its handler calls are traced, `suspended` while its component is, `suspend_ms` the time without a message after which it is, what it publishes of it, `paused` while no call reaches it, with the order `pausing` waiting for its holder to pause and the replay `replaying` running on it; causes as a header holds them.
 linear struct Driver {
     moniker: ident::Moniker
     slot: u32
@@ -58,8 +58,18 @@ linear struct Driver {
     suspended: bool
     showing: Showing
     restoring: Option[os::Checkpoint]
+    paused: bool
+    pausing: Option[task::Sender[Result[os::Outcome, os::ControlError]]]
+    replaying: Option[Replaying]
     alloc: mem::Alloc
 } Driver
+
+/// A replay running on a paused instance: where its outcome goes, its header, and the dead letter it delivers again.
+struct Replaying {
+    done: task::Sender[Result[os::Outcome, os::ControlError]]
+    header: os::Header
+    redelivery: Option[u64]
+} Replaying
 
 /// The running incarnation's domain: where its calls go, what abandons it, and the call delivered to it whose handler call has not ended.
 struct Domain {
@@ -135,7 +145,7 @@ fn Driver.of(
     take gate: os::Gate,
     alloc: mem::Alloc,
     ) -> Driver {
-    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, traps: 0, started_ns: 0, queue: mem::List.empty(alloc), intake: mem::Shared.of(core::atomic::AtomicU32.of(0), alloc), domain: None, then: Then.Stop, abandonment: Abandonment.Inside, cause: 0, changed_by: 0, traced_until: None, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false, showing: Showing.none(), restoring: None, alloc: alloc)
+    return Driver(moniker: take moniker, slot: slot, spec: take spec, lifecycle: None, gate: take gate, incarnation: 0, traps: 0, started_ns: 0, queue: mem::List.empty(alloc), intake: mem::Shared.of(core::atomic::AtomicU32.of(0), alloc), domain: None, then: Then.Stop, abandonment: Abandonment.Inside, cause: 0, changed_by: 0, traced_until: None, restarts: Restarts.none(alloc), waiters: mem::List.empty(alloc), minted: Minted.none(alloc), reserved: None, postponed: mem::List.empty(alloc), deleting: None, unplugged: false, suspend_ms: None, suspended: false, showing: Showing.none(), restoring: None, paused: false, pausing: None, replaying: None, alloc: alloc)
 } Driver.of
 
 /// Carries out the lifecycle of the instance `driver` holds, as its inputs come, until they end or the instance, deleted, has stopped, left the directory and had its capabilities revoked; the tasks of its incarnations run in the driver's own scope.
@@ -547,12 +557,42 @@ fn Shared.order[J: Journal](
                 try await self.create_or_start(mut driver, sender, journal, s)
             }
         }
+        else => try await mut driver.pause_order(take action, take done, cause, now_ns: now(self.config.clock))
+    }
+    try await mut driver.settle()
+} Shared.order
+
+/// Carries out `action` when it pauses or resumes the instance, replays a call on it, or releases or drops what its replays keep, telling `done`; `request.invalid-operand` for any other action.
+fn Driver.pause_order(
+    mut self,
+    take action: os::Action,
+    take done: task::Sender[Result[os::Outcome, os::ControlError]],
+    cause: u64,
+    now_ns: u64,
+    ) fails task::Cancelled uses wait {
+    match action {
+        os::Action.Pause => {
+            if self.paused {
+                discard attempt await done.send(Ok(os::Outcome.Done))
+                return
+            }
+            self.paused = true
+            self.pausing = Some(take done)
+            try await mut self.pause_holder()
+        }
+        os::Action.Resume => {
+            try await mut self.resume(now_ns)
+            discard attempt await done.send(Ok(os::Outcome.Done))
+        }
+        os::Action.Replay(call: call, redelivery: redelivery, branch: branch) => try await mut self.replay(take call, redelivery, take branch, take done, cause)
+        os::Action.Release(kept: kept) => try await self.hold_order(HolderOrder.Release(kept: take kept, done: take done))
+        os::Action.Deliver(kept: kept) => try await self.hold_order(HolderOrder.Deliver(kept: kept, done: take done))
+        os::Action.Discard => try await self.hold_order(HolderOrder.Discard(done: take done))
         else => {
             discard attempt await done.send(Err(os::ControlError.Invalid))
         }
     }
-    try await mut driver.settle()
-} Shared.order
+} Driver.pause_order
 
 /// Creates the instance from its specification, or starts it from `stopped` or `failed`: it hibernates when lazy, and starts at once otherwise.
 fn Shared.create_or_start[J: Journal](
@@ -1090,6 +1130,9 @@ fn Driver.report[J: Journal](mut self, take report: Report, journal: J, now_ns: 
         }
         Report.CheckpointFailed(code: code, bytes: bytes) => journal.record(self.slot, cause: 0, event: Event.CheckpointFailed(code: code, bytes: bytes))
         Report.Published(summary: summary) => mut self.showing.summarize(take summary)
+        Report.Replayed(outcome: outcome) => {
+            noted = try await mut self.replayed(take outcome)
+        }
         Report.Taken(id: id) => {
             let taken = mut self.take_outstanding(id, request: false, journal, now_ns)
             match taken {
@@ -1196,8 +1239,109 @@ fn Domain.ends(self, id: u64, request: bool) -> bool {
     return outstanding.id == id and outstanding.reply.is_some() == request
 } Domain.ends
 
+/// Hands the order waiting for the instance to pause to the holder of its domain once no call is outstanding, or answers it at once when no domain runs.
+fn Driver.pause_holder(mut self) fails task::Cancelled uses wait {
+    let calling = match self.domain {
+        Some(domain) => domain.outstanding.is_some()
+        None => false
+    }
+    if calling {
+        return
+    }
+    let Some(done) = mut self.pausing.extract() else {
+        return
+    }
+    try await self.hold_order(HolderOrder.Pause(done: take done))
+} Driver.pause_holder
+
+/// Ends the instance's pause: its holder posts again what it set aside, and its queued calls reach it from `now_ns` on; an order waiting for the pause is answered `port.stopped`.
+fn Driver.resume(mut self, now_ns: u64) fails task::Cancelled uses wait {
+    if not self.paused {
+        return
+    }
+    self.paused = false
+    match mut self.pausing.extract() {
+        Some(done) => {
+            discard attempt await done.send(Err(os::ControlError.Stopped))
+        }
+        None => {
+            match self.domain {
+                Some(domain) => {
+                    discard attempt await domain.deliveries.send(Delivery.Hold(order: HolderOrder.Resume))
+                }
+                None => {
+                }
+            }
+        }
+    }
+    try await mut self.deliver(now_ns)
+} Driver.resume
+
+/// Has the holder of the paused instance replay `call` under the cause `cause`, as the dead letter `redelivery` delivered again when given, its Views of `main` reaching `branch`; `done` hears what it gave once the holder reports. `request.invalid-operand` unless the instance is paused, with no call outstanding and no replay running, and `port.stopped` when no domain runs.
+fn Driver.replay(
+    mut self,
+    take call: os::ForkCall,
+    redelivery: Option[u64],
+    take branch: text::String,
+    take done: task::Sender[Result[os::Outcome, os::ControlError]],
+    cause: u64,
+    ) fails task::Cancelled uses wait {
+    let Some(domain) = self.domain else {
+        discard attempt await done.send(Err(os::ControlError.Stopped))
+        return
+    }
+    if not self.paused or self.pausing.is_some() or self.replaying.is_some() or domain.outstanding.is_some() {
+        discard attempt await done.send(Err(os::ControlError.Invalid))
+        return
+    }
+    let header = match redelivery {
+        Some(_) => os::Header.redelivered(cause)
+        None => os::Header.of_work(cause, slot: 0)
+    }
+    self.replaying = Some(Replaying(done: take done, header: header, redelivery: redelivery))
+    discard attempt await domain.deliveries.send(Delivery.Hold(order: HolderOrder.Replay(call: take call, header: header, branch: take branch, redirect: self.minted.redirect.share())))
+} Driver.replay
+
+/// Tells the replay running on the instance its outcome `outcome`, and gives the note of the dead letter it delivered again once it was handled.
+fn Driver.replayed(mut self, take outcome: Result[os::Replayed, os::ControlError]) -> Option[Noted] fails task::Cancelled uses wait {
+    let Some(replaying) = mut self.replaying.extract() else {
+        return None
+    }
+    let Replaying(done: done, header: header, redelivery: redelivery) = replaying
+    var noted: Option[Noted] = None
+    match redelivery {
+        Some(seq) => {
+            if outcome.is_ok() {
+                noted = Some(Noted(seq: seq, redelivery: os::Redelivery(cause: header.named_cause(), outcome: os::Redelivered.Handled)))
+            }
+        }
+        None => {
+        }
+    }
+    let answer: Result[os::Outcome, os::ControlError] = match outcome {
+        Ok(given) => Ok(os::Outcome.Replayed(take given))
+        Err(failure) => Err(take failure)
+    }
+    discard attempt await done.send(take answer)
+    return noted
+} Driver.replayed
+
+/// Hands `order` to the holder of the running domain, or answers it `port.stopped` when none runs.
+fn Driver.hold_order(self, take order: HolderOrder) fails task::Cancelled uses wait {
+    match self.domain {
+        Some(domain) => {
+            discard attempt await domain.deliveries.send(Delivery.Hold(order: take order))
+        }
+        None => try await take order.refuse()
+    }
+} Driver.hold_order
+
 /// Delivers the next queued call at `now_ns` to a running domain with no call outstanding, beginning its span when its cause or the instance is traced.
 fn Driver.deliver(mut self, now_ns: u64) fails task::Cancelled uses wait {
+    if self.paused {
+        try await mut self.pause_holder()
+        return
+    }
     if self.lifecycle != Some(os::Lifecycle.Running) or self.queue.len() == 0 {
         return
     }
@@ -1248,6 +1392,20 @@ fn Driver.end_domain(mut self) fails task::Cancelled uses wait {
     }
     while self.postponed.len() > 0 {
         try await stop_outstanding(mut self.postponed.remove(0), ending)
+    }
+    match mut self.pausing.extract() {
+        Some(done) => {
+            discard attempt await done.send(Ok(os::Outcome.Done))
+        }
+        None => {
+        }
+    }
+    match mut self.replaying.extract() {
+        Some(replaying) => {
+            discard attempt await replaying.done.send(Err(os::ControlError.Stopped))
+        }
+        None => {
+        }
     }
     let Some(domain) = mut self.domain.extract() else {
         return
@@ -1354,7 +1512,7 @@ fn Driver.trigger(self) {
 
 /// Releases what the driver holds once its inputs have ended.
 fn Driver.abandon(take self) {
-    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, traps: _, started_ns: _, queue: _, intake: _, domain: _, then: _, abandonment: _, cause: _, changed_by: _, traced_until: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _, showing: _, restoring: _, alloc: _) = self
+    let Driver(moniker: _, slot: _, spec: _, lifecycle: _, gate: gate, incarnation: _, traps: _, started_ns: _, queue: _, intake: _, domain: _, then: _, abandonment: _, cause: _, changed_by: _, traced_until: _, restarts: _, waiters: _, minted: minted, reserved: _, postponed: _, deleting: _, unplugged: _, suspend_ms: _, suspended: _, showing: _, restoring: _, paused: _, pausing: _, replaying: _, alloc: _) = self
     gate.set(open: false)
     take minted.close()
 } Driver.abandon

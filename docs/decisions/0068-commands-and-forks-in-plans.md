@@ -1,6 +1,6 @@
 # 0068. Commands and forks in plans
 
-Status: accepted
+Status: superseded by 0071
 
 ## Context
 

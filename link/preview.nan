@@ -21,14 +21,20 @@ pub closed struct Planning derives Encode {
     pub now_utc: i64
 } Planning
 
-/// The part of a plan one commit applies: its number, its writes in order, the nodes they read, the instances it activates, and the commands the runner carries out once it commits.
+/// The part of a plan one commit applies: its number, the writes of each of its steps in order, the nodes they read, the instances it activates, and the commands of its steps.
 pub closed struct SpanWork derives Encode {
     pub span: u32
-    pub writes: mem::List[store::Write]
+    pub steps: mem::List[StepWrites]
     pub reads: mem::List[NodeRead]
     pub activations: mem::List[Activation]
     pub commands: mem::List[InstanceStep]
 } SpanWork
+
+/// The writes of a step of a span, in order: a tree step's, or those the run of a command's message makes.
+pub closed struct StepWrites derives Encode {
+    pub step: u32
+    pub writes: mem::List[store::Write]
+} StepWrites
 
 /// A plan a preview kept: its hash, its record, the work of its spans, the subjects the policy decides, and the records printing its effect set.
 pub closed struct Previewed derives Encode {
@@ -82,7 +88,7 @@ pub fn preview(
     return outcome
 } preview
 
-/// Applies each tree step of `asked` to the preview branch `branch` through `forked`, its head at `base`, and reads the command of each other step through `main` and `control`, then computes the plan's effect set.
+/// Applies each tree step of `asked` to the preview branch `branch` through `forked`, its head at `base`, and reads the command of each other step through `main` and `control`, running its message on a fork of its instance there, then computes the plan's effect set.
 fn preview_on(
     asked: Planning,
     main: store::service::View,
@@ -94,17 +100,23 @@ fn preview_on(
     alloc: mem::Alloc,
     ) -> Preview fails task::Cancelled uses wait {
     var stepped = mem::List[Stepped].empty(alloc)
+    var forking = MessageRuns.none(alloc)
     var head = base
     var index: u32 = 0
     for written in asked.steps {
         index += 1
         match written.step {
             Step.Call(moniker: _, operation: _, arguments: _) or Step.Redeliver(moniker: _, seq: _) or Step.RestoreCheckpoint(moniker: _, number: _) => {
-                let commanded = match try await command_of(written, step: index, view: main, control, holding: asked.holding, now_utc: asked.now_utc, alloc) {
+                var commanded = match try await command_of(written, step: index, view: main, control, holding: asked.holding, now_utc: asked.now_utc, alloc) {
                     Ok(found) => found
                     Err(failure) => return Preview.Failed(take failure)
                 }
-                mut stepped.push(Stepped(step: index, before: head, after: head, made: Made(writes: mem::List.empty(alloc), reads: mem::List.empty(alloc)), command: Some(take commanded)))
+                let Ran(before: before, writes: writes, after: after) = match try await message_run(mut commanded, view: forked, branch, head, control, mut forking, alloc) {
+                    Ok(found) => found
+                    Err(failure) => return Preview.Failed(take failure)
+                }
+                mut stepped.push(Stepped(step: index, before: before, after: after, made: Made(writes: take writes, reads: mem::List.empty(alloc)), command: Some(take commanded)))
+                head = after
                 continue
             }
             else => {
@@ -129,7 +141,7 @@ fn preview_on(
         mut stepped.push(Stepped(step: index, before: head, after: after, made: take made, command: None))
         head = after
     }
-    return try await effects_of(asked, main, forked, branch, base, mut stepped, control, oversight, alloc)
+    return try await effects_of(asked, main, forked, branch, base, mut stepped, forked_runs: take forking.runs, control, oversight, alloc)
 } preview_on
 
 /// A copy of `value`, through its encoding.

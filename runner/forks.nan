@@ -24,11 +24,29 @@ fn Shared.fork(
     let source = try await self.fork_source(mut driver, take from, checkpointed: spec.durability.class == os::DurabilityClass.Checkpointed)
     let header = os::Header.of_work(cause: driver.changed_by, slot: driver.slot)
     let forks = Forks(components: self.components, config: self.config, directory: self.directory.share(), withheld: self.withheld)
-    discard s.spawn(fn[take forks, take spec, take moniker, take branch, take source, take call, take done]() fails task::Cancelled uses wait limits stack 32_768 {
-        let seen = try await forks.run(take spec, take moniker, branch: branch.as_str(), take source, take call, header)
+    let taken = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
+    let task::Channel(sender: intake, receiver: calls) = task::Channel[os::Call].bounded(1, alloc)
+    let reaching = taken.share()
+    discard s.spawn(fn[take calls, take reaching]() fails task::Cancelled uses wait limits stack 8_192 {
+        try await forked_calls(take calls, taken: reaching)
+    })
+    discard s.spawn(fn[take forks, take spec, take moniker, take branch, take source, take call, take intake, take taken, take done]() fails task::Cancelled uses wait limits stack 32_768 {
+        let seen = try await forks.run(take spec, take moniker, branch: branch.as_str(), take source, take call, take intake, take taken, header)
         discard attempt await done.send(Ok(os::Outcome.Forked(Some(take seen))))
     })
 } Shared.fork
+
+/// Refuses each call a fork's world makes to another instance, noting in `taken` that the fork reached beyond what a replay serves back.
+fn forked_calls(take calls: task::Receiver[os::Call], taken: mem::Shared[core::atomic::AtomicBool]) fails task::Cancelled uses wait {
+    var receiver = calls
+    loop {
+        let Some(call) = try await mut receiver.receive() else {
+            return
+        }
+        taken.contents().store(true)
+        try await refuse(take call, answer: os::Answer.ServerStopped)
+    }
+} forked_calls
 
 /// Where a fork's state comes from: nowhere, its start running; a checkpoint, the latest when `number` is `None`, read through the instance's View of `/state`; the copy the instance's holder sends; or a copy given.
 enum Source {
@@ -80,7 +98,7 @@ struct Forks[C: Components and Copy and Send] {
     withheld: Withheld
 } Forks
 
-/// What a fork of the instance `moniker` under `spec` saw, run on the branch `branch` from the state `source` gives, handling `call` once, under `header`.
+/// What a fork of the instance `moniker` under `spec` saw, run on the branch `branch` from the state `source` gives, handling `call` once, under `header`, its ports reaching `intake` and its clock and random source noting their use in `taken`.
 fn Forks.run(
     self,
     take spec: os::InstanceSpec,
@@ -88,6 +106,8 @@ fn Forks.run(
     branch: Str,
     take source: Source,
     take call: Option[os::ForkCall],
+    take intake: task::Sender[os::Call],
+    take taken: mem::Shared[core::atomic::AtomicBool],
     header: os::Header,
     ) -> os::Forked fails task::Cancelled uses wait {
     let alloc = self.config.alloc
@@ -121,14 +141,17 @@ fn Forks.run(
     defer take budget.close()
     let account = self.config.exec.split_on(self.config.share(spec.share), alloc: budget.alloc())
     defer take account.close()
-    let task::Channel(sender: intake, receiver: _) = task::Channel[os::Call].bounded(1, alloc)
     let task::Channel(sender: orders, receiver: _) = task::Channel[os::Order].bounded(1, alloc)
     let task::Channel(sender: logs, receiver: _) = task::Channel[journal::Logged].bounded(1, alloc)
-    let request = Request(moniker: ident::Moniker(text: moniker.text), cell: budget.alloc(), exec: account.executor(), clock: self.config.clock, random: self.config.random, withheld: self.withheld, orders: take orders, logs: take logs, forking: Some(Substitutes(intake: take intake, branch: text::String.of(branch, alloc))), alloc: alloc)
+    let Some(sources) = ForkSources.of(self.config.clock, taken: taken.share(), alloc) else {
+        return unbuilt(text::Fixed[32].of("instance.env-incomplete"), alloc)
+    }
+    defer take sources.close()
+    let request = Request(moniker: ident::Moniker(text: moniker.text), cell: budget.alloc(), exec: account.executor(), clock: sources.clock, random: sources.random, withheld: self.withheld, orders: take orders, logs: take logs, forking: Some(Substitutes(intake: take intake, branch: text::String.of(branch, alloc))), alloc: alloc)
     let directory = self.directory.share()
     let built = await when directory => directory.world(spec, mut minted, request)
     return match built {
-        Some(world) => try await self.domain(component: spec.component.as_str(), take world, take restore, take config, take call, exec: account.executor(), alloc: budget.alloc(), header)
+        Some(world) => try await self.domain(component: spec.component.as_str(), take world, take restore, take config, take call, taken: sources.taken.share(), exec: account.executor(), alloc: budget.alloc(), header)
         None => unbuilt(text::Fixed[32].of("instance.env-incomplete"), alloc)
     }
 } Forks.run
@@ -147,6 +170,7 @@ fn Forks.domain(
     take restore: Option[os::Checkpoint],
     take config: Option[Untrusted[mem::Bytes]],
     take call: Option[os::ForkCall],
+    take taken: mem::Shared[core::atomic::AtomicBool],
     exec: task::Executor,
     alloc: mem::Alloc,
     header: os::Header,
@@ -158,7 +182,7 @@ fn Forks.domain(
     let task::Channel(sender: reports, receiver: _) = task::Channel[Input].bounded(1, alloc: held)
     let task::Channel(sender: marks, receiver: _) = task::Channel[Mark].bounded(1, alloc: held)
     let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: held)
-    let serving = Serving(deliveries: take delivered, reports: take reports, marks: take marks, incarnation: 0, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: 0, keeping: None, restore: take restore, config: take config, forking: Some(ForkRun(call: take call, reporting: take reporting)))
+    let serving = Serving(deliveries: take delivered, reports: take reports, marks: take marks, incarnation: 0, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: 0, keeping: None, restore: take restore, config: take config, forking: Some(ForkRun(call: take call, reporting: take reporting, taken: take taken)))
     let components = self.components
     let path = text::String.of(component, alloc: held)
     let ran = attempt await abandoner.contents().run_sized(fn[take path, take world, take serving]() -> Ended fails task::Cancelled uses wait limits stack 131_072 {
@@ -189,14 +213,14 @@ fn Forks.domain(
             mut kind.write(Dyn[Render].view(trap.kind()), budget: 64)
             var report = text::String.empty(held)
             mut report.write(Dyn[Render].view(trap), budget: 1_024)
-            return os::Forked(state_bytes: state_bytes, reply: None, sent: mem::List.empty(held), spawns: mem::List.empty(held), state: None, fault: Some(os::ForkFault.Trap(kind: take kind, report: take report)))
+            return os::Forked(state_bytes: state_bytes, reply: None, sent: mem::List.empty(held), spawns: mem::List.empty(held), state: None, reached: false, fault: Some(os::ForkFault.Trap(kind: take kind, report: take report)))
         }
     }
 } Forks.domain
 
 /// What a fork that could not be built for the reason `code` saw.
 fn unbuilt(code: text::Fixed[32], alloc: mem::Alloc) -> os::Forked {
-    return os::Forked(state_bytes: 0, reply: None, sent: mem::List.empty(alloc), spawns: mem::List.empty(alloc), state: None, fault: Some(os::ForkFault.Unbuilt(code: code)))
+    return os::Forked(state_bytes: 0, reply: None, sent: mem::List.empty(alloc), spawns: mem::List.empty(alloc), state: None, reached: false, fault: Some(os::ForkFault.Unbuilt(code: code)))
 } unbuilt
 
 /// The checkpoint of the instance `moniker` a fork resumes from: the one `numbered` names, or its latest when `None`, none when it keeps none; the code of the failure to read it.
@@ -301,11 +325,7 @@ fn held_outputs[S, Env: Any, P: sys::Protocol](mut stepper: sys::Stepper[S, Env,
         let Some(sent) = mut stepper.take_sent() else {
             return outputs
         }
-        let sys::Sent(message: message, header: _, delay_ns: delay_ns) = sent
-        var encoded = sys::Encoded.empty(alloc)
-        let number = sys::Wire[P].encode_any(message, out: mut encoded)
-        let operation = operations[usize.widen(number)]
-        mut outputs.push(os::HeldOutput(operation: text::String.of(operation.name.as_str(), alloc), class: operation.class, encoded: take encoded.bytes, delay_ns: delay_ns))
+        mut outputs.push(held_output(sent, operations, alloc))
     }
 } held_outputs
 

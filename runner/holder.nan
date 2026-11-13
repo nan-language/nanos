@@ -1,49 +1,92 @@
-//! Holder orders: what the task of an instance's domain carries out between its handler calls on its driver's order, which the dispatcher queues before waking the stepper.
+//! Holder orders: what the task of an instance's domain carries out between its handler calls on its driver's order, which the dispatcher queues before waking the stepper and signalling a paused holder: copies of the component's state, pauses setting aside the messages it sent itself, replays of a call whose messages and keyed tasks the holder keeps, and their release.
 
 /// The orders a holder's queue holds.
 const HOLDER_ORDERS: usize = 8
 
-/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`.
+/// The request number a replayed call is served under.
+const REPLAYED_REQUEST: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`; a pause, told to `done`; the end of the pause; a replay of `call` under `header`, the component's Views of `main` reaching the branch `branch` through `redirect` meanwhile, which the holder reports; the release of what replays keep but those `kept` names; the release of the first message or keyed task `kept` names; and the drop of what replays keep.
 enum HolderOrder {
     Snapshot(reply: task::Sender[os::StateCopy])
+    Pause(done: task::Sender[Result[os::Outcome, os::ControlError]])
+    Resume
+    Replay(call: os::ForkCall, header: os::Header, branch: text::String, redirect: store::service::Redirect)
+    Release(kept: mem::List[os::Kept], done: task::Sender[Result[os::Outcome, os::ControlError]])
+    Deliver(kept: os::Kept, done: task::Sender[Result[os::Outcome, os::ControlError]])
+    Discard(done: task::Sender[Result[os::Outcome, os::ControlError]])
 } HolderOrder
 
-/// The orders waiting for an instance's holder, and the waker of its stepper.
+/// The orders waiting for an instance's holder, the waker of its stepper, and the signal each order posts for a paused holder.
 struct Orders {
     queue: mem::Shared[hw::SpinLock[mem::Bounded[HolderOrder, HOLDER_ORDERS]]]
     waker: sys::Waker
+    signal: mem::Shared[hw::Signal[Unit]]
 } Orders
+
+/// What a holder sets aside and keeps: whether its component is paused, the messages the component sent itself before it paused, and the messages and keyed tasks its replays keep.
+struct Holding[P: sys::Protocol and Send] {
+    paused: bool
+    aside: mem::List[sys::Sent[P]]
+    sent: mem::List[KeptSent[P]]
+    tasks: mem::List[u64]
+} Holding
+
+/// A message a replay keeps, with the BLAKE3 of its encoding.
+struct KeptSent[P: Any] {
+    sent: sys::Sent[P]
+    blake3: ident::HashValue
+} KeptSent
+
+/// What a replayed call's task tells the holder: whether its call could not be served, and the encoding of its reply.
+struct Answering {
+    failed: mem::Shared[core::atomic::AtomicBool]
+    replies: task::Sender[Option[mem::Bytes]]
+} Answering
 
 /// An empty queue of orders for the holder of the stepper `waker` wakes.
 fn Orders.of(waker: sys::Waker, alloc: mem::Alloc) -> Orders {
-    return Orders(queue: mem::Shared.of(hw::SpinLock.of(mem::Bounded[HolderOrder, HOLDER_ORDERS].empty()), alloc), waker: waker)
+    return Orders(queue: mem::Shared.of(hw::SpinLock.of(mem::Bounded[HolderOrder, HOLDER_ORDERS].empty()), alloc), waker: waker, signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
 } Orders.of
 
 /// The same queue.
 fn Orders.share(self) -> Orders {
-    return Orders(queue: self.queue.share(), waker: self.waker)
+    return Orders(queue: self.queue.share(), waker: self.waker, signal: self.signal.share())
 } Orders.share
 
-/// Queues `order` and wakes the holder; whether the queue had room.
+/// Queues `order`, signals it and wakes the holder; whether the queue had room.
 fn Orders.give(self, take order: HolderOrder) -> bool {
     var held = Some(take order)
     let fitted = hw::without_irqs(fn[mut held](t: hw::IrqsDisabled) -> bool limits notrap {
-        return self.queue.contents().with(t, body: fn[mut held](mut queue: mem::Bounded[HolderOrder, HOLDER_ORDERS]) -> bool limits notrap, terminates, noalloc {
+        let pushed = self.queue.contents().with(t, body: fn[mut held](mut queue: mem::Bounded[HolderOrder, HOLDER_ORDERS]) -> bool limits notrap, terminates, noalloc {
             let Some(next) = mut held.extract() else {
                 return false
             }
-            if queue.is_full() {
-                return false
-            }
-            mut queue.push(take next)
-            return true
+            let placed = attempt mut queue.try_push(take next)
+            return placed.is_ok()
         })
+        if pushed {
+            self.signal.contents().post(t, value: Unit)
+        }
+        return pushed
     })
     if fitted {
         self.waker.wake()
     }
     return fitted
 } Orders.give
+
+/// Answers the order `port.stopped`, as no holder carries it out.
+fn HolderOrder.refuse(take self) fails task::Cancelled uses wait {
+    let done = match self {
+        HolderOrder.Pause(done: done) => done
+        HolderOrder.Release(kept: _, done: done) => done
+        HolderOrder.Deliver(kept: _, done: done) => done
+        HolderOrder.Discard(done: done) => done
+        else => return
+    }
+    discard attempt await done.send(Err(os::ControlError.Stopped))
+} HolderOrder.refuse
 
 /// The order queued first, taken from the queue.
 fn Orders.next(self) -> Option[HolderOrder] {
@@ -54,8 +97,27 @@ fn Orders.next(self) -> Option[HolderOrder] {
     })
 } Orders.next
 
-/// Carries out every order waiting for the holder of `stepper`, its component quiescent.
-fn carry_out[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], orders: Orders, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Waits until an order is given.
+fn Orders.wait(self) fails task::Cancelled uses wait {
+    try await self.signal.contents().wait()
+} Orders.wait
+
+/// Nothing set aside or kept, the component running.
+fn Holding.none(alloc: mem::Alloc) -> Holding[P] {
+    return Holding(paused: false, aside: mem::List.empty(alloc), sent: mem::List.empty(alloc), tasks: mem::List.empty(alloc))
+} Holding.none
+
+/// Carries out every order waiting for the holder of `stepper`, its component quiescent, telling the driver through `reports` what each replay gave; the messages it posts again go from tasks of `s`, once their delay has passed by `clock`.
+fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
+    mut stepper: sys::Stepper[S, Env, P],
+    orders: Orders,
+    mut holding: Holding[P],
+    reports: task::Sender[Input],
+    incarnation: u64,
+    clock: sys::Clock,
+    s: task::Scope,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
     loop {
         let Some(order) = orders.next() else {
             return
@@ -64,9 +126,258 @@ fn carry_out[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], orde
             HolderOrder.Snapshot(reply: reply) => {
                 discard attempt await reply.send(state_copy(stepper, alloc))
             }
+            HolderOrder.Pause(done: done) => {
+                holding.paused = true
+                loop {
+                    let Some(sent) = mut stepper.take_sent() else {
+                        break
+                    }
+                    mut holding.aside.push(take sent)
+                }
+                discard attempt await done.send(Ok(os::Outcome.Done))
+            }
+            HolderOrder.Resume => {
+                holding.paused = false
+                while holding.aside.len() > 0 {
+                    repost(stepper.outbox(), sent: mut holding.aside.remove(0), clock, s)
+                }
+            }
+            HolderOrder.Replay(call: call, header: header, branch: branch, redirect: redirect) => {
+                let outcome = try await replayed(mut stepper, take call, header, branch: branch.as_str(), redirect, mut holding, s, alloc)
+                try await tell(reports, incarnation, report: Report.Replayed(outcome: take outcome))
+            }
+            HolderOrder.Release(kept: kept, done: done) => {
+                mut holding.release(mut stepper, kept, clock, s, alloc)
+                discard attempt await done.send(Ok(os::Outcome.Done))
+            }
+            HolderOrder.Deliver(kept: kept, done: done) => {
+                let answer: Result[os::Outcome, os::ControlError] = match mut holding.deliver(mut stepper, kept, clock, s) {
+                    true => Ok(os::Outcome.Done)
+                    false => Err(os::ControlError.Missing)
+                }
+                discard attempt await done.send(take answer)
+            }
+            HolderOrder.Discard(done: done) => {
+                mut holding.drop_kept(mut stepper)
+                discard attempt await done.send(Ok(os::Outcome.Done))
+            }
         }
     }
 } carry_out
+
+/// Replays `call` on the paused component behind `stepper` under `header`, its Views of `main` reaching `branch` through `redirect` until its handler returns: a task of `s` posts it, and the holder calls the handlers of the messages its intake holds, starting the keyed tasks they spawn, until it handles the call. Keeps in `holding` the messages and keyed tasks the call's handler gave, setting the other messages aside, and gives them with the encoding of its reply; `request.invalid-operand` when `branch` is no branch name, `port.stopped` when the call could not be served.
+fn replayed[S, Env: Any, P: sys::Protocol and Send](
+    mut stepper: sys::Stepper[S, Env, P],
+    take call: os::ForkCall,
+    header: os::Header,
+    branch: Str,
+    redirect: store::service::Redirect,
+    mut holding: Holding[P],
+    s: task::Scope,
+    alloc: mem::Alloc,
+    ) -> Result[os::Replayed, os::ControlError] fails task::Cancelled uses wait {
+    if not redirect.set(branch: Some(branch)) {
+        return Err(os::ControlError.Invalid)
+    }
+    let failed = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
+    let task::Channel(sender: answering, receiver: answered) = task::Channel[Option[mem::Bytes]].bounded(1, alloc)
+    serve_replayed(stepper.outbox(), waker: stepper.waker(), take call, carried: header.carried(), answering: Answering(failed: failed.share(), replies: take answering), s, alloc)
+    loop {
+        try await stepper.incoming()
+        let Some(handled) = mut stepper.step() else {
+            if failed.contents().load() {
+                break
+            }
+            continue
+        }
+        let replay = match handled.header {
+            Some(carried) => os::Header.from_bits(carried.bytes).cause == header.cause
+            None => false
+        }
+        if replay {
+            break
+        }
+        start_unkept(mut stepper, kept: holding.tasks, alloc)
+    }
+    discard redirect.set(branch: None)
+    if failed.contents().load() {
+        return Err(os::ControlError.Stopped)
+    }
+    var receiver = answered
+    let reply = match try await mut receiver.receive() {
+        Some(found) => found
+        None => None
+    }
+    let sent = mut holding.keep_sent(mut stepper, cause: header.cause, alloc)
+    let spawns = mut holding.keep_tasks(stepper, alloc)
+    return Ok(os::Replayed(reply: take reply, sent: take sent, spawns: take spawns))
+} replayed
+
+/// Serves `call` on the component behind `out` from a task of `s`, under the header `carried`, telling `answering` its reply, or that it could not be served, waking the stepper `waker` then.
+fn serve_replayed[P: sys::Protocol and Send](
+    out: sys::Outbox[P],
+    waker: sys::Waker,
+    take call: os::ForkCall,
+    carried: sys::Header,
+    take answering: Answering,
+    s: task::Scope,
+    alloc: mem::Alloc,
+    ) {
+    discard s.spawn(fn[take call, take answering]() fails task::Cancelled uses wait limits stack 40_960 {
+        let served = attempt await sys::run_headed(carried, body: fn() -> Option[sys::Encoded] fails sys::CallError[Never] uses wait {
+            let peers = mem::List[sys::ProtocolSchema].empty(alloc)
+            let handles = mem::List[sys::Handle].empty(alloc)
+            return try await sys::Wire[P].serve(out, request: REPLAYED_REQUEST, hash: call.hash, peers: peers.view(), raw: Untrusted.of(call.encoded.view()), handles: handles.view(), alloc)
+        })
+        if served.is_err() {
+            answering.failed.contents().store(true)
+            waker.wake()
+        }
+        let reply = match served {
+            Ok(Some(encoded)) => replied(take encoded)
+            else => None
+        }
+        discard attempt await answering.replies.send(take reply)
+    })
+} serve_replayed
+
+/// Keeps the messages the component behind `stepper` sent under the cause `cause`, setting the others aside, and gives them as held outputs.
+fn Holding.keep_sent[S, Env: Any](mut self, mut stepper: sys::Stepper[S, Env, P], cause: u64, alloc: mem::Alloc) -> mem::List[os::HeldOutput] {
+    let operations = sys::Wire[P].operations(alloc)
+    var outputs = mem::List[os::HeldOutput].empty(alloc)
+    loop {
+        let Some(sent) = mut stepper.take_sent() else {
+            return outputs
+        }
+        let ours = match sent.header {
+            Some(carried) => os::Header.from_bits(carried.bytes).cause == cause
+            None => false
+        }
+        if not ours {
+            mut self.aside.push(take sent)
+            continue
+        }
+        let output = held_output(sent, operations, alloc)
+        let blake3 = ident::HashValue.of_content(output.encoded.view())
+        mut outputs.push(take output)
+        mut self.sent.push(KeptSent(sent: take sent, blake3: blake3))
+    }
+} Holding.keep_sent
+
+/// Keeps the keyed tasks the component behind `stepper` holds that the holder does not keep yet, and gives their classes.
+fn Holding.keep_tasks[S, Env: Any](mut self, stepper: sys::Stepper[S, Env, P], alloc: mem::Alloc) -> mem::List[sys::Reversibility] {
+    var classes = mem::List[sys::Reversibility].empty(alloc)
+    for held in stepper.held(alloc) {
+        if self.tasks.position(fn(key: u64) => key == held.key).is_some() {
+            continue
+        }
+        mut self.tasks.push(held.key)
+        mut classes.push(held.class)
+    }
+    return classes
+} Holding.keep_tasks
+
+/// Releases what replays keep but one message or keyed task per name of `kept`: posts the messages again from tasks of `s` and starts the keyed tasks.
+fn Holding.release[S, Env: Any](mut self, mut stepper: sys::Stepper[S, Env, P], kept: mem::List[os::Kept], clock: sys::Clock, s: task::Scope, alloc: mem::Alloc) {
+    var names = mem::List[os::Kept].empty(alloc)
+    for name in kept {
+        mut names.push(name)
+    }
+    var staying = mem::List[KeptSent[P]].empty(alloc)
+    while self.sent.len() > 0 {
+        let message = mut self.sent.remove(0)
+        match names.position(fn(name: os::Kept) => not name.task and name.blake3 == message.blake3) {
+            Some(at) => {
+                discard mut names.remove(at)
+                mut staying.push(take message)
+            }
+            None => repost(stepper.outbox(), sent: take message.sent, clock, s)
+        }
+    }
+    self.sent = staying
+    var keys = mem::List[u64].empty(alloc)
+    for key in self.tasks {
+        match names.position(fn(name: os::Kept) => name.task) {
+            Some(at) => {
+                discard mut names.remove(at)
+                mut keys.push(key)
+            }
+            None => {
+                discard mut stepper.start_held(key)
+            }
+        }
+    }
+    self.tasks = keys
+} Holding.release
+
+/// Releases the first message or keyed task replays keep that `kept` names: posts the message again from a task of `s`, or starts the keyed task; whether one was kept.
+fn Holding.deliver[S, Env: Any](mut self, mut stepper: sys::Stepper[S, Env, P], kept: os::Kept, clock: sys::Clock, s: task::Scope) -> bool {
+    if kept.task {
+        if self.tasks.len() == 0 {
+            return false
+        }
+        discard mut stepper.start_held(mut self.tasks.remove(0))
+        return true
+    }
+    let Some(at) = self.sent.position(fn(message: KeptSent[P]) => message.blake3 == kept.blake3) else {
+        return false
+    }
+    let message = mut self.sent.remove(at)
+    repost(stepper.outbox(), sent: take message.sent, clock, s)
+    return true
+} Holding.deliver
+
+/// Drops what replays keep, cancelling the keyed tasks before they start.
+fn Holding.drop_kept[S, Env: Any](mut self, mut stepper: sys::Stepper[S, Env, P]) {
+    while self.sent.len() > 0 {
+        discard mut self.sent.remove(0)
+    }
+    while self.tasks.len() > 0 {
+        discard mut stepper.drop_held(mut self.tasks.remove(0))
+    }
+} Holding.drop_kept
+
+/// Starts the held keyed tasks of the component behind `stepper` but those `kept` names.
+fn start_unkept[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept: mem::List[u64], alloc: mem::Alloc) {
+    if kept.len() == 0 {
+        discard mut stepper.start_keyed()
+        return
+    }
+    for held in stepper.held(alloc) {
+        if kept.position(fn(key: u64) => key == held.key).is_none() {
+            discard mut stepper.start_held(held.key)
+        }
+    }
+} start_unkept
+
+/// Posts `sent` again to the component behind `out` from a task of `s`, under its header, once its delay has passed by `clock`.
+fn repost[P: Send](out: sys::Outbox[P], take sent: sys::Sent[P], clock: sys::Clock, s: task::Scope) {
+    let sys::Sent(message: message, header: header, delay_ns: delay_ns) = sent
+    let carried = match header {
+        Some(found) => found
+        None => os::Header.current().carried()
+    }
+    discard s.spawn(fn[take message]() fails task::Cancelled uses wait limits stack 16_384 {
+        if delay_ns > 0 {
+            try await clock.sleep_ns(delay_ns)
+        }
+        var given = Some(take message)
+        discard attempt await sys::run_headed(carried, body: fn[mut given]() fails task::SendError uses wait {
+            let Some(posted) = mut given.extract() else {
+                return
+            }
+            try await out.post(take posted)
+        })
+    })
+} repost
+
+/// A message a handler of the component of protocol P sent it, as a held output: the operation it calls with its declared class among `operations`, its encoding, and the nanoseconds left before it would enter the intake.
+fn held_output[P: sys::Protocol](sent: sys::Sent[P], operations: mem::List[sys::OperationSchema], alloc: mem::Alloc) -> os::HeldOutput {
+    var encoded = sys::Encoded.empty(alloc)
+    let number = sys::Wire[P].encode_any(sent.message, out: mut encoded)
+    let operation = operations[usize.widen(number)]
+    return os::HeldOutput(operation: text::String.of(operation.name.as_str(), alloc), class: operation.class, encoded: take encoded.bytes, delay_ns: sent.delay_ns)
+} held_output
 
 /// A copy of the state of the component behind `stepper`.
 fn state_copy[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], alloc: mem::Alloc) -> os::StateCopy {

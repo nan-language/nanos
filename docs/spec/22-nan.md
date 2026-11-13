@@ -324,7 +324,7 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **Language 1:** primitive capabilities are std types only (NaN 05 §Capability types). Implementing `sys::Capability` elsewhere is `authority.capability-impl`.
 - **NaN OS requires:** capability types whose operations dispatch to kernel functions. They are revocable and attenuable, appear in digests and authority summaries, and can be replaced by recording substitutes outside tests.
 - **Chapters:** [04](04-kernel.md), [05](05-memory.md), [06](06-execution.md), [07](07-communication.md), [09](09-authority.md), [10](10-code.md), [11](11-store.md), [14](14-changes.md), [15](15-devices.md), [16](16-network.md).
-- **Issue:** [nan-language/nan#29](https://github.com/nan-language/nan/issues/29).
+- **Issue:** [nan-language/nan#29](https://github.com/nan-language/nan/issues/29), [nan-language/nan#179](https://github.com/nan-language/nan/issues/179).
 
 ## N28
 

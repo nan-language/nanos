@@ -19,16 +19,25 @@ pub layout Rights: u8 {
     reserved: rest
 } Rights
 
-/// What a View reaches: the store's port, the subtree and branch of its grant, the principal on whose authority it acts, the instance or session writing through it, and the origin labels stamped on its commits.
+/// What a View reaches: the store's port, the subtree and branch of its grant, the redirect of its Views of `main`, the principal on whose authority it acts, the instance or session writing through it, and the origin labels stamped on its commits.
 struct Scope {
     store: os::PortHandle
     prefix: ident::Path
     branch: text::String
+    redirect: Option[Redirect]
     principal: ident::Principal
     instance: Option[ident::Moniker]
     session: Option[ident::SessionId]
     origins: mem::List[ident::OriginLabel]
 } Scope
+
+/// The branch the Views of `main` of one root entry or more reach in its place while it holds one.
+pub open struct Redirect derives Send {
+    branch: mem::Shared[hw::SpinLock[Option[text::Fixed[MOST_BRANCH_BYTES]]]]
+} Redirect
+
+/// The most bytes of a branch name.
+const MOST_BRANCH_BYTES: usize = 64
 
 /// What a View reaches within its root entry's scope: its rights, the commit it reads as of when `dated` is 1, and the path below the scope's subtree it is narrowed to, the first `length` bytes of `below`, each segment led by `/`.
 layout Reach: bytes 256 le {
@@ -39,6 +48,69 @@ layout Reach: bytes 256 le {
     as_of: u64 at 8
     below: Array[u8, 240] at 16
 } Reach
+
+/// A redirect holding no branch.
+pub fn Redirect.none(alloc: mem::Alloc) -> Redirect {
+    return Redirect(branch: mem::Shared.of(hw::SpinLock.of(None), alloc))
+} Redirect.none
+
+/// The same redirect.
+pub fn Redirect.share(self) -> Redirect {
+    return Redirect(branch: self.branch.share())
+} Redirect.share
+
+/// Has the Views of `main` this redirect governs reach `branch` in its place, or `main` again for `None`; false, holding no branch, when `branch` is longer than a branch name.
+pub fn Redirect.set(self, branch: Option[Str]) -> bool {
+    var fixed: Option[text::Fixed[MOST_BRANCH_BYTES]] = None
+    var fits = true
+    match branch {
+        Some(name) => {
+            match attempt text::Fixed[MOST_BRANCH_BYTES].try_of(name) {
+                Ok(held) => {
+                    fixed = Some(held)
+                }
+                Err(_) => {
+                    fits = false
+                }
+            }
+        }
+        None => {
+        }
+    }
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        self.branch.contents().with(t, body: fn(mut held: Option[text::Fixed[MOST_BRANCH_BYTES]]) limits notrap, terminates, noalloc {
+            held = fixed
+        })
+    })
+    return fits
+} Redirect.set
+
+/// The branch the redirect holds.
+fn Redirect.held(self) -> Option[text::Fixed[MOST_BRANCH_BYTES]] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[text::Fixed[MOST_BRANCH_BYTES]] limits notrap, terminates {
+        return self.branch.contents().with(t, body: fn(mut held: Option[text::Fixed[MOST_BRANCH_BYTES]]) -> Option[text::Fixed[MOST_BRANCH_BYTES]] limits notrap, terminates, noalloc {
+            return held
+        })
+    })
+} Redirect.held
+
+/// The branch the Views of this scope reach: the branch its redirect holds for a scope of `main`, else its own.
+fn Scope.reached(self, alloc: mem::Alloc) -> text::String {
+    if self.branch.as_str() == "main" {
+        match self.redirect {
+            Some(redirect) => {
+                match redirect.held() {
+                    Some(name) => return text::String.of(name.as_str(), alloc)
+                    None => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    return text::String.of(self.branch.as_str(), alloc)
+} Scope.reached
 
 /// The root entry the Views of one grant and holder derive from, revoked when it closes.
 pub open linear struct MintedView derives Send {
@@ -74,16 +146,18 @@ pub fn Rights.of(rights: mem::Set[os::Right]) -> Rights {
     return Rights(read: rights.contains(os::Right.Read), write: rights.contains(os::Right.Write), admin: rights.contains(os::Right.Admin), secret_read: rights.contains(os::Right.SecretRead), own: false, reserved: 0)
 } Rights.of
 
-/// A root entry of Views of the subtree `prefix` of `branch` through the store's port `store`, acting for `principal`, written through by `instance`.
+/// A root entry of Views of the subtree `prefix` of `branch` through the store's port `store`, which reach the branch `redirect` holds in place of `main`, acting for `principal`, written through by `instance`.
 pub fn MintedView.of(
     store: os::PortHandle,
     take prefix: ident::Path,
     branch: Str,
+    take redirect: Option[Redirect],
     take principal: ident::Principal,
     take instance: Option[ident::Moniker],
     alloc: mem::Alloc,
     ) -> MintedView {
-    return MintedView.of_writer(store, take prefix, branch, take principal, take instance, session: None, origins: mem::List.empty(alloc), alloc)
+    let scope = Scope(store: store, prefix: take prefix, branch: text::String.of(branch, alloc), redirect: take redirect, principal: take principal, instance: take instance, session: None, origins: mem::List.empty(alloc))
+    return MintedView(minter: sys::Minter[View, Scope, Reach].of(take scope, alloc))
 } MintedView.of
 
 /// A root entry of Views of the subtree `prefix` of `branch` through the store's port `store`, acting for `principal`, written through by `instance` or in `session`, stamping `origins` on its commits.
@@ -97,7 +171,7 @@ fn MintedView.of_writer(
     take origins: mem::List[ident::OriginLabel],
     alloc: mem::Alloc,
     ) -> MintedView {
-    let scope = Scope(store: store, prefix: take prefix, branch: text::String.of(branch, alloc), principal: take principal, instance: take instance, session: session, origins: take origins)
+    let scope = Scope(store: store, prefix: take prefix, branch: text::String.of(branch, alloc), redirect: None, principal: take principal, instance: take instance, session: session, origins: take origins)
     return MintedView(minter: sys::Minter[View, Scope, Reach].of(take scope, alloc))
 } MintedView.of_writer
 
@@ -197,7 +271,7 @@ fn View.scoped(self, alloc: mem::Alloc) -> Option[Scoped] {
             true => Some(ident::CommitId(number: record.as_of))
             false => None
         }
-        return Some(Scoped(store: state.store, prefix: take prefix, branch: text::String.of(state.branch.as_str(), alloc), rights: record.rights.to_bits(), as_of: as_of, principal: ident::Principal(text: state.principal.text), instance: take instance, session: state.session, origins: labels_of(state.origins, alloc), cause: os::Header.current().named_cause()))
+        return Some(Scoped(store: state.store, prefix: take prefix, branch: state.reached(alloc), rights: record.rights.to_bits(), as_of: as_of, principal: ident::Principal(text: state.principal.text), instance: take instance, session: state.session, origins: labels_of(state.origins, alloc), cause: os::Header.current().named_cause()))
     })
     return match reached {
         Some(scoped) => scoped
@@ -434,12 +508,16 @@ linear struct TestViews {
 } TestViews
 
 fn TestViews.of(branch: Str, alloc: mem::Alloc) -> TestViews {
+    return TestViews.redirected(branch, redirect: None, alloc)
+} TestViews.of
+
+fn TestViews.redirected(branch: Str, take redirect: Option[Redirect], alloc: mem::Alloc) -> TestViews {
     let task::Channel(sender: intake, receiver: unread) = task::Channel[os::Call].bounded(1, alloc)
     discard unread
     let port = os::MintedPort.of(intake, gate: os::Gate.of(alloc), protocols: os::Protocols(own: sys::Wire[Store].hash(), serves: None), operations: None, credit: os::Credit(messages: 1, calls: 1), alloc)
-    let root = MintedView.of(store: port.handle(), prefix: ident::Path(text: text::String.of("/data", alloc)), branch, principal: ident::Principal(text: text::Fixed[64].of("owner")), instance: None, alloc)
+    let root = MintedView.of(store: port.handle(), prefix: ident::Path(text: text::String.of("/data", alloc)), branch, take redirect, principal: ident::Principal(text: text::Fixed[64].of("owner")), instance: None, alloc)
     return TestViews(port: take port, root: take root)
-} TestViews.of
+} TestViews.redirected
 
 fn TestViews.close(take self) {
     let TestViews(port: port, root: root) = self
@@ -496,6 +574,40 @@ test views_narrow_to_subtrees_and_earlier_commits for View.scoped {
     let stamp = caused.stamp(typed: true, alloc)
     expect stamp.cause == working and top.cause == ident::Cause(bits: 0)
 } views_narrow_to_subtrees_and_earlier_commits
+
+test views_of_main_reach_the_branch_their_redirect_holds for View.scoped {
+    let alloc = testing::world().alloc
+    let redirect = Redirect.none(alloc)
+    var mains = TestViews.redirected(branch: "main", redirect: Some(redirect.share()), alloc)
+    defer take mains.close()
+    var features = TestViews.redirected(branch: "feature", redirect: Some(redirect.share()), alloc)
+    defer take features.close()
+    let main = mains.root.mint(Rights.all())
+    let feature = features.root.mint(Rights.all())
+    let before = branch_reached(main, alloc)
+    let redirected = redirect.set(branch: Some("preview/3"))
+    let during = branch_reached(main, alloc)
+    let other = branch_reached(feature, alloc)
+    var long = text::String.empty(alloc)
+    for _ in 0..<65u32 {
+        mut long.push('b')
+    }
+    let overlong = redirect.set(branch: Some(long.as_str()))
+    let refused = branch_reached(main, alloc)
+    let again = redirect.set(branch: Some("preview/4"))
+    let back = redirect.set(branch: None)
+    let after = branch_reached(main, alloc)
+    expect before.as_str() == "main" and redirected and during.as_str() == "preview/3" and other.as_str() == "feature"
+    expect not overlong and refused.as_str() == "main" and again and back and after.as_str() == "main"
+} views_of_main_reach_the_branch_their_redirect_holds
+
+/// The branch the requests made through `view` reach, empty once it is stale.
+fn branch_reached(view: View, alloc: mem::Alloc) -> text::String {
+    let Some(scoped) = view.scoped(alloc) else {
+        return text::String.empty(alloc)
+    }
+    return scoped.branch
+} branch_reached
 
 /// A copy of `labels`.
 fn labels_of(labels: mem::List[ident::OriginLabel], alloc: mem::Alloc) -> mem::List[ident::OriginLabel] {
