@@ -1,0 +1,228 @@
+//! What a plan's effect reserves: the CPU each instance it starts gets for the reservation of its `latency` share, and the memory its reserved instances set aside.
+
+/// The core reserve beyond the frame metadata: 8 MiB, and 256 KiB per CPU.
+const CORE_RESERVE: u64 = 8_388_608
+
+const CORE_RESERVE_PER_CPU: u64 = 262_144
+
+/// The entries one listing gives at once.
+const RESERVING_PAGE: u32 = 256
+
+/// The reservations admitted at a moment: the millionths of each CPU they take, and the one each instance holds, by moniker.
+struct Admissions {
+    used: mem::List[u64]
+    held: mem::Map[text::Fixed[59], os::CpuReservation]
+} Admissions
+
+/// Checks what the plan reserves, `activations` and `changes` being its effect set's, its specifications read through `forked`, a View of the preview branch, and the running system through the link's View `tree`: gives each activation that starts or restarts an instance asking for a CPU reservation the CPU it gets; `budget.over-reservation` when one fits on no CPU, or when the plan writes a reserved instance's specification and the limits of the reserved instances sum to more than RAM less the core reserve.
+fn reservations_of(
+    tree: store::service::View,
+    forked: store::service::View,
+    mut activations: mem::List[Activation],
+    changes: mem::List[NodeChange],
+    alloc: mem::Alloc,
+    ) -> Option[Failure] fails task::Cancelled uses wait {
+    match try await reserve_cpus(tree, forked, mut activations, alloc) {
+        Some(failure) => return Some(take failure)
+        None => {
+        }
+    }
+    return try await reserve_memory(tree, forked, changes, alloc)
+} reservations_of
+
+/// Gives each activation of `activations` that starts or restarts an instance whose specification, read through `forked`, asks for a CPU reservation the CPU it gets: as the reservations `/live/instances` shows are admitted, read through `tree`, those of the instances the activations before it stop or restart released first; `budget.over-reservation` when one fits on no CPU.
+fn reserve_cpus(tree: store::service::View, forked: store::service::View, mut activations: mem::List[Activation], alloc: mem::Alloc) -> Option[Failure] fails task::Cancelled uses wait {
+    var wanted = mem::List[u64].empty(alloc)
+    var wanting = false
+    for activation in activations {
+        var ppm: u64 = 0
+        if activation.kind == ActivationKind.Start or activation.kind == ActivationKind.Restart {
+            match try await Records[os::InstanceSpec].at(forked, path: specification_path(activation.moniker, alloc).as_str(), alloc) {
+                Some(spec) => {
+                    if not spec.stopped {
+                        ppm = spec.share.reserved_ppm()
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        mut wanted.push(ppm)
+        wanting = wanting or ppm > 0
+    }
+    if not wanting {
+        return None
+    }
+    let Some(machine) = try await Records[os::Machine].at(tree, path: "/live/machine", alloc) else {
+        return None
+    }
+    var admissions = try await admitted(tree, cpus: machine.cpus, alloc)
+    for index in 0..<activations.len() {
+        let moniker = activations[index].moniker.text
+        mut admissions.release(moniker)
+        let ppm = wanted[index]
+        if ppm == 0 {
+            continue
+        }
+        let Some(cpu) = os::admitting_cpu(admissions.used.view(), ppm) else {
+            return Some(unfit(admissions, moniker: moniker.as_str(), ppm, alloc))
+        }
+        mut admissions.admit(moniker, reservation: os::CpuReservation(cpu: cpu, ppm: u32.fit(ppm)))
+        activations[index].cpu = Some(cpu)
+    }
+    return None
+} reserve_cpus
+
+/// The reservations `/live/instances` shows admitted on the `cpus` CPUs, read through `tree`.
+fn admitted(tree: store::service::View, cpus: u32, alloc: mem::Alloc) -> Admissions fails task::Cancelled uses wait {
+    var admissions = Admissions(used: mem::List.empty(alloc), held: mem::Map.empty(alloc))
+    for _ in 0..<cpus {
+        mut admissions.used.push(0)
+    }
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await tree.list(ident::Path(text: text::String.of("/live/instances", alloc)), take after, limit: RESERVING_PAGE, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return admissions
+        }
+        for entry in listing.entries {
+            var path = text::String.of("/live/instances/", alloc)
+            mut path.append(entry.name.as_str())
+            let Some(record) = try await Records[os::LiveInstance].at(tree, path: path.as_str(), alloc) else {
+                continue
+            }
+            var moniker = text::Fixed[59].empty()
+            mut moniker.append(entry.name.as_str())
+            match record.reservation {
+                Some(reservation) => mut admissions.admit(moniker, reservation)
+                None => {
+                }
+            }
+        }
+        let Some(next) = listing.next else {
+            return admissions
+        }
+        after = Some(take next)
+    }
+} admitted
+
+/// Notes the reservation `reservation` admitted for the instance `moniker`.
+fn Admissions.admit(mut self, moniker: text::Fixed[59], reservation: os::CpuReservation) {
+    let cpu = usize.widen(reservation.cpu)
+    if cpu < self.used.len() {
+        self.used[cpu] = self.used[cpu].saturating_add(u64.widen(reservation.ppm))
+    }
+    discard mut self.held.insert(moniker, value: reservation)
+} Admissions.admit
+
+/// Releases the reservation the instance `moniker` holds, when it holds one.
+fn Admissions.release(mut self, moniker: text::Fixed[59]) {
+    let Some(reservation) = mut self.held.remove(moniker) else {
+        return
+    }
+    let cpu = usize.widen(reservation.cpu)
+    if cpu < self.used.len() {
+        self.used[cpu] = self.used[cpu].saturating_sub(u64.widen(reservation.ppm))
+    }
+} Admissions.release
+
+/// `budget.over-reservation` for the reservation of `ppm` millionths of a CPU the instance `moniker` asks for, which no CPU holds.
+fn unfit(admissions: Admissions, moniker: Str, ppm: u64, alloc: mem::Alloc) -> Failure {
+    var least = os::ADMISSIBLE_PPM
+    for used in admissions.used {
+        least = least.min(used)
+    }
+    var expected = text::String.of("a CPU with ", alloc)
+    mut expected.write(Dyn[Render].view(ppm), budget: 8)
+    mut expected.append(" millionths left within 80% of it")
+    var found = text::String.of("at most ", alloc)
+    mut found.write(Dyn[Render].view(os::ADMISSIBLE_PPM.saturating_sub(least)), budget: 8)
+    mut found.append(" millionths left on any CPU")
+    return Failure.of("budget.over-reservation", subject: moniker, alloc).expecting(expected.as_str(), found: found.as_str(), alloc)
+} unfit
+
+/// `budget.over-reservation` when the plan writes the specification of a reserved instance, among `changes`, and the limits of the reserved instances sum to more than RAM less the core reserve, which `/live/memory` and `/live/machine` tell through `tree`: the specifications the plan writes as `forked` reads them, the others as `tree` reads them.
+fn reserve_memory(tree: store::service::View, forked: store::service::View, changes: mem::List[NodeChange], alloc: mem::Alloc) -> Option[Failure] fails task::Cancelled uses wait {
+    var written = mem::List[ident::Moniker].empty(alloc)
+    var reserving = false
+    var reserved: u64 = 0
+    for change in changes {
+        let Some(moniker) = instance_named(change.path.text.as_str(), dir: "/sys/instances/") else {
+            continue
+        }
+        match try await Records[os::InstanceSpec].at(forked, path: specification_path(moniker, alloc).as_str(), alloc) {
+            Some(spec) => {
+                if spec.budget.reserved {
+                    reserving = true
+                    reserved = reserved.saturating_add(spec.budget.limit)
+                }
+            }
+            None => {
+            }
+        }
+        mut written.push(take moniker)
+    }
+    if not reserving {
+        return None
+    }
+    let Some(machine) = try await Records[os::Machine].at(tree, path: "/live/machine", alloc) else {
+        return None
+    }
+    let Some(memory) = try await Records[os::MemorySummary].at(tree, path: "/live/memory", alloc) else {
+        return None
+    }
+    let reserve = CORE_RESERVE + CORE_RESERVE_PER_CPU * u64.widen(machine.cpus) + memory.frame_metadata
+    let room = memory.ram.saturating_sub(reserve)
+    reserved = reserved.saturating_add(try await reserved_limits(tree, passing: written, alloc))
+    if reserved <= room {
+        return None
+    }
+    var expected = text::String.of("reserved limits of at most ", alloc)
+    mut expected.write(Dyn[Render].view(room), budget: 24)
+    mut expected.append(" bytes, RAM less the core reserve")
+    var found = text::String.empty(alloc)
+    mut found.write(Dyn[Render].view(reserved), budget: 24)
+    mut found.append(" bytes")
+    return Some(Failure.of("budget.over-reservation", subject: "/sys/instances", alloc).expecting(expected.as_str(), found: found.as_str(), alloc))
+} reserve_memory
+
+/// The limits of the reserved instances the specifications read through `tree` give, summed, those of the instances `passing` names passed over.
+fn reserved_limits(tree: store::service::View, passing: mem::List[ident::Moniker], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    var reserved: u64 = 0
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await tree.list(ident::Path(text: text::String.of("/sys/instances", alloc)), take after, limit: RESERVING_PAGE, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return reserved
+        }
+        for entry in listing.entries {
+            if passing.position(fn(moniker: ident::Moniker) => moniker.text.as_str() == entry.name.as_str()).is_some() {
+                continue
+            }
+            var path = text::String.of("/sys/instances/", alloc)
+            mut path.append(entry.name.as_str())
+            match try await Records[os::InstanceSpec].at(tree, path: path.as_str(), alloc) {
+                Some(spec) => {
+                    if spec.budget.reserved {
+                        reserved = reserved.saturating_add(spec.budget.limit)
+                    }
+                }
+                None => {
+                }
+            }
+        }
+        let Some(next) = listing.next else {
+            return reserved
+        }
+        after = Some(take next)
+    }
+} reserved_limits
+
+/// The path of the specification of the instance `moniker`.
+fn specification_path(moniker: ident::Moniker, alloc: mem::Alloc) -> text::String {
+    var path = text::String.of("/sys/instances/", alloc)
+    mut path.append(moniker.text.as_str())
+    return path
+} specification_path

@@ -1,7 +1,4 @@
-//! CPU reservations: the CPUs on which the `latency` shares of instances are admitted, each holding at most 80% of its time in reservations, and the latency tolerance they set on each.
-
-/// The millionths of a CPU its admitted reservations may use together.
-const ADMISSIBLE_PPM: u64 = 800_000
+//! CPU reservations: the CPUs on which the `latency` shares of instances are admitted, and the latency tolerance they set on each.
 
 /// What a reservation holds of a CPU: `ppm` millionths of its time, leaving it `slack_ns` of each period.
 struct Reservation derives Copy, Eq {
@@ -15,18 +12,15 @@ struct Admitted derives Copy, Eq {
     reservation: Reservation
 } Admitted
 
-/// The reservations admitted on the machine's `cpus` CPUs.
+/// The millionths of each CPU, by number, that admitted reservations take, and the reservations admitted.
 struct Reservations {
-    cpus: u32
+    used: mem::List[u64]
     admitted: mem::List[Admitted]
 } Reservations
 
-/// The reservation of `share`: its runtime in each period, none outside the `latency` class or when it rounds to no millionth of a CPU.
+/// The reservation of `share`, none outside the `latency` class.
 fn Reservation.of(share: os::Share) -> Option[Reservation] {
-    if share.class != os::CpuClass.Latency or share.period_us == 0 {
-        return None
-    }
-    let ppm = u64.widen(share.runtime_us) * 1_000_000 / u64.widen(share.period_us)
+    let ppm = share.reserved_ppm()
     if ppm == 0 {
         return None
     }
@@ -35,25 +29,21 @@ fn Reservation.of(share: os::Share) -> Option[Reservation] {
 } Reservation.of
 
 /// No reservation admitted on any of `cpus` CPUs.
-fn Reservations.of(cpus: u32, alloc: mem::Alloc) -> Reservations = Reservations(cpus: cpus, admitted: mem::List.empty(alloc))
+fn Reservations.of(cpus: u32, alloc: mem::Alloc) -> Reservations {
+    var used = mem::List[u64].empty(alloc)
+    for _ in 0..<cpus {
+        mut used.push(0)
+    }
+    return Reservations(used: take used, admitted: mem::List.empty(alloc))
+} Reservations.of
 
-/// Admits `reservation` on the CPU whose admitted reservations use the least of it, the lowest numbered on ties, when they then use at most 80% of it; `None` when none holds it.
+/// Admits `reservation` on the CPU `os::admitting_cpu` names; `None` when none holds it.
 fn Reservations.admit(mut self, reservation: Reservation) -> Option[Admitted] {
-    var chosen: Option[u32] = None
-    var least: u64 = 0
-    for cpu in 0..<self.cpus {
-        let used = self.used(cpu)
-        if chosen.is_none() or used < least {
-            chosen = Some(cpu)
-            least = used
-        }
-    }
-    let Some(cpu) = chosen else {
+    let Some(cpu) = os::admitting_cpu(self.used.view(), ppm: reservation.ppm) else {
         return None
     }
-    if least.saturating_add(reservation.ppm) > ADMISSIBLE_PPM {
-        return None
-    }
+    let index = usize.widen(cpu)
+    self.used[index] = self.used[index].saturating_add(reservation.ppm)
     let admitted = Admitted(cpu: cpu, reservation: reservation)
     mut self.admitted.push(admitted)
     return Some(admitted)
@@ -64,21 +54,14 @@ fn Reservations.release(mut self, admitted: Admitted) {
     for index in 0..<self.admitted.len() {
         if self.admitted[index] == admitted {
             discard mut self.admitted.remove(index)
+            let cpu = usize.widen(admitted.cpu)
+            if cpu < self.used.len() {
+                self.used[cpu] = self.used[cpu].saturating_sub(admitted.reservation.ppm)
+            }
             return
         }
     }
 } Reservations.release
-
-/// The millionths of CPU `cpu` its admitted reservations use.
-fn Reservations.used(self, cpu: u32) -> u64 {
-    var used: u64 = 0
-    for admitted in self.admitted {
-        if admitted.cpu == cpu {
-            used = used.saturating_add(admitted.reservation.ppm)
-        }
-    }
-    return used
-} Reservations.used
 
 /// The latency tolerance of CPU `cpu`: the least slack of the reservations admitted on it, `None` when none is.
 fn Reservations.tolerance(self, cpu: u32) -> Option[u64] {
@@ -91,7 +74,7 @@ fn Reservations.tolerance(self, cpu: u32) -> Option[u64] {
     return tolerance
 } Reservations.tolerance
 
-/// Reservations go to the least used CPU, the lowest numbered on ties, as long as each CPU's stay within 80% of it, and an ended one frees its part; each CPU tolerates the least slack of those it holds.
+/// Reservations spread over the CPUs as `os::admitting_cpu` places them, and an ended one frees its part; each CPU tolerates the least slack of those it holds.
 test reservations_spread_over_cpus_up_to_80_percent for Reservations.admit {
     let alloc = testing::world().alloc
     var reservations = Reservations.of(cpus: 2, alloc)

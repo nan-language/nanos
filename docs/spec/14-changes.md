@@ -174,6 +174,8 @@ pub closed struct Activation derives Encode {
     pub migration: Option[Migration]
     /// The expected intake pause.
     pub pause_ms: u32
+    /// The CPU the instance's reservation gets.
+    pub cpu: Option[u32]
 } Activation
 
 pub closed enum ActivationKind derives Copy, Eq, Encode {
@@ -256,7 +258,7 @@ pub closed struct Costs derives Encode {
 
 - `steps`: each step's span, class and basis: `Observed` when a forked run or a tree step produced the class, `Declared` when it comes from a declaration; `reply` renders as a value of the operation's reply type.
 - `delta`: every record and blob the plan writes or removes, in path order; a change prints `before` and `after` as `-` and `+` lines of the fields that differ, or of the blob ids.
-- `activations`: each [instance](06-execution.md#instances) a step activates, its kind being the reconciliation effect of the change ([instance specifications](06-execution.md#instance-specifications)), `Rebuild` for an Env rebuild, `Restart` for a `restore-checkpoint` step and `Reboot` for a `generation` step, with the migration class of an update ([admission](10-code.md#admission)) and the expected pause.
+- `activations`: each [instance](06-execution.md#instances) a step activates, its kind being the reconciliation effect of the change ([instance specifications](06-execution.md#instance-specifications)), `Rebuild` for an Env rebuild, `Restart` for a `restore-checkpoint` step and `Reboot` for a `generation` step, with the migration class of an update ([admission](10-code.md#admission)), the expected pause, and the CPU the [reservation](08-scheduling.md#shares-and-reservations) of an instance it starts or restarts gets.
 - `widenings`: authority a holder gains: a [grant](09-authority.md#grants) beyond what the holder held at the base, an admission whose authority summary exceeds the previous [bundle](10-code.md#artefacts-and-bundles)'s, or a revert restoring a revoked grant.
 - `deliveries`: held outputs and held spawns of class above `none`, and requests to instances holding resources. Those of irreversible class are the plan's outbox entries.
 - `faults`: traps, `Unhealthy` replies and `opaque` results of forked runs, the report giving the trap kind and site or the reason.

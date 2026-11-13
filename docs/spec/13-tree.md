@@ -161,6 +161,7 @@ Jobs are instances and appear under `/live/instances`. An [account](08-schedulin
 | `intake` | `u32` | queued messages |
 | `memory` | `Usage { charged: u64, limit: u64, peak: u64 }` | its cell |
 | `cpu_ns` | `u64` | CPU time charged to its account |
+| `reservation` | `Option[{ cpu: u32, ppm: u32 }]` | the CPU its [reservation](08-scheduling.md#shares-and-reservations) was admitted on, and the millionths of that CPU it takes |
 | `probation` | `Option[WallTime]` | the end of a [probation](10-code.md#probation) in progress |
 | `summary` | `Option[TypedValue]` | the summary it last published |
 
