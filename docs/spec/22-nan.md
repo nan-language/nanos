@@ -442,3 +442,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a holder tells whether its component runs keyed tasks, whatever messages it delays.
 - **Chapters:** [05](05-memory.md), [06](06-execution.md).
 - **Issue:** [nan-language/nan#200](https://github.com/nan-language/nan/issues/200).
+
+## N41
+
+**Shared handle counts.**
+
+- **Language 1:** a `mem::Shared` value lives until its last handle goes, and no handle tells whether others share it (NaN 12 §Shared values).
+- **NaN OS requires:** a holder tells whether its handle is the only one.
+- **Chapters:** [05](05-memory.md).
+- **Issue:** [nan-language/nan#201](https://github.com/nan-language/nan/issues/201).

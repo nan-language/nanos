@@ -123,7 +123,7 @@ A **mapped blob** is a store [blob](11-store.md#nodes) read in place, without a 
 
 - Its 64 KiB pieces lie in the blob cache ([blob pieces](12-store-format.md#blob-pieces)), one chunk each, once whatever the number of readers.
 - A reader in the shared space reaches the pieces through a read-only byte view ([transfer](07-communication.md#transfer)) (requires [N27](22-nan.md#n27)). A reader in an isolated space gets them mapped read-only and non-executable into its window.
-- A piece stays in the cache while a view or a mapping holds it; pressure level 1 drops only pieces nothing holds.
+- A piece stays in the cache while a view or a mapping holds it; pressure level 1 drops only pieces nothing holds (requires [N41](22-nan.md#n41)).
 - The pieces are charged to the blob cache's cell, never to readers. A mapping costs its reader only page tables.
 
 ## Transfers
