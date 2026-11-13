@@ -1,4 +1,4 @@
-//! Power off and reboot as the core carries them out: through the sandbox's exit port.
+//! Power off and reboot as the core carries them out, through the sandbox's exit port, and the power settings it applies.
 
 const EXIT_PORT: u16 = 0xF4
 
@@ -11,18 +11,38 @@ registers ExitPort {
     status: u8 at 0x0 write
 } ExitPort
 
-/// Carries out each power off or reboot `orders` brings, for as long as they come.
-fn switch_power(take orders: task::Receiver[power::Switching]) fails task::Cancelled uses wait {
+/// Carries out each power off or reboot `orders` brings, and applies each setting of power to `cpus`, for as long as they come.
+fn switch_power(take orders: task::Receiver[power::Switching], cpus: mem::Shared[sched::State]) fails task::Cancelled uses wait {
     var receiver = orders
     loop {
         let Some(switching) = try await mut receiver.receive() else {
             return
         }
-        var port = trusted "the exit port is I/O port 0xF4, which the sandbox decodes and the core maps nowhere else" { hw::Ports[ExitPort].map(port: EXIT_PORT) }
-        mut port.write(ExitPort.status, value: match switching {
+        let status = match switching {
             power::Switching.Off => OFF
             power::Switching.Reboot => REBOOT
-        })
+            power::Switching.Apply(busy_mw: busy_mw) => {
+                cpus.contents().busy_mw.contents().store(busy_mw)
+                continue
+            }
+        }
+        var port = trusted "the exit port is I/O port 0xF4, which the sandbox decodes and the core maps nowhere else" { hw::Ports[ExitPort].map(port: EXIT_PORT) }
+        mut port.write(ExitPort.status, value: status)
         take port.unmap()
     }
 } switch_power
+
+/// Applying the power settings sets the power of a running CPU the core charges energy at.
+test settings_apply_to_the_cores_state for switch_power {
+    let world = testing::world()
+    var places = mem::List[sched::Place].empty(world.alloc)
+    mut places.push(sched::Place(package_id: 0, core: 0, cache: 0, node: 0))
+    let cpus = mem::Shared.of(sched::State.of(take places, clock: world.clock, idle_states: mem::List.empty(world.alloc), alloc: world.alloc), alloc: world.alloc)
+    let task::Channel(sender: orders, receiver: ordered) = task::Channel[power::Switching].bounded(1, alloc: world.alloc)
+    let before = cpus.contents().busy_mw.contents().load()
+    try await orders.send(power::Switching.Apply(busy_mw: 2_500))
+    discard orders
+    try await switch_power(take ordered, cpus: cpus.share())
+    let after = cpus.contents().busy_mw.contents().load()
+    expect before == 2_000 and after == 2_500
+} settings_apply_to_the_cores_state

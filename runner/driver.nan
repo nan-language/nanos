@@ -408,7 +408,7 @@ fn Shared.restore[J: Journal](
     mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
     try await self.stop(mut driver, then: Then.Restart, journal)
     if driver.lifecycle == Some(os::Lifecycle.Failed) or driver.lifecycle == Some(os::Lifecycle.Stopped) or driver.lifecycle.is_none() {
-        try await self.create_or_start(mut driver, sender, journal, s)
+        try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
     }
 } Shared.restore
 
@@ -570,7 +570,7 @@ fn Shared.order[J: Journal](
         os::Action.Call(hash: hash, encoded: encoded, request: request) => try await self.call(driver, hash, take encoded, request, take done, cause, s)
         os::Action.Start => {
             mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
-            try await self.create_or_start(mut driver, sender, journal, s)
+            try await self.create_or_start(mut driver, sender, journal, s, lazily: true)
         }
         os::Action.Stop => {
             mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Stopped))
@@ -580,7 +580,7 @@ fn Shared.order[J: Journal](
             mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
             try await self.stop(mut driver, then: Then.Restart, journal)
             if driver.lifecycle == Some(os::Lifecycle.Failed) or driver.lifecycle == Some(os::Lifecycle.Stopped) or driver.lifecycle.is_none() {
-                try await self.create_or_start(mut driver, sender, journal, s)
+                try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
             }
         }
         os::Action.Replay(call: call, redelivery: redelivery, branch: branch, recorded: recorded) => try await self.replay(mut driver, waking: Waking(call: take call, redelivery: redelivery, branch: take branch, recorded: take recorded, done: take done, cause: cause), sender, journal, s)
@@ -649,13 +649,14 @@ fn Driver.pause_order(
     }
 } Driver.pause_order
 
-/// Creates the instance from its specification, or starts it from `stopped` or `failed`: it hibernates when lazy, and starts at once otherwise.
+/// Creates the instance from its specification, or starts it from `stopped` or `failed`: at once, unless it is lazy and `lazily`, as for a start clearing `stopped`, when it hibernates instead.
 fn Shared.create_or_start[J: Journal](
     self,
     mut driver: Driver,
     sender: task::Sender[Input],
     journal: J,
     s: task::Scope,
+    lazily: bool,
     ) fails task::Cancelled uses wait {
     match driver.lifecycle {
         None or Some(os::Lifecycle.Stopped) or Some(os::Lifecycle.Failed) => {
@@ -667,7 +668,7 @@ fn Shared.create_or_start[J: Journal](
     }
     driver.spec.stopped = false
     driver.gate.set(open: true)
-    if driver.spec.lazy {
+    if driver.spec.lazy and lazily {
         driver.lifecycle = Some(os::Lifecycle.Hibernated)
         return
     }
@@ -915,8 +916,8 @@ fn Shared.watch(
     handlers: os::Limits,
     ) {
     let clock = self.config.clock
-    let busy_mw = self.config.busy_mw
-    discard s.spawn(fn[take marks, take held, take abandoner, take inputs]() fails task::Cancelled uses wait limits stack 16_384 {
+    let busy_mw = self.machine.busy_mw()
+    discard s.spawn(fn[take marks, take held, take abandoner, take inputs, take busy_mw]() fails task::Cancelled uses wait limits stack 16_384 {
         let watched = attempt await watch_marks(take marks, held, abandoner, inputs, clock, busy_mw, incarnation, handlers)
         let Held(budget: budget, reserved: _, account: account, energy_budget: _, class: _, intake: _, bundle: _, traps: _) = held
         take account.close()
@@ -929,14 +930,14 @@ fn Shared.watch(
     })
 } Shared.watch
 
-/// Takes the marks of an incarnation until its domain has ended, bounding each handler call it tells of and answering each reading with the gauge of `held`; charges its account's energy at `busy_mw` after each handler call and reading.
+/// Takes the marks of an incarnation until its domain has ended, bounding each handler call it tells of and answering each reading with the gauge of `held`; charges its account's energy at the power `busy_mw` holds after each handler call and reading.
 fn watch_marks(
     take marks: task::Receiver[Mark],
     held: Held,
     abandoner: mem::Shared[sys::Abandoner],
     inputs: task::Sender[Input],
     clock: sys::Clock,
-    busy_mw: u64,
+    busy_mw: mem::Shared[core::atomic::AtomicU64],
     incarnation: u64,
     handlers: os::Limits,
     ) fails task::Cancelled uses wait {
@@ -974,7 +975,7 @@ fn watch_marks(
             }
             Some(Mark.Took(ns: ns)) => {
                 overran_at = None
-                mut spent.charge(used_ns: held.account.used_ns(), busy_mw, now_ns: now(clock))
+                mut spent.charge(used_ns: held.account.used_ns(), busy_mw: busy_mw.contents().load(), now_ns: now(clock))
                 calls.count += 1
                 calls.latency[latency_bucket(ns)] += 1
                 if ns >= u64.widen(handlers.slow_ms) * NS_PER_MS {
@@ -982,7 +983,7 @@ fn watch_marks(
                 }
             }
             Some(Mark.Read(reply: reply)) => {
-                mut spent.charge(used_ns: held.account.used_ns(), busy_mw, now_ns: now(clock))
+                mut spent.charge(used_ns: held.account.used_ns(), busy_mw: busy_mw.contents().load(), now_ns: now(clock))
                 discard attempt await reply.send(held.gauge(incarnation, calls, energy: spent.energy))
             }
             else => return
@@ -1057,7 +1058,7 @@ fn Shared.ended[J: Journal](
         Ok(Ended.Stopped) or Ok(Ended.Hibernated) => {
             mut driver.stopped(journal, abandoned: false)
             if driver.then == Then.Restart {
-                try await self.create_or_start(mut driver, sender, journal, s)
+                try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
             }
         }
         Ok(Ended.EnvIncomplete) or Ok(Ended.Unhealthy) or Ok(Ended.CheckpointUndecodable) => try await self.give_up(mut driver, journal, cause: driver.cause)
@@ -1074,7 +1075,7 @@ fn Shared.ended[J: Journal](
             if driver.abandonment == Abandonment.Lingered {
                 mut driver.stopped(journal, abandoned: true)
                 if driver.then == Then.Restart {
-                    try await self.create_or_start(mut driver, sender, journal, s)
+                    try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
                 }
             } else {
                 match dead {
