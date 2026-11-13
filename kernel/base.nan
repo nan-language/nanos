@@ -986,8 +986,12 @@ fn run_base(
     rings: rings::Rings,
     cpus: mem::Shared[sched::State],
     mut frames: frames::Frames,
+    take cells: frames::PoolCells,
+    fixed: frames::Fixed,
     ) fails task::Cancelled uses wait {
-    let task::Channel(sender: requests, receiver: incoming) = task::Channel[Reservation].bounded(1, alloc: config.alloc)
+    let task::Channel(sender: requests, receiver: incoming) = task::Channel[MemoryRequest].bounded(1, alloc: config.alloc)
+    var pool = cells
+    defer take pool.close()
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
     let minted = devices::MintedRoot.of(orders, alloc: config.alloc)
     defer take minted.close()
@@ -1007,9 +1011,10 @@ fn run_base(
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
     let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: switching.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint())
     var requested = incoming
+    let counters = Counters(requests: requests.split(), alloc: config.alloc)
     var given = Some(Given(known: take known, reservations: Reserver(requests: take requests, alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced))
     defer abandon_given(take given)
-    try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested](s: task::Scope) fails task::Cancelled uses wait {
+    try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested, mut pool](s: task::Scope) fails task::Cancelled uses wait {
         let Some(Given(known: genesis, reservations: reserver, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders, logged: log_records, traced: tracing)) = mut given.extract() else {
             return
         }
@@ -1021,7 +1026,7 @@ fn run_base(
             try await sample_metrics(sampling, backlog, clock: config.clock, wall: config.wall, alloc: config.alloc)
         })
         discard s.spawn(fn[take board, take reading]() fails task::Cancelled uses wait limits stack 32_768 {
-            try await serve_board(take board, origin, machine, security: security_of(handoff, machine, alloc: config.alloc), cpus, gauges: reading, exec: config.exec, alloc: config.alloc)
+            try await serve_board(take board, origin, machine, security: security_of(handoff, machine, alloc: config.alloc), cpus, gauges: reading, memory: counters, exec: config.exec, alloc: config.alloc)
         })
         discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
             try await print_events(rings, backlog, exec: config.exec, alloc: config.alloc)
@@ -1059,7 +1064,7 @@ fn run_base(
                 }
             })
         })
-        try await serve_reservations(mut frames, requests: mut requested)
+        try await keep_memory(mut frames, cells: mut pool, fixed, requests: mut requested)
     })
 } run_base
 
@@ -1167,49 +1172,6 @@ linear struct Given {
     traced: task::Receiver[mem::List[journal::TracedInstance]]
 } Given
 
-/// A reserved instance's request for a region of `bytes`, and where the store over it goes, `None` when no free range holds one.
-struct Reservation {
-    bytes: u64
-    done: task::Sender[Option[mem::Heap]]
-} Reservation
-
-/// The runner's reservations, asking the task that holds the frame allocator for their regions.
-struct Reserver {
-    requests: task::Sender[Reservation]
-    alloc: mem::Alloc
-} Reserver
-
-impl Reserver: runner::Reservations
-
-fn Reserver.reserve(self, bytes: u64) -> Option[mem::Heap] fails task::Cancelled uses wait {
-    let task::Channel(sender: done, receiver: outcome) = task::Channel[Option[mem::Heap]].bounded(1, alloc: self.alloc)
-    match attempt await self.requests.send(Reservation(bytes: bytes, done: take done)) {
-        Ok(_) => {
-        }
-        Err(task::SendError.Closed) => return None
-        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
-    }
-    var receiver = outcome
-    let Some(store) = try await mut receiver.receive() else {
-        return None
-    }
-    return store
-} Reserver.reserve
-
-/// Carves the region of each reservation `requests` brings from `frames`, under a store of its own, for as long as requests come.
-fn serve_reservations(mut frames: frames::Frames, mut requests: task::Receiver[Reservation]) fails task::Cancelled uses wait {
-    loop {
-        let Some(Reservation(bytes: bytes, done: done)) = try await mut requests.receive() else {
-            return
-        }
-        let store = match mut frames.reserve(bytes) {
-            Some(region) => Some(mem::Heap.over(take region))
-            None => None
-        }
-        discard attempt await done.send(store)
-    }
-} serve_reservations
-
 /// The rights of `Control`, or every right when `every`.
 fn rights(every: bool, alloc: mem::Alloc) -> mem::Set[os::Right] {
     var set = mem::Set[os::Right].empty(alloc)
@@ -1269,7 +1231,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     bundle[0] = 0x01
     let config = runner::Config(exec: world.exec, pool: alloc, hibernation: alloc, alloc: alloc, clock: world.clock, wall: ident::Wall(at: ident::WallTime.unknown(), since_ns: 0), random: world.random, classes: sched::classes(), system: ident::Cause.of(1, number: 1))
     let rings = rings::Rings.of(cpus: hw::cpu_count(), clock: world.clock, boot: 1, alloc)
-    let task::Channel(sender: requests, receiver: unanswered) = task::Channel[Reservation].bounded(1, alloc)
+    let task::Channel(sender: requests, receiver: unanswered) = task::Channel[MemoryRequest].bounded(1, alloc)
     discard unanswered
     let task::Channel(sender: orders, receiver: unserved) = task::Channel[devices::RootOrder].bounded(1, alloc)
     discard unserved

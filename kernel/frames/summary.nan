@@ -1,0 +1,173 @@
+//! The memory summary: the parts of RAM the start fixes, the cells the core splits from a node pool with its pressure level, and what they and the frame allocator read at one moment.
+
+/// NaN's boot heap on the `x86_64-bare` machine.
+pkg const BOOT_HEAP: u64 = 16 * MIB
+
+/// The part of a pool its hibernation cell may hold.
+const HIBERNATION_SHARE: u64 = 16
+
+/// The unit cells are charged in.
+const CHUNK: u64 = 65_536
+
+/// The highest pressure level.
+const TOP_LEVEL: u8 = 4
+
+/// The parts of RAM the start fixes: usable memory, the kernel image, the boot heap, the core pool, and usable memory that no region, chunk or frame covers.
+pkg struct Fixed derives Copy, Eq {
+    pkg ram: u64
+    pkg image: u64
+    pkg boot_heap: u64
+    pkg core: u64
+    pkg excluded: u64
+} Fixed
+
+/// A pool's pressure: its watermark in bytes and its level, from 0 to 4.
+pkg struct Pressure derives Copy, Eq {
+    pkg watermark: u64
+    pkg level: u8 where level <= TOP_LEVEL
+} Pressure
+
+/// The cells the core splits from a node pool of `bytes`: its own, through which every draw from the pool goes, so that its charge is what the pool has drawn, and its hibernation cell, a sixteenth of the pool at most; and the pool's pressure.
+pkg linear struct PoolCells {
+    pkg whole: mem::Budget
+    pkg hibernation: mem::Budget
+    pkg bytes: u64
+    pkg pressure: Pressure
+} PoolCells
+
+/// What the core's counters read at one moment: the fixed parts, the frames of page tables, the regions given to reserved instances, the free frames, and of the pool its bytes, what it has drawn, what its hibernation cell holds and its pressure level.
+pkg struct Reading derives Copy, Eq {
+    pkg fixed: Fixed
+    pkg page_tables: u64
+    pkg reserved_regions: u64
+    pkg free_frames: u64
+    pkg pool_bytes: u64
+    pkg pool_drawn: u64
+    pkg hibernation: u64
+    pkg level: u8 where level <= TOP_LEVEL
+} Reading
+
+/// The parts the start fixes of `ram` bytes of usable memory: the kernel image's `image` bytes, the boot heap, the `core` bytes of the core pool, and what is left beside the `pools` bytes of node pools and the `frames` bytes of the frame allocator.
+fn Fixed.of(
+    ram: u64,
+    image: u64,
+    core: u64,
+    pools: u64,
+    frames: u64,
+    ) -> Fixed {
+    let held = image + BOOT_HEAP + core + pools + frames
+    return Fixed(ram: ram, image: image, boot_heap: BOOT_HEAP, core: core, excluded: ram.saturating_sub(held))
+} Fixed.of
+
+/// The cells of the pool `pool`: one of its whole size, and below it the hibernation cell.
+pkg fn PoolCells.of(pool: Pool) -> PoolCells {
+    let whole = pool.heap.alloc().split(usize.widen(pool.bytes))
+    let hibernation = whole.alloc().split(usize.widen(pool.bytes / HIBERNATION_SHARE / CHUNK * CHUNK))
+    return PoolCells(whole: take whole, hibernation: take hibernation, bytes: pool.bytes, pressure: Pressure.of(pool.bytes))
+} PoolCells.of
+
+/// Closes the cells.
+pkg fn PoolCells.close(take self) {
+    let PoolCells(whole: whole, hibernation: hibernation, bytes: _, pressure: _) = self
+    take hibernation.close()
+    take whole.close()
+} PoolCells.close
+
+/// What `frames` and the pool's cells read now, the pool's level settled on its free memory first.
+pkg fn PoolCells.reading(mut self, fixed: Fixed, frames: Frames) -> Reading {
+    let drawn = u64.widen(self.whole.charged())
+    discard mut self.pressure.settle(free: self.bytes.saturating_sub(drawn))
+    return Reading(fixed: fixed, page_tables: frames.table_bytes(), reserved_regions: frames.reserved_bytes(), free_frames: frames.free_bytes(), pool_bytes: self.bytes, pool_drawn: drawn, hibernation: u64.widen(self.hibernation.charged()), level: self.pressure.level)
+} PoolCells.reading
+
+/// The pressure of a pool of `bytes`: its watermark 4·√(its size in KiB) KiB, rounded down to a whole KiB, and level 0.
+pkg fn Pressure.of(bytes: u64) -> Pressure {
+    return Pressure(watermark: square_root(16 * (bytes / 1_024)) * 1_024, level: 0)
+} Pressure.of
+
+/// The free memory below which the pool enters `level`: 4, 3, 2 and 1 watermarks for levels 1 to 4.
+fn Pressure.entry(self, level: u8) -> u64
+    requires level >= 1 and level <= TOP_LEVEL
+{
+    return self.watermark * u64.widen(5 - level)
+} Pressure.entry
+
+/// Moves the level to the one `free` bytes of free memory give: up while it falls below the next level's entry, down while it reaches the current level's entry and half a watermark; whether it changed.
+pkg fn Pressure.settle(mut self, free: u64) -> bool {
+    let before = self.level
+    while self.level < TOP_LEVEL and free < self.entry(self.level + 1) {
+        self.level += 1
+    }
+    while self.level > 0 and free >= self.entry(self.level) + self.watermark / 2 {
+        self.level -= 1
+    }
+    return self.level != before
+} Pressure.settle
+
+/// The greatest integer whose square is at most `value`.
+fn square_root(value: u64) -> u64 {
+    var low: u64 = 0
+    var high: u64 = 4_294_967_296
+    while high - low > 1 {
+        let middle = low + (high - low) / 2
+        if middle * middle <= value {
+            low = middle
+        } else {
+            high = middle
+        }
+    }
+    return low
+} square_root
+
+/// The summary the counters `self` read and the cells of the instances running give, `pooled` bytes charged to those drawing from the pool and `reserved` to those drawing from reserved regions: its byte counts sum exactly to RAM, what the cells of the pool hold but no running instance's or the hibernation cell's being unattributed.
+pkg fn Reading.summary(self, pooled: u64, reserved: u64) -> os::MemorySummary {
+    let fixed = self.fixed
+    var summary = os::MemorySummary(ram: fixed.ram, image: fixed.image, boot_heap: fixed.boot_heap, excluded: fixed.excluded, frame_metadata: 0, page_tables: self.page_tables, core: fixed.core, intakes: 0, hibernation: self.hibernation, store_cache: 0, blob_cache: 0, reserved: self.reserved_regions.saturating_sub(reserved), accounts: pooled + reserved, free: self.free_frames + self.pool_bytes.saturating_sub(self.pool_drawn), unattributed: 0, level: self.level)
+    let counted = summary.image + summary.boot_heap + summary.excluded + summary.page_tables + summary.core + summary.hibernation + summary.reserved + summary.accounts + summary.free
+    if counted <= fixed.ram {
+        summary.unattributed = fixed.ram - counted
+    } else {
+        summary.free = summary.free.saturating_sub(counted - fixed.ram)
+    }
+    return summary
+} Reading.summary
+
+test watermarks_scale_with_the_square_root_of_the_pool for Pressure.of {
+    expect Pressure.of(64 * MIB).watermark == MIB
+    expect Pressure.of(512 * MIB).watermark == 2_896 * 1_024
+    expect Pressure.of(MIB * 16 * 1_024).watermark == 16 * MIB
+    expect Pressure.of(MIB * 1_024 * 1_024).watermark == 128 * MIB
+} watermarks_scale_with_the_square_root_of_the_pool
+
+/// A pool of 64 MiB, its watermark 1 MiB: free memory falling below 4, 3, 2 and 1 MiB enters levels 1 to 4, and the level falls back one step at a time once it reaches its entry and half a megabyte.
+test levels_rise_and_fall_with_hysteresis for Pressure.settle {
+    var pressure = Pressure.of(64 * MIB)
+    var changes = Array[bool, 6].filled(false)
+    var levels = Array[u8, 6].filled(0)
+    var frees = Array[u64, 6].filled(4 * MIB)
+    frees[1] = 4 * MIB - 1
+    frees[2] = MIB - 1
+    frees[3] = MIB + MIB / 2 - 1
+    frees[4] = MIB + MIB / 2
+    frees[5] = 64 * MIB
+    for at in 0..<6usize {
+        changes[at] = mut pressure.settle(free: frees[at])
+        levels[at] = pressure.level
+    }
+    expect not changes[0] and levels[0] == 0
+    expect changes[1] and levels[1] == 1
+    expect changes[2] and levels[2] == 4
+    expect not changes[3] and levels[3] == 4
+    expect changes[4] and levels[4] == 3
+    expect changes[5] and levels[5] == 0
+} levels_rise_and_fall_with_hysteresis
+
+/// The summary's byte counts sum to RAM: what the pool's cells hold beyond the running instances and the hibernation cell is unattributed, and counters read apart that overlap take it from free memory.
+test summaries_partition_ram for Reading.summary {
+    let fixed = Fixed(ram: 1_000, image: 100, boot_heap: 50, core: 40, excluded: 10)
+    let reading = Reading(fixed: fixed, page_tables: 20, reserved_regions: 80, free_frames: 100, pool_bytes: 600, pool_drawn: 300, hibernation: 30, level: 1)
+    let summary = reading.summary(pooled: 250, reserved: 60)
+    expect summary.accounts == 310 and summary.reserved == 20 and summary.free == 400 and summary.unattributed == 20 and summary.level == 1
+    let skewed = reading.summary(pooled: 290, reserved: 60)
+    expect skewed.unattributed == 0 and skewed.free == 380 and skewed.accounts == 350
+} summaries_partition_ram

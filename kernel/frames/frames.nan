@@ -30,12 +30,13 @@ pkg struct Plan {
     set_aside: u64
 } Plan
 
-/// The memory the core holds after start step 3: the frame allocator, the core pool, and the pool of each node with memory, holding `pool_bytes` together.
+/// The memory the core holds after start step 3: the frame allocator, the core pool, the pool of each node with memory, holding `pool_bytes` together, and the parts of RAM the start fixes.
 pkg linear struct Memory {
     pkg frames: Frames
     pkg core: mem::Heap
     pkg pools: mem::List[Pool]
     pkg pool_bytes: u64
+    pkg fixed: Fixed
 } Memory
 
 /// A node pool: the store over its region, and the bytes of the chunks it supplies.
@@ -51,11 +52,13 @@ linear struct NodeFrames {
     huge: mem::List[hw::PhysFrame[1_073_741_824]]
 } NodeFrames
 
-/// The frame allocator: the free frames of each node, the core reserve's frames for page tables, and the ranges reserved instances take their regions from.
+/// The frame allocator: the free frames of each node, the core reserve's frames for page tables, the ranges reserved instances take their regions from, the bytes of all it held at the start, and those of the regions it gave reserved instances.
 pkg linear struct Frames {
     nodes: mem::List[NodeFrames]
     tables: mem::List[hw::PhysFrame[4_096]]
     reservable: mem::List[hw::Region]
+    total: u64
+    reserved: u64
 } Frames
 
 /// The core pool's size: 4 MiB and 256 KiB per CPU.
@@ -162,10 +165,18 @@ fn align_up(value: u64, to: u64) -> u64
     return (value + to - 1) / to * to
 } align_up
 
-/// The memory of `regions` laid out as `plan` gives: the core pool over its region, each node's pool over its own, and every other region's frames in the frame allocator, which then sets aside the core reserve's frames for page tables. The frame allocator keeps its records in the core pool, and draws the lists it splits regions into through `scratch`.
-pkg fn Memory.build(take regions: mem::List[hw::Region], plan: Plan, scratch: mem::Alloc) -> Memory {
+/// The memory of `regions` laid out as `plan` gives: the core pool over its region, each node's pool over its own, and every other region's frames in the frame allocator, which then sets aside the core reserve's frames for page tables; of `usable` bytes of usable memory, the kernel image holding `image`. The frame allocator keeps its records in the core pool, and draws the lists it splits regions into through `scratch`.
+pkg fn Memory.build(
+    take regions: mem::List[hw::Region],
+    plan: Plan,
+    usable: u64,
+    image: u64,
+    scratch: mem::Alloc,
+    ) -> Memory {
     var rest = regions
-    let core = mem::Heap.over(mut rest.remove(plan.core))
+    let core_region = mut rest.remove(plan.core)
+    let core_bytes = chunk_bytes(Extent(base: core_region.base(), end: core_region.base() + core_region.byte_len()))
+    let core = mem::Heap.over(take core_region)
     let alloc = core.alloc()
     var nodes = mem::List[NodeFrames].empty(alloc)
     for _ in 0..<plan.pools.len() {
@@ -193,14 +204,16 @@ pkg fn Memory.build(take regions: mem::List[hw::Region], plan: Plan, scratch: me
         }
         index += 1
     }
-    var frames = Frames(nodes: take nodes, tables: mem::List.empty(alloc), reservable: take reservable)
+    var frames = Frames(nodes: take nodes, tables: mem::List.empty(alloc), reservable: take reservable, total: 0, reserved: 0)
+    frames.total = frames.free_bytes()
     for _ in 0..<TABLE_FRAMES {
         let Some(frame) = mut frames.take_small() else {
             break
         }
         mut frames.tables.push(take frame)
     }
-    return Memory(frames: take frames, core: core, pools: take pools, pool_bytes: pool_bytes)
+    let fixed = Fixed.of(ram: usable, image, core: core_bytes, pools: pool_bytes, frames: frames.total)
+    return Memory(frames: take frames, core: core, pools: take pools, pool_bytes: pool_bytes, fixed: fixed)
 } Memory.build
 
 /// Adds the frames of `region` to the node's: whole 1 GiB and 2 MiB frames where the region holds them, 4 KiB frames elsewhere, splitting the region through `scratch`.
@@ -329,6 +342,14 @@ pkg fn Frames.release(mut self, take frame: hw::PhysFrame[4_096]) {
     mut self.tables.push(take frame)
 } Frames.release
 
+/// The bytes of the frames that page tables hold or the core reserve keeps for them.
+pkg fn Frames.table_bytes(self) -> u64 {
+    return self.total.saturating_sub(self.free_bytes()).saturating_sub(self.reserved)
+} Frames.table_bytes
+
+/// The bytes of the regions given to reserved instances.
+pkg fn Frames.reserved_bytes(self) -> u64 = self.reserved
+
 /// The bytes of the frames and ranges free for any use, the core reserve's excepted.
 pkg fn Frames.free_bytes(self) -> u64 {
     var bytes: u64 = 0
@@ -376,6 +397,7 @@ pkg fn Frames.reserve(mut self, bytes: u64) -> Option[hw::Region] {
             }
         }
         set_aside(mut whole, bytes: whole.byte_len() - (span.end - span.base), into: mut self.reservable)
+        self.reserved += whole.byte_len()
         return Some(take whole)
     }
     return None

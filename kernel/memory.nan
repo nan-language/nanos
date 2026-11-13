@@ -1,0 +1,76 @@
+//! The memory keeper: the core's task holding the frame allocator and the pool's cells, which carves the regions of reserved instances and reads the counters of the memory summary.
+
+/// What the memory keeper takes: a reserved instance's request for a region of `bytes`, whose store goes to `done`, `None` when no free range holds one; or a reading of its counters.
+enum MemoryRequest {
+    Reserve(bytes: u64, done: task::Sender[Option[mem::Heap]])
+    Read(done: task::Sender[frames::Reading])
+} MemoryRequest
+
+/// The runner's reservations, asking the memory keeper for their regions.
+struct Reserver {
+    requests: task::Sender[MemoryRequest]
+    alloc: mem::Alloc
+} Reserver
+
+impl Reserver: runner::Reservations
+
+/// Where the board reads the memory keeper's counters.
+struct Counters {
+    requests: task::Sender[MemoryRequest]
+    alloc: mem::Alloc
+} Counters
+
+fn Reserver.reserve(self, bytes: u64) -> Option[mem::Heap] fails task::Cancelled uses wait {
+    let task::Channel(sender: done, receiver: outcome) = task::Channel[Option[mem::Heap]].bounded(1, alloc: self.alloc)
+    if not try await ask(self.requests, request: MemoryRequest.Reserve(bytes: bytes, done: take done)) {
+        return None
+    }
+    var receiver = outcome
+    let Some(store) = try await mut receiver.receive() else {
+        return None
+    }
+    return store
+} Reserver.reserve
+
+/// Another handle on the same memory keeper.
+fn Counters.share(self) -> Counters = Counters(requests: self.requests.split(), alloc: self.alloc)
+
+/// The counters as the memory keeper reads them now, `None` once it no longer runs.
+fn Counters.read(self) -> Option[frames::Reading] fails task::Cancelled uses wait {
+    let task::Channel(sender: done, receiver: outcome) = task::Channel[frames::Reading].bounded(1, alloc: self.alloc)
+    if not try await ask(self.requests, request: MemoryRequest.Read(done: take done)) {
+        return None
+    }
+    var receiver = outcome
+    return try await mut receiver.receive()
+} Counters.read
+
+/// Sends `request` to the memory keeper; whether it still runs.
+fn ask(requests: task::Sender[MemoryRequest], take request: MemoryRequest) -> bool fails task::Cancelled uses wait {
+    return match attempt await requests.send(take request) {
+        Ok(_) => true
+        Err(task::SendError.Closed) => false
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+    }
+} ask
+
+/// Carves the region of each reservation `requests` brings from `frames`, under a store of its own, and answers each reading with the counters of `frames` and the pool's `cells` beside the start's `fixed` parts, for as long as requests come.
+fn keep_memory(mut frames: frames::Frames, mut cells: frames::PoolCells, fixed: frames::Fixed, mut requests: task::Receiver[MemoryRequest]) fails task::Cancelled uses wait {
+    loop {
+        let Some(request) = try await mut requests.receive() else {
+            return
+        }
+        match request {
+            MemoryRequest.Reserve(bytes: bytes, done: done) => {
+                let store = match mut frames.reserve(bytes) {
+                    Some(region) => Some(mem::Heap.over(take region))
+                    None => None
+                }
+                discard attempt await done.send(store)
+            }
+            MemoryRequest.Read(done: done) => {
+                discard attempt await done.send(mut cells.reading(fixed, frames))
+            }
+        }
+    }
+} keep_memory
