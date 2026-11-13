@@ -45,7 +45,7 @@ fn Linker.plan(
         None => text::String.empty(env.alloc)
     }
     let steps = steps_of(list.as_str(), alloc: env.alloc)
-    mut self.preview_steps(take request, take steps, number, mut env, mut cx)
+    mut self.preview_steps(take request, take steps, number, undone: None, mut env, mut cx)
 } Linker.plan
 
 /// `call <moniker> <op>(<args>)`: a keyed task previews the one-step plan of that call for the session's principal, and the plan applies at once under the request's key, answering as `apply` does with its reply first.
@@ -70,10 +70,10 @@ fn Linker.call(
             steps = Err(take failure)
         }
     }
-    mut self.preview_steps(take request, take steps, number, mut env, mut cx)
+    mut self.preview_steps(take request, take steps, number, undone: None, mut env, mut cx)
 } Linker.call
 
-/// `undo <commit or plan>`: a keyed task previews the inverse plan: `revert <commit>`, or the reverts of a plan's span commits, newest first.
+/// `undo <commit or plan>`: a keyed task previews the inverse plan: `revert <commit>`, or the reverts of a plan's span commits, newest first, with an `irreversible` record for each delivered outbox entry of the plan.
 fn Linker.undo(
     mut self,
     take request: Request,
@@ -82,8 +82,23 @@ fn Linker.undo(
     mut cx: sys::Cx[LinkSession],
     ) {
     let steps = self.inverse_steps(request, alloc: env.alloc)
-    mut self.preview_steps(take request, take steps, number, mut env, mut cx)
+    let undone = self.undone_plan(request, alloc: env.alloc)
+    mut self.preview_steps(take request, take steps, number, undone, mut env, mut cx)
 } Linker.undo
+
+/// The hash of the plan the operand of `undo` names, `None` for a commit.
+fn Linker.undone_plan(self, request: Request, alloc: mem::Alloc) -> Option[ident::HashValue] {
+    let Some(word) = request.operands.get(0) else {
+        return None
+    }
+    if ident::CommitId.of_text(word.as_str()).is_some() {
+        return None
+    }
+    return match self.plan_named(word.as_str(), alloc) {
+        Ok(at) => Some(self.plans[at].hash)
+        Err(_) => None
+    }
+} Linker.undone_plan
 
 /// The inverse steps of the commit or the kept plan `request` names.
 fn Linker.inverse_steps(self, request: Request, alloc: mem::Alloc) -> Result[mem::List[Written], Failure] {
@@ -119,12 +134,13 @@ fn Linker.inverse_steps(self, request: Request, alloc: mem::Alloc) -> Result[mem
     return Ok(take steps)
 } Linker.inverse_steps
 
-/// Has a keyed task preview `steps`, the steps `request` gives or their failure, for the session's principal, at most `SessionBudget.previews` previews of its sessions running at once.
+/// Has a keyed task preview `steps`, the steps `request` gives or their failure, for the session's principal, at most `SessionBudget.previews` previews of its sessions running at once; the preview of the inverse of the plan `undone` adds what no undo reaches of it.
 fn Linker.preview_steps(
     mut self,
     take request: Request,
     take steps: Result[mem::List[Written], Failure],
     number: u64,
+    undone: Option[ident::HashValue],
     mut env: Env,
     mut cx: sys::Cx[LinkSession],
     ) {
@@ -150,11 +166,33 @@ fn Linker.preview_steps(
     let control = env.control
     let oversight = env.oversight
     mut cx.spawn(key: ANSWERING + slot, run: fn[take planned](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 131_072 {
-        let outcome = try await preview(take planned, tree, control, oversight, alloc)
+        var outcome = try await preview(take planned, tree, control, oversight, alloc)
+        match undone {
+            Some(plan) => {
+                outcome = try await irreversible_added(take outcome, undone: plan, tree, alloc)
+            }
+            None => {
+            }
+        }
         discard attempt await out.previewed(number, take outcome)
     })
     mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))
 } Linker.preview_steps
+
+/// `outcome` with, when it kept a plan, an `irreversible` record for each outbox entry of the plan `undone` that `tree` holds delivered.
+fn irreversible_added(take outcome: Preview, undone: ident::HashValue, tree: store::service::View, alloc: mem::Alloc) -> Preview fails task::Cancelled uses wait {
+    match outcome {
+        Preview.Kept(previewed) => {
+            var shown = previewed
+            let records = try await irreversible_records(tree, plan: undone, alloc)
+            for record in take records {
+                mut shown.records.push(take record)
+            }
+            return Preview.Kept(take shown)
+        }
+        Preview.Failed(failure) => return Preview.Failed(take failure)
+    }
+} irreversible_added
 
 /// What the preview of `steps` for `request` in the session numbered `session` needs: the steps and the request's options, the session's principal and what it holds, its taint, and the sessions open; refused without a session, with options of the wrong form, or while the principal's sessions run their most previews.
 fn Linker.planning(
@@ -309,7 +347,11 @@ fn outbox_entries(held: KeptPlan, alloc: mem::Alloc) -> mem::List[text::String] 
 /// Emits `plan.failed` for each plan `link`'s restart interrupted, as `events` tell.
 fn Linker.interrupted(mut self, take events: mem::List[PlanEvent], mut env: Env, mut cx: sys::Cx[LinkSession]) {
     for event in take events {
-        mut self.notify(Notice.Plan(kind: PlanState.Failed.event_kind(), event: take event), mut env, mut cx)
+        let kind = match event.entry.is_some() {
+            true => text::Fixed[32].of("plan.delivered")
+            false => PlanState.Failed.event_kind()
+        }
+        mut self.notify(Notice.Plan(kind: kind, event: take event), mut env, mut cx)
     }
 } Linker.interrupted
 

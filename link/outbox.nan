@@ -1,0 +1,506 @@
+//! The outbox: the irreversible deliveries of committed spans, held at `/sys/outbox` until their span's turn, then delivered in order through the runner; and, when `link` starts again, the entries it left settled: those of spans all still `Held` cancelled, and those `Delivering` delivered again.
+
+/// The attempts an outbox delivery makes in all while its target is restarting.
+const DELIVERY_ATTEMPTS: u32 = 5
+
+/// How long an outbox delivery waits before its next attempt.
+const RETRY_MS: u64 = 1_000
+
+/// An irreversible delivery of a span, which the outbox holds: its record and payload, the step whose command it carries out, and the message or keyed task the replay of that step keeps for it, `None` for the command itself.
+struct Outgoing {
+    delivery: Delivery
+    payload: mem::Bytes
+    commanded: InstanceStep
+    kept: Option[os::Kept]
+} Outgoing
+
+/// The irreversible deliveries of `span` of `applying`, whose outbox entries its commit adds, in order: each irreversible message or keyed task the replay of a step keeps, and each irreversible command to an instance holding a resource.
+fn outbox_of(applying: Applying, span: SpanWork, alloc: mem::Alloc) -> mem::List[Outgoing] {
+    var entries = mem::List[Outgoing].empty(alloc)
+    for commanded in span.commands {
+        if commanded.foreseen.is_some() {
+            for held in take commanded.held_deliveries(alloc) {
+                if not held.delivery.class.is_irreversible() {
+                    continue
+                }
+                let Some(copy) = duplicate(commanded, alloc) else {
+                    continue
+                }
+                let item = os::Kept(task: held.delivery.kind == DeliveryKind.Spawn, blake3: held.delivery.blake3)
+                let HeldDelivery(delivery: delivery, payload: payload) = held
+                mut entries.push(Outgoing(delivery: take delivery, payload: take payload, commanded: take copy, kept: Some(item)))
+            }
+            continue
+        }
+        if not commanded.class.is_irreversible() {
+            continue
+        }
+        let Some(delivery) = commanded.delivery(issuer: applying.plan.principal, alloc) else {
+            continue
+        }
+        let Some(copy) = duplicate(commanded, alloc) else {
+            continue
+        }
+        mut entries.push(Outgoing(delivery: take delivery, payload: copied_bytes(commanded.message, alloc), commanded: take copy, kept: None))
+    }
+    return entries
+} outbox_of
+
+/// `<plan short hash>-<span>-<n>`, the id of the outbox entry of the n-th irreversible delivery of span `span`.
+pub fn entry_id(hash: ident::HashValue, span: u32, n: usize, alloc: mem::Alloc) -> text::String {
+    var id = text::String.of(hash.short_form().as_str(), alloc)
+    mut id.push('-')
+    mut id.write(Dyn[Render].view(span), budget: 12)
+    mut id.push('-')
+    mut id.write(Dyn[Render].view(n), budget: 12)
+    return id
+} entry_id
+
+/// The write of the outbox entry of `outgoing`, the n-th irreversible delivery of span `span` of `applying`, in `status` after `attempts` attempts, holding the encoding of its reply `reply`.
+fn entry_write(
+    applying: Applying,
+    span: u32,
+    n: usize,
+    outgoing: Outgoing,
+    status: DeliveryStatus,
+    attempts: u32,
+    reply: Option[mem::Bytes],
+    alloc: mem::Alloc,
+    ) -> Option[store::Write] {
+    let Some(delivery) = duplicate(outgoing.delivery, alloc) else {
+        return None
+    }
+    var key = text::String.of(applying.key.as_str(), alloc)
+    mut key.push('.')
+    mut key.write(Dyn[Render].view(span), budget: 12)
+    mut key.push('.')
+    mut key.write(Dyn[Render].view(n), budget: 12)
+    let payload = copied_bytes(outgoing.payload, alloc)
+    var held: Option[mem::Bytes] = None
+    match reply {
+        Some(bytes) => {
+            var copy = mem::Bytes.empty(alloc)
+            mut copy.append(bytes.view())
+            held = Some(take copy)
+        }
+        None => {
+        }
+    }
+    let entry = OutboxEntry(plan: applying.hash, span: span, delivery: take delivery, key: take key, payload: take payload, status: status, attempts: attempts, reply: take held)
+    return Some(outbox_write(id: entry_id(applying.hash, span, n, alloc).as_str(), entry, alloc))
+} entry_write
+
+/// The write of `entry` at `/sys/outbox/<id>`.
+fn outbox_write(id: Str, entry: OutboxEntry, alloc: mem::Alloc) -> store::Write {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[OutboxEntry].encode(entry, out: mut bytes)
+    var path = text::String.of("/sys/outbox/", alloc)
+    mut path.append(id)
+    return store::Write.Put(path: ident::Path(text: take path), value: store::Value.Record(type: store::TypeRef.of("link::OutboxEntry", schema: mem::wire::Codec[OutboxEntry].schema_hash(), alloc), bytes: take bytes, secret: false))
+} outbox_write
+
+/// The writes setting the outbox entries `entries` of span `span` of `applying` in `status`, from the n-th on.
+fn entries_in(
+    applying: Applying,
+    span: u32,
+    entries: mem::List[Outgoing],
+    from: usize,
+    status: DeliveryStatus,
+    alloc: mem::Alloc,
+    ) -> mem::List[store::Write] {
+    var writes = mem::List[store::Write].empty(alloc)
+    for at in from..<entries.len() {
+        match entry_write(applying, span, n: at + 1, outgoing: entries[at], status, attempts: 0, reply: None, alloc) {
+            Some(write) => mut writes.push(take write)
+            None => {
+            }
+        }
+    }
+    return writes
+} entries_in
+
+/// Delivers the outbox entries of `span` in order through `control` once one commit sets them `Delivering`, each retried while its target is restarting, at most `DELIVERY_ATTEMPTS` attempts in all: a delivered entry becomes `Delivered`, and the first that fails `Failed` with the later ones `Cancelled`, the plan then failing with `plan.delivery-failed`. `out` hears of each entry delivered or failed; the store's code when a commit fails.
+fn deliver_outbox(
+    applying: Applying,
+    span: SpanWork,
+    control: os::Control,
+    acting: store::service::View,
+    clocks: Clocks,
+    out: sys::Outbox[LinkSession],
+    alloc: mem::Alloc,
+    ) -> Option[text::String] fails task::Cancelled uses wait {
+    let entries = outbox_of(applying, span, alloc)
+    if entries.len() == 0 {
+        return None
+    }
+    match try await commit_writes(applying, writes: entries_in(applying, span: span.span, entries, from: 0, status: DeliveryStatus.Delivering, alloc), acting, alloc) {
+        Some(code) => return Some(take code)
+        None => {
+        }
+    }
+    for at in 0..<entries.len() {
+        var attempts: u32 = 0
+        let outcome = try await attempted(outgoing: entries[at], control, clocks, mut attempts, alloc)
+        let failed = outcome.is_err()
+        let status = match failed {
+            true => DeliveryStatus.Failed
+            false => DeliveryStatus.Delivered
+        }
+        let reply = match outcome {
+            Ok(found) => found
+            Err(_) => None
+        }
+        var writes = mem::List[store::Write].empty(alloc)
+        match entry_write(applying, span: span.span, n: at + 1, outgoing: entries[at], status, attempts, reply, alloc) {
+            Some(write) => mut writes.push(take write)
+            None => {
+            }
+        }
+        if failed {
+            for write in take entries_in(applying, span: span.span, entries, from: at + 1, status: DeliveryStatus.Cancelled, alloc) {
+                mut writes.push(take write)
+            }
+        }
+        match try await commit_writes(applying, take writes, acting, alloc) {
+            Some(code) => return Some(take code)
+            None => {
+            }
+        }
+        match reply {
+            Some(bytes) => {
+                discard attempt await out.plan_moved(applying.number, moved: Moved.Replied(step: entries[at].commanded.step, reply: take bytes))
+            }
+            None => {
+            }
+        }
+        discard attempt await out.plan_moved(applying.number, moved: Moved.Delivered(entry: entry_id(applying.hash, span: span.span, n: at + 1, alloc), status: status))
+        if failed {
+            try await told_cancelled(applying, span: span.span, from: at + 2, through: entries.len(), out, alloc)
+            return Some(text::String.of("plan.delivery-failed", alloc))
+        }
+    }
+    return None
+} deliver_outbox
+
+/// Makes the delivery `outgoing` through `control`: releases what a replay keeps for it, or carries out its command; again after `RETRY_MS` while its target is restarting, at most `DELIVERY_ATTEMPTS` attempts in all, counted in `attempts`: the encoding of the reply to a request when it is one, or the code of its failure.
+fn attempted(
+    outgoing: Outgoing,
+    control: os::Control,
+    clocks: Clocks,
+    mut attempts: u32,
+    alloc: mem::Alloc,
+    ) -> Result[Option[mem::Bytes], text::Fixed[32]] fails task::Cancelled uses wait {
+    loop {
+        attempts += 1
+        let outcome = try await delivered_once(outgoing, control, alloc)
+        let restarting = match outcome {
+            Err(code) => code.as_str() == "port.stopped"
+            Ok(_) => false
+        }
+        if not restarting or attempts >= DELIVERY_ATTEMPTS {
+            return outcome
+        }
+        try await clocks.clock.sleep(RETRY_MS)
+    }
+} attempted
+
+/// Makes the delivery `outgoing` once through `control`: the encoding of the reply to its command's request when it is one, or the code of its failure.
+fn delivered_once(outgoing: Outgoing, control: os::Control, alloc: mem::Alloc) -> Result[Option[mem::Bytes], text::Fixed[32]] fails task::Cancelled uses wait {
+    let Some(item) = outgoing.kept else {
+        return try await carried_out(outgoing.commanded, control, alloc)
+    }
+    return match first attempt await control.deliver(ident::Moniker(text: outgoing.commanded.moniker.text), kept: item, alloc) {
+        Ok(_) => Ok(None)
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(failed.code())
+    }
+} delivered_once
+
+/// Tells `out` that the outbox entries `from` to `through` of span `span` of `applying` ended `Cancelled`.
+fn told_cancelled(
+    applying: Applying,
+    span: u32,
+    from: usize,
+    through: usize,
+    out: sys::Outbox[LinkSession],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var n = from
+    while n <= through {
+        discard attempt await out.plan_moved(applying.number, moved: Moved.Delivered(entry: entry_id(applying.hash, span, n, alloc), status: DeliveryStatus.Cancelled))
+        n += 1
+    }
+} told_cancelled
+
+/// An outbox entry as `/sys/outbox` holds it: its id, its number within its span, and its record.
+struct StoredEntry {
+    id: text::String
+    n: u32
+    entry: OutboxEntry
+} StoredEntry
+
+/// Settles, through `tree` and `control`, the outbox entries a restart of `link` left: those of a span all still `Held` become `Cancelled`; those `Delivering` are delivered again in order, and the first that fails sets the later ones of its span `Cancelled`; then the instances that issued them drop what they keep. Gives the failure with `plan.interrupted` of each plan with such entries that `interrupted` does not name, and the event of each entry delivered again or failed.
+pub fn recover_outbox(tree: store::service::View, control: os::Control, interrupted: mem::List[PlanEvent], alloc: mem::Alloc) -> mem::List[PlanEvent] fails task::Cancelled uses wait {
+    var events = mem::List[PlanEvent].empty(alloc)
+    let entries_left = try await stored_entries(tree, alloc)
+    var from: usize = 0
+    while from < entries_left.len() {
+        var through = from + 1
+        while through < entries_left.len() and entries_left[through].entry.plan == entries_left[from].entry.plan and entries_left[through].entry.span == entries_left[from].entry.span {
+            through += 1
+        }
+        if open_between(entries_left, from, through, status: DeliveryStatus.Held) or open_between(entries_left, from, through, status: DeliveryStatus.Delivering) {
+            let plan = entries_left[from].entry.plan
+            if interrupted.position(fn(event: PlanEvent) => event.plan == plan).is_none() and events.position(fn(event: PlanEvent) => event.plan == plan).is_none() {
+                mut events.push(PlanEvent(plan: plan, state: PlanState.Failed, span: entries_left[from].entry.span, commit: None, entry: None, code: Some(text::String.of("plan.interrupted", alloc))))
+            }
+            try await settled(entries_left, from, through, tree, control, mut events, alloc)
+        }
+        from = through
+    }
+    for moniker in issuers_of(entries_left, alloc) {
+        match attempt await control.discard_kept(ident::Moniker(text: moniker.text), alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    }
+    return events
+} recover_outbox
+
+/// Whether an entry from `from` up to `through` of `entries_left` is in `status`.
+fn open_between(entries_left: mem::List[StoredEntry], from: usize, through: usize, status: DeliveryStatus) -> bool {
+    for at in from..<through {
+        if entries_left[at].entry.status == status {
+            return true
+        }
+    }
+    return false
+} open_between
+
+/// Settles the entries from `from` up to `through` of `entries_left`, one span's, through `tree` and `control`: delivers again in order those `Delivering`, then cancels each after the first that fails, or cancels them all when none is `Delivering`, adding to `events` the event of each delivered again or failed.
+fn settled(
+    entries_left: mem::List[StoredEntry],
+    from: usize,
+    through: usize,
+    tree: store::service::View,
+    control: os::Control,
+    mut events: mem::List[PlanEvent],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var cancelling = not open_between(entries_left, from, through, status: DeliveryStatus.Delivering)
+    for at in from..<through {
+        let entry = entries_left[at].entry
+        if entry.status != DeliveryStatus.Held and entry.status != DeliveryStatus.Delivering {
+            continue
+        }
+        if cancelling {
+            try await rewritten(entries_left[at], status: DeliveryStatus.Cancelled, reply: None, tree, alloc)
+            continue
+        }
+        let outcome = try await delivered_again(entry, control, alloc)
+        cancelling = outcome.is_err()
+        let status = match cancelling {
+            true => DeliveryStatus.Failed
+            false => DeliveryStatus.Delivered
+        }
+        let reply = match outcome {
+            Ok(found) => found
+            Err(_) => None
+        }
+        try await rewritten(entries_left[at], status, take reply, tree, alloc)
+        mut events.push(PlanEvent(plan: entry.plan, state: PlanState.Failed, span: entry.span, commit: None, entry: Some(text::String.of(entries_left[at].id.as_str(), alloc)), code: None))
+    }
+} settled
+
+/// Commits through `tree` the outbox entry `entries_left` in `status`, after one more attempt unless cancelled, holding the encoding of its reply `reply`.
+fn rewritten(entries_left: StoredEntry, status: DeliveryStatus, take reply: Option[mem::Bytes], tree: store::service::View, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(copy) = duplicate(entries_left.entry, alloc) else {
+        return
+    }
+    var entry = copy
+    entry.status = status
+    if status != DeliveryStatus.Cancelled {
+        entry.attempts += 1
+    }
+    entry.reply = reply
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(outbox_write(id: entries_left.id.as_str(), entry, alloc))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: Some(entry.plan), intent: None)
+    match attempt await tree.commit(take transaction, typed: true, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} rewritten
+
+/// Delivers `entry` again through `control`: a message an instance kept is released while it still keeps it, a command is carried out again on the instance and operation its target names, and a keyed task fails, as no holder keeps one past a restart of `link`. The encoding of the reply to a request, or the code of the failure.
+fn delivered_again(entry: OutboxEntry, control: os::Control, alloc: mem::Alloc) -> Result[Option[mem::Bytes], text::Fixed[32]] fails task::Cancelled uses wait {
+    if entry.delivery.kind == DeliveryKind.Spawn {
+        return Err(text::Fixed[32].of("port.no-target"))
+    }
+    match issuing_instance(entry.delivery.issuer.text.as_str()) {
+        Some(moniker) => return match first attempt await control.deliver(take moniker, kept: os::Kept(task: false, blake3: entry.delivery.blake3), alloc) {
+            Ok(_) => Ok(None)
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => Err(failed.code())
+        }
+        None => {
+        }
+    }
+    let target = entry.delivery.target.as_str()
+    var cut: usize = 0
+    for at in 0..<target.byte_len() {
+        if target.as_bytes()[at] == b'.' {
+            cut = at
+        }
+    }
+    let Some(name) = target.slice_bytes(0, end: cut) else {
+        return Err(text::Fixed[32].of("request.invalid-operand"))
+    }
+    let Some(operation) = target.slice_bytes(cut + 1, end: target.byte_len()) else {
+        return Err(text::Fixed[32].of("request.invalid-operand"))
+    }
+    let Ok(moniker) = attempt text::Fixed[59].try_of(name) else {
+        return Err(text::Fixed[32].of("request.invalid-operand"))
+    }
+    let described = match first attempt await control.describe(ident::Moniker(text: moniker), alloc) {
+        Ok(found) => found
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(failed.code())
+    }
+    let Some(at) = described.schema.operations.position(fn(each: sys::OperationSchema) => each.name.as_str() == operation) else {
+        return Err(text::Fixed[32].of("request.unknown-name"))
+    }
+    let request = reply_schema(described.schema.operations[at], alloc).is_some()
+    var encoded = sys::Encoded.empty(alloc)
+    mut encoded.bytes.append(entry.payload.view())
+    return match first attempt await control.call(ident::Moniker(text: moniker), hash: described.schema.hash, take encoded, request, alloc) {
+        Ok(replied) => match request {
+            true => Ok(Some(take replied.bytes))
+            false => Ok(None)
+        }
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(failed.code())
+    }
+} delivered_again
+
+/// The instance an issuer `inst.<moniker>` names, `None` for a principal.
+fn issuing_instance(issuer: Str) -> Option[ident::Moniker] {
+    if not issuer.starts_with("inst.") {
+        return None
+    }
+    let Some(name) = issuer.slice_bytes(5, end: issuer.byte_len()) else {
+        return None
+    }
+    return match attempt text::Fixed[59].try_of(name) {
+        Ok(moniker) => Some(ident::Moniker(text: moniker))
+        Err(_) => None
+    }
+} issuing_instance
+
+/// The instances that issued the entries of `entries_left` still `Held` or `Delivering`, once each.
+fn issuers_of(entries_left: mem::List[StoredEntry], alloc: mem::Alloc) -> mem::List[ident::Moniker] {
+    var instances = mem::List[ident::Moniker].empty(alloc)
+    for each in entries_left {
+        if each.entry.status != DeliveryStatus.Held and each.entry.status != DeliveryStatus.Delivering {
+            continue
+        }
+        let Some(moniker) = issuing_instance(each.entry.delivery.issuer.text.as_str()) else {
+            continue
+        }
+        if instances.position(fn(known: ident::Moniker) => known == moniker).is_none() {
+            mut instances.push(take moniker)
+        }
+    }
+    return instances
+} issuers_of
+
+/// The outbox entries `tree` holds that decode, by plan, then span, then number.
+fn stored_entries(tree: store::service::View, alloc: mem::Alloc) -> mem::List[StoredEntry] fails task::Cancelled uses wait {
+    var entries_left = mem::List[StoredEntry].empty(alloc)
+    var after: Option[text::String] = None
+    loop {
+        let page = match first attempt await tree.list(ident::Path(text: text::String.of("/sys/outbox", alloc)), after: take after, limit: 256, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => break
+        }
+        let store::Listing(entries: children, next: next) = page
+        for child in children {
+            match try await stored_entry(tree, name: child.name.as_str(), alloc) {
+                Some(found) => mut entries_left.push(take found)
+                None => {
+                }
+            }
+        }
+        let Some(more) = next else {
+            break
+        }
+        after = Some(take more)
+    }
+    mut entries_left.sort_by(entry_order)
+    return entries_left
+} stored_entries
+
+/// The outbox entry `name` that `tree` holds, `None` when it does not decode.
+fn stored_entry(tree: store::service::View, name: Str, alloc: mem::Alloc) -> Option[StoredEntry] fails task::Cancelled uses wait {
+    var path = text::String.of("/sys/outbox/", alloc)
+    mut path.append(name)
+    let node = match first attempt await tree.get(ident::Path(text: take path), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(raw) = node.value else {
+        return None
+    }
+    let Ok(entry) = attempt mem::wire::Codec[OutboxEntry].decode(raw.view(), alloc) else {
+        return None
+    }
+    var cut: usize = 0
+    for at in 0..<name.byte_len() {
+        if name.as_bytes()[at] == b'-' {
+            cut = at + 1
+        }
+    }
+    let n = match name.slice_bytes(cut, end: name.byte_len()) {
+        Some(tail) => number_of(tail).value_or(0)
+        None => 0
+    }
+    return Some(StoredEntry(id: text::String.of(name, alloc), n: u32.saturate(n), entry: take entry))
+} stored_entry
+
+/// The order of outbox entries: by plan, then span, then number.
+fn entry_order(left: StoredEntry, right: StoredEntry) -> core::Ordering {
+    let left_plan = left.entry.plan.short_form()
+    let right_plan = right.entry.plan.short_form()
+    let plans = left_plan.as_str().as_bytes().cmp(right_plan.as_str().as_bytes())
+    if plans != core::Ordering.Equal {
+        return plans
+    }
+    if left.entry.span != right.entry.span {
+        return left.entry.span.cmp(right.entry.span)
+    }
+    return left.n.cmp(right.n)
+} entry_order
+
+/// An `irreversible <entry>, target, class` record for each outbox entry of the plan `plan` that `tree` holds delivered, newest first, as no undo reaches its effect.
+pub fn irreversible_records(tree: store::service::View, plan: ident::HashValue, alloc: mem::Alloc) -> mem::List[Record] fails task::Cancelled uses wait {
+    var records = mem::List[Record].empty(alloc)
+    let entries_left = try await stored_entries(tree, alloc)
+    var at = entries_left.len()
+    while at > 0 {
+        at -= 1
+        let each = entries_left[at]
+        if each.entry.plan != plan or each.entry.status != DeliveryStatus.Delivered {
+            continue
+        }
+        var record = Record.of("irreversible", alloc)
+        mut record.subject(Dyn[Render].view(Rendered(text: text::String.of(each.id.as_str(), alloc))))
+        mut record.text("target", value: each.entry.delivery.target.as_str(), alloc)
+        mut record.field("class", value: Dyn[Render].view(each.entry.delivery.class))
+        mut records.push(take record)
+    }
+    return records
+} irreversible_records
