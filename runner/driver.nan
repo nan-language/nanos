@@ -149,9 +149,9 @@ enum Awaited derives Copy, Eq {
 } Awaited
 
 /// What the tasks a driver spawns need from the runner.
-struct Shared[C: Components and Copy and Send, R: Memory and Send] {
+struct Shared[C: Components and Copy and Send, R: Machine and Send] {
     components: C
-    memory: R
+    machine: R
     reservations: task::Cown[Reservations]
     config: Config
     directory: task::Cown[Directory]
@@ -278,7 +278,7 @@ fn Shared.take_input[J: Journal](
             if incarnation == driver.incarnation {
                 try await self.gauges.unwatch(driver.moniker, alloc: self.config.alloc)
                 try await self.ended(mut driver, take outcome, sender, journal, s)
-                discard try await self.memory.settle()
+                discard try await self.machine.settle()
             }
         }
         Input.Elapsed(incarnation: incarnation) => {
@@ -761,13 +761,8 @@ fn Shared.start[J: Journal](
 
 /// What a new incarnation takes: the CPU reservation of a `latency` share, admitted unless one is, `budget.over-reservation` when no CPU holds it, then its cell, the reservation ending when the cell is refused.
 fn Shared.resources(self, mut driver: Driver) -> Result[mem::Budget, text::Fixed[32]] fails task::Cancelled uses wait {
-    let ppm = reserved_ppm(driver.spec.share)
-    if ppm > 0 and driver.reservation.is_none() {
-        let reservations = self.reservations.share()
-        driver.reservation = await when mut reservations => mut reservations.admit(ppm)
-        if driver.reservation.is_none() {
-            return Err(text::Fixed[32].of("budget.over-reservation"))
-        }
+    if not try await self.admit(mut driver) {
+        return Err(text::Fixed[32].of("budget.over-reservation"))
     }
     let refusal = match try await self.cell(mut driver) {
         Ok(cell) => return Ok(take cell)
@@ -776,6 +771,23 @@ fn Shared.resources(self, mut driver: Driver) -> Result[mem::Budget, text::Fixed
     try await self.end_reservation(mut driver)
     return Err(refusal)
 } Shared.resources
+
+/// Admits the CPU reservation the instance's share asks for unless it holds one; whether it holds it.
+fn Shared.admit(self, mut driver: Driver) -> bool fails task::Cancelled uses wait {
+    let Some(reservation) = Reservation.of(driver.spec.share) else {
+        return true
+    }
+    if driver.reservation.is_some() {
+        return true
+    }
+    let reservations = self.reservations.share()
+    driver.reservation = await when mut reservations => mut reservations.admit(reservation)
+    let Some(admitted) = driver.reservation else {
+        return false
+    }
+    try await self.tolerate(admitted.cpu)
+    return true
+} Shared.admit
 
 /// Ends the instance's CPU reservation, when it holds one.
 fn Shared.end_reservation(self, mut driver: Driver) fails task::Cancelled uses wait {
@@ -786,19 +798,28 @@ fn Shared.end_reservation(self, mut driver: Driver) fails task::Cancelled uses w
     await when mut reservations {
         mut reservations.release(admitted)
     }
+    try await self.tolerate(admitted.cpu)
 } Shared.end_reservation
+
+/// Gives the machine CPU `cpu`'s latency tolerance as the reservations admitted on it now set it.
+fn Shared.tolerate(self, cpu: u32) fails task::Cancelled uses wait {
+    let reservations = self.reservations.share()
+    await when reservations {
+        self.machine.tolerate(cpu, tolerance_ns: reservations.tolerance(cpu))
+    }
+} Shared.tolerate
 
 /// The cell of a new incarnation: split from the node pool at the specification's limit, `budget.memory-pressure` while the pool is at the top pressure level; or for a reserved instance from the store over its region, which its first start takes and later starts reuse, `budget.over-reservation` when no free range holds the region.
 fn Shared.cell(self, mut driver: Driver) -> Result[mem::Budget, text::Fixed[32]] fails task::Cancelled uses wait {
     let limit = driver.spec.budget.limit
     if not driver.spec.budget.reserved {
-        if try await self.memory.settle() >= TOP_LEVEL {
+        if try await self.machine.settle() >= TOP_LEVEL {
             return Err(text::Fixed[32].of("budget.memory-pressure"))
         }
         return Ok(self.config.pool.split(usize.widen(limit)))
     }
     if driver.reserved.is_none() {
-        driver.reserved = try await self.memory.reserve(limit)
+        driver.reserved = try await self.machine.reserve(limit)
     }
     let Some(store) = driver.reserved else {
         return Err(text::Fixed[32].of("budget.over-reservation"))

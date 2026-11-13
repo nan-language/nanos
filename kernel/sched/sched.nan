@@ -1,4 +1,4 @@
-//! Run queues, CPU classes, wake placement, accounting and idle: the policy through which NaN's runtime runs the kernel's tasks.
+//! Run queues, CPU classes, wake placement, accounting, idle and idle states: the policy through which NaN's runtime runs the kernel's tasks.
 
 /// The class of the root executor's share, and so of the core's tasks.
 const CORE: u8 = 0
@@ -39,6 +39,15 @@ const VALUE_MASK: u64 = 0x3FFF_FFFF_FFFF_FFFF
 /// The accounts with ready work that each CPU keeps the virtual time of.
 const ENTITIES: usize = 64
 
+/// The idle periods each CPU remembers to predict its next.
+const PERIODS: usize = 8
+
+/// An MWAIT idle state: its hint and its exit latency.
+pkg struct IdleState derives Copy, Eq {
+    pkg hint: u8
+    pkg exit_ns: u64
+} IdleState
+
 /// Where a CPU lies: its package, core, last-level cache and NUMA node.
 pkg struct Place derives Copy, Eq {
     pkg package_id: u32
@@ -47,13 +56,14 @@ pkg struct Place derives Copy, Eq {
     pkg node: u32
 } Place
 
-/// What the policy and the core's tasks share: each CPU's state behind its lock, where each CPU lies, the running CPU's number and the clock.
+/// What the policy and the core's tasks share: each CPU's state behind its lock, where each CPU lies, the running CPU's number, the clock, and the MWAIT states idle CPUs may enter, none without MWAIT.
 pkg struct State {
     cpus: mem::List[hw::SpinLock[Cpu]]
     places: mem::List[Place]
     here: hw::PerCpu[u32]
     clock: sys::Clock
     started: core::atomic::AtomicBool
+    idle_states: mem::List[IdleState]
 } State
 
 /// The kernel's policy, whose hooks NaN's runtime calls with the CPU's interrupts disabled.
@@ -61,7 +71,7 @@ pkg struct Scheduler {
     state: mem::Shared[State]
 } Scheduler
 
-/// A CPU's run queue as the policy sees it, with the time it spent, whether it rests and since when, and the rests it left.
+/// A CPU's run queue as the policy sees it, with the time it spent, whether it rests, since when and in which MWAIT state, none for HLT, the rests it left, the lengths of its last idle periods, each from its entry into an idle state to its return, the next taking slot `next_period`, the start of the one it is in, and its latency tolerance, none when unbounded.
 struct Cpu {
     started: bool
     idle: bool
@@ -73,7 +83,12 @@ struct Cpu {
     times: Times
     resting: bool
     rested_ns: u64
+    resting_in: Option[u8]
     wakeups: u64
+    periods: Array[u64, PERIODS]
+    next_period: usize
+    period_ns: u64
+    tolerance_ns: Option[u64]
 } Cpu
 
 /// The time a CPU spent on work of each class, core work counting all of its classes, and idle.
@@ -85,10 +100,11 @@ pkg struct Times derives Copy, Eq {
     pkg idle: u64
 } Times
 
-/// What a CPU's state tells at a moment: whether it started and rests, its time, the work queued on it and the rests it left.
+/// What a CPU's state tells at a moment: whether it started and rests, the hint of the MWAIT state it rests in, none for HLT, its time, the work queued on it and the rests it left.
 pkg struct Reading derives Copy {
     pkg started: bool
     pkg resting: bool
+    pkg resting_in: Option[u8]
     pkg times: Times
     pkg queued: u32
     pkg wakeups: u64
@@ -152,15 +168,22 @@ fn virtual_of(ns: u64, weight: u64) -> u64 {
     return ns.saturating_mul(UNIT_WEIGHT) / weight
 } virtual_of
 
-/// The state for `places.len()` CPUs, every CPU but the boot CPU not yet started.
-pkg fn State.of(take places: mem::List[Place], clock: sys::Clock, alloc: mem::Alloc) -> State {
+/// The state for `places.len()` CPUs, every CPU but the boot CPU not yet started, idle CPUs entering `idle_states` or halting.
+pkg fn State.of(take places: mem::List[Place], clock: sys::Clock, take idle_states: mem::List[IdleState], alloc: mem::Alloc) -> State {
     var cpus = mem::List[hw::SpinLock[Cpu]].empty(alloc)
     for index in 0..<places.len() {
-        let idle = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-        mut cpus.push(hw::SpinLock.of(Cpu(started: index == 0, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: idle, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, wakeups: 0)))
+        var cpu = Cpu.fresh()
+        cpu.started = index == 0
+        mut cpus.push(hw::SpinLock.of(take cpu))
     }
-    return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false))
+    return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), idle_states: take idle_states)
 } State.of
+
+/// A CPU not started, running nothing.
+fn Cpu.fresh() -> Cpu {
+    let nothing = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
+    return Cpu(started: false, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, resting_in: None, wakeups: 0, periods: Array[u64, PERIODS].filled(0), next_period: 0, period_ns: 0, tolerance_ns: None)
+} Cpu.fresh
 
 /// Marks CPU `cpu` started: it runs on the shared space with its features enabled, so work may go to it.
 pkg fn State.start(self, cpu: u32) {
@@ -173,6 +196,18 @@ pkg fn State.start(self, cpu: u32) {
         })
     })
 } State.start
+
+/// Sets CPU `cpu`'s latency tolerance to `tolerance_ns`, unbounded when `None`.
+pkg fn State.tolerate(self, cpu: u32, tolerance_ns: Option[u64]) {
+    let Some(lock) = self.cpus.get(usize.widen(cpu)) else {
+        return
+    }
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        lock.with(t, body: fn(mut state: Cpu) limits notrap, terminates, noalloc {
+            state.tolerance_ns = tolerance_ns
+        })
+    })
+} State.tolerate
 
 /// Marks every CPU started, from which on idle CPUs take work from others.
 pkg fn State.all_started(self) {
@@ -377,17 +412,82 @@ fn bounded(value: u64, low: u64, high: u64) -> u64 limits notrap, terminates, no
     return value
 } bounded
 
+/// The idle state of a CPU with no work: the deepest MWAIT state whose exit latency is below half the rest it predicts and below its latency tolerance, else HLT.
 pkg fn Scheduler.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
     let state = self.state.contents()
     let now = state.now()
     let Some(lock) = state.cpus.get(usize.widen(cpu)) else {
         return hw::Idle.Halt
     }
-    lock.with(t, body: fn(mut current: Cpu) limits notrap, terminates, noalloc {
+    let entered = lock.with(t, body: fn(mut current: Cpu) -> Option[u8] limits notrap, terminates, noalloc {
         mut current.go_idle(now_ns: now)
+        current.resting_in = match deepest(state.idle_states.view(), below: current.exit_bound(now_ns: now, until_ns)) {
+            Some(chosen) => Some(chosen.hint)
+            None => None
+        }
+        return current.resting_in
     })
-    return hw::Idle.Halt
+    return match entered {
+        Some(hint) => hw::Idle.Mwait(hint)
+        None => hw::Idle.Halt
+    }
 } Scheduler.idle
+
+/// The exit latency below which the idle state a CPU enters at `now_ns` stays: half the rest it predicts and its latency tolerance, `None` when it knows neither.
+fn Cpu.exit_bound(self, now_ns: u64, until_ns: Option[u64]) -> Option[u64] limits notrap, terminates, noalloc {
+    let half = match self.predicted(now_ns, until_ns) {
+        Some(rest) => Some(rest / 2)
+        None => None
+    }
+    return least(half, right: self.tolerance_ns)
+} Cpu.exit_bound
+
+/// The idle period the CPU predicts at `now_ns`: the time to its earliest timer, `until_ns`, or, when shorter, the mean of its last idle periods; `None` when it knows neither.
+fn Cpu.predicted(self, now_ns: u64, until_ns: Option[u64]) -> Option[u64] limits notrap, terminates, noalloc {
+    let timer = match until_ns {
+        Some(at) => Some(at.saturating_sub(now_ns))
+        None => None
+    }
+    var total: u64 = 0
+    var counted: u64 = 0
+    for period in self.periods {
+        if period > 0 {
+            total = total.saturating_add(period)
+            counted = counted.saturating_add(1)
+        }
+    }
+    if counted == 0 {
+        return timer
+    }
+    return least(timer, right: Some(total / counted))
+} Cpu.predicted
+
+/// The lesser of two bounds, each `None` when unbounded.
+fn least(left: Option[u64], right: Option[u64]) -> Option[u64] limits notrap, terminates, noalloc {
+    return match left {
+        Some(ns) => Some(ns.min(right.value_or(ns)))
+        None => right
+    }
+} least
+
+/// The state of `states` with the longest exit latency below `below`, any when it is `None`.
+fn deepest(states: Slice[IdleState], below: Option[u64]) -> Option[IdleState] limits notrap, terminates, noalloc {
+    var chosen: Option[IdleState] = None
+    for state in states {
+        let fits = match below {
+            Some(ns) => state.exit_ns < ns
+            None => true
+        }
+        let deeper = match chosen {
+            Some(held) => state.exit_ns > held.exit_ns
+            None => true
+        }
+        if fits and deeper {
+            chosen = Some(state)
+        }
+    }
+    return chosen
+} deepest
 
 /// Charges the running work for the time since it started or was last charged: to the CPU's time of its class, and `normal` and `background` work to its account's virtual runtime.
 fn Cpu.charge(mut self, now_ns: u64) limits notrap, terminates, noalloc {
@@ -459,8 +559,10 @@ fn Cpu.ready_entity(mut self, executor: u64) -> u64 limits notrap, terminates, n
 fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, terminates, noalloc {
     mut self.charge(now_ns)
     if self.resting {
+        mut self.end_period(now_ns)
         self.times.idle = self.times.idle.saturating_add(now_ns.saturating_sub(self.rested_ns))
         self.resting = false
+        self.resting_in = None
         self.wakeups = self.wakeups.saturating_add(1)
     }
     self.queued = self.queued.saturating_sub(1)
@@ -486,13 +588,16 @@ fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap
     return 0
 } Cpu.switch_to
 
-/// Makes this CPU idle at `now_ns`: its queue is empty, and it rests from then on unless it already does.
+/// Makes this CPU idle at `now_ns`, about to enter an idle state: its queue is empty, it rests from then on unless it already does, ending the idle period it returned from, and a new idle period begins.
 fn Cpu.go_idle(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     mut self.charge(now_ns)
-    if not self.resting {
+    if self.resting {
+        mut self.end_period(now_ns)
+    } else {
         self.resting = true
         self.rested_ns = now_ns
     }
+    self.period_ns = now_ns
     self.running.active = false
     self.idle = true
     self.queued = 0
@@ -501,6 +606,13 @@ fn Cpu.go_idle(mut self, now_ns: u64) limits notrap, terminates, noalloc {
         entity.ready = 0
     }
 } Cpu.go_idle
+
+/// Counts the idle period the CPU leaves at `now_ns` among its last ones.
+fn Cpu.end_period(mut self, now_ns: u64) limits notrap, terminates, noalloc {
+    let slot = self.next_period % PERIODS
+    self.periods[slot] = now_ns.saturating_sub(self.period_ns).max(1)
+    self.next_period = (slot + 1) % PERIODS
+} Cpu.end_period
 
 /// What this CPU's state tells at `now_ns`, the work it runs and its rest counted until then.
 fn Cpu.reading(self, now_ns: u64) -> Reading limits notrap, terminates, noalloc {
@@ -511,7 +623,7 @@ fn Cpu.reading(self, now_ns: u64) -> Reading limits notrap, terminates, noalloc 
     if self.resting {
         times.idle = times.idle.saturating_add(now_ns.saturating_sub(self.rested_ns))
     }
-    return Reading(started: self.started, resting: self.resting, times: times, queued: self.queued, wakeups: self.wakeups)
+    return Reading(started: self.started, resting: self.resting, resting_in: self.resting_in, times: times, queued: self.queued, wakeups: self.wakeups)
 } Cpu.reading
 
 fn Times.none() -> Times = Times(normal: 0, background: 0, latency: 0, core: 0, idle: 0)
@@ -536,8 +648,10 @@ fn view(executor: u64, class: u8, weight: u32) -> hw::TaskView {
 } view
 
 fn idle_cpu() -> Cpu {
-    let nothing = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-    return Cpu(started: true, idle: true, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, wakeups: 0)
+    var cpu = Cpu.fresh()
+    cpu.started = true
+    cpu.idle = true
+    return cpu
 } idle_cpu
 
 /// A CPU charges each class the time it ran work of it and counts its rests as idle time, each rest it leaves a wakeup, until the moment it is read.
@@ -622,7 +736,7 @@ fn four_cpus(clock: sys::Clock, alloc: mem::Alloc) -> Scheduler {
     for cpu in 0u64..<4 {
         mut places.push(Place(package_id: 0, core: u32.truncate(cpu), cache: cpu / 2, node: 0))
     }
-    let state = mem::Shared.of(State.of(take places, clock, alloc), alloc)
+    let state = mem::Shared.of(State.of(take places, clock, idle_states: mem::List.empty(alloc), alloc), alloc)
     for cpu in 1u32..<4 {
         state.contents().start(cpu)
     }
@@ -707,3 +821,40 @@ test slack_follows_the_class_arming_the_deadline for Scheduler.slack {
     expect slacks[3] == 100_000_000 and slacks[4] == 1_000_000_000
     expect slacks[5] == 0 and slacks[6] == DEFERRED_SLACK_NS
 } slack_follows_the_class_arming_the_deadline
+
+/// With one MWAIT state exiting in 1 µs, a CPU whose earliest timer is 1 ms away enters it and shows it, one whose timer is 2 µs away halts, as does one whose reservations leave it 1 µs of each period; idle periods of 1.5 µs, whether a task or another idle state ends them, bring the prediction down to their mean.
+test idle_cpus_enter_the_deepest_state_their_rest_and_tolerance_allow for Scheduler.idle {
+    let world = testing::world()
+    var places = mem::List[Place].empty(world.alloc)
+    mut places.push(Place(package_id: 0, core: 0, cache: 0, node: 0))
+    var states = mem::List[IdleState].empty(world.alloc)
+    mut states.push(IdleState(hint: 0x20, exit_ns: 1_000))
+    let state = mem::Shared.of(State.of(take places, clock: world.clock, idle_states: take states, alloc: world.alloc), alloc: world.alloc)
+    let policy = Scheduler.of(state.share())
+    let far = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
+        return policy.idle(t, cpu: 0, until_ns: Some(state.contents().now() + 1_000_000))
+    })
+    let shown = match state.contents().reading(0) {
+        Some(reading) => reading.resting_in
+        None => None
+    }
+    let near = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
+        return policy.idle(t, cpu: 0, until_ns: Some(state.contents().now() + 2_000))
+    })
+    state.contents().tolerate(0, tolerance_ns: Some(1_000))
+    let tolerated = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
+        return policy.idle(t, cpu: 0, until_ns: Some(state.contents().now() + 1_000_000))
+    })
+    expect far == hw::Idle.Mwait(0x20) and near == hw::Idle.Halt and tolerated == hw::Idle.Halt
+    expect shown == Some(0x20)
+    var woken = idle_cpu()
+    var returning = idle_cpu()
+    for at in 0u64..<8 {
+        mut woken.go_idle(now_ns: at * 2_000)
+        discard mut woken.switch_to(view(executor: 1, class: NORMAL, weight: 100), now_ns: at * 2_000 + 1_500)
+        mut returning.go_idle(now_ns: at * 1_500)
+    }
+    mut returning.go_idle(now_ns: 12_000)
+    expect woken.predicted(now_ns: 0, until_ns: Some(1_000_000)) == Some(1_500)
+    expect returning.predicted(now_ns: 12_000, until_ns: Some(1_000_000)) == Some(1_500)
+} idle_cpus_enter_the_deepest_state_their_rest_and_tolerance_allow
