@@ -50,13 +50,13 @@ pub closed struct Share derives Copy, Eq, Encode {
 - Each account's executor carries its share. `Executor.split(Share)` returns a `CpuBudget` whose weight, reservation runtime and energy budget it moves from the splitting account's share, returns them when the `CpuBudget` closes, and fails when the splitting account lacks them (requires [N8](22-nan.md#n8)).
 - A **reservation** is the `runtime_us` of CPU time in every `period_us` that a `latency` share gives.
 
-A reservation is admitted when its instance starts or its `Session` grant is written, on one CPU: the one whose admitted reservations use the smallest fraction of it, the lowest numbered on ties, provided the reservations admitted there then use at most 80% of it. The [preview](14-changes.md#preview) of the plan reports the CPU it gets; a plan whose reservation fits on no CPU is refused ([`budget.over-reservation`](18-link.md#codes)). The `latency` work of the account, or of the principal's sessions together, runs only on that CPU, and the reservation ends when its instance stops or its grant ends.
+A reservation is admitted when its instance starts or its `Session` grant is written, on one CPU: the one whose admitted reservations use the smallest fraction of it, the lowest numbered on ties, provided the reservations admitted there then use at most 80% of it. The [preview](14-changes.md#preview) of the plan reports the CPU it gets; a plan whose reservation fits on no CPU is refused ([`budget.over-reservation`](18-link.md#codes)). The `latency` work of the account, or of the principal's sessions together, runs only on that CPU (requires [N38](22-nan.md#n38)), and the reservation ends when its instance stops or its grant ends.
 
 ## Deadlines
 
 - A task's deadline is its earliest enclosing `task::within` deadline ([NaN 16 §Deadlines and races](https://github.com/nan-language/nan/blob/main/docs/spec/16-concurrency.md#deadlines-and-races)) (requires [N9](22-nan.md#n9)) or, for a keyed task without one, the deadline of the dispatch that spawned it. A dispatch's deadline is its message's.
 - A message carries a deadline in its [header](07-communication.md#headers): the deadline of the dispatch or task that sent it, or none.
-- **Inheritance**: an instance's next dispatch takes the earliest deadline among the messages in its intake and runs in the highest class among their accounts. In `latency` it consumes the reservation of the account whose message holds that deadline, while its CPU time is charged as [accounting](#accounting) states.
+- **Inheritance**: an instance's next dispatch takes the earliest deadline among the messages in its intake and runs in the highest class among their accounts (requires [N39](22-nan.md#n39)). In `latency` it consumes the reservation of the account whose message holds that deadline, while its CPU time is charged as [accounting](#accounting) states.
 - In `latency`, deadlines order the entities; an entity without one uses the end of its reservation's current period. Deadlines never change the order of `normal` or `background` entities.
 
 ## Wake placement
@@ -156,7 +156,7 @@ An account's **energy budget** is `Share.energy_mj_per_h` millijoules per hour: 
 
 | State | Event | Next | Effect |
 | --- | --- | --- | --- |
-| within budget | the bucket empties | throttled | the account's entities run as `background` |
+| within budget | the bucket empties | throttled | the account's entities run as `background` (requires [N38](22-nan.md#n38)) |
 | throttled | the bucket refills to one minute of budget | within budget | the account's entities run in their class again |
 
 `/live/accounts` shows each account's energy and state. An account without an energy budget is never throttled.

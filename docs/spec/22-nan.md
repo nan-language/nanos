@@ -406,3 +406,39 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** each step gives the runner the header and the operation's number of the message it handled.
 - **Chapters:** [17](17-observability.md).
 - **Issue:** [nan-language/nan#159](https://github.com/nan-language/nan/issues/159).
+
+## N37
+
+**Charge watermarks.**
+
+- **Language 1:** a budget tells its charge when asked (NaN 12 §Budgets), and nothing tells a kernel when a draw or a return moves it.
+- **NaN OS requires:** a kernel task waits until draws and returns carry a cell's charge across thresholds it sets.
+- **Chapters:** [05](05-memory.md).
+- **Issue:** [nan-language/nan#197](https://github.com/nan-language/nan/issues/197).
+
+## N38
+
+**Executor identity.**
+
+- **Language 1:** a policy sees the executor of each task as a number (NaN 24 §Policies), which no account or executor gives.
+- **NaN OS requires:** each account gives the number of its executor, so that the core keeps per-account state its policy reads.
+- **Chapters:** [08](08-scheduling.md).
+- **Issue:** [nan-language/nan#198](https://github.com/nan-language/nan/issues/198).
+
+## N39
+
+**Scheduling deadlines.**
+
+- **Language 1:** a task takes a deadline only through `task::within`, which cancels it when the deadline passes, and cannot read its deadline (NaN 16 §Deadlines and races).
+- **NaN OS requires:** a deadline the policy sees that cancels nothing, and the calling task's deadline read.
+- **Chapters:** [07](07-communication.md), [08](08-scheduling.md).
+- **Issue:** [nan-language/nan#199](https://github.com/nan-language/nan/issues/199).
+
+## N40
+
+**Keyed task counts.**
+
+- **Language 1:** `Stepper.idle` counts the delayed messages with the keyed tasks (NaN 26 §Steppers), and nothing else tells whether keyed tasks run.
+- **NaN OS requires:** a holder tells whether its component runs keyed tasks, whatever messages it delays.
+- **Chapters:** [05](05-memory.md), [06](06-execution.md).
+- **Issue:** [nan-language/nan#200](https://github.com/nan-language/nan/issues/200).

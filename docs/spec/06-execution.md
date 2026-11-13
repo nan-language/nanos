@@ -255,7 +255,7 @@ The plan step `redeliver <moniker> <seq>` appends the message to the instance's 
 
 ## Hibernation
 
-An instance is **idle** when its intake is empty, no handler runs and it has no keyed task. Only checkpointed instances hibernate: memory pressure hibernates idle ones ([pressure](05-memory.md#pressure)), and the `hibernate` operation of `supervisor` any `running` one; that operation fails with `instance.volatile` or `instance.not-running` otherwise. Hibernation runs these steps:
+An instance is **idle** when its intake is empty, no handler runs and it has no keyed task (requires [N40](22-nan.md#n40)). Only checkpointed instances hibernate: memory pressure hibernates idle ones ([pressure](05-memory.md#pressure)), and the `hibernate` operation of `supervisor` any `running` one; that operation fails with `instance.volatile` or `instance.not-running` otherwise. Hibernation runs these steps:
 
 1. The runner pauses the intake at quiescence.
 2. It checkpoints a dirty state, waits until the commits of the instance's checkpoints are durable, and encodes the state into a **hibernation image**. A failed checkpoint or an encoding over `Durability.max_bytes` ends the hibernation: the intake resumes, and the instance stays `running`.

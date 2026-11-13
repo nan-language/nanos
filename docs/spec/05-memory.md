@@ -100,7 +100,7 @@ The **watermark** of a pool is w = 4·√(its size in KiB) KiB, rounded down to 
 | 4 | it calls `pressure(4)` on them, and the core makes an extra pool when the frame allocator holds a free range of at least 64 MiB beyond the core reserve; while every pool is at level 4, instance starts and limit increases fail with [`budget.memory-pressure`](18-link.md#codes) |
 
 - w is 1 MiB for a pool of 64 MiB, 2,896 KiB for 512 MiB, 16 MiB for 16 GiB and 128 MiB for 1 TiB.
-- The core changes a pool's level only when a draw or a return carries its free memory across a threshold; pressure arms no timer.
+- The core changes a pool's level only when a draw or a return carries its free memory across a threshold; pressure arms no timer (requires [N37](22-nan.md#n37)).
 - Hibernation for pressure goes on while the pool's level is 3 or more and an idle checkpointed instance of the pool remains that it does not pass over. It passes over an instance whose [hibernation](06-execution.md#hibernation) ended with the instance `running`, until one of its handlers runs or its next checkpoint is durable.
 - A draw that fails, at any level, fails where it is made: the drawing instance traps (`trap.exhausted`) or handles `mem::OutOfMemory` ([NaN 12 §Growth](https://github.com/nan-language/nan/blob/main/docs/spec/12-memory.md#growth)). No instance is stopped to give its memory to another.
 - `Pressure` is a [system interface](06-execution.md#system-interfaces) (requires [N1](22-nan.md#n1)): the runner calls `pressure(level)` as a handler call at each rise of the pool's level, with that level.
