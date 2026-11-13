@@ -15,11 +15,12 @@ pub open struct Serving {
     forking: Option[ForkRun]
 } Serving
 
-/// What a fork's domain runs: the call it handles, or none for its start or resumption, where it tells what its run saw, and the note its clock, random source and ports keep of their use.
+/// What a fork's domain runs: the call it handles, or none for its start or resumption, where it tells what its run saw, the tape of its clock and random source, and whether its ports reached another instance.
 struct ForkRun {
     call: Option[os::ForkCall]
     reporting: task::Sender[os::Forked]
-    taken: mem::Shared[core::atomic::AtomicBool]
+    tape: Tape
+    reaching: mem::Shared[core::atomic::AtomicBool]
 } ForkRun
 
 /// What a driver delivers to its instance's domain: a call with its header, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns.
@@ -180,7 +181,7 @@ pub fn Driven.run(
     return Ended.Stopped
 } Driven.run
 
-/// Runs a fork of an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, then handles once, one level deep, the call `serving` gives, or without one calls its `resume`, then probes its health once; tells `serving` the bytes of the state it resumed from, the reply to its call, the messages its handlers sent it and the classes of the keyed tasks they spawned, none of which runs, its state once it handled its call, whether its call's handler read the clock, drew random values or called another instance, and whether it is unhealthy; then ends it, handing its Env to `release`.
+/// Runs a fork of an instance on `env`: starts the component, or resumes it from the checkpoint `serving` restores, then handles once, one level deep, the call `serving` gives, or without one calls its `resume`, then probes its health once; tells `serving` the bytes of the state it resumed from, the reply to its call, the messages its handlers sent it and the classes of the keyed tasks they spawned, none of which runs, its state once it handled its call, the clock reads and random words its call's handler took through its tape, whether that handler called another instance, and whether it is unhealthy; then ends it, handing its Env to `release`.
 fn Driven.forked(
     take env: Env,
     exec: task::Executor,
@@ -189,7 +190,7 @@ fn Driven.forked(
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
     let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, config: _, forking: forking) = serving
-    let Some(ForkRun(call: call, reporting: reporting, taken: taken)) = forking else {
+    let Some(ForkRun(call: call, reporting: reporting, tape: tape, reaching: reaching)) = forking else {
         release(take env)
         return Ended.Stopped
     }
@@ -201,14 +202,17 @@ fn Driven.forked(
     defer take stepper.abandon()
     var reply: Option[mem::Bytes] = None
     var state: Option[os::StateCopy] = None
+    var recorded = os::Recorded(clock: mem::List.empty(alloc), random: mem::List.empty(alloc))
     var reached = false
     match call {
         Some(given) => {
             discard held_outputs(mut stepper, alloc)
             discard held_spawns(mut stepper, alloc)
-            taken.contents().store(false)
+            reaching.contents().store(false)
+            tape.record()
             reply = try await Driven[S, Env, P].handled_once(mut stepper, call: take given, exec, alloc)
-            reached = taken.contents().load()
+            recorded = tape.recorded(alloc)
+            reached = reaching.contents().load()
             state = Some(state_copy(stepper, alloc))
         }
         None => mut stepper.resumed(reason)
@@ -219,7 +223,7 @@ fn Driven.forked(
         sys::HealthReply.Healthy => None
         sys::HealthReply.Unhealthy(why) => Some(os::ForkFault.Unhealthy(reason: text::String.of(why.as_str(), alloc)))
     }
-    discard attempt await reporting.send(os::Forked(state_bytes: state_bytes, reply: take reply, sent: take sent, spawns: take spawns, state: take state, reached: reached, fault: take fault))
+    discard attempt await reporting.send(os::Forked(state_bytes: state_bytes, reply: take reply, sent: take sent, spawns: take spawns, state: take state, recorded: take recorded, reached: reached, fault: take fault))
     undefer stepper
     let sys::Stopped(state: _, env: ended) = try await take stepper.end()
     release(take ended)

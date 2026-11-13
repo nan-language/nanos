@@ -1,0 +1,266 @@
+//! Tapes: the clock reads and random draws of an instance's handlers, recorded while a fork of the instance handles a call and served back while the instance replays it, through the clock and random source the runner serves an instance it may fork. While a tape records or replays, every clock read gives one reading: the first the run takes.
+
+/// The random words a tape holds at most.
+const TAPE_WORDS: usize = 16
+
+/// What a tape does with the reads passing through it.
+enum Taping derives Copy, Eq {
+    Passing
+    Recording
+    Replaying
+} Taping
+
+/// A tape's clock reading: what the tape does, as `Taping.code` encodes it, whether it holds a reading, and that reading.
+struct ClockReading {
+    taping: core::atomic::AtomicU32
+    held: core::atomic::AtomicBool
+    value: core::atomic::AtomicU64
+} ClockReading
+
+/// A tape's random words: what the tape does with them, the words it holds, and how many it served back.
+struct Draws {
+    taping: Taping
+    words: mem::Bounded[u64, TAPE_WORDS]
+    served: usize
+} Draws
+
+/// The reads of an instance's clock and random source, shared between the runner and the sources it serves the instance.
+struct Tape {
+    reading: mem::Shared[ClockReading]
+    draws: mem::Shared[hw::SpinLock[Draws]]
+} Tape
+
+/// What the taped sources of an instance reach: the runner's clock and random source, and the instance's tape.
+struct Taps {
+    clock: sys::Clock
+    random: sys::Random
+    tape: Tape
+} Taps
+
+/// The clock and random source of an instance, passing their reads through its tape.
+pub open struct Taped {
+} Taped
+
+impl Taped: sys::Kind[Taps, u8]
+
+impl Taped: sys::ClockService
+
+impl Taped: sys::RandomService
+
+/// The clock and random source an instance's world holds.
+struct Sources {
+    clock: sys::Clock
+    random: sys::Random
+} Sources
+
+/// The code of the taping in a `ClockReading`.
+fn Taping.code(self) -> u32 {
+    return match self {
+        Taping.Passing => 0
+        Taping.Recording => 1
+        Taping.Replaying => 2
+    }
+} Taping.code
+
+/// The same sources and tape.
+fn Taps.share(self) -> Taps {
+    return Taps(clock: self.clock, random: self.random, tape: self.tape.share())
+} Taps.share
+
+/// An empty tape, passing the reads.
+fn Tape.none(alloc: mem::Alloc) -> Tape {
+    let reading = ClockReading(taping: core::atomic::AtomicU32.of(0), held: core::atomic::AtomicBool.of(false), value: core::atomic::AtomicU64.of(0))
+    return Tape(reading: mem::Shared.of(take reading, alloc), draws: mem::Shared.of(hw::SpinLock.of(Draws(taping: Taping.Passing, words: mem::Bounded.empty(), served: 0)), alloc))
+} Tape.none
+
+/// The same tape.
+fn Tape.share(self) -> Tape {
+    return Tape(reading: self.reading.share(), draws: self.draws.share())
+} Tape.share
+
+/// Records the reads passing through the tape from now on, forgetting those it held.
+fn Tape.record(self) {
+    self.reset(taping: Taping.Recording)
+} Tape.record
+
+/// Passes the reads from now on, forgetting those it held.
+fn Tape.pass(self) {
+    self.reset(taping: Taping.Passing)
+} Tape.pass
+
+/// Serves back the reads of `recorded`: its clock reading to every clock read, the reads' own once it holds none, and its random words in order, then the drawn ones.
+fn Tape.replay(self, recorded: os::Recorded) {
+    self.reset(taping: Taping.Replaying)
+    for read in recorded.clock {
+        self.reading.contents().value.store(read)
+        self.reading.contents().held.store(true)
+    }
+    for word in recorded.random {
+        hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+            self.draws.contents().with(t, body: fn(mut draws: Draws) limits notrap, terminates, noalloc {
+                discard attempt mut draws.words.try_push(word)
+            })
+        })
+    }
+} Tape.replay
+
+/// The reads the tape recorded, which it forgets as it passes them from now on.
+fn Tape.recorded(self, alloc: mem::Alloc) -> os::Recorded {
+    var recorded = os::Recorded(clock: mem::List.empty(alloc), random: mem::List.empty(alloc))
+    if self.reading.contents().held.load() {
+        mut recorded.clock.push(self.reading.contents().value.load())
+    }
+    loop {
+        let Some(word) = self.word(at: recorded.random.len()) else {
+            break
+        }
+        mut recorded.random.push(word)
+    }
+    self.pass()
+    return recorded
+} Tape.recorded
+
+/// The random word the tape holds at `at`.
+fn Tape.word(self, at: usize) -> Option[u64] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[u64] limits notrap, terminates {
+        return self.draws.contents().with(t, body: fn(mut draws: Draws) -> Option[u64] limits notrap, terminates, noalloc {
+            if at >= draws.words.len() {
+                return None
+            }
+            return Some(draws.words.at(at))
+        })
+    })
+} Tape.word
+
+/// Empties the tape, which then does what `taping` says.
+fn Tape.reset(self, taping: Taping) {
+    self.reading.contents().held.store(false)
+    self.reading.contents().taping.store(taping.code())
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        self.draws.contents().with(t, body: fn(mut draws: Draws) limits notrap, terminates, noalloc {
+            draws = Draws(taping: taping, words: mem::Bounded.empty(), served: 0)
+        })
+    })
+} Tape.reset
+
+/// What a clock read of `real` gives through the tape: `real` while it passes; the reading it holds while it records or replays, the first read's while recording one.
+fn Tape.clock_read(self, real: u64) -> u64 {
+    let reading = self.reading.contents()
+    let taping = reading.taping.load()
+    if taping == Taping.Passing.code() {
+        return real
+    }
+    if reading.held.load() {
+        return reading.value.load()
+    }
+    if taping == Taping.Recording.code() {
+        reading.value.store(real)
+        reading.held.store(true)
+    }
+    return real
+} Tape.clock_read
+
+/// What a random word `real` gives through the tape: `real`, recorded while it records, or the next word it serves back while it replays, `real` once they run out.
+fn Tape.word_read(self, real: u64) -> u64 {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap {
+        return self.draws.contents().with(t, body: fn(mut draws: Draws) -> u64 limits notrap, terminates, noalloc {
+            return mut draws.read(real)
+        })
+    })
+} Tape.word_read
+
+/// What a random word `real` gives through these draws, as `Tape.word_read` does.
+fn Draws.read(mut self, real: u64) -> u64 limits notrap, terminates, noalloc {
+    match self.taping {
+        Taping.Passing => return real
+        Taping.Recording => {
+            discard attempt mut self.words.try_push(real)
+            return real
+        }
+        Taping.Replaying => {
+            if self.served >= self.words.len() {
+                return real
+            }
+            self.served += 1
+            return self.words.at(self.served - 1)
+        }
+    }
+} Draws.read
+
+/// The clock and random source the instance's world holds, passing their reads through its tape from `clock` and `random`, through a root entry minted at the first use; `None` once revoked.
+fn Minted.taped_sources(mut self, clock: sys::Clock, random: sys::Random, alloc: mem::Alloc) -> Option[Sources] {
+    if self.taped.len() == 0 {
+        mut self.taped.push(sys::Minter[Taped, Taps, u8].of(Taps(clock: clock, random: random, tape: self.tape.share()), alloc))
+    }
+    let source = self.taped[0].mint(0)
+    let Ok(taped_clock) = attempt sys::Clock.served(source) else {
+        return None
+    }
+    let Ok(taped_random) = attempt sys::Random.served(source) else {
+        return None
+    }
+    return Some(Sources(clock: taped_clock, random: taped_random))
+} Minted.taped_sources
+
+pub fn Taped.elapsed_ns(self) -> u64 limits stack 1_024 {
+    let Some(taps) = sys::reach(self, body: fn(taps: Taps, record: u8) => taps.share()) else {
+        return 0
+    }
+    let real = match attempt taps.clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+    return taps.tape.clock_read(real)
+} Taped.elapsed_ns
+
+pub fn Taped.sleep_ns(self, ns: u64) fails task::Cancelled uses wait limits stack 1_024 {
+    let Some(taps) = sys::reach(self, body: fn(taps: Taps, record: u8) => taps.share()) else {
+        return
+    }
+    try await taps.clock.sleep_ns(ns)
+} Taped.sleep_ns
+
+pub fn Taped.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    let Some(taps) = sys::reach(self, body: fn(taps: Taps, record: u8) => taps.share()) else {
+        return
+    }
+    discard attempt taps.random.fill(mut buf)
+    var at: usize = 0
+    while at < buf.len() {
+        var word: u64 = 0
+        var shift: u32 = 0
+        var end = at
+        while end < buf.len() and end < at + 8 {
+            word = word | (u64.widen(buf[end]) << shift)
+            shift += 8
+            end += 1
+        }
+        let read = taps.tape.word_read(real: word)
+        shift = 0
+        while at < end {
+            buf[at] = u8.truncate(read >> shift)
+            shift += 8
+            at += 1
+        }
+    }
+} Taped.fill
+
+test tapes_record_a_run_then_serve_it_back for Tape.clock_read {
+    let alloc = testing::world().alloc
+    let tape = Tape.none(alloc)
+    let passed = tape.clock_read(real: 5)
+    tape.record()
+    let earliest = tape.clock_read(real: 7)
+    let later = tape.clock_read(real: 8)
+    let word = tape.word_read(real: 9)
+    let recorded = tape.recorded(alloc)
+    let unrecorded = tape.clock_read(real: 10)
+    tape.replay(recorded)
+    let served = tape.clock_read(real: 11)
+    let drawn = tape.word_read(real: 15)
+    let beyond = tape.word_read(real: 16)
+    tape.pass()
+    let after = tape.clock_read(real: 17)
+    expect passed == 5 and earliest == 7 and later == 7 and word == 9 and unrecorded == 10 and recorded.clock.len() == 1 and recorded.random.len() == 1
+    expect served == 7 and drawn == 9 and beyond == 16 and after == 17
+} tapes_record_a_run_then_serve_it_back

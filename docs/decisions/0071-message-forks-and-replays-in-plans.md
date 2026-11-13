@@ -1,6 +1,6 @@
 # 0071. Message forks and replays in plans
 
-Status: accepted
+Status: superseded by 0075
 
 ## Context
 
