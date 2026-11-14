@@ -1,4 +1,4 @@
-//! Sessions' accounts: the account and the cell of each session `link` opens, the sessions of one principal drawing through one cell and draining one energy bucket, and the gauge of each session.
+//! Sessions' accounts: the account and the cell of each session `link` opens, the sessions of one principal drawing through one cell and draining one energy bucket, the gauge of each session, and the CPU reservations of `Session` grants.
 
 /// A principal with open sessions: the cell they draw through and the energy bucket they drain.
 linear struct Principal {
@@ -14,12 +14,13 @@ struct Session {
     marks: task::Sender[Mark]
 } Session
 
-/// Carries out each order `orders` brings for the accounts of sessions, running the gauge of each open session on a task of `s`, until the orders end.
+/// Carries out each order `orders` brings for the accounts of sessions and the reservations of `Session` grants, running the gauge of each open session on a task of `s`, until the orders end.
 fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: task::Scope) fails task::Cancelled uses wait {
     let alloc = self.config.alloc
     var principals = mem::List[Principal].empty(alloc)
     defer close_principals(take principals)
     var sessions = mem::Map[u64, Session].empty(alloc)
+    var granted = mem::Map[u64, Admitted].empty(alloc)
     var receiver = orders
     loop {
         let Some(order) = try await mut receiver.receive() else {
@@ -51,9 +52,71 @@ fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: 
                 }
                 discard attempt await done.send(Unit)
             }
+            os::AccountOrder.Reserve(grants: grants, done: done) => {
+                let held = try await self.reserve_grants(mut granted, grants)
+                discard attempt await done.send(take held)
+            }
         }
     }
 } Shared.keep_sessions
+
+/// Holds in `granted`, by grant, the reservations of exactly `grants`: ends those of the grants left out or asking for another reservation, admits the others, and sets the latency tolerance of each CPU this changes; the reservation each of `grants` holds.
+fn Shared.reserve_grants(self, mut granted: mem::Map[u64, Admitted], grants: mem::List[os::SessionGrant]) -> mem::List[os::GrantReservation] fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    var touched = mem::List[u32].empty(alloc)
+    var ended = mem::List[u64].empty(alloc)
+    for held in granted {
+        let kept = grants.position(fn(each: os::SessionGrant) => each.grant == held.key() and Reservation.of(each.share) == Some(held.value().reservation))
+        if kept.is_none() {
+            mut ended.push(held.key())
+        }
+    }
+    let reservations = self.reservations.share()
+    for grant in ended {
+        let Some(admitted) = mut granted.remove(grant) else {
+            continue
+        }
+        await when mut reservations {
+            mut reservations.release(admitted)
+        }
+        mut touched.push(admitted.cpu)
+    }
+    var holding = mem::List[os::GrantReservation].empty(alloc)
+    for each in grants {
+        var reservation: Option[os::CpuReservation] = None
+        match try await self.grant_admitted(mut granted, each) {
+            Some(admitted) => {
+                mut touched.push(admitted.cpu)
+                reservation = Some(os::CpuReservation(cpu: admitted.cpu, ppm: u32.fit(admitted.reservation.ppm)))
+            }
+            None => {
+            }
+        }
+        mut holding.push(os::GrantReservation(grant: each.grant, reservation: reservation))
+    }
+    for cpu in touched {
+        try await self.tolerate(cpu)
+    }
+    return holding
+} Shared.reserve_grants
+
+/// The reservation `each` holds in `granted`, admitted first when it holds none; `None` when it asks for none or fits on no CPU.
+fn Shared.grant_admitted(self, mut granted: mem::Map[u64, Admitted], each: os::SessionGrant) -> Option[Admitted] fails task::Cancelled uses wait {
+    match granted.get(each.grant) {
+        Some(admitted) => return Some(admitted)
+        None => {
+        }
+    }
+    let Some(reservation) = Reservation.of(each.share) else {
+        return None
+    }
+    let reservations = self.reservations.share()
+    let Some(admitted) = await when mut reservations => mut reservations.admit(reservation) else {
+        return None
+    }
+    discard mut granted.insert(each.grant, value: admitted)
+    return Some(admitted)
+} Shared.grant_admitted
 
 /// Opens the account of the session numbered `session` of `principal`, with the share `share`, its cell split from its principal's, and its gauge on a task of `s`; gives the account of a session already open, and `None` when its principal has no cell.
 fn Shared.open_session(

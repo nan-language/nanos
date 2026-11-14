@@ -1,4 +1,4 @@
-//! What a plan's effect reserves: the CPU each instance it starts gets for the reservation of its `latency` share, and the memory its reserved instances set aside.
+//! Reservations: what a plan's effect reserves, the CPU each instance it starts and each `Session` grant it writes gets for the reservation of its `latency` share and the memory its reserved instances set aside, and the reservations the core holds for the `Session` grants of `/sys/grants`.
 
 /// The core reserve beyond the frame metadata: 8 MiB, and 256 KiB per CPU.
 const CORE_RESERVE: u64 = 8_388_608
@@ -8,30 +8,157 @@ const CORE_RESERVE_PER_CPU: u64 = 262_144
 /// The entries one listing gives at once.
 const RESERVING_PAGE: u32 = 256
 
-/// The reservations admitted at a moment: the millionths of each CPU they take, and the one each instance holds, by moniker.
+/// The reservations admitted at a moment: the millionths of each CPU they take, the one each instance holds, by moniker, and the one each `Session` grant holds, by number.
 struct Admissions {
     used: mem::List[u64]
     held: mem::Map[text::Fixed[59], os::CpuReservation]
+    granted: mem::Map[u64, os::CpuReservation]
 } Admissions
 
-/// Checks what the plan reserves, `activations` and `changes` being its effect set's, its specifications read through `forked`, a View of the preview branch, and the running system through the link's View `tree`: gives each activation that starts or restarts an instance asking for a CPU reservation the CPU it gets; `budget.over-reservation` when one fits on no CPU, or when the plan writes a reserved instance's specification and the limits of the reserved instances sum to more than RAM less the core reserve.
+/// What `link` keeps of the reservations of `Session` grants: the one the core holds for each, whether a keyed task is handing the grants to the core and whether `/sys/grants` changed meanwhile, and the UTC time of the timer handing them again, the earliest expiry among them.
+pub closed struct Reserving derives Encode {
+    pub held: mem::List[os::GrantReservation]
+    pub running: bool
+    pub again: bool
+    pub due_utc: Option[i64]
+} Reserving
+
+/// The `Session` grants asking for a CPU reservation, and the earliest expiry among them.
+struct Asked {
+    grants: mem::List[os::SessionGrant]
+    until: Option[i64]
+} Asked
+
+/// Has a keyed task hand the core the `Session` grants of `/sys/grants` asking for a CPU reservation, once no hand-over is under way.
+fn Linker.reserve_grants(mut self, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    if self.reserving.running {
+        self.reserving.again = true
+        return
+    }
+    self.reserving.running = true
+    self.reserving.again = false
+    let tree = env.tree
+    let accounts = env.accounts
+    let alloc = env.alloc
+    let now_utc = now_utc_ns(env.wall, clock: env.clock)
+    mut cx.spawn(key: RESERVING_GRANTS, run: fn(out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 32_768 {
+        let Some(asked) = try await asked_grants(tree, now_utc, alloc) else {
+            discard attempt await out.reserved(held: None, until: None)
+            return
+        }
+        let Asked(grants: grants, until: until) = asked
+        let held = try await accounts.reserve(take grants, alloc)
+        discard attempt await out.reserved(held: Some(take held), until)
+    })
+} Linker.reserve_grants
+
+/// Takes the reservations the core holds for `Session` grants, `held`, unless `/sys/grants` could not be read; hands the grants over again when it changed meanwhile, and arms a timer for `until`, the earliest expiry among them, unless one is armed for earlier.
+fn Linker.reserved(
+    mut self,
+    take held: Option[mem::List[os::GrantReservation]],
+    take until: Option[i64],
+    mut env: Env,
+    mut cx: sys::Cx[LinkSession],
+    ) {
+    self.reserving.running = false
+    match held {
+        Some(given) => {
+            self.reserving.held = given
+        }
+        None => {
+        }
+    }
+    match until {
+        Some(at) => {
+            let earlier = match self.reserving.due_utc {
+                Some(armed) => at < armed
+                None => true
+            }
+            if earlier {
+                self.reserving.due_utc = Some(at)
+                let wait_ns = at.saturating_sub(now_utc_ns(env.wall, clock: env.clock))
+                mut cx.after_ns(ns: u64.saturate(wait_ns), send: LinkSession.reservations_due())
+            }
+        }
+        None => {
+        }
+    }
+    if self.reserving.again {
+        mut self.reserve_grants(mut env, mut cx)
+    }
+} Linker.reserved
+
+/// A copy of the reservations the core holds for `Session` grants.
+fn Linker.reserved_grants(self, alloc: mem::Alloc) -> mem::List[os::GrantReservation] {
+    var copied = mem::List[os::GrantReservation].empty(alloc)
+    for reserved in self.reserving.held {
+        mut copied.push(reserved)
+    }
+    return copied
+} Linker.reserved_grants
+
+/// Hands the `Session` grants to the core again once the earliest expiry among them passed.
+fn Linker.reservations_due(mut self, mut env: Env, mut cx: sys::Cx[LinkSession]) {
+    self.reserving.due_utc = None
+    mut self.reserve_grants(mut env, mut cx)
+} Linker.reservations_due
+
+/// The `Session` grants of `/sys/grants`, read through `tree`, that ask for a CPU reservation and are live at the UTC time `now_utc`, and the earliest expiry among them; `None` when `/sys/grants` cannot be read.
+fn asked_grants(tree: store::service::View, now_utc: i64, alloc: mem::Alloc) -> Option[Asked] fails task::Cancelled uses wait {
+    let Ok(held) = try await grants_of(tree, alloc) else {
+        return None
+    }
+    var asked = Asked(grants: mem::List.empty(alloc), until: None)
+    for each in held {
+        let os::Object.Session(share: share, budget: _) = each.grant.object else {
+            continue
+        }
+        if share.reserved_ppm() == 0 {
+            continue
+        }
+        match each.grant.caveats.expires_utc_ns {
+            Some(at) => {
+                if at <= now_utc {
+                    continue
+                }
+                asked.until = Some(asked.until.value_or(at).min(at))
+            }
+            None => {
+            }
+        }
+        mut asked.grants.push(os::SessionGrant(grant: each.number, share: share))
+    }
+    return Some(take asked)
+} asked_grants
+
+/// Checks what the plan reserves, `activations` and `changes` being its effect set's, its specifications and grants read through `forked`, a View of the preview branch, and the running system through the link's View `tree`, the core holding the reservations `held` for `Session` grants: gives each activation that starts or restarts an instance asking for a CPU reservation the CPU it gets, and the reservation each `Session` grant the plan writes asking for one gets; `budget.over-reservation` when one fits on no CPU, or when the plan writes a reserved instance's specification and the limits of the reserved instances sum to more than RAM less the core reserve.
 fn reservations_of(
     tree: store::service::View,
     forked: store::service::View,
     mut activations: mem::List[Activation],
     changes: mem::List[NodeChange],
+    held: mem::List[os::GrantReservation],
     alloc: mem::Alloc,
-    ) -> Option[Failure] fails task::Cancelled uses wait {
-    match try await reserve_cpus(tree, forked, mut activations, alloc) {
-        Some(failure) => return Some(take failure)
-        None => {
-        }
+    ) -> Result[mem::List[os::GrantReservation], Failure] fails task::Cancelled uses wait {
+    let granted = match try await reserve_cpus(tree, forked, mut activations, changes, held, alloc) {
+        Ok(given) => given
+        Err(failure) => return Err(take failure)
     }
-    return try await reserve_memory(tree, forked, changes, alloc)
+    return match try await reserve_memory(tree, forked, changes, alloc) {
+        Some(failure) => Err(take failure)
+        None => Ok(take granted)
+    }
 } reservations_of
 
-/// Gives each activation of `activations` that starts or restarts an instance whose specification, read through `forked`, asks for a CPU reservation the CPU it gets: as the reservations `/live/instances` shows are admitted, read through `tree`, those of the instances the activations before it stop or restart released first; `budget.over-reservation` when one fits on no CPU.
-fn reserve_cpus(tree: store::service::View, forked: store::service::View, mut activations: mem::List[Activation], alloc: mem::Alloc) -> Option[Failure] fails task::Cancelled uses wait {
+/// Gives each activation of `activations` that starts or restarts an instance whose specification, read through `forked`, asks for a CPU reservation the CPU it gets, then each `Session` grant of `changes` asking for one, read through `forked`, its reservation: as the reservations `/live/instances` shows are admitted, read through `tree`, and the core holds `held` for `Session` grants, those of the instances the activations before it stop or restart and that of a grant the plan writes again released first; `budget.over-reservation` when one fits on no CPU.
+fn reserve_cpus(
+    tree: store::service::View,
+    forked: store::service::View,
+    mut activations: mem::List[Activation],
+    changes: mem::List[NodeChange],
+    held: mem::List[os::GrantReservation],
+    alloc: mem::Alloc,
+    ) -> Result[mem::List[os::GrantReservation], Failure] fails task::Cancelled uses wait {
     var wanted = mem::List[u64].empty(alloc)
     var wanting = false
     for activation in activations {
@@ -50,13 +177,22 @@ fn reserve_cpus(tree: store::service::View, forked: store::service::View, mut ac
         mut wanted.push(ppm)
         wanting = wanting or ppm > 0
     }
-    if not wanting {
-        return None
+    let written = try await written_grants(forked, changes, alloc)
+    var given = mem::List[os::GrantReservation].empty(alloc)
+    if not wanting and written.len() == 0 {
+        return Ok(take given)
     }
     let Some(machine) = try await Records[os::Machine].at(tree, path: "/live/machine", alloc) else {
-        return None
+        return Ok(take given)
     }
     var admissions = try await admitted(tree, cpus: machine.cpus, alloc)
+    for reserved in held {
+        match reserved.reservation {
+            Some(reservation) => mut admissions.admit_grant(reserved.grant, reservation)
+            None => {
+            }
+        }
+    }
     for index in 0..<activations.len() {
         let moniker = activations[index].moniker.text
         mut admissions.release(moniker)
@@ -65,17 +201,51 @@ fn reserve_cpus(tree: store::service::View, forked: store::service::View, mut ac
             continue
         }
         let Some(cpu) = os::admitting_cpu(admissions.used.view(), ppm) else {
-            return Some(unfit(admissions, moniker: moniker.as_str(), ppm, alloc))
+            return Err(unfit(admissions, subject: moniker.as_str(), ppm, alloc))
         }
         mut admissions.admit(moniker, reservation: os::CpuReservation(cpu: cpu, ppm: u32.fit(ppm)))
         activations[index].cpu = Some(cpu)
     }
-    return None
+    for each in written {
+        mut admissions.release_grant(each.grant)
+        let ppm = each.share.reserved_ppm()
+        let Some(cpu) = os::admitting_cpu(admissions.used.view(), ppm) else {
+            return Err(unfit(admissions, subject: grant_path(each.grant, alloc).as_str(), ppm, alloc))
+        }
+        let reservation = os::CpuReservation(cpu: cpu, ppm: u32.fit(ppm))
+        mut admissions.admit_grant(each.grant, reservation)
+        mut given.push(os::GrantReservation(grant: each.grant, reservation: Some(reservation)))
+    }
+    return Ok(take given)
 } reserve_cpus
+
+/// The `Session` grants among `changes` that the plan writes asking for a CPU reservation, read through `forked`.
+fn written_grants(forked: store::service::View, changes: mem::List[NodeChange], alloc: mem::Alloc) -> mem::List[os::SessionGrant] fails task::Cancelled uses wait {
+    var written = mem::List[os::SessionGrant].empty(alloc)
+    for change in changes {
+        let path = change.path.text.as_str()
+        if change.after.is_none() or not path.starts_with("/sys/grants/") {
+            continue
+        }
+        let Some(number) = grant_number_of(part_of(path, start: 12, end: path.byte_len(), alloc).as_str()) else {
+            continue
+        }
+        let Some(grant) = try await Records[os::Grant].at(forked, path, alloc) else {
+            continue
+        }
+        let os::Object.Session(share: share, budget: _) = grant.object else {
+            continue
+        }
+        if share.reserved_ppm() > 0 {
+            mut written.push(os::SessionGrant(grant: number, share: share))
+        }
+    }
+    return written
+} written_grants
 
 /// The reservations `/live/instances` shows admitted on the `cpus` CPUs, read through `tree`.
 fn admitted(tree: store::service::View, cpus: u32, alloc: mem::Alloc) -> Admissions fails task::Cancelled uses wait {
-    var admissions = Admissions(used: mem::List.empty(alloc), held: mem::Map.empty(alloc))
+    var admissions = Admissions(used: mem::List.empty(alloc), held: mem::Map.empty(alloc), granted: mem::Map.empty(alloc))
     for _ in 0..<cpus {
         mut admissions.used.push(0)
     }
@@ -116,6 +286,26 @@ fn Admissions.admit(mut self, moniker: text::Fixed[59], reservation: os::CpuRese
     discard mut self.held.insert(moniker, value: reservation)
 } Admissions.admit
 
+/// Notes the reservation `reservation` the `Session` grant numbered `grant` holds.
+fn Admissions.admit_grant(mut self, grant: u64, reservation: os::CpuReservation) {
+    let cpu = usize.widen(reservation.cpu)
+    if cpu < self.used.len() {
+        self.used[cpu] = self.used[cpu].saturating_add(u64.widen(reservation.ppm))
+    }
+    discard mut self.granted.insert(grant, value: reservation)
+} Admissions.admit_grant
+
+/// Releases the reservation the `Session` grant numbered `grant` holds, when it holds one.
+fn Admissions.release_grant(mut self, grant: u64) {
+    let Some(reservation) = mut self.granted.remove(grant) else {
+        return
+    }
+    let cpu = usize.widen(reservation.cpu)
+    if cpu < self.used.len() {
+        self.used[cpu] = self.used[cpu].saturating_sub(u64.widen(reservation.ppm))
+    }
+} Admissions.release_grant
+
 /// Releases the reservation the instance `moniker` holds, when it holds one.
 fn Admissions.release(mut self, moniker: text::Fixed[59]) {
     let Some(reservation) = mut self.held.remove(moniker) else {
@@ -127,8 +317,8 @@ fn Admissions.release(mut self, moniker: text::Fixed[59]) {
     }
 } Admissions.release
 
-/// `budget.over-reservation` for the reservation of `ppm` millionths of a CPU the instance `moniker` asks for, which no CPU holds.
-fn unfit(admissions: Admissions, moniker: Str, ppm: u64, alloc: mem::Alloc) -> Failure {
+/// `budget.over-reservation` for the reservation of `ppm` millionths of a CPU that `subject`, an instance or a grant, asks for, which no CPU holds.
+fn unfit(admissions: Admissions, subject: Str, ppm: u64, alloc: mem::Alloc) -> Failure {
     var least = os::ADMISSIBLE_PPM
     for used in admissions.used {
         least = least.min(used)
@@ -139,7 +329,7 @@ fn unfit(admissions: Admissions, moniker: Str, ppm: u64, alloc: mem::Alloc) -> F
     var found = text::String.of("at most ", alloc)
     mut found.write(Dyn[Render].view(os::ADMISSIBLE_PPM.saturating_sub(least)), budget: 8)
     mut found.append(" millionths left on any CPU")
-    return Failure.of("budget.over-reservation", subject: moniker, alloc).expecting(expected.as_str(), found: found.as_str(), alloc)
+    return Failure.of("budget.over-reservation", subject, alloc).expecting(expected.as_str(), found: found.as_str(), alloc)
 } unfit
 
 /// `budget.over-reservation` when the plan writes the specification of a reserved instance, among `changes`, and the limits of the reserved instances sum to more than RAM less the core reserve, which `/live/memory` and `/live/machine` tell through `tree`: the specifications the plan writes as `forked` reads them, the others as `tree` reads them.

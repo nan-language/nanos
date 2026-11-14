@@ -1,6 +1,6 @@
 //! The `link` instance: the protocol through which agents and humans reach the system, served on the serial and port transports.
 
-/// The keys of the keyed tasks: the serial transport's reader, the one reading the facts of the ready record, the one handing lines to `console`, the one reading the principals' grants, the one telling the journal and `/live` of sessions, the one reverting the plans a restart interrupted, those answering requests and writing to each connection, plus the slot of each, and those closing the account of each session, plus its number.
+/// The keys of the keyed tasks: the serial transport's reader, the one reading the facts of the ready record, the one handing lines to `console`, the one reading the principals' grants, the one telling the journal and `/live` of sessions, the one reverting the plans a restart interrupted, the one handing the core the reservations of `Session` grants, those answering requests and writing to each connection, plus the slot of each, and those closing the account of each session, plus its number.
 const READING: u64 = 1
 
 const OPENING: u64 = 3
@@ -12,6 +12,8 @@ const GRANTING: u64 = 5
 const NOTIFYING: u64 = 6
 
 const RECOVERING: u64 = 7
+
+const RESERVING_GRANTS: u64 = 8
 
 const ANSWERING: u64 = 0x1_0000_0000
 
@@ -66,6 +68,10 @@ pub protocol LinkSession {
     fn plan_moved(number: u64, moved: Moved) limits traceless
     /// The plans `link`'s restart interrupted ended, and the outbox entries it left were settled, as `events` tell.
     fn interrupted(events: mem::List[PlanEvent]) limits traceless
+    /// The core holds the reservations of `Session` grants as `held` gives them, `None` when `/sys/grants` could not be read, until `until`, the earliest expiry among them.
+    fn reserved(held: Option[mem::List[os::GrantReservation]], until: Option[i64]) limits traceless
+    /// The earliest expiry among the `Session` grants holding reservations passed.
+    fn reservations_due() limits traceless
 } LinkSession
 
 /// What a resident agent serves for the blocks of its connection.
@@ -140,7 +146,7 @@ pub closed struct Running derives Encode {
     pub keyed: Option[Keyed]
 } Running
 
-/// The state of `link`: its configuration, the facts read at its start, its connections and the number of the next, the requests running and the number of the next, the sessions open and the number of the next, what the principals holding them hold and what their sessions spent and gained, whether their grants are being read and whether they changed meanwhile, the watches, when the ready record went out, the console lines waiting for `console` and whether one is being handed over, the notices waiting for the journal and `/live` and whether one is being told, the plans it keeps, and the results of the latest mutating requests of each session.
+/// The state of `link`: its configuration, the facts read at its start, its connections and the number of the next, the requests running and the number of the next, the sessions open and the number of the next, what the principals holding them hold and what their sessions spent and gained, whether their grants are being read and whether they changed meanwhile, the watches, when the ready record went out, the console lines waiting for `console` and whether one is being handed over, the notices waiting for the journal and `/live` and whether one is being told, the plans it keeps, the results of the latest mutating requests of each session, and the reservations of `Session` grants.
 pub closed struct Linker derives Encode {
     pub config: LinkConfig
     pub facts: Option[Facts]
@@ -162,6 +168,7 @@ pub closed struct Linker derives Encode {
     pub notifying: bool
     pub plans: mem::List[KeptPlan]
     pub results: mem::List[KeptResult]
+    pub reserving: Reserving
 } Linker
 
 impl Linker: sys::Component[Env, LinkSession]
@@ -194,7 +201,7 @@ pub fn Linker.start(mut env: Env) -> Linker {
     let alloc = env.alloc
     var connections = mem::List[Connection].empty(alloc)
     mut connections.push(Connection.of(SERIAL_CONNECTION, transport: Transport.Serial, opener: 0, slot: 0, alloc))
-    return Linker(config: env.config, facts: None, connections: take connections, next_connection: SERIAL_CONNECTION + 1, running: mem::List.empty(alloc), next: 1, sessions: mem::List.empty(alloc), next_session: 1, holdings: mem::List.empty(alloc), tallies: mem::List.empty(alloc), granting: false, stale: false, watches: mem::List.empty(alloc), ready_ns: 0, lines: mem::List.empty(alloc), consoling: false, notices: mem::List.empty(alloc), notifying: false, plans: mem::List.empty(alloc), results: mem::List.empty(alloc))
+    return Linker(config: env.config, facts: None, connections: take connections, next_connection: SERIAL_CONNECTION + 1, running: mem::List.empty(alloc), next: 1, sessions: mem::List.empty(alloc), next_session: 1, holdings: mem::List.empty(alloc), tallies: mem::List.empty(alloc), granting: false, stale: false, watches: mem::List.empty(alloc), ready_ns: 0, lines: mem::List.empty(alloc), consoling: false, notices: mem::List.empty(alloc), notifying: false, plans: mem::List.empty(alloc), results: mem::List.empty(alloc), reserving: Reserving(held: mem::List.empty(alloc), running: false, again: false, due_utc: None))
 } Linker.start
 
 /// Listens on serial, reads the facts of the ready record and subscribes to the grants and principals, and once started reverts each span commit that awaited its confirmation and each schedule of a timed plan when `link` stopped and settles the outbox entries left, emitting the failure of their plans and what became of the entries.
@@ -235,6 +242,7 @@ fn Linker.opened(mut self, take facts: Facts, mut env: Env, mut cx: sys::Cx[Link
     for at in 0..<self.connections.len() {
         mut self.write(self.connections[at].number, mut env, mut cx)
     }
+    mut self.reserve_grants(mut env, mut cx)
 } Linker.opened
 
 /// The ready record's block.
