@@ -1,6 +1,6 @@
 # 0091. Dispatch accounting
 
-Status: accepted
+Status: superseded by 0092
 
 ## Context
 

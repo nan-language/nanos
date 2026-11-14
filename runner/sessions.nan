@@ -137,16 +137,19 @@ fn Shared.open_session(
     let Some(index) = try await self.principal_of(mut principals, principal: ident::Principal(text: principal.text), share, memory_bytes) else {
         return None
     }
+    let number = os::SESSION_ACCOUNTS | u32.truncate(session)
+    try await self.gauges.open_folds(number)
     let cell = principals.at(index).cell.alloc().split(principals.at(index).cell.limit())
     let account = self.config.exec.split_on(self.config.share(share), alloc: cell.alloc())
-    let given = os::SessionAccount(exec: account.executor(), alloc: cell.alloc())
+    let given = os::SessionAccount(exec: account.executor(), alloc: cell.alloc(), number: number)
     let task::Channel(sender: marks, receiver: marked) = task::Channel[Mark].bounded(1, alloc: self.config.alloc)
     let bucket = principals.at(index).bucket.share()
     let busy_mw = self.machine.busy_mw()
     let clock = self.config.clock
     let class = share.class
-    discard s.spawn(fn[take marked, take account, take cell, take bucket, take busy_mw]() fails task::Cancelled uses wait limits stack 8_192 {
-        try await gauge_session(take marked, take account, take cell, bucket, class, busy_mw, clock)
+    let charging = Charging(gauges: self.gauges.share(), account: number)
+    discard s.spawn(fn[take marked, take account, take cell, take bucket, take busy_mw, take charging]() fails task::Cancelled uses wait limits stack 8_192 {
+        try await gauge_session(take marked, take account, take cell, bucket, class, busy_mw, clock, charging)
     })
     try await self.gauges.watch(session_name(session).as_str(), watch: marks.split(), alloc: self.config.alloc)
     discard mut sessions.insert(session, value: Session(principal: take principal, account: given, marks: take marks))
@@ -181,6 +184,7 @@ fn Shared.close_session(self, mut principals: mem::List[Principal], mut sessions
         return
     }
     try await self.gauges.unwatch(session_name(session).as_str(), alloc: self.config.alloc)
+    try await self.gauges.end_folds(closed.account.number)
     discard attempt await closed.marks.send(Mark.Ended)
     for open in sessions {
         if open.value().principal == closed.principal {
@@ -196,7 +200,7 @@ fn Shared.close_session(self, mut principals: mem::List[Principal], mut sessions
     }
 } Shared.close_session
 
-/// Answers each reading of a session's gauge from `marks` with the counters of its `account` and `cell`, charging the CPU time it ran since the last reading to its own energy and to its principal's `bucket` at the power `busy_mw` holds, until the marks end; then closes the account and the cell.
+/// Answers each reading of a session's gauge from `marks` with the counters of its `account`, with the handler calls of its messages that `charging` folded into it, and of its `cell`, charging the CPU time it ran since the last reading to its own energy and to its principal's `bucket` at the power `busy_mw` holds, until the marks end; then closes the account and the cell.
 fn gauge_session(
     take marks: task::Receiver[Mark],
     take account: task::Account,
@@ -205,6 +209,7 @@ fn gauge_session(
     class: os::CpuClass,
     busy_mw: mem::Shared[core::atomic::AtomicU64],
     clock: sys::Clock,
+    charging: Charging,
     ) fails task::Cancelled uses wait {
     defer take account.close()
     defer take cell.close()
@@ -216,7 +221,7 @@ fn gauge_session(
             Some(Mark.Began) or Some(Mark.Took(ns: _)) or Some(Mark.Charged(account: _, ns: _)) => continue
             Some(Mark.Ended) or None => return
         }
-        let used = account.used_ns()
+        let used = account.used_ns().saturating_add(try await charging.gauges.folded(charging.account))
         let ran = used.saturating_sub(spent.charged_ns)
         let power = busy_mw.contents().load()
         let at = now(clock)
