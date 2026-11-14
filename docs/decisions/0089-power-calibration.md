@@ -1,6 +1,6 @@
 # 0089. Power calibration
 
-Status: accepted
+Status: superseded by 0097
 
 ## Context
 

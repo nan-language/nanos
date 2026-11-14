@@ -26,8 +26,8 @@ const AMD_POWER_UNIT: u32 = 0xC001_0299
 
 const AMD_PACKAGE_ENERGY: u32 = 0xC001_029B
 
-/// The models of Intel family 6 whose package energy counter counts units of 2^-n joules: the cores from Sandy Bridge on and the Atoms from Goldmont on.
-const RAPL_MODELS: Slice[u8] = b"\x2A\x2D\x3A\x3E\x3C\x3F\x45\x46\x3D\x47\x4F\x56\x4E\x5E\x55\x8E\x9E\x66\x7D\x7E\x6A\x6C\x9D\xA5\xA6\x8C\x8D\xA7\x97\x9A\xBE\xB7\xBA\xBF\xAA\xAC\xB5\xBD\xC5\xC6\x8F\xCF\xAD\xAE\x8A\x5C\x5F\x7A\x86\x96\x9C\x57\x85"
+/// The models of Intel family 6 whose package energy counter counts units other than 2^-n joules: the Silvermont and Airmont Atoms.
+const OTHER_UNIT_MODELS: Slice[u8] = b"\x37\x4A\x4C\x4D\x5A\x5D"
 
 /// The MSRs of RAPL's package energy counter: the one giving its unit, 2^-n joules for the n of its bits 12:8, and the one counting that unit in its bits 31:0.
 pkg struct Rapl derives Copy, Eq {
@@ -101,7 +101,7 @@ pkg fn Features.read(cpu: hw::Ring0) -> Features {
         hwp: bit(leaves.thermal.eax, at: 7) and bit(leaves.thermal.eax, at: 10),
         meltdown_immune: (capabilities & RDCL_NO) != 0 or vendor_of(leaves.basic, is: AMD) or vendor_of(leaves.basic, is: HYGON),
         x2apic: bit(leaves.features.ecx, at: 21),
-        rapl: rapl_of(leaves),
+        rapl: probed(cpu, rapl: rapl_of(leaves)),
         level: level(leaves),
         smt: threads_per_core(cpu, max: basic.eax) > 1,
         topology: topology_of(cpu, max: basic.eax),
@@ -129,7 +129,7 @@ fn performance_request(capabilities: u64, preference: u8) -> u64 {
     return lowest | (highest << 8) | (u64.widen(preference) << 24)
 } performance_request
 
-/// The RAPL counter leaves 0, 1 and `0x8000_0007` report: AMD's and Hygon's where leaf `0x8000_0007` sets EDX bit 14, Intel's on the family 6 models of `RAPL_MODELS`; `None` otherwise.
+/// The RAPL counter leaves 0, 1 and `0x8000_0007` point to: AMD's and Hygon's where leaf `0x8000_0007` sets EDX bit 14, Intel's on family 6 but the models of `OTHER_UNIT_MODELS`; `None` otherwise.
 fn rapl_of(leaves: Leaves) -> Option[Rapl] {
     if vendor_of(leaves.basic, is: AMD) or vendor_of(leaves.basic, is: HYGON) {
         return match bit(leaves.power.edx, at: 14) {
@@ -142,24 +142,41 @@ fn rapl_of(leaves: Leaves) -> Option[Rapl] {
         return None
     }
     let model = u8.truncate(((signature >> 12) & 0xF0) | ((signature >> 4) & 0xF))
-    for known in RAPL_MODELS {
-        if known == model {
-            return Some(Rapl(unit: INTEL_POWER_UNIT, energy: INTEL_PACKAGE_ENERGY))
+    for other in OTHER_UNIT_MODELS {
+        if other == model {
+            return None
         }
     }
-    return None
+    return Some(Rapl(unit: INTEL_POWER_UNIT, energy: INTEL_PACKAGE_ENERGY))
 } rapl_of
 
-/// The unit of the counter: n for 2^-n joules.
-pkg fn Rapl.unit_shift(self, cpu: hw::Ring0) -> u8 {
-    let units = trusted "CPUID enumerates RAPL, whose power unit MSR this is" { cpu.read_msr(self.unit) }
-    return u8.truncate((units >> 8) & 0x1F)
+/// `rapl` when `cpu` reads both its MSRs without a fault.
+fn probed(cpu: hw::Ring0, rapl: Option[Rapl]) -> Option[Rapl] {
+    let Some(counter) = rapl else {
+        return None
+    }
+    let unit = trusted "reading RAPL's power unit MSR changes nothing, and a read the CPU faults on gives none" { cpu.checked_read_msr(counter.unit) }
+    let energy = trusted "reading RAPL's package energy MSR changes nothing, and a read the CPU faults on gives none" { cpu.checked_read_msr(counter.energy) }
+    if unit.is_none() or energy.is_none() {
+        return None
+    }
+    return Some(counter)
+} probed
+
+/// The unit of the counter: n for 2^-n joules; `None` when reading it faults.
+pkg fn Rapl.unit_shift(self, cpu: hw::Ring0) -> Option[u8] {
+    let Some(units) = trusted "reading RAPL's power unit MSR changes nothing, and a read the CPU faults on gives none" { cpu.checked_read_msr(self.unit) } else {
+        return None
+    }
+    return Some(u8.truncate((units >> 8) & 0x1F))
 } Rapl.unit_shift
 
-/// The count of the running CPU's package.
-pkg fn Rapl.count(self, cpu: hw::Ring0) -> u32 {
-    let counted = trusted "CPUID enumerates RAPL, whose package energy MSR this is" { cpu.read_msr(self.energy) }
-    return u32.truncate(counted)
+/// The count of the running CPU's package; `None` when reading it faults.
+pkg fn Rapl.count(self, cpu: hw::Ring0) -> Option[u32] {
+    let Some(counted) = trusted "reading RAPL's package energy MSR changes nothing, and a read the CPU faults on gives none" { cpu.checked_read_msr(self.energy) } else {
+        return None
+    }
+    return Some(u32.truncate(counted))
 } Rapl.count
 
 /// Leaf `leaf` of the basic range, all zero beyond its highest leaf `max`.
@@ -339,7 +356,7 @@ test cache_sharing_rounds_up_to_a_power_of_two for sharing_shift {
     expect sharing_shift(0x3_C163) == 4
 } cache_sharing_rounds_up_to_a_power_of_two
 
-/// RAPL is AMD's where leaf `0x8000_0007` reports it, which QEMU's `max` model does not, and Intel's on the models of the list.
+/// RAPL is AMD's where leaf `0x8000_0007` reports it, which QEMU's `max` model does not, and Intel's on family 6 but the Atoms counting other units.
 test rapl_counters_follow_the_vendor_and_model for rapl_of {
     let max = qemu_max()
     expect rapl_of(max).is_none()
@@ -353,6 +370,9 @@ test rapl_counters_follow_the_vendor_and_model for rapl_of {
     var silvermont = kaby_lake
     silvermont.features.eax = 0x3_0678
     expect rapl_of(silvermont).is_none()
+    var unlisted = kaby_lake
+    unlisted.features.eax = 0xD_0670
+    expect rapl_of(unlisted) == Some(Rapl(unit: INTEL_POWER_UNIT, energy: INTEL_PACKAGE_ENERGY))
 } rapl_counters_follow_the_vendor_and_model
 
 /// A request spans the CPU's lowest to highest performance, leaves the desired one to the hardware, and carries the preference.
