@@ -1,6 +1,6 @@
 # 0096. Idle states
 
-Status: accepted
+Status: superseded by 0103
 
 ## Context
 

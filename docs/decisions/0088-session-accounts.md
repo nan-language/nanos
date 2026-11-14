@@ -1,6 +1,6 @@
 # 0088. Session accounts
 
-Status: accepted
+Status: superseded by 0104
 
 ## Context
 

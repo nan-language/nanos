@@ -1,16 +1,20 @@
-//! Sessions' accounts: the account and the cell of each session `link` opens, the sessions of one principal drawing through one cell, draining one energy bucket and consuming together, the gauge of each session, and the CPU reservations of `Session` grants.
+//! Sessions' accounts: the account and the cell of each session `link` opens, the sessions of one principal drawing through one cell, draining one energy bucket, consuming together and sharing their weight on each CPU, the gauge of each session, and the CPU reservations of `Session` grants, on which the `latency` work of their sessions draws.
 
-/// A principal with open sessions: the cell they draw through and the energy bucket they drain.
+/// A principal with open sessions: the cell they draw through, the energy bucket they drain, and the group whose weight their accounts share, the number of its first session.
 linear struct Principal {
     name: ident::Principal
     cell: mem::Budget
     bucket: task::Cown[Energy]
+    group: u64
 } Principal
 
-/// An open session: its principal, its share, what its work runs on, and where its gauge is read and its share and end told.
+/// An open session: its principal and the group of its principal's sessions, the number of the `Session` grant it opened under, none for the default share, its share, the number of its account's executor, what its work runs on, and where its gauge is read and its share and end told.
 struct Session {
     principal: ident::Principal
+    group: u64
+    grant: Option[u64]
     share: os::Share
+    executor: u64
     account: os::SessionAccount
     marks: task::Sender[Mark]
 } Session
@@ -35,8 +39,8 @@ fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: 
             return
         }
         match order {
-            os::AccountOrder.Open(session: session, principal: principal, share: share, memory_bytes: memory_bytes, done: done) => {
-                let given = match try await self.open_session(mut principals, mut sessions, session, take principal, share, memory_bytes, s) {
+            os::AccountOrder.Open(session: session, principal: principal, grant: grant, memory_bytes: memory_bytes, done: done) => {
+                let given = match try await self.open_session(mut principals, mut sessions, granted, session, take principal, grant, memory_bytes, s) {
                     Some(account) => Some(os::OpenedAccount(account: account, consumed: try await self.consumed(session, sessions, consumption)))
                     None => None
                 }
@@ -66,16 +70,19 @@ fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: 
             }
             os::AccountOrder.Reserve(grants: grants, done: done) => {
                 let held = try await self.reserve_grants(mut granted, grants)
+                for kept in sessions {
+                    let open = kept.value()
+                    self.bind(open.executor, reservation: granted_reservation(granted, grant: open.grant), group: open.group)
+                }
                 discard attempt await done.send(take held)
             }
         }
     }
 } Shared.keep_sessions
 
-/// Holds in `granted`, by grant, the reservations of exactly `grants`: ends those of the grants left out or asking for another reservation, admits the others, and sets the latency tolerance of each CPU this changes; the reservation each of `grants` holds.
+/// Holds in `granted`, by grant, the reservations of exactly `grants`: ends those of the grants left out or asking for another reservation and admits the others; the reservation each of `grants` holds.
 fn Shared.reserve_grants(self, mut granted: mem::Map[u64, Admitted], grants: mem::List[os::SessionGrant]) -> mem::List[os::GrantReservation] fails task::Cancelled uses wait {
     let alloc = self.config.alloc
-    var touched = mem::List[u32].empty(alloc)
     var ended = mem::List[u64].empty(alloc)
     for held in granted {
         let kept = grants.position(fn(each: os::SessionGrant) => each.grant == held.key() and Reservation.of(each.share) == Some(held.value().reservation))
@@ -83,31 +90,19 @@ fn Shared.reserve_grants(self, mut granted: mem::Map[u64, Admitted], grants: mem
             mut ended.push(held.key())
         }
     }
-    let reservations = self.reservations.share()
     for grant in ended {
         let Some(admitted) = mut granted.remove(grant) else {
             continue
         }
-        await when mut reservations {
-            mut reservations.release(admitted)
-        }
-        mut touched.push(admitted.cpu)
+        try await self.release(admitted)
     }
     var holding = mem::List[os::GrantReservation].empty(alloc)
     for each in grants {
-        var reservation: Option[os::CpuReservation] = None
-        match try await self.grant_admitted(mut granted, each) {
-            Some(admitted) => {
-                mut touched.push(admitted.cpu)
-                reservation = Some(os::CpuReservation(cpu: admitted.cpu, ppm: u32.fit(admitted.reservation.ppm)))
-            }
-            None => {
-            }
+        let reservation = match try await self.grant_admitted(mut granted, each) {
+            Some(admitted) => Some(os::CpuReservation(cpu: admitted.cpu, ppm: u32.fit(admitted.reservation.ppm)))
+            None => None
         }
         mut holding.push(os::GrantReservation(grant: each.grant, reservation: reservation))
-    }
-    for cpu in touched {
-        try await self.tolerate(cpu)
     }
     return holding
 } Shared.reserve_grants
@@ -126,38 +121,53 @@ fn Shared.grant_admitted(self, mut granted: mem::Map[u64, Admitted], each: os::S
     let Some(admitted) = await when mut reservations => mut reservations.admit(reservation) else {
         return None
     }
+    self.run_reservation(admitted)
     discard mut granted.insert(each.grant, value: admitted)
     return Some(admitted)
 } Shared.grant_admitted
 
-/// Opens the account of the session numbered `session` of `principal`, with the share `share`, its cell split from its principal's, and its gauge on a task of `s`; gives the account of a session already open, and `None` when its principal has no cell.
+/// The reservation `granted` holds for the grant numbered `grant`, none for `None`.
+fn granted_reservation(granted: mem::Map[u64, Admitted], grant: Option[u64]) -> Option[Admitted] {
+    let Some(number) = grant else {
+        return None
+    }
+    return granted.get(number)
+} granted_reservation
+
+/// Opens the account of the session numbered `session` of `principal`, with the share of its `Session` grant `grant`, the default share when `None`, and its `latency` work drawing on the reservation `granted` holds for that grant, its cell split from its principal's, and its gauge on a task of `s`; gives the account of a session already open, under that grant from then on, and `None` when its principal has no cell.
 fn Shared.open_session(
     self,
     mut principals: mem::List[Principal],
     mut sessions: mem::Map[u64, Session],
+    granted: mem::Map[u64, Admitted],
     session: u64,
     take principal: ident::Principal,
-    share: os::Share,
+    grant: Option[os::SessionGrant],
     memory_bytes: Option[u64],
     s: task::Scope,
     ) -> Option[os::SessionAccount] fails task::Cancelled uses wait {
     match mut sessions.remove(session) {
         Some(kept) => {
             let account = kept.account
-            let reshared = try await self.reshare_session(mut principals, take kept, share)
-            discard mut sessions.insert(session, value: take reshared)
+            let regranted = try await self.regrant_session(mut principals, take kept, grant, granted)
+            discard mut sessions.insert(session, value: take regranted)
             return Some(account)
         }
         None => {
         }
     }
-    let Some(index) = try await self.principal_of(mut principals, principal: ident::Principal(text: principal.text), share, memory_bytes) else {
+    let share = share_of(grant)
+    let Some(index) = try await self.principal_of(mut principals, principal: ident::Principal(text: principal.text), share, memory_bytes, opening: session) else {
         return None
     }
     let number = os::SESSION_ACCOUNTS | u32.truncate(session)
     try await self.gauges.open_folds(number)
     let cell = principals.at(index).cell.alloc().split(principals.at(index).cell.limit())
     let account = self.config.exec.split_on(self.config.share(share), alloc: cell.alloc())
+    let executor = account.id()
+    let group = principals.at(index).group
+    let numbered = number_of(grant)
+    self.bind(executor, reservation: granted_reservation(granted, grant: numbered), group)
     let given = os::SessionAccount(exec: account.executor(), alloc: cell.alloc(), number: number)
     let task::Channel(sender: marks, receiver: marked) = task::Channel[Mark].bounded(1, alloc: self.config.alloc)
     let bucket = principals.at(index).bucket.share()
@@ -169,16 +179,41 @@ fn Shared.open_session(
         try await gauge_session(take marked, take account, take cell, bucket, shares, busy_mw, clock, charging)
     })
     try await self.gauges.watch(session_name(session).as_str(), watch: marks.split(), alloc: self.config.alloc)
-    discard mut sessions.insert(session, value: Session(principal: take principal, share: share, account: given, marks: take marks))
+    discard mut sessions.insert(session, value: Session(principal: take principal, group: group, grant: numbered, share: share, executor: executor, account: given, marks: take marks))
     return Some(given)
 } Shared.open_session
 
-/// The open session `kept`, which takes the share `share` when its principal's grant gives another: its gauge reshares its account, and its principal's energy bucket takes the share's budget.
-fn Shared.reshare_session(self, mut principals: mem::List[Principal], take kept: Session, share: os::Share) -> Session fails task::Cancelled uses wait {
-    if kept.share == share {
-        return kept
+/// The share of the `Session` grant `grant`, the default share for `None`.
+fn share_of(grant: Option[os::SessionGrant]) -> os::Share {
+    return match grant {
+        Some(held) => held.share
+        None => os::Share.default_of()
     }
+} share_of
+
+/// The number of the `Session` grant `grant`.
+fn number_of(grant: Option[os::SessionGrant]) -> Option[u64] {
+    return match grant {
+        Some(held) => Some(held.grant)
+        None => None
+    }
+} number_of
+
+/// The open session `kept` under its principal's `Session` grant `grant`: its `latency` work draws on the reservation `granted` holds for it, and when that grant gives another share, its gauge reshares its account and its principal's energy bucket takes the share's budget.
+fn Shared.regrant_session(
+    self,
+    mut principals: mem::List[Principal],
+    take kept: Session,
+    grant: Option[os::SessionGrant],
+    granted: mem::Map[u64, Admitted],
+    ) -> Session fails task::Cancelled uses wait {
     var session = kept
+    session.grant = number_of(grant)
+    self.bind(session.executor, reservation: granted_reservation(granted, grant: session.grant), group: session.group)
+    let share = share_of(grant)
+    if session.share == share {
+        return session
+    }
     session.share = share
     discard attempt await session.marks.send(Mark.Reshare(shares: self.config.shares(share)))
     match principals.position(fn(each: Principal) => each.name == session.principal) {
@@ -192,15 +227,16 @@ fn Shared.reshare_session(self, mut principals: mem::List[Principal], take kept:
         }
     }
     return session
-} Shared.reshare_session
+} Shared.regrant_session
 
-/// The place in `principals` of `principal`, whose cell is split when it has none, of `memory_bytes`, or of its pool's size when `None`, from the pool the machine names, and whose energy bucket then holds `share`'s budget; `None` while every pool is at its top pressure level.
+/// The place in `principals` of `principal`, whose cell is split when it has none, of `memory_bytes`, or of its pool's size when `None`, from the pool the machine names, whose energy bucket then holds `share`'s budget, and whose group is then numbered after its session `opening`; `None` while every pool is at its top pressure level.
 fn Shared.principal_of(
     self,
     mut principals: mem::List[Principal],
     take principal: ident::Principal,
     share: os::Share,
     memory_bytes: Option[u64],
+    opening: u64,
     ) -> Option[usize] fails task::Cancelled uses wait {
     for index in 0..<principals.len() {
         if principals.at(index).name == principal {
@@ -212,7 +248,7 @@ fn Shared.principal_of(
     }
     let cell = pooled.alloc.split(usize.widen(memory_bytes.value_or(pooled.bytes)))
     let bucket = task::Cown.of(Energy.of(budget_mj_per_h: share.energy_mj_per_h, now_ns: now(self.config.clock)), alloc: self.config.alloc)
-    mut principals.push(Principal(name: take principal, cell: take cell, bucket: take bucket))
+    mut principals.push(Principal(name: take principal, cell: take cell, bucket: take bucket, group: opening))
     return Some(principals.len() - 1)
 } Shared.principal_of
 
@@ -262,9 +298,9 @@ fn Shared.close_session(
     }
     let name = session_name(session)
     let last = try await self.gauges.read(name.as_str(), alloc: self.config.alloc)
+    self.machine.unbind(closed.executor)
     try await self.gauges.unwatch(name.as_str(), alloc: self.config.alloc)
     try await self.gauges.end_folds(closed.account.number)
-    discard attempt await closed.marks.send(Mark.Ended)
     match last {
         Some(gauge) => {
             match consumption.position(fn(each: Consumption) => each.principal == closed.principal) {
@@ -284,7 +320,7 @@ fn Shared.close_session(
     }
     for index in 0..<principals.len() {
         if principals.at(index).name == closed.principal {
-            let Principal(name: _, cell: cell, bucket: _) = mut principals.remove(index)
+            let Principal(name: _, cell: cell, bucket: _, group: _) = mut principals.remove(index)
             take cell.close()
             return
         }
@@ -327,7 +363,7 @@ fn gauge_session(
         mut spent.charge(used_ns: used, busy_mw: power, now_ns: at)
         throttled = await when mut bucket => drained(mut bucket, cpu_ns: ran, busy_mw: power, now_ns: at)
         mut resharing.run(account, throttled)
-        let gauge = os::Gauge(intake: 0, memory: os::Usage(charged: u64.widen(cell.charged()), limit: u64.widen(cell.limit()), peak: u64.widen(cell.peak())), reserved: false, cpu_ns: used, read_bytes: folded.read_bytes, written_bytes: folded.written_bytes, energy_mj: spent.energy.used_mj(), throttled: throttled, class: resharing.shares.class, bundle: ident::HashValue(bytes: Array[u8, 33].filled(0)), incarnation: 0, messages: 0, latency: Array[u64, 32].filled(0), traps: 0)
+        let gauge = os::Gauge(intake: 0, memory: os::Usage(charged: u64.widen(cell.charged()), limit: u64.widen(cell.limit()), peak: u64.widen(cell.peak())), reserved: false, executor: account.id(), cpu_ns: used, read_bytes: folded.read_bytes, written_bytes: folded.written_bytes, energy_mj: spent.energy.used_mj(), throttled: throttled, class: resharing.shares.class, bundle: ident::HashValue(bytes: Array[u8, 33].filled(0)), incarnation: 0, messages: 0, latency: Array[u64, 32].filled(0), traps: 0)
         discard attempt await reply.send(gauge)
     }
 } gauge_session
@@ -348,7 +384,7 @@ fn session_name(session: u64) -> text::Fixed[24] {
 /// Closes the cells of the principals left with open sessions.
 fn close_principals(take principals: mem::List[Principal]) {
     for held in take principals {
-        let Principal(name: _, cell: cell, bucket: _) = held
+        let Principal(name: _, cell: cell, bucket: _, group: _) = held
         take cell.close()
     }
 } close_principals

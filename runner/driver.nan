@@ -103,6 +103,7 @@ struct Domain {
     deliveries: task::Sender[Delivery]
     abandoner: mem::Shared[sys::Abandoner]
     outstanding: Option[Outstanding]
+    executor: u64
 } Domain
 
 /// A call waiting in the instance's intake since the monotonic time `since_ns`, the message of the dead letter `redelivery` when it delivers one again.
@@ -277,6 +278,7 @@ fn Shared.take_input[J: Journal](
         }
         Input.Ended(incarnation: incarnation, outcome: outcome) => {
             if incarnation == driver.incarnation {
+                self.unbind(driver)
                 try await self.gauges.unwatch(driver.moniker.text.as_str(), alloc: self.config.alloc)
                 try await self.ended(mut driver, take outcome, sender, journal, s)
                 discard try await self.machine.settle(driver.pool)
@@ -772,16 +774,17 @@ fn Shared.start[J: Journal](
     }
     let task::Channel(sender: deliveries, receiver: delivered) = task::Channel[Delivery].bounded(2, alloc: self.config.alloc)
     let task::Channel(sender: marks, receiver: marked) = task::Channel[Mark].bounded(2, alloc: self.config.alloc)
-    let ending = marks.split()
     let gauged = marks.split()
     let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: self.config.alloc)
     let serving = Serving(deliveries: take delivered, reports: sender.split(), marks: take marks, incarnation: driver.incarnation, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: driver.suspend_ms.value_or(0), keeping: keeping, restore: take restore, revival: revival, config: take config, forking: None)
+    let executor = account.id()
+    self.bind(executor, reservation: driver.reservation, group: 0)
     let exec = account.executor()
     let alloc = budget.alloc()
     let held = Held(budget: take budget, reserved: driver.spec.budget.reserved, account: take account, shares: self.config.shares(driver.spec.share), intake: driver.intake.share(), bundle: driver.spec.bundle, traps: driver.traps)
-    self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, exec, alloc, abandoner: abandoner.share(), take ending, ended: sender.split(), incarnation: driver.incarnation, header: os::Header.of_work(cause: driver.cause, slot: driver.slot))
+    self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, exec, alloc, abandoner: abandoner.share(), ended: sender.split(), incarnation: driver.incarnation, header: os::Header.of_work(cause: driver.cause, slot: driver.slot))
     self.watch(s, marks: take marked, take held, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers, number: driver.slot)
-    driver.domain = Some(Domain(deliveries: take deliveries, abandoner: take abandoner, outstanding: None))
+    driver.domain = Some(Domain(deliveries: take deliveries, abandoner: take abandoner, outstanding: None, executor: executor))
     try await self.gauges.watch(driver.moniker.text.as_str(), watch: take gauged, alloc: self.config.alloc)
 } Shared.start
 
@@ -811,17 +814,19 @@ fn Shared.admit(self, mut driver: Driver) -> bool fails task::Cancelled uses wai
     let Some(admitted) = driver.reservation else {
         return false
     }
-    try await self.tolerate(admitted.cpu)
+    self.run_reservation(admitted)
     return true
 } Shared.admit
 
-/// Has the running incarnation of the instance take the share its specification gives at its next quiescence, its CPU reservation admitted again for that share.
+/// Has the running incarnation of the instance take the share its specification gives at its next quiescence, its CPU reservation admitted again for that share, on which its account draws from then on.
 fn Shared.reshare(self, mut driver: Driver) fails task::Cancelled uses wait {
-    if driver.domain.is_none() {
-        return
+    let executor = match driver.domain {
+        Some(domain) => domain.executor
+        None => return
     }
     try await self.end_reservation(mut driver)
     discard try await self.admit(mut driver)
+    self.bind(executor, reservation: driver.reservation, group: 0)
     try await self.gauges.reshare(driver.moniker.text.as_str(), shares: self.config.shares(driver.spec.share), alloc: self.config.alloc)
 } Shared.reshare
 
@@ -830,20 +835,38 @@ fn Shared.end_reservation(self, mut driver: Driver) fails task::Cancelled uses w
     let Some(admitted) = mut driver.reservation.extract() else {
         return
     }
+    try await self.release(admitted)
+} Shared.end_reservation
+
+/// Has the machine's CPUs run the reservation `admitted`.
+fn Shared.run_reservation(self, admitted: Admitted) {
+    self.machine.run_reservation(admitted.id, cpu: admitted.cpu, runtime_ns: admitted.reservation.runtime_ns, period_ns: admitted.reservation.period_ns)
+} Shared.run_reservation
+
+/// Ends the reservation `admitted`, which no CPU runs from then on.
+fn Shared.release(self, admitted: Admitted) fails task::Cancelled uses wait {
     let reservations = self.reservations.share()
     await when mut reservations {
         mut reservations.release(admitted)
     }
-    try await self.tolerate(admitted.cpu)
-} Shared.end_reservation
+    self.machine.end_reservation(admitted.id)
+} Shared.release
 
-/// Gives the machine CPU `cpu`'s latency tolerance as the reservations admitted on it now set it.
-fn Shared.tolerate(self, cpu: u32) fails task::Cancelled uses wait {
-    let reservations = self.reservations.share()
-    await when reservations {
-        self.machine.tolerate(cpu, tolerance_ns: reservations.tolerance(cpu))
+/// Forgets the account of the incarnation whose domain ended, before its watch closes it.
+fn Shared.unbind(self, driver: Driver) {
+    let Some(domain) = driver.domain else {
+        return
     }
-} Shared.tolerate
+    self.machine.unbind(domain.executor)
+} Shared.unbind
+
+/// Has the `latency` work of the account whose executor is numbered `executor` draw on `reservation`, or on none, and its work share its weight with the other accounts of the group `group`, none when 0.
+fn Shared.bind(self, executor: u64, reservation: Option[Admitted], group: u64) {
+    match reservation {
+        Some(admitted) => self.machine.bind(executor, reservation: admitted.id, cpu: admitted.cpu, group)
+        None => self.machine.bind(executor, reservation: 0, cpu: 0, group)
+    }
+} Shared.bind
 
 /// The cell of a new incarnation: split at the specification's limit from the pool the machine names, `budget.memory-pressure` while every pool is at the top pressure level; or for a reserved instance from the store over its region, which its first start takes and later starts reuse, `budget.over-reservation` when no free range holds the region.
 fn Shared.cell(self, mut driver: Driver) -> Result[mem::Budget, text::Fixed[32]] fails task::Cancelled uses wait {
@@ -891,7 +914,7 @@ fn Held.gauge(
     transferred: Folded,
     shares: Shares,
     ) -> os::Gauge {
-    return os::Gauge(intake: self.intake.contents().load(), memory: os::Usage(charged: u64.widen(self.budget.charged()), limit: u64.widen(self.budget.limit()), peak: u64.widen(self.budget.peak())), reserved: self.reserved, cpu_ns: cpu_ns, read_bytes: transferred.read_bytes, written_bytes: transferred.written_bytes, energy_mj: energy.used_mj(), throttled: energy.throttled, class: shares.class, bundle: self.bundle, incarnation: incarnation, messages: calls.count, latency: calls.latency, traps: self.traps)
+    return os::Gauge(intake: self.intake.contents().load(), memory: os::Usage(charged: u64.widen(self.budget.charged()), limit: u64.widen(self.budget.limit()), peak: u64.widen(self.budget.peak())), reserved: self.reserved, executor: self.account.id(), cpu_ns: cpu_ns, read_bytes: transferred.read_bytes, written_bytes: transferred.written_bytes, energy_mj: energy.used_mj(), throttled: energy.throttled, class: shares.class, bundle: self.bundle, incarnation: incarnation, messages: calls.count, latency: calls.latency, traps: self.traps)
 } Held.gauge
 
 /// The bucket of a handler call that ran `ns`: 0 below 1 µs, k from 2^(k−1) to 2^k µs, 31 beyond.
@@ -905,7 +928,7 @@ fn latency_bucket(ns: u64) -> usize {
     return bucket
 } latency_bucket
 
-/// Runs an incarnation's domain under `header` on a task of `s` through `exec` and `alloc`, then tells its watch, through `ending`, and its driver how it ended.
+/// Runs an incarnation's domain under `header` on a task of `s` through `exec` and `alloc`, then tells its driver how it ended.
 fn Shared.launch(
     self,
     s: task::Scope,
@@ -915,13 +938,12 @@ fn Shared.launch(
     exec: task::Executor,
     alloc: mem::Alloc,
     take abandoner: mem::Shared[sys::Abandoner],
-    take ending: task::Sender[Mark],
     take ended: task::Sender[Input],
     incarnation: u64,
     header: os::Header,
     ) {
     let components = self.components
-    discard s.spawn(fn[take component, take world, take serving, take abandoner, take ending, take ended]() fails task::Cancelled uses wait limits stack 16_384 {
+    discard s.spawn(fn[take component, take world, take serving, take abandoner, take ended]() fails task::Cancelled uses wait limits stack 16_384 {
         let ran = attempt await abandoner.contents().run_sized(fn[take component, take world, take serving]() -> Ended fails task::Cancelled uses wait limits stack 131_072 {
             var given = Some(Launched(component: take component, world: take world, serving: take serving))
             return try await sys::run_headed(header.carried(), body: fn[mut given]() -> Ended fails task::Cancelled uses wait {
@@ -931,7 +953,6 @@ fn Shared.launch(
                 return try await components.serve(path.as_str(), world: take built, serving: take served)
             })
         }, stack: INSTANCE_STACK, exec, alloc)
-        discard attempt await ending.send(Mark.Ended)
         let outcome = match ran {
             Ok(result) => result
             Err(cancelled) => fail cancelled
@@ -1677,7 +1698,7 @@ fn Driver.end_domain(mut self) fails task::Cancelled uses wait {
     let Some(domain) = mut self.domain.extract() else {
         return
     }
-    let Domain(deliveries: _, abandoner: _, outstanding: outstanding) = domain
+    let Domain(deliveries: _, abandoner: _, outstanding: outstanding, executor: _) = domain
     let Some(ended) = outstanding else {
         return
     }

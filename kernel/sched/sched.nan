@@ -59,9 +59,34 @@ pkg struct Place derives Copy, Eq {
     pkg node: u32
 } Place
 
-/// What the policy and the core's tasks share: each CPU's state behind its lock, where each CPU lies, the running CPU's number, the clock, whether the CPUs have MWAIT, the power of a running CPU in mW, which charges the energy of CPU time, and whether a calibration set it, the energy-performance preferences of `latency`, `normal` and `background` work in bits 7:0, 15:8 and 23:16, on a machine with HWP the signal through which each CPU posts the preference it wants, and on a machine with RAPL the one through which each running CPU asks for a calibration.
+/// What the core tells the policy of an account: its executor's number, 0 for a free slot, the reservation its `latency` work draws on, none when 0, with the CPU running it, the group of accounts its entities share their weight with on each CPU, none when 0, and the times its work was made ready.
+pkg struct Terms derives Copy, Eq {
+    pkg executor: u64
+    pkg reservation: u64
+    pkg cpu: u32
+    pkg group: u64
+    pkg wakeups: u64
+} Terms
+
+/// A free slot of the account terms.
+const FREE_TERMS: Terms = Terms(executor: 0, reservation: 0, cpu: 0, group: 0, wakeups: 0)
+
+/// A reservation a CPU runs: its number, 0 for a free slot, its runtime in each of its periods, the start of the current period, and the time its work ran in it.
+struct Reserved derives Copy, Eq {
+    id: u64
+    runtime_ns: u64
+    period_ns: u64
+    since_ns: u64
+    used_ns: u64
+} Reserved
+
+/// A free slot of a CPU's reservations.
+const FREE_RESERVED: Reserved = Reserved(id: 0, runtime_ns: 0, period_ns: 0, since_ns: 0, used_ns: 0)
+
+/// What the policy and the core's tasks share: each CPU's state behind its lock, the terms of the accounts the core tells of in slots that grow through `alloc`, where each CPU lies, the running CPU's number, the clock, whether the CPUs have MWAIT, the power of a running CPU in mW, which charges the energy of CPU time, and whether a calibration set it, the energy-performance preferences of `latency`, `normal` and `background` work in bits 7:0, 15:8 and 23:16, on a machine with HWP the signal through which each CPU posts the preference it wants, and on a machine with RAPL the one through which each running CPU asks for a calibration.
 pkg struct State {
     cpus: mem::List[hw::SpinLock[Cpu]]
+    accounts: hw::SpinLock[mem::List[Terms]]
     places: mem::List[Place]
     here: hw::PerCpu[u32]
     clock: sys::Clock
@@ -72,6 +97,7 @@ pkg struct State {
     pkg preferences: core::atomic::AtomicU32
     wanting: mem::List[mem::Shared[hw::Signal[u8]]]
     calibrating: mem::List[mem::Shared[hw::Signal[Unit]]]
+    alloc: mem::Alloc
 } State
 
 /// The kernel's policy, whose hooks NaN's runtime calls with the CPU's interrupts disabled.
@@ -79,7 +105,7 @@ pkg struct Scheduler {
     state: mem::Shared[State]
 } Scheduler
 
-/// A CPU's run queue as the policy sees it, with the time it spent, whether it rests, since when and in which MWAIT state, none for HLT, the rests it left, the lengths of its last idle periods, each from its entry into an idle state to its return, the next taking slot `next_period`, the start of the one it is in, its latency tolerance, none when unbounded, the MWAIT states it may enter, the tasks of `latency`, `normal` and `background` work queued on it, the energy-performance preference it last wanted, and when it last asked for a calibration.
+/// A CPU's run queue as the policy sees it, with the reservations it runs, the time it spent, whether it rests, since when and in which MWAIT state, none for HLT, the rests it left, the lengths of its last idle periods, each from its entry into an idle state to its return, the next taking slot `next_period`, the start of the one it is in, the MWAIT states it may enter, the tasks of `latency`, `normal` and `background` work queued on it, the energy-performance preference it last wanted, and when it last asked for a calibration.
 struct Cpu {
     started: bool
     idle: bool
@@ -88,6 +114,7 @@ struct Cpu {
     virtual_ns: u64
     running: Running
     entities: mem::Bounded[Entity, ENTITIES]
+    reserved: mem::List[Reserved]
     times: Times
     resting: bool
     rested_ns: u64
@@ -96,7 +123,6 @@ struct Cpu {
     periods: Array[u64, PERIODS]
     next_period: usize
     period_ns: u64
-    tolerance_ns: Option[u64]
     idle_states: Array[Option[IdleState], power::MOST_IDLE_STATES]
     classes: Array[u32, 3]
     preference: Option[u8]
@@ -122,20 +148,22 @@ pkg struct Reading derives Copy {
     pkg wakeups: u64
 } Reading
 
-/// The work a CPU runs: its account, weight and class, since when, and whether it runs any.
+/// The work a CPU runs: its account, weight and class, the reservation its `latency` work draws on, none when 0, since when, and whether it runs any.
 struct Running derives Copy {
     executor: u64
     weight: u64
     class: u8
+    reservation: u64
     since_ns: u64
     active: bool
 } Running
 
-/// An account with ready work on a CPU: its virtual runtime and its tasks placed there that have not started.
+/// An account with ready work on a CPU: its virtual runtime, its tasks placed there that have not started, and the group it shares its weight with.
 struct Entity derives Copy {
     executor: u64
     virtual_ns: u64
     ready: u32
+    group: u64
 } Entity
 
 /// The classes of the executors of `latency`, `normal` and `background` accounts, then of deferrable core work, in that order.
@@ -154,8 +182,36 @@ pkg fn pinned_share(cpu: u32) -> task::Share
     return task::Share(weight: 1, class: PINNED, reserve_ppm: cpu)
 } pinned_share
 
+/// The class work of `task`'s account runs in under its `terms`: `latency` work drawing on no reservation runs as `normal`.
+fn class_of(task: hw::TaskView, terms: Option[Terms]) -> u8 {
+    if task.share.class == LATENCY and reserved_cpu(terms).is_none() {
+        return NORMAL
+    }
+    return task.share.class
+} class_of
+
+/// The CPU running the reservation that the account of `terms` draws on, `None` when it draws on none.
+fn reserved_cpu(terms: Option[Terms]) -> Option[u32] {
+    let Some(held) = terms else {
+        return None
+    }
+    if held.reservation == 0 {
+        return None
+    }
+    return Some(held.cpu)
+} reserved_cpu
+
 /// Whether work of `class` stays on the CPU it is placed on, where no steal takes it: `latency` work and core work for one CPU.
 fn binds(class: u8) -> bool = class == LATENCY or class == PINNED
+
+/// This reservation as of `now_ns`: in the period holding `now_ns`, its runtime used afresh when that period is a later one.
+fn Reserved.rolled(self, now_ns: u64) -> Reserved {
+    if self.period_ns == 0 or now_ns < self.since_ns.saturating_add(self.period_ns) {
+        return self
+    }
+    let passed = now_ns.saturating_sub(self.since_ns) / self.period_ns
+    return Reserved(id: self.id, runtime_ns: self.runtime_ns, period_ns: self.period_ns, since_ns: self.since_ns.saturating_add(passed.saturating_mul(self.period_ns)), used_ns: 0)
+} Reserved.rolled
 
 /// The rank of a class in every run queue: `latency` work first, then the core's, then `normal` and `background` work.
 fn rank(class: u8) -> u64 {
@@ -191,7 +247,7 @@ pkg fn State.of(
     ) -> State {
     var cpus = mem::List[hw::SpinLock[Cpu]].empty(alloc)
     for index in 0..<places.len() {
-        var cpu = Cpu.fresh()
+        var cpu = Cpu.fresh(alloc)
         cpu.started = index == 0
         mut cpus.push(hw::SpinLock.of(take cpu))
     }
@@ -211,7 +267,7 @@ pkg fn State.of(
     chosen[1] = defaults.preference_normal
     chosen[2] = defaults.preference_background
     let preferences = core::atomic::AtomicU32.of(pack(chosen))
-    return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), mwait: mwait, busy_mw: take busy_mw, calibrated: core::atomic::AtomicBool.of(false), preferences: take preferences, wanting: take wanting, calibrating: take calibrating)
+    return State(cpus: take cpus, accounts: hw::SpinLock.of(mem::List[Terms].empty(alloc)), places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), mwait: mwait, busy_mw: take busy_mw, calibrated: core::atomic::AtomicBool.of(false), preferences: take preferences, wanting: take wanting, calibrating: take calibrating, alloc: alloc)
 } State.of
 
 /// Applies the power settings: a running CPU's power `busy_mw`, unless a calibration set it, `preferences`, those of `latency`, `normal` and `background` work, and on a machine with MWAIT the idle states `idle_states`.
@@ -263,10 +319,10 @@ pkg fn State.wanted_by(self, cpu: u32) -> Option[mem::Shared[hw::Signal[u8]]] {
 /// `preferences` as the state holds them, in bits 7:0, 15:8 and 23:16.
 fn pack(preferences: Array[u8, 3]) -> u32 = u32.widen(preferences[0]) | (u32.widen(preferences[1]) << 8) | (u32.widen(preferences[2]) << 16)
 
-/// A CPU not started, running nothing.
-fn Cpu.fresh() -> Cpu {
-    let nothing = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-    return Cpu(started: false, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, resting_in: None, wakeups: 0, periods: Array[u64, PERIODS].filled(0), next_period: 0, period_ns: 0, tolerance_ns: None, idle_states: Array[Option[IdleState], power::MOST_IDLE_STATES].filled(None), classes: Array[u32, 3].filled(0), preference: None, calibrated_ns: 0)
+/// A CPU not started, running nothing, whose reservations grow through `alloc`.
+fn Cpu.fresh(alloc: mem::Alloc) -> Cpu {
+    let nothing = Running(executor: 0, weight: 1, class: CORE, reservation: 0, since_ns: 0, active: false)
+    return Cpu(started: false, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), reserved: mem::List.empty(alloc), times: Times.none(), resting: false, rested_ns: 0, resting_in: None, wakeups: 0, periods: Array[u64, PERIODS].filled(0), next_period: 0, period_ns: 0, idle_states: Array[Option[IdleState], power::MOST_IDLE_STATES].filled(None), classes: Array[u32, 3].filled(0), preference: None, calibrated_ns: 0)
 } Cpu.fresh
 
 /// Marks CPU `cpu` started: it runs on the shared space with its features enabled, so work may go to it.
@@ -281,17 +337,198 @@ pkg fn State.start(self, cpu: u32) {
     })
 } State.start
 
-/// Sets CPU `cpu`'s latency tolerance to `tolerance_ns`, unbounded when `None`.
-pkg fn State.tolerate(self, cpu: u32, tolerance_ns: Option[u64]) {
+/// Has CPU `cpu` run the reservation numbered `id`: `runtime_ns` of `latency` work in every `period_ns`, its first period starting now.
+pkg fn State.reserve(
+    self,
+    id: u64,
+    cpu: u32,
+    runtime_ns: u64,
+    period_ns: u64,
+    ) {
     let Some(lock) = self.cpus.get(usize.widen(cpu)) else {
         return
     }
+    let fresh = Reserved(id: id, runtime_ns: runtime_ns, period_ns: period_ns, since_ns: self.now(), used_ns: 0)
+    loop {
+        let full = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[usize] limits notrap, terminates {
+            return lock.with(t, body: fn(mut state: Cpu) -> Option[usize] limits notrap, terminates, noalloc {
+                if slotted(mut state.reserved, value: fresh, same: fn(held: Reserved) => held.id == id, free: fn(held: Reserved) => held.id == 0) {
+                    return None
+                }
+                return Some(state.reserved.len())
+            })
+        })
+        let Some(slots) = full else {
+            return
+        }
+        var spare = Some(free_slots(grown_size(slots), free: FREE_RESERVED, alloc: self.alloc))
+        hw::without_irqs(fn[mut spare](t: hw::IrqsDisabled) limits notrap, terminates {
+            lock.with(t, body: fn[mut spare](mut state: Cpu) limits notrap, terminates, noalloc {
+                let Some(grown) = mut spare.extract() else {
+                    return
+                }
+                regrown(mut state.reserved, take grown, count: slots)
+            })
+        })
+    }
+} State.reserve
+
+/// Has no CPU run the reservation numbered `id` any more.
+pkg fn State.unreserve(self, id: u64) {
+    for lock in self.cpus {
+        hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+            lock.with(t, body: fn(mut state: Cpu) limits notrap, terminates, noalloc {
+                for held in mut state.reserved {
+                    if held.id == id {
+                        held.id = 0
+                    }
+                }
+            })
+        })
+    }
+} State.unreserve
+
+/// Takes the terms of the account whose executor is numbered `executor`: its `latency` work draws on the reservation numbered `reservation` that CPU `cpu` runs, none when 0, and its entities share their weight with those of the group `group`, none when 0; the times its work was made ready count on.
+pkg fn State.bind(
+    self,
+    executor: u64,
+    reservation: u64,
+    cpu: u32,
+    group: u64,
+    ) {
+    let table = self.accounts
+    loop {
+        let full = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[usize] limits notrap, terminates {
+            return table.with(t, body: fn(mut held: mem::List[Terms]) -> Option[usize] limits notrap, terminates, noalloc {
+                for terms in mut held {
+                    if terms.executor == executor {
+                        terms.reservation = reservation
+                        terms.cpu = cpu
+                        terms.group = group
+                        return None
+                    }
+                }
+                let fresh = Terms(executor: executor, reservation: reservation, cpu: cpu, group: group, wakeups: 0)
+                if slotted(mut held, value: fresh, same: fn(terms: Terms) => false, free: fn(terms: Terms) => terms.executor == 0) {
+                    return None
+                }
+                return Some(held.len())
+            })
+        })
+        let Some(slots) = full else {
+            return
+        }
+        var spare = Some(free_slots(grown_size(slots), free: FREE_TERMS, alloc: self.alloc))
+        hw::without_irqs(fn[mut spare](t: hw::IrqsDisabled) limits notrap, terminates {
+            table.with(t, body: fn[mut spare](mut held: mem::List[Terms]) limits notrap, terminates, noalloc {
+                let Some(grown) = mut spare.extract() else {
+                    return
+                }
+                regrown(mut held, take grown, count: slots)
+            })
+        })
+    }
+} State.bind
+
+/// Forgets the terms of the account whose executor is numbered `executor`.
+pkg fn State.unbind(self, executor: u64) {
+    let table = self.accounts
     hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
-        lock.with(t, body: fn(mut state: Cpu) limits notrap, terminates, noalloc {
-            state.tolerance_ns = tolerance_ns
+        table.with(t, body: fn(mut held: mem::List[Terms]) limits notrap, terminates, noalloc {
+            for terms in mut held {
+                if terms.executor == executor {
+                    terms = FREE_TERMS
+                }
+            }
         })
     })
-} State.tolerate
+} State.unbind
+
+/// The slots that replace `slots` full ones: twice as many, at least 8.
+fn grown_size(slots: usize) -> usize = slots.saturating_mul(2).max(8)
+
+/// `count` slots holding `free`, through `alloc`.
+fn free_slots[T: Copy](count: usize, free: T, alloc: mem::Alloc) -> mem::List[T] {
+    var slots = mem::List[T].empty(alloc)
+    for _ in 0..<count {
+        mut slots.push(free)
+    }
+    return slots
+} free_slots
+
+/// Writes `value` to the slot of `slots` that `same` picks, else to the first that `free` does; whether a slot took it.
+fn slotted[T: Copy](mut slots: mem::List[T], value: T, same: fn(held: T) -> bool limits notrap, terminates, noalloc, free: fn(held: T) -> bool limits notrap, terminates, noalloc) -> bool limits notrap, terminates, noalloc {
+    for held in mut slots {
+        if same(held) {
+            held = value
+            return true
+        }
+    }
+    for held in mut slots {
+        if free(held) {
+            held = value
+            return true
+        }
+    }
+    return false
+} slotted
+
+/// Has `grown` take the place of `slots`, their values first, when `slots` still has `count` of them.
+fn regrown[T: Copy](mut slots: mem::List[T], take grown: mem::List[T], count: usize) limits notrap, terminates, noalloc {
+    if slots.len() != count {
+        return
+    }
+    var next = grown
+    var index: usize = 0
+    for value in slots {
+        if index < next.len() {
+            next[index] = value
+        }
+        index = index.saturating_add(1)
+    }
+    slots = next
+} regrown
+
+/// The times the work of the account whose executor is numbered `executor` was made ready, 0 for one the state holds no terms of.
+pkg fn State.wakeups(self, executor: u64) -> u64 {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+        return match self.terms(t, executor) {
+            Some(terms) => terms.wakeups
+            None => 0
+        }
+    })
+} State.wakeups
+
+/// The terms of the account whose executor is numbered `executor`, `None` for one the state holds none of.
+fn State.terms(self, t: hw::IrqsDisabled, executor: u64) -> Option[Terms] limits notrap, terminates, noalloc {
+    if executor == 0 {
+        return None
+    }
+    return self.accounts.with(t, body: fn(mut held: mem::List[Terms]) -> Option[Terms] limits notrap, terminates, noalloc {
+        for terms in held {
+            if terms.executor == executor {
+                return Some(terms)
+            }
+        }
+        return None
+    })
+} State.terms
+
+/// The terms of the account whose executor is numbered `executor`, one more wakeup counted, `None` for one the state holds none of.
+fn State.woken(self, t: hw::IrqsDisabled, executor: u64) -> Option[Terms] limits notrap, terminates, noalloc {
+    if executor == 0 {
+        return None
+    }
+    return self.accounts.with(t, body: fn(mut held: mem::List[Terms]) -> Option[Terms] limits notrap, terminates, noalloc {
+        for terms in mut held {
+            if terms.executor == executor {
+                terms.wakeups = terms.wakeups.saturating_add(1)
+                return Some(terms)
+            }
+        }
+        return None
+    })
+} State.woken
 
 /// Marks every CPU started, from which on idle CPUs take work from others.
 pkg fn State.all_started(self) {
@@ -408,14 +645,20 @@ fn State.charge_running(self, t: hw::IrqsDisabled, task: hw::TaskView) limits no
     })
 } State.charge_running
 
-/// Adds `task` to CPU `cpu`'s queue and gives its key.
-fn State.enqueue(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc {
+/// Adds `task`, of an account under `terms`, to CPU `cpu`'s queue and gives its key.
+fn State.enqueue(
+    self,
+    t: hw::IrqsDisabled,
+    cpu: u32,
+    task: hw::TaskView,
+    terms: Option[Terms],
+    ) -> u64 limits notrap, terminates, noalloc {
     let Some(lock) = self.cpus.get(usize.widen(cpu)) else {
         return key(task.share.class, value: 0)
     }
     let now = self.now()
     return lock.with(t, body: fn(mut state: Cpu) -> u64 limits notrap, terminates, noalloc {
-        return mut state.enqueue(task, now_ns: now)
+        return mut state.enqueue(task, terms, now_ns: now)
     })
 } State.enqueue
 
@@ -427,17 +670,21 @@ pkg fn Scheduler.of(take state: mem::Shared[State]) -> Scheduler = Scheduler(sta
 pkg fn Scheduler.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
     let state = self.state.contents()
     state.charge_running(t, task)
+    let terms = state.woken(t, executor: task.executor)
+    let class = class_of(task, terms)
     var here = state.running_cpu(t)
     if not state.is_started(t, cpu: here) {
         here = 0
     }
     var target = here
-    if task.share.class == PINNED {
+    if class == PINNED {
         target = task.share.reserve_ppm
+    } else if class == LATENCY {
+        target = reserved_cpu(terms).value_or(here)
     } else {
         target = state.wake_cpu(t, previous: task.last_cpu, waker: here)
     }
-    return hw::Placement(cpu: target, key: state.enqueue(t, cpu: target, task), bound: binds(task.share.class))
+    return hw::Placement(cpu: target, key: state.enqueue(t, cpu: target, task, terms), bound: binds(class))
 } Scheduler.place
 
 pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] limits notrap, terminates, noalloc, stack 4_096 {
@@ -491,8 +738,9 @@ pkg fn Scheduler.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) 
         return 0
     }
     let calibrating = state.calibrating.get(usize.widen(cpu))
+    let terms = state.terms(t, executor: task.executor)
     let switched = lock.with(t, body: fn(mut current: Cpu) -> Switched limits notrap, terminates, noalloc {
-        let slice = mut current.switch_to(task, now_ns: now)
+        let slice = mut current.switch_to(task, terms, now_ns: now)
         return Switched(slice: slice, wanted: mut current.prefer(preferences), calibrating: calibrating.is_some() and mut current.calibration_due(now_ns: now))
     })
     match switched.wanted {
@@ -600,8 +848,20 @@ fn Cpu.exit_bound(self, now_ns: u64, until_ns: Option[u64]) -> Option[u64] limit
         Some(rest) => Some(rest / 2)
         None => None
     }
-    return least(half, right: self.tolerance_ns)
+    return least(half, right: self.tolerance())
 } Cpu.exit_bound
+
+/// The CPU's latency tolerance: the least slack of the reservations it runs, `None` when it runs none.
+fn Cpu.tolerance(self) -> Option[u64] limits notrap, terminates, noalloc {
+    var tolerance: Option[u64] = None
+    for held in self.reserved {
+        if held.id != 0 {
+            let slack = held.period_ns.saturating_sub(held.runtime_ns)
+            tolerance = Some(tolerance.value_or(slack).min(slack))
+        }
+    }
+    return tolerance
+} Cpu.tolerance
 
 /// The idle period the CPU predicts at `now_ns`: the time to its earliest timer, `until_ns`, or, when shorter, the mean of its last idle periods; `None` when it knows neither.
 fn Cpu.predicted(self, now_ns: u64, until_ns: Option[u64]) -> Option[u64] limits notrap, terminates, noalloc {
@@ -653,7 +913,7 @@ fn deepest(states: Array[Option[IdleState], power::MOST_IDLE_STATES], below: Opt
     return chosen
 } deepest
 
-/// Charges the running work for the time since it started or was last charged: to the CPU's time of its class, and `normal` and `background` work to its account's virtual runtime.
+/// Charges the running work for the time since it started or was last charged: to the CPU's time of its class, `latency` work to its reservation's runtime, and `normal` and `background` work to its account's virtual runtime.
 fn Cpu.charge(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     if not self.running.active {
         return
@@ -661,6 +921,15 @@ fn Cpu.charge(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     let ran = now_ns.saturating_sub(self.running.since_ns)
     self.running.since_ns = now_ns
     self.times = self.times.charged(self.running.class, ns: ran)
+    if self.running.reservation != 0 {
+        let reservation = self.running.reservation
+        for held in mut self.reserved {
+            if held.id == reservation {
+                held = held.rolled(now_ns)
+                held.used_ns = held.used_ns.saturating_add(ran)
+            }
+        }
+    }
     if self.running.class != NORMAL and self.running.class != BACKGROUND {
         return
     }
@@ -673,11 +942,11 @@ fn Cpu.charge(mut self, now_ns: u64) limits notrap, terminates, noalloc {
     }
 } Cpu.charge
 
-/// Adds `task` to this CPU's queue at `now_ns` and gives its key: `latency` work by deadline, `normal` and `background` work by its account's virtual deadline, the core's work in the order it arrives.
-fn Cpu.enqueue(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, terminates, noalloc {
+/// Adds `task`, of an account under `terms`, to this CPU's queue at `now_ns` and gives its key: `latency` work with runtime left in its reservation's period by its deadline, or the period's end without one, `normal` and `background` work, and `latency` work without runtime left, by its account's virtual deadline, the core's work in the order it arrives.
+fn Cpu.enqueue(mut self, task: hw::TaskView, terms: Option[Terms], now_ns: u64) -> u64 limits notrap, terminates, noalloc {
     self.queued = self.queued.saturating_add(1)
     self.idle = false
-    let class = task.share.class
+    let class = class_of(task, terms)
     match class_index(class) {
         Some(index) => {
             self.classes[index % 3] = self.classes[index % 3].saturating_add(1)
@@ -688,46 +957,100 @@ fn Cpu.enqueue(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, 
     if binds(class) {
         self.bound = self.bound.saturating_add(1)
     }
-    if class == LATENCY {
-        return key(class, value: task.deadline_ns.value_or(now_ns))
+    let group = match terms {
+        Some(held) => held.group
+        None => 0
     }
-    if class == NORMAL or class == BACKGROUND {
-        let start = mut self.ready_entity(task.executor)
-        return key(class, value: start.saturating_add(virtual_of(SLICE_NS, weight: u64.widen(task.share.weight))))
+    if class == LATENCY {
+        let reserved = mut self.reservation(reserved_id(terms), now_ns)
+        if reserved.used_ns < reserved.runtime_ns {
+            return key(class, value: task.deadline_ns.value_or(reserved.since_ns.saturating_add(reserved.period_ns)))
+        }
+    }
+    if class == NORMAL or class == BACKGROUND or class == LATENCY {
+        let start = mut self.ready_entity(task.executor, group)
+        var ranked = class
+        if class == LATENCY {
+            ranked = NORMAL
+        }
+        return key(ranked, value: start.saturating_add(virtual_of(SLICE_NS, weight: self.weight_of(task, group))))
     }
     return key(class, value: 0)
 } Cpu.enqueue
 
-/// The virtual runtime of account `executor` on this CPU, counting one more ready task of it: an account this CPU keeps none for starts at the CPU's virtual time, in the place of one without ready work when the CPU keeps as many as it can.
-fn Cpu.ready_entity(mut self, executor: u64) -> u64 limits notrap, terminates, noalloc {
+/// The reservation numbered `id` this CPU runs, as of `now_ns`; one without runtime when it runs none of that number.
+fn Cpu.reservation(mut self, id: u64, now_ns: u64) -> Reserved limits notrap, terminates, noalloc {
+    if id != 0 {
+        for held in mut self.reserved {
+            if held.id == id {
+                held = held.rolled(now_ns)
+                return held
+            }
+        }
+    }
+    return Reserved(id: 0, runtime_ns: 0, period_ns: 0, since_ns: now_ns, used_ns: 0)
+} Cpu.reservation
+
+/// The number of the reservation the account of `terms` draws on, 0 for none.
+fn reserved_id(terms: Option[Terms]) -> u64 {
+    return match terms {
+        Some(held) => held.reservation
+        None => 0
+    }
+} reserved_id
+
+/// The weight of `task` on this CPU: its share's, divided equally among the entities of its account's group `group` with ready or running work here, its own counted.
+fn Cpu.weight_of(self, task: hw::TaskView, group: u64) -> u64 limits notrap, terminates, noalloc {
+    let weight = u64.widen(task.share.weight)
+    if group == 0 {
+        return weight
+    }
+    var sharing: u64 = 0
+    var counted = false
+    for entity in self.entities {
+        let active = entity.ready > 0 or (self.running.active and self.running.executor == entity.executor)
+        if entity.group == group and active {
+            sharing = sharing.saturating_add(1)
+            if entity.executor == task.executor {
+                counted = true
+            }
+        }
+    }
+    if not counted {
+        sharing = sharing.saturating_add(1)
+    }
+    return (weight / sharing.max(1)).max(1)
+} Cpu.weight_of
+
+/// The virtual runtime of account `executor`, of the group `group`, on this CPU, counting one more ready task of it: an account this CPU keeps none for starts at the CPU's virtual time, in the place of one without ready work when the CPU keeps as many as it can.
+fn Cpu.ready_entity(mut self, executor: u64, group: u64) -> u64 limits notrap, terminates, noalloc {
     let floor = self.virtual_ns
     for entity in mut self.entities {
         if entity.executor == executor {
             entity.ready = entity.ready.saturating_add(1)
+            entity.group = group
             if entity.virtual_ns < floor {
                 entity.virtual_ns = floor
             }
             return entity.virtual_ns
         }
     }
-    let fresh = Entity(executor: executor, virtual_ns: floor, ready: 1)
+    let fresh = Entity(executor: executor, virtual_ns: floor, ready: 1, group: group)
     if (attempt mut self.entities.try_push(fresh)).is_ok() {
         return floor
     }
     let running = self.running
     for entity in mut self.entities {
         if entity.ready == 0 and not (running.active and running.executor == entity.executor) {
-            entity.executor = executor
-            entity.virtual_ns = floor
-            entity.ready = 1
+            entity = fresh
             return floor
         }
     }
     return floor
 } Cpu.ready_entity
 
-/// Switches this CPU to `task` at `now_ns` and gives its slice: `normal` and `background` work gets one while other work waits on the CPU, other work none. A rest it leaves counts as idle time and a wakeup.
-fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap, terminates, noalloc {
+/// Switches this CPU to `task`, of an account under `terms`, at `now_ns` and gives its slice while other work waits on the CPU: `latency` work with runtime left in its reservation's period the rest of that runtime, then running as `normal`, `normal` and `background` work a slice, other work none. A rest it leaves counts as idle time and a wakeup.
+fn Cpu.switch_to(mut self, task: hw::TaskView, terms: Option[Terms], now_ns: u64) -> u64 limits notrap, terminates, noalloc {
     mut self.charge(now_ns)
     if self.resting {
         mut self.end_period(now_ns)
@@ -737,7 +1060,7 @@ fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap
         self.wakeups = self.wakeups.saturating_add(1)
     }
     self.queued = self.queued.saturating_sub(1)
-    let class = task.share.class
+    let class = class_of(task, terms)
     if binds(class) {
         self.bound = self.bound.saturating_sub(1)
     }
@@ -749,7 +1072,23 @@ fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap
         }
     }
     self.idle = false
-    self.running = Running(executor: task.executor, weight: u64.widen(task.share.weight), class: class, since_ns: now_ns, active: true)
+    var running = class
+    var reservation: u64 = 0
+    var left: u64 = 0
+    if class == LATENCY {
+        let reserved = mut self.reservation(reserved_id(terms), now_ns)
+        left = reserved.runtime_ns.saturating_sub(reserved.used_ns)
+        if left > 0 {
+            reservation = reserved.id
+        } else {
+            running = NORMAL
+        }
+    }
+    let group = match terms {
+        Some(held) => held.group
+        None => 0
+    }
+    self.running = Running(executor: task.executor, weight: self.weight_of(task, group), class: running, reservation: reservation, since_ns: now_ns, active: true)
     var floor = self.virtual_ns
     for entity in mut self.entities {
         if entity.executor == task.executor {
@@ -760,7 +1099,13 @@ fn Cpu.switch_to(mut self, task: hw::TaskView, now_ns: u64) -> u64 limits notrap
         }
     }
     self.virtual_ns = floor
-    if (class == NORMAL or class == BACKGROUND) and self.queued > 0 {
+    if self.queued == 0 {
+        return 0
+    }
+    if running == LATENCY {
+        return left
+    }
+    if running == NORMAL or running == BACKGROUND {
         return SLICE_NS
     }
     return 0
@@ -837,22 +1182,29 @@ fn view(executor: u64, class: u8, weight: u32) -> hw::TaskView {
     return hw::TaskView(task: executor, executor: executor, share: task::Share(weight: weight, class: class, reserve_ppm: 0), last_cpu: None, ran_ns: 0, deadline_ns: None)
 } view
 
-fn idle_cpu() -> Cpu {
-    var cpu = Cpu.fresh()
+fn idle_cpu(alloc: mem::Alloc) -> Cpu {
+    var cpu = Cpu.fresh(alloc)
     cpu.started = true
     cpu.idle = true
     return cpu
 } idle_cpu
 
+/// The terms of an account of executor `executor` drawing on reservation 1 of CPU 0.
+fn reserved_terms(executor: u64) -> Option[Terms] = Some(Terms(executor: executor, reservation: 1, cpu: 0, group: 0, wakeups: 0))
+
+/// Reservation 1: `runtime_ns` of every 1 ms, its first period starting at 0.
+fn reservation_of(runtime_ns: u64) -> Reserved = Reserved(id: 1, runtime_ns: runtime_ns, period_ns: 1_000_000, since_ns: 0, used_ns: 0)
+
 /// A CPU charges each class the time it ran work of it and counts its rests as idle time, each rest it leaves a wakeup, until the moment it is read.
 test cpus_count_their_time_by_class_and_their_wakeups for Cpu.reading {
-    var cpu = idle_cpu()
-    discard mut cpu.switch_to(view(executor: 1, class: NORMAL, weight: 100), now_ns: 0)
-    discard mut cpu.switch_to(view(executor: 2, class: LATENCY, weight: 100), now_ns: 30)
-    discard mut cpu.switch_to(view(executor: 0, class: CORE, weight: 1), now_ns: 50)
+    var cpu = idle_cpu(testing::world().alloc)
+    mut cpu.reserved.push(reservation_of(1_000))
+    discard mut cpu.switch_to(view(executor: 1, class: NORMAL, weight: 100), terms: None, now_ns: 0)
+    discard mut cpu.switch_to(view(executor: 2, class: LATENCY, weight: 100), terms: reserved_terms(2), now_ns: 30)
+    discard mut cpu.switch_to(view(executor: 0, class: CORE, weight: 1), terms: None, now_ns: 50)
     mut cpu.go_idle(now_ns: 60)
     mut cpu.go_idle(now_ns: 80)
-    discard mut cpu.switch_to(view(executor: 3, class: BACKGROUND, weight: 100), now_ns: 100)
+    discard mut cpu.switch_to(view(executor: 3, class: BACKGROUND, weight: 100), terms: None, now_ns: 100)
     let running = cpu.reading(now_ns: 110)
     expect running.times == Times(normal: 30, background: 10, latency: 20, core: 10, idle: 40)
     expect running.wakeups == 1 and not running.resting
@@ -872,12 +1224,12 @@ test classes_order_every_queue for key {
 
 /// Two `normal` accounts weighing 300 and 100 share a CPU, each running a slice whenever its key is the queue's smallest, the earlier queued first among equal keys: they run in the ratio of their weights.
 test weights_divide_a_cpu for Cpu.enqueue {
-    var cpu = idle_cpu()
+    var cpu = idle_cpu(testing::world().alloc)
     let heavy = view(executor: 1, class: NORMAL, weight: 300)
     let light = view(executor: 2, class: NORMAL, weight: 100)
     var now: u64 = 0
-    var heavy_key = mut cpu.enqueue(heavy, now_ns: now)
-    var light_key = mut cpu.enqueue(light, now_ns: now)
+    var heavy_key = mut cpu.enqueue(heavy, terms: None, now_ns: now)
+    var light_key = mut cpu.enqueue(light, terms: None, now_ns: now)
     var heavy_first = false
     var heavy_runs: u32 = 0
     var light_runs: u32 = 0
@@ -887,16 +1239,16 @@ test weights_divide_a_cpu for Cpu.enqueue {
         if pick_heavy {
             running = heavy
         }
-        discard mut cpu.switch_to(running, now_ns: now)
+        discard mut cpu.switch_to(running, terms: None, now_ns: now)
         now += SLICE_NS
         mut cpu.charge(now_ns: now)
         if pick_heavy {
             heavy_runs += 1
-            heavy_key = mut cpu.enqueue(heavy, now_ns: now)
+            heavy_key = mut cpu.enqueue(heavy, terms: None, now_ns: now)
             heavy_first = false
         } else {
             light_runs += 1
-            light_key = mut cpu.enqueue(light, now_ns: now)
+            light_key = mut cpu.enqueue(light, terms: None, now_ns: now)
             heavy_first = true
         }
     }
@@ -905,16 +1257,16 @@ test weights_divide_a_cpu for Cpu.enqueue {
 } weights_divide_a_cpu
 
 test slices_end_only_shared_work for Cpu.switch_to {
-    var cpu = idle_cpu()
+    var cpu = idle_cpu(testing::world().alloc)
     let alone = view(executor: 1, class: NORMAL, weight: 100)
-    discard mut cpu.enqueue(alone, now_ns: 0)
-    let solo = mut cpu.switch_to(alone, now_ns: 0)
+    discard mut cpu.enqueue(alone, terms: None, now_ns: 0)
+    let solo = mut cpu.switch_to(alone, terms: None, now_ns: 0)
     expect solo == 0
-    discard mut cpu.enqueue(alone, now_ns: 10)
-    discard mut cpu.enqueue(view(executor: 2, class: BACKGROUND, weight: 100), now_ns: 10)
-    let shared = mut cpu.switch_to(alone, now_ns: 10)
+    discard mut cpu.enqueue(alone, terms: None, now_ns: 10)
+    discard mut cpu.enqueue(view(executor: 2, class: BACKGROUND, weight: 100), terms: None, now_ns: 10)
+    let shared = mut cpu.switch_to(alone, terms: None, now_ns: 10)
     expect shared == SLICE_NS
-    let core_work = mut cpu.switch_to(view(executor: 0, class: CORE, weight: 1), now_ns: 20)
+    let core_work = mut cpu.switch_to(view(executor: 0, class: CORE, weight: 1), terms: None, now_ns: 20)
     expect core_work == 0
     mut cpu.go_idle(now_ns: 30)
     expect cpu.idle and cpu.queued == 0
@@ -973,10 +1325,10 @@ fn steals(policy: Scheduler) -> Array[Option[hw::Steal], 3] {
             discard policy.idle(t, cpu, until_ns: None)
         }
         let state = policy.state.contents()
-        discard state.enqueue(t, cpu: 0, task: view(executor: 5, class: NORMAL, weight: 100))
-        discard state.enqueue(t, cpu: 0, task: view(executor: 6, class: NORMAL, weight: 100))
-        discard state.enqueue(t, cpu: 2, task: view(executor: 7, class: NORMAL, weight: 100))
-        discard state.enqueue(t, cpu: 2, task: hw::TaskView(task: 8, executor: 8, share: pinned_share(2), last_cpu: None, ran_ns: 0, deadline_ns: None))
+        discard state.enqueue(t, cpu: 0, task: view(executor: 5, class: NORMAL, weight: 100), terms: None)
+        discard state.enqueue(t, cpu: 0, task: view(executor: 6, class: NORMAL, weight: 100), terms: None)
+        discard state.enqueue(t, cpu: 2, task: view(executor: 7, class: NORMAL, weight: 100), terms: None)
+        discard state.enqueue(t, cpu: 2, task: hw::TaskView(task: 8, executor: 8, share: pinned_share(2), last_cpu: None, ran_ns: 0, deadline_ns: None), terms: None)
         var victims = Array[Option[hw::Steal], 3].filled(None)
         victims[0] = policy.steal(t, cpu: 3, round: 0)
         victims[1] = policy.steal(t, cpu: 1, round: 0)
@@ -1032,17 +1384,17 @@ test idle_cpus_enter_the_deepest_state_their_rest_and_tolerance_allow for Schedu
     let near = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
         return policy.idle(t, cpu: 0, until_ns: Some(state.contents().now() + 2_000))
     })
-    state.contents().tolerate(0, tolerance_ns: Some(1_000))
+    state.contents().reserve(id: 1, cpu: 0, runtime_ns: 9_000, period_ns: 10_000)
     let tolerated = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
         return policy.idle(t, cpu: 0, until_ns: Some(state.contents().now() + 1_000_000))
     })
     expect far == hw::Idle.Mwait(0x20) and near == hw::Idle.Halt and tolerated == hw::Idle.Halt
     expect shown == Some(0x20)
-    var woken = idle_cpu()
-    var returning = idle_cpu()
+    var woken = idle_cpu(world.alloc)
+    var returning = idle_cpu(world.alloc)
     for at in 0u64..<8 {
         mut woken.go_idle(now_ns: at * 2_000)
-        discard mut woken.switch_to(view(executor: 1, class: NORMAL, weight: 100), now_ns: at * 2_000 + 1_500)
+        discard mut woken.switch_to(view(executor: 1, class: NORMAL, weight: 100), terms: None, now_ns: at * 2_000 + 1_500)
         mut returning.go_idle(now_ns: at * 1_500)
     }
     mut returning.go_idle(now_ns: 12_000)
@@ -1056,25 +1408,26 @@ test cpus_want_the_lowest_preference_of_the_classes_they_run for Cpu.prefer {
     chosen[1] = 128
     chosen[2] = 255
     let preferences = pack(chosen)
-    var cpu = idle_cpu()
-    discard mut cpu.enqueue(view(executor: 1, class: NORMAL, weight: 100), now_ns: 0)
-    discard mut cpu.switch_to(view(executor: 1, class: NORMAL, weight: 100), now_ns: 0)
+    var cpu = idle_cpu(testing::world().alloc)
+    mut cpu.reserved.push(reservation_of(1_000))
+    discard mut cpu.enqueue(view(executor: 1, class: NORMAL, weight: 100), terms: None, now_ns: 0)
+    discard mut cpu.switch_to(view(executor: 1, class: NORMAL, weight: 100), terms: None, now_ns: 0)
     let running_normal = mut cpu.prefer(preferences)
     let again = mut cpu.prefer(preferences)
-    discard mut cpu.enqueue(view(executor: 2, class: LATENCY, weight: 100), now_ns: 10)
+    discard mut cpu.enqueue(view(executor: 2, class: LATENCY, weight: 100), terms: reserved_terms(2), now_ns: 10)
     let queued = mut cpu.prefer(preferences)
-    discard mut cpu.switch_to(view(executor: 2, class: LATENCY, weight: 100), now_ns: 20)
+    discard mut cpu.switch_to(view(executor: 2, class: LATENCY, weight: 100), terms: reserved_terms(2), now_ns: 20)
     let running_latency = mut cpu.prefer(preferences)
     mut cpu.go_idle(now_ns: 30)
-    discard mut cpu.enqueue(view(executor: 3, class: BACKGROUND, weight: 100), now_ns: 40)
-    discard mut cpu.switch_to(view(executor: 3, class: BACKGROUND, weight: 100), now_ns: 40)
+    discard mut cpu.enqueue(view(executor: 3, class: BACKGROUND, weight: 100), terms: None, now_ns: 40)
+    discard mut cpu.switch_to(view(executor: 3, class: BACKGROUND, weight: 100), terms: None, now_ns: 40)
     let running_background = mut cpu.prefer(preferences)
     expect running_normal == Some(128) and again.is_none() and queued == Some(0) and running_latency.is_none() and running_background == Some(255)
 } cpus_want_the_lowest_preference_of_the_classes_they_run
 
 /// A running CPU asks for a calibration once 10 ms passed since it last asked.
 test running_cpus_ask_for_calibrations_every_10_ms for Cpu.calibration_due {
-    var cpu = idle_cpu()
+    var cpu = idle_cpu(testing::world().alloc)
     let once = mut cpu.calibration_due(now_ns: 10_000_000)
     let soon = mut cpu.calibration_due(now_ns: 15_000_000)
     let later = mut cpu.calibration_due(now_ns: 20_000_000)
@@ -1098,3 +1451,59 @@ test calibrations_take_over_from_the_power_settings for State.calibrate {
     let asking = state.calibrated_by(0)
     expect configured == 3_000 and calibrated == 9_000 and asking.is_some()
 } calibrations_take_over_from_the_power_settings
+
+/// Reserved `latency` work queues ahead of `normal` work while its period has runtime left: it runs that runtime, then as `normal` work, and as `latency` work again from its next period. Work of a `latency` account drawing on no reservation runs as `normal` work.
+test reservations_run_their_runtime_on_their_cpu_each_period for Cpu.switch_to {
+    var cpu = idle_cpu(testing::world().alloc)
+    mut cpu.reserved.push(reservation_of(300_000))
+    let reserved = view(executor: 2, class: LATENCY, weight: 100)
+    let other = view(executor: 1, class: NORMAL, weight: 100)
+    let normal_key = mut cpu.enqueue(other, terms: None, now_ns: 0)
+    let latency_key = mut cpu.enqueue(reserved, terms: reserved_terms(2), now_ns: 0)
+    let slice = mut cpu.switch_to(reserved, terms: reserved_terms(2), now_ns: 0)
+    mut cpu.charge(now_ns: 300_000)
+    let spent_key = mut cpu.enqueue(reserved, terms: reserved_terms(2), now_ns: 300_000)
+    let next_key = mut cpu.enqueue(reserved, terms: reserved_terms(2), now_ns: 1_000_000)
+    let unreserved = mut cpu.enqueue(reserved, terms: None, now_ns: 1_000_000)
+    expect latency_key < normal_key and slice == 300_000
+    expect spent_key >= normal_key and spent_key < key(BACKGROUND, value: 0) and next_key < normal_key
+    expect unreserved >= key(NORMAL, value: 0) and unreserved < key(BACKGROUND, value: 0)
+    expect cpu.times.latency == 300_000
+} reservations_run_their_runtime_on_their_cpu_each_period
+
+/// Two sessions of a principal sharing a CPU divide their group's weight there: each runs as an account of half its weight beside one of the whole.
+test groups_divide_their_weight_on_each_cpu for Cpu.weight_of {
+    var cpu = idle_cpu(testing::world().alloc)
+    let grouped = Some(Terms(executor: 1, reservation: 0, cpu: 0, group: 7, wakeups: 0))
+    let other = Some(Terms(executor: 2, reservation: 0, cpu: 0, group: 7, wakeups: 0))
+    discard mut cpu.enqueue(view(executor: 1, class: NORMAL, weight: 100), terms: grouped, now_ns: 0)
+    let alone = cpu.weight_of(view(executor: 1, class: NORMAL, weight: 100), group: 7)
+    discard mut cpu.enqueue(view(executor: 2, class: NORMAL, weight: 100), terms: other, now_ns: 0)
+    let shared = cpu.weight_of(view(executor: 1, class: NORMAL, weight: 100), group: 7)
+    let ungrouped = cpu.weight_of(view(executor: 3, class: NORMAL, weight: 100), group: 0)
+    expect alone == 100 and shared == 50 and ungrouped == 100
+} groups_divide_their_weight_on_each_cpu
+
+/// The policy counts each wake of a bound account's work, places reserved `latency` work on its reservation's CPU, bound there and ahead of core work, finding its terms and its reservation after those of 20 other accounts and reservations, and forgets an unbound account.
+test bound_accounts_count_their_wakes_and_reserved_ones_wake_on_their_cpu for Scheduler.place {
+    let world = testing::world()
+    let policy = four_cpus(world.clock, alloc: world.alloc)
+    let state = policy.state.share()
+    for other in 10u64..<30 {
+        state.contents().reserve(id: other, cpu: 3, runtime_ns: 1_000, period_ns: 1_000_000)
+        state.contents().bind(executor: other, reservation: 0, cpu: 0, group: 0)
+    }
+    state.contents().reserve(id: 9, cpu: 3, runtime_ns: 500_000, period_ns: 1_000_000)
+    state.contents().bind(executor: 5, reservation: 9, cpu: 3, group: 0)
+    var task = view(executor: 5, class: LATENCY, weight: 100)
+    task.last_cpu = Some(0)
+    let placed = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Placement limits notrap, terminates {
+        discard policy.place(t, task: view(executor: 5, class: LATENCY, weight: 100))
+        return policy.place(t, task)
+    })
+    let counted = state.contents().wakeups(5)
+    state.contents().unbind(5)
+    let forgotten = state.contents().wakeups(5)
+    expect placed.cpu == 3 and placed.bound and placed.key < key(CORE, value: 0)
+    expect counted == 2 and forgotten == 0
+} bound_accounts_count_their_wakes_and_reserved_ones_wake_on_their_cpu

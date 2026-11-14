@@ -1,6 +1,6 @@
 # 0081. CPU reservations
 
-Status: accepted
+Status: superseded by 0102
 
 ## Context
 
