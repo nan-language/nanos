@@ -1,6 +1,6 @@
 # 0079. Memory pressure
 
-Status: accepted
+Status: superseded by 0098
 
 ## Context
 

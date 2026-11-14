@@ -23,9 +23,10 @@ pub open struct Env derives Send {
     waiting: mem::List[Queued]
 } Env
 
-/// The requests handed to the sequencer, and the signal its waits end on.
+/// The requests handed to the sequencer, whether memory pressure asks it to drop the blob pieces no mapping holds, and the signal its waits end on.
 struct Handoff {
     queued: mem::Shared[hw::SpinLock[mem::Bounded[Queued, HANDED]]]
+    relieving: mem::Shared[core::atomic::AtomicBool]
     signal: mem::Shared[hw::Signal[Unit]]
 } Handoff
 
@@ -94,6 +95,8 @@ impl Service: sys::Component[Env, Store]
 
 impl Service: sys::Resume[Env, Store]
 
+impl Service: sys::Pressure[Env, Store]
+
 /// The Env of a store on the volume behind `volume`, committing `genesis` and `boot` on an empty one.
 pub fn Env.of(
     volume: os::Port[devices::Block],
@@ -108,7 +111,7 @@ pub fn Env.of(
     keys: Option[os::Port[Sealing]],
     alloc: mem::Alloc,
     ) -> Env {
-    let handoff = Handoff(queued: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Queued, HANDED].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
+    let handoff = Handoff(queued: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Queued, HANDED].empty()), alloc), relieving: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
     return Env(volume: volume, genesis: Some(take genesis), boot: Some(take boot), clock: clock, wall: wall, random: random, reporter: reporter, live: live, devices: devices, keys: keys, alloc: alloc, handoff: take handoff, waiting: mem::List.empty(alloc))
 } Env.of
 
@@ -148,7 +151,16 @@ fn Env.feed(mut self) {
     }
 } Env.feed
 
-/// The hand-off's requests, oldest first, waiting until there are some.
+/// Asks the sequencer to drop the blob pieces no mapping holds.
+fn Handoff.relieve(self) {
+    self.relieving.contents().store(true)
+    let signal = self.signal.share()
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        signal.contents().post(t, value: Unit)
+    })
+} Handoff.relieve
+
+/// The hand-off's requests, oldest first, waiting until there are some or memory pressure asks for relief.
 fn Handoff.take_all(self, alloc: mem::Alloc) -> mem::List[Queued] fails task::Cancelled uses wait {
     loop {
         var taken = mem::List[Queued].empty(alloc)
@@ -164,7 +176,7 @@ fn Handoff.take_all(self, alloc: mem::Alloc) -> mem::List[Queued] fails task::Ca
             }
             mut taken.insert(0, value: take queued_request)
         }
-        if taken.len() > 0 {
+        if taken.len() > 0 or self.relieving.contents().load() {
             return taken
         }
         try await self.signal.contents().wait()
@@ -172,7 +184,7 @@ fn Handoff.take_all(self, alloc: mem::Alloc) -> mem::List[Queued] fails task::Ca
 } Handoff.take_all
 
 fn Handoff.share(self) -> Handoff {
-    return Handoff(queued: self.queued.share(), signal: self.signal.share())
+    return Handoff(queued: self.queued.share(), relieving: self.relieving.share(), signal: self.signal.share())
 } Handoff.share
 
 pub fn Service.start(mut env: Env) -> Service = Service(ready: false, failure: None, next_subscription: 1)
@@ -194,6 +206,11 @@ pub fn Service.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx:
         try await sequence(world, take genesis, take boot, take handoff, out)
     })
 } Service.resume
+
+/// At each rise of its pool's pressure level, has the sequencer drop the blob pieces no mapping holds.
+pub fn Service.pressure(mut self, level: u8, mut env: Env, mut cx: sys::Cx[Store]) {
+    env.handoff.relieve()
+} Service.pressure
 
 fn Service.mounted(mut self, take failure: Option[Failure], mut env: Env, mut cx: sys::Cx[Store]) {
     self.ready = failure.is_none()
