@@ -59,14 +59,14 @@ pkg struct Place derives Copy, Eq {
     pkg node: u32
 } Place
 
-/// What the policy and the core's tasks share: each CPU's state behind its lock, where each CPU lies, the running CPU's number, the clock, the MWAIT states idle CPUs may enter, none without MWAIT, the power of a running CPU in mW, which charges the energy of CPU time, and whether a calibration set it, the energy-performance preferences of `latency`, `normal` and `background` work in bits 7:0, 15:8 and 23:16, on a machine with HWP the signal through which each CPU posts the preference it wants, and on a machine with RAPL the one through which each running CPU asks for a calibration.
+/// What the policy and the core's tasks share: each CPU's state behind its lock, where each CPU lies, the running CPU's number, the clock, whether the CPUs have MWAIT, the power of a running CPU in mW, which charges the energy of CPU time, and whether a calibration set it, the energy-performance preferences of `latency`, `normal` and `background` work in bits 7:0, 15:8 and 23:16, on a machine with HWP the signal through which each CPU posts the preference it wants, and on a machine with RAPL the one through which each running CPU asks for a calibration.
 pkg struct State {
     cpus: mem::List[hw::SpinLock[Cpu]]
     places: mem::List[Place]
     here: hw::PerCpu[u32]
     clock: sys::Clock
     started: core::atomic::AtomicBool
-    idle_states: mem::List[IdleState]
+    mwait: bool
     pkg busy_mw: mem::Shared[core::atomic::AtomicU64]
     calibrated: core::atomic::AtomicBool
     pkg preferences: core::atomic::AtomicU32
@@ -79,7 +79,7 @@ pkg struct Scheduler {
     state: mem::Shared[State]
 } Scheduler
 
-/// A CPU's run queue as the policy sees it, with the time it spent, whether it rests, since when and in which MWAIT state, none for HLT, the rests it left, the lengths of its last idle periods, each from its entry into an idle state to its return, the next taking slot `next_period`, the start of the one it is in, its latency tolerance, none when unbounded, the tasks of `latency`, `normal` and `background` work queued on it, the energy-performance preference it last wanted, and when it last asked for a calibration.
+/// A CPU's run queue as the policy sees it, with the time it spent, whether it rests, since when and in which MWAIT state, none for HLT, the rests it left, the lengths of its last idle periods, each from its entry into an idle state to its return, the next taking slot `next_period`, the start of the one it is in, its latency tolerance, none when unbounded, the MWAIT states it may enter, the tasks of `latency`, `normal` and `background` work queued on it, the energy-performance preference it last wanted, and when it last asked for a calibration.
 struct Cpu {
     started: bool
     idle: bool
@@ -97,6 +97,7 @@ struct Cpu {
     next_period: usize
     period_ns: u64
     tolerance_ns: Option[u64]
+    idle_states: Array[Option[IdleState], power::MOST_IDLE_STATES]
     classes: Array[u32, 3]
     preference: Option[u8]
     calibrated_ns: u64
@@ -179,11 +180,11 @@ fn virtual_of(ns: u64, weight: u64) -> u64 {
     return ns.saturating_mul(UNIT_WEIGHT) / weight
 } virtual_of
 
-/// The state for `places.len()` CPUs, every CPU but the boot CPU not yet started, idle CPUs entering `idle_states` or halting, a running CPU's power and the preferences those of the power settings by default, each CPU posting the preference it wants when `hwp`.
+/// The state for `places.len()` CPUs, every CPU but the boot CPU not yet started, idle CPUs halting until the power settings give MWAIT states on a machine with `mwait`, a running CPU's power and the preferences those of the power settings by default, each CPU posting the preference it wants when `hwp`.
 pkg fn State.of(
     take places: mem::List[Place],
     clock: sys::Clock,
-    take idle_states: mem::List[IdleState],
+    mwait: bool,
     hwp: bool,
     rapl: bool,
     alloc: mem::Alloc,
@@ -210,15 +211,25 @@ pkg fn State.of(
     chosen[1] = defaults.preference_normal
     chosen[2] = defaults.preference_background
     let preferences = core::atomic::AtomicU32.of(pack(chosen))
-    return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), idle_states: take idle_states, busy_mw: take busy_mw, calibrated: core::atomic::AtomicBool.of(false), preferences: take preferences, wanting: take wanting, calibrating: take calibrating)
+    return State(cpus: take cpus, places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), mwait: mwait, busy_mw: take busy_mw, calibrated: core::atomic::AtomicBool.of(false), preferences: take preferences, wanting: take wanting, calibrating: take calibrating)
 } State.of
 
-/// Applies the power settings: a running CPU's power `busy_mw`, unless a calibration set it, and `preferences`, those of `latency`, `normal` and `background` work.
-pkg fn State.apply(self, busy_mw: u64, preferences: Array[u8, 3]) {
+/// Applies the power settings: a running CPU's power `busy_mw`, unless a calibration set it, `preferences`, those of `latency`, `normal` and `background` work, and on a machine with MWAIT the idle states `idle_states`.
+pkg fn State.apply(self, busy_mw: u64, preferences: Array[u8, 3], idle_states: Array[Option[IdleState], power::MOST_IDLE_STATES]) {
     if not self.calibrated.load() {
         self.busy_mw.contents().store(busy_mw)
     }
     self.preferences.store(pack(preferences))
+    if not self.mwait {
+        return
+    }
+    for lock in self.cpus {
+        hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+            lock.with(t, body: fn(mut state: Cpu) limits notrap, terminates, noalloc {
+                state.idle_states = idle_states
+            })
+        })
+    }
 } State.apply
 
 /// Takes `estimate_mw` as a calibration of the power of a running CPU: the power becomes it at the first, then moves an eighth of the way to each.
@@ -255,7 +266,7 @@ fn pack(preferences: Array[u8, 3]) -> u32 = u32.widen(preferences[0]) | (u32.wid
 /// A CPU not started, running nothing.
 fn Cpu.fresh() -> Cpu {
     let nothing = Running(executor: 0, weight: 1, class: CORE, since_ns: 0, active: false)
-    return Cpu(started: false, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, resting_in: None, wakeups: 0, periods: Array[u64, PERIODS].filled(0), next_period: 0, period_ns: 0, tolerance_ns: None, classes: Array[u32, 3].filled(0), preference: None, calibrated_ns: 0)
+    return Cpu(started: false, idle: false, queued: 0, bound: 0, virtual_ns: 0, running: nothing, entities: mem::Bounded.empty(), times: Times.none(), resting: false, rested_ns: 0, resting_in: None, wakeups: 0, periods: Array[u64, PERIODS].filled(0), next_period: 0, period_ns: 0, tolerance_ns: None, idle_states: Array[Option[IdleState], power::MOST_IDLE_STATES].filled(None), classes: Array[u32, 3].filled(0), preference: None, calibrated_ns: 0)
 } Cpu.fresh
 
 /// Marks CPU `cpu` started: it runs on the shared space with its features enabled, so work may go to it.
@@ -571,7 +582,7 @@ pkg fn Scheduler.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]
     }
     let entered = lock.with(t, body: fn(mut current: Cpu) -> Option[u8] limits notrap, terminates, noalloc {
         mut current.go_idle(now_ns: now)
-        current.resting_in = match deepest(state.idle_states.view(), below: current.exit_bound(now_ns: now, until_ns)) {
+        current.resting_in = match deepest(current.idle_states, below: current.exit_bound(now_ns: now, until_ns)) {
             Some(chosen) => Some(chosen.hint)
             None => None
         }
@@ -621,9 +632,12 @@ fn least(left: Option[u64], right: Option[u64]) -> Option[u64] limits notrap, te
 } least
 
 /// The state of `states` with the longest exit latency below `below`, any when it is `None`.
-fn deepest(states: Slice[IdleState], below: Option[u64]) -> Option[IdleState] limits notrap, terminates, noalloc {
+fn deepest(states: Array[Option[IdleState], power::MOST_IDLE_STATES], below: Option[u64]) -> Option[IdleState] limits notrap, terminates, noalloc {
     var chosen: Option[IdleState] = None
-    for state in states {
+    for slot in states {
+        let Some(state) = slot else {
+            continue
+        }
         let fits = match below {
             Some(ns) => state.exit_ns < ns
             None => true
@@ -912,7 +926,7 @@ fn four_cpus(clock: sys::Clock, alloc: mem::Alloc) -> Scheduler {
     for cpu in 0u64..<4 {
         mut places.push(Place(package_id: 0, core: u32.truncate(cpu), cache: cpu / 2, node: 0))
     }
-    let state = mem::Shared.of(State.of(take places, clock, idle_states: mem::List.empty(alloc), hwp: false, rapl: false, alloc), alloc)
+    let state = mem::Shared.of(State.of(take places, clock, mwait: false, hwp: false, rapl: false, alloc), alloc)
     for cpu in 1u32..<4 {
         state.contents().start(cpu)
     }
@@ -1003,9 +1017,10 @@ test idle_cpus_enter_the_deepest_state_their_rest_and_tolerance_allow for Schedu
     let world = testing::world()
     var places = mem::List[Place].empty(world.alloc)
     mut places.push(Place(package_id: 0, core: 0, cache: 0, node: 0))
-    var states = mem::List[IdleState].empty(world.alloc)
-    mut states.push(IdleState(hint: 0x20, exit_ns: 1_000))
-    let state = mem::Shared.of(State.of(take places, clock: world.clock, idle_states: take states, hwp: false, rapl: false, alloc: world.alloc), alloc: world.alloc)
+    let state = mem::Shared.of(State.of(take places, clock: world.clock, mwait: true, hwp: false, rapl: false, alloc: world.alloc), alloc: world.alloc)
+    var states = Array[Option[IdleState], power::MOST_IDLE_STATES].filled(None)
+    states[0] = Some(IdleState(hint: 0x20, exit_ns: 1_000))
+    state.contents().apply(busy_mw: 2_000, preferences: Array[u8, 3].filled(0), idle_states: states)
     let policy = Scheduler.of(state.share())
     let far = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
         return policy.idle(t, cpu: 0, until_ns: Some(state.contents().now() + 1_000_000))
@@ -1071,13 +1086,14 @@ test calibrations_take_over_from_the_power_settings for State.calibrate {
     let world = testing::world()
     var places = mem::List[Place].empty(world.alloc)
     mut places.push(Place(package_id: 0, core: 0, cache: 0, node: 0))
-    let state = State.of(take places, clock: world.clock, idle_states: mem::List.empty(world.alloc), hwp: false, rapl: true, alloc: world.alloc)
+    let state = State.of(take places, clock: world.clock, mwait: false, hwp: false, rapl: true, alloc: world.alloc)
     let preferences = Array[u8, 3].filled(128)
-    state.apply(busy_mw: 3_000, preferences)
+    let halting = Array[Option[IdleState], power::MOST_IDLE_STATES].filled(None)
+    state.apply(busy_mw: 3_000, preferences, idle_states: halting)
     let configured = state.busy_mw.contents().load()
     state.calibrate(8_000)
     state.calibrate(16_000)
-    state.apply(busy_mw: 3_000, preferences)
+    state.apply(busy_mw: 3_000, preferences, idle_states: halting)
     let calibrated = state.busy_mw.contents().load()
     let asking = state.calibrated_by(0)
     expect configured == 3_000 and calibrated == 9_000 and asking.is_some()

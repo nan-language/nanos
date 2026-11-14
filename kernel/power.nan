@@ -178,8 +178,8 @@ fn switch_power(take orders: task::Receiver[power::Switching], cpus: mem::Shared
         let status = match switching {
             power::Switching.Off => OFF
             power::Switching.Reboot => REBOOT
-            power::Switching.Apply(busy_mw: busy_mw, preferences: preferences) => {
-                cpus.contents().apply(busy_mw, preferences)
+            power::Switching.Apply(busy_mw: busy_mw, preferences: preferences, idle_states: idle_states) => {
+                cpus.contents().apply(busy_mw, preferences, idle_states: idle_states_of(idle_states))
                 continue
             }
         }
@@ -189,21 +189,46 @@ fn switch_power(take orders: task::Receiver[power::Switching], cpus: mem::Shared
     }
 } switch_power
 
-/// Applying the power settings sets the power of a running CPU the core charges energy at, and the energy-performance preference of each class.
+/// The idle states the scheduler takes of the power settings' `states`: each hint's low byte, and its exit latency in ns.
+fn idle_states_of(states: Array[Option[power::IdleState], power::MOST_IDLE_STATES]) -> Array[Option[sched::IdleState], power::MOST_IDLE_STATES] {
+    var taken = Array[Option[sched::IdleState], power::MOST_IDLE_STATES].filled(None)
+    for at in 0..<power::MOST_IDLE_STATES {
+        match states[at] {
+            Some(state) => {
+                taken[at] = Some(sched::IdleState(hint: u8.truncate(state.hint), exit_ns: u64.widen(state.exit_latency_us) * 1_000))
+            }
+            None => {
+            }
+        }
+    }
+    return taken
+} idle_states_of
+
+/// Applying the power settings sets the power of a running CPU the core charges energy at, the energy-performance preference of each class, and the MWAIT states an idle CPU enters on a machine with MWAIT.
 test settings_apply_to_the_cores_state for switch_power {
     let world = testing::world()
     var places = mem::List[sched::Place].empty(world.alloc)
     mut places.push(sched::Place(package_id: 0, core: 0, cache: 0, node: 0))
-    let cpus = mem::Shared.of(sched::State.of(take places, clock: world.clock, idle_states: mem::List.empty(world.alloc), hwp: false, rapl: false, alloc: world.alloc), alloc: world.alloc)
+    let cpus = mem::Shared.of(sched::State.of(take places, clock: world.clock, mwait: true, hwp: false, rapl: false, alloc: world.alloc), alloc: world.alloc)
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[power::Switching].bounded(1, alloc: world.alloc)
     let before = cpus.contents().busy_mw.contents().load()
     var preferences = Array[u8, 3].filled(10)
     preferences[1] = 20
     preferences[2] = 30
-    try await orders.send(power::Switching.Apply(busy_mw: 2_500, preferences: preferences))
+    var states = Array[Option[power::IdleState], power::MOST_IDLE_STATES].filled(None)
+    states[0] = Some(power::IdleState(hint: 0x20, exit_latency_us: 2))
+    try await orders.send(power::Switching.Apply(busy_mw: 2_500, preferences: preferences, idle_states: states))
     discard orders
     try await switch_power(take ordered, cpus: cpus.share())
     let after = cpus.contents().busy_mw.contents().load()
     let applied = cpus.contents().preferences.load()
+    let scheduler = sched::Scheduler.of(cpus.share())
+    let far = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
+        return scheduler.idle(t, cpu: 0, until_ns: Some(rings::elapsed(world.clock) + 1_000_000))
+    })
+    let near = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Idle limits notrap, terminates {
+        return scheduler.idle(t, cpu: 0, until_ns: Some(rings::elapsed(world.clock) + 3_000))
+    })
     expect before == 2_000 and after == 2_500 and applied == 0x1E_140A
+    expect far == hw::Idle.Mwait(0x20) and near == hw::Idle.Halt
 } settings_apply_to_the_cores_state

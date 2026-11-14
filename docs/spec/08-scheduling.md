@@ -144,7 +144,7 @@ The record `PowerConfig` at [`/sys/config/power`](13-tree.md#sysconfig) configur
 
 | Field | Meaning | Default |
 | --- | --- | --- |
-| `PowerConfig.idle_states` | MWAIT states, each with its hint and exit latency in µs | MWAIT C1, exit latency 1 µs |
+| `PowerConfig.idle_states` | MWAIT states, at most 8, each with its hint and exit latency in µs | MWAIT C1, exit latency 1 µs |
 | `PowerConfig.preference_latency` | preference for `latency` work, 0 to 255 | 0 |
 | `PowerConfig.preference_normal` | preference for `normal` work | 128 |
 | `PowerConfig.preference_background` | preference for `background` work | 255 |
