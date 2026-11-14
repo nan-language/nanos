@@ -47,7 +47,8 @@ The plan steps `start <moniker>` and `stop <moniker>` write `stopped`, and `upda
 | `principal`, `component`, `placement`, `InstanceSpec.budget.reserved` | a restart |
 | `wiring`, `grants`, or the record at `/sys/config/<moniker>` | an Env rebuild |
 | `InstanceSpec.budget.limit` | applied at the next start, revival or update ([cells and limits](05-memory.md#cells-and-limits)) |
-| `share`, `durability`, `restart`, `handlers` | applied at the next quiescence |
+| `share` | applied at the next quiescence (requires [N42](22-nan.md#n42)) |
+| `durability`, `restart`, `handlers` | applied at the next quiescence |
 | `stopped` | a start or a stop |
 | `lazy` | applied at the next start |
 

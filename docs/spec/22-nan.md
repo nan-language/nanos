@@ -451,3 +451,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a holder tells whether its handle is the only one.
 - **Chapters:** [05](05-memory.md).
 - **Issue:** [nan-language/nan#201](https://github.com/nan-language/nan/issues/201).
+
+## N42
+
+**Account shares that change.**
+
+- **Language 1:** `Executor.split` fixes an account's share, and nothing changes it afterwards (NaN 16 §Executors).
+- **NaN OS requires:** an account whose class and weight change while its tasks run.
+- **Chapters:** [06](06-execution.md), [08](08-scheduling.md).
+- **Issue:** [nan-language/nan#220](https://github.com/nan-language/nan/issues/220).
