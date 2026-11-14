@@ -777,7 +777,7 @@ fn Shared.start[J: Journal](
     let alloc = budget.alloc()
     let held = Held(budget: take budget, reserved: driver.spec.budget.reserved, account: take account, energy_budget: driver.spec.share.energy_mj_per_h, class: driver.spec.share.class, intake: driver.intake.share(), bundle: driver.spec.bundle, traps: driver.traps)
     self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), take world, take serving, exec, alloc, abandoner: abandoner.share(), take ending, ended: sender.split(), incarnation: driver.incarnation, header: os::Header.of_work(cause: driver.cause, slot: driver.slot))
-    self.watch(s, marks: take marked, take held, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers)
+    self.watch(s, marks: take marked, take held, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers, number: driver.slot)
     driver.domain = Some(Domain(deliveries: take deliveries, abandoner: take abandoner, outstanding: None))
     try await self.gauges.watch(driver.moniker.text.as_str(), watch: take gauged, alloc: self.config.alloc)
 } Shared.start
@@ -870,8 +870,14 @@ struct Calls derives Copy {
 } Calls
 
 /// The gauge of the incarnation `incarnation` that `held` keeps, its handler calls being `calls` and its account's energy `energy`.
-fn Held.gauge(self, incarnation: u64, calls: Calls, energy: Energy) -> os::Gauge {
-    return os::Gauge(intake: self.intake.contents().load(), memory: os::Usage(charged: u64.widen(self.budget.charged()), limit: u64.widen(self.budget.limit()), peak: u64.widen(self.budget.peak())), reserved: self.reserved, cpu_ns: self.account.used_ns(), energy_mj: energy.used_mj(), throttled: energy.throttled, class: self.class, bundle: self.bundle, incarnation: incarnation, messages: calls.count, latency: calls.latency, traps: self.traps)
+fn Held.gauge(
+    self,
+    incarnation: u64,
+    calls: Calls,
+    energy: Energy,
+    cpu_ns: u64,
+    ) -> os::Gauge {
+    return os::Gauge(intake: self.intake.contents().load(), memory: os::Usage(charged: u64.widen(self.budget.charged()), limit: u64.widen(self.budget.limit()), peak: u64.widen(self.budget.peak())), reserved: self.reserved, cpu_ns: cpu_ns, energy_mj: energy.used_mj(), throttled: energy.throttled, class: self.class, bundle: self.bundle, incarnation: incarnation, messages: calls.count, latency: calls.latency, traps: self.traps)
 } Held.gauge
 
 /// The bucket of a handler call that ran `ns`: 0 below 1 µs, k from 2^(k−1) to 2^k µs, 31 beyond.
@@ -927,7 +933,7 @@ struct Launched {
     serving: Serving
 } Launched
 
-/// Watches an incarnation's handlers on a task of `s`, answering the readings of its gauge from `held` until its domain has ended, then closes its account and cell: a handler call past `handlers.handler_s` abandons the domain, and one of `handlers.slow_ms` or more is reported slow.
+/// Watches an incarnation's handlers on a task of `s`, answering the readings of its gauge from `held` until its domain has ended, then closes its account and cell: a handler call past `handlers.handler_s` abandons the domain, and one of `handlers.slow_ms` or more is reported slow. The instance's account is numbered `number`.
 fn Shared.watch(
     self,
     s: task::Scope,
@@ -937,11 +943,13 @@ fn Shared.watch(
     take inputs: task::Sender[Input],
     incarnation: u64,
     handlers: os::Limits,
+    number: u32,
     ) {
     let clock = self.config.clock
     let busy_mw = self.machine.busy_mw()
-    discard s.spawn(fn[take marks, take held, take abandoner, take inputs, take busy_mw]() fails task::Cancelled uses wait limits stack 16_384 {
-        let watched = attempt await watch_marks(take marks, held, abandoner, inputs, clock, busy_mw, incarnation, handlers)
+    let charging = Charging(gauges: self.gauges.share(), account: number)
+    discard s.spawn(fn[take marks, take held, take abandoner, take inputs, take busy_mw, take charging]() fails task::Cancelled uses wait limits stack 16_384 {
+        let watched = attempt await watch_marks(take marks, held, abandoner, inputs, clock, busy_mw, incarnation, handlers, charging)
         let Held(budget: budget, reserved: _, account: account, energy_budget: _, class: _, intake: _, bundle: _, traps: _) = held
         take account.close()
         take budget.close()
@@ -953,7 +961,13 @@ fn Shared.watch(
     })
 } Shared.watch
 
-/// Takes the marks of an incarnation until its domain has ended, bounding each handler call it tells of and answering each reading with the gauge of `held`; charges its account's energy at the power `busy_mw` holds after each handler call and reading.
+/// Where the CPU time of an incarnation's account goes: the gauges, which fold the handler calls of other accounts' messages into those, and the number of the incarnation's account.
+struct Charging {
+    gauges: Gauges
+    account: u32
+} Charging
+
+/// Takes the marks of an incarnation until its domain has ended, bounding each handler call it tells of and answering each reading with the gauge of `held`, folding each handler call of another account's message into that account through `charging`; charges its account's energy at the power `busy_mw` holds after each handler call and reading.
 fn watch_marks(
     take marks: task::Receiver[Mark],
     held: Held,
@@ -963,11 +977,13 @@ fn watch_marks(
     busy_mw: mem::Shared[core::atomic::AtomicU64],
     incarnation: u64,
     handlers: os::Limits,
+    charging: Charging,
     ) fails task::Cancelled uses wait {
     var receiver = marks
     var overran_at: Option[u64] = None
     var calls = Calls(count: 0, latency: Array[u64, 32].filled(0))
     var spent = Spent(energy: Energy.of(budget_mj_per_h: held.energy_budget, now_ns: now(clock)), charged_ns: 0)
+    var folds = Folds(out_ns: 0, in_base: try await charging.gauges.folded(charging.account))
     loop {
         var received: Option[Mark] = None
         match overran_at {
@@ -998,21 +1014,38 @@ fn watch_marks(
             }
             Some(Mark.Took(ns: ns)) => {
                 overran_at = None
-                mut spent.charge(used_ns: held.account.used_ns(), busy_mw: busy_mw.contents().load(), now_ns: now(clock))
+                mut spent.charge(used_ns: try await folds.charged(held, charging), busy_mw: busy_mw.contents().load(), now_ns: now(clock))
                 calls.count += 1
                 calls.latency[latency_bucket(ns)] += 1
                 if ns >= u64.widen(handlers.slow_ms) * NS_PER_MS {
                     discard attempt await inputs.send(Input.Slow(ns: ns))
                 }
             }
+            Some(Mark.Charged(account: account, ns: ns)) => {
+                folds.out_ns = folds.out_ns.saturating_add(ns)
+                try await charging.gauges.fold(account, ns)
+            }
             Some(Mark.Read(reply: reply)) => {
-                mut spent.charge(used_ns: held.account.used_ns(), busy_mw: busy_mw.contents().load(), now_ns: now(clock))
-                discard attempt await reply.send(held.gauge(incarnation, calls, energy: spent.energy))
+                let used = try await folds.charged(held, charging)
+                mut spent.charge(used_ns: used, busy_mw: busy_mw.contents().load(), now_ns: now(clock))
+                discard attempt await reply.send(held.gauge(incarnation, calls, energy: spent.energy, cpu_ns: used))
             }
             else => return
         }
     }
 } watch_marks
+
+/// What an incarnation's account has folded: the time its handler calls of other accounts' messages took, and what other instances had folded into it when it started.
+struct Folds derives Copy {
+    out_ns: u64
+    in_base: u64
+} Folds
+
+/// The CPU time charged to the incarnation's account: its tasks' time, less its handler calls of other accounts' messages, with those of its messages in other instances since it started.
+fn Folds.charged(self, held: Held, charging: Charging) -> u64 fails task::Cancelled uses wait {
+    let folded_in = try await charging.gauges.folded(charging.account)
+    return held.account.used_ns().saturating_sub(self.out_ns).saturating_add(folded_in.saturating_sub(self.in_base))
+} Folds.charged
 
 /// Stops the instance, or has it start again once stopped when `then` is `Restart`: queued calls stay for a restart and are dropped or failed for a stop, what a hibernation left it is dropped, and an instance not yet created is created `stopped`.
 fn Shared.stop[J: Journal](self, mut driver: Driver, then: Then, journal: J) fails task::Cancelled uses wait {

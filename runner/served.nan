@@ -47,10 +47,11 @@ enum Report {
     Replayed(outcome: Result[os::Replayed, os::ControlError])
 } Report
 
-/// What the watch of an incarnation takes: when its handlers run, which it bounds, their start, then how long they took; a reading of its gauge; and the end of its domain.
+/// What the watch of an incarnation takes: when its handlers run, which it bounds, their start, then how long they took; how long a handler call of a message charged to the account `account` took; a reading of its gauge; and the end of its domain.
 enum Mark {
     Began
     Took(ns: u64)
+    Charged(account: u32, ns: u64)
     Read(reply: task::Sender[os::Gauge])
     Ended
 } Mark
@@ -598,15 +599,22 @@ fn idle[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], quiet: core::
     try await telling.tell(report: Report.Woken)
 } idle
 
-/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn but those `kept` names, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and returns whether it called any.
+/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn but those `kept` names, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and the time of each handler call of a message charged to another account than the running work's, and returns whether it called any.
 fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept: mem::List[u64], telling: Telling) -> bool fails task::Cancelled uses wait {
     try await mark(telling.marks, marked: Mark.Began)
     let started = now(telling.clock)
+    let own = os::Header.current().account
     let counts = telling.steps.contents()
     var handled = false
     loop {
         discard counts.begun.fetch_add(1)
+        let stepping = now(telling.clock)
         let stepped = mut stepper.step()
+        match charged_elsewhere(stepped, own) {
+            Some(account) => try await mark(telling.marks, marked: Mark.Charged(account: account, ns: now(telling.clock).saturating_sub(stepping)))
+            None => {
+            }
+        }
         let done = counts.done.fetch_add(1).value_or(0) + 1
         if counts.wanted.compare_swap(expected: done, replacement: 0).is_ok() {
             match attempt await telling.finished.send(done) {
@@ -624,6 +632,32 @@ fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept
     try await mark(telling.marks, marked: Mark.Took(ns: now(telling.clock).saturating_sub(started)))
     return handled
 } call_handlers
+
+/// The account a handled message is charged to when it is neither the running work's `own` nor the core's.
+fn charged_elsewhere(stepped: Option[sys::Handled], own: u32) -> Option[u32] {
+    let Some(handled) = stepped else {
+        return None
+    }
+    let Some(header) = handled.header else {
+        return None
+    }
+    let account = os::Header.from_bits(header.bytes).account
+    if account == own or account == 0 {
+        return None
+    }
+    return Some(account)
+} charged_elsewhere
+
+/// A handler call of another instance's message is charged to that instance's account; one of the running instance's own message, of the core's, or without a header, to the running instance.
+test handler_calls_go_to_the_account_their_message_names for charged_elsewhere {
+    let other = sys::Handled(header: Some(os::Header.of_work(cause: 1, slot: 7).handled_by(3).carried()), operation: 0)
+    let own = sys::Handled(header: Some(os::Header.of_work(cause: 1, slot: 3).carried()), operation: 0)
+    let core = sys::Handled(header: Some(os::Header.of_work(cause: 1, slot: 0).carried()), operation: 0)
+    let bare = sys::Handled(header: None, operation: 0)
+    expect charged_elsewhere(Some(other), own: 3) == Some(7)
+    expect charged_elsewhere(Some(own), own: 3).is_none() and charged_elsewhere(Some(core), own: 3).is_none()
+    expect charged_elsewhere(Some(bare), own: 3).is_none() and charged_elsewhere(None, own: 3).is_none()
+} handler_calls_go_to_the_account_their_message_names
 
 /// Sends a report of the incarnation `incarnation` to the driver, which a driver that has stopped listening no longer needs.
 fn tell(reports: task::Sender[Input], incarnation: u64, take report: Report) fails task::Cancelled uses wait {
