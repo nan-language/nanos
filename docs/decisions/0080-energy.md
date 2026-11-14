@@ -1,6 +1,6 @@
 # 0080. Energy
 
-Status: accepted
+Status: superseded by 0099
 
 ## Context
 

@@ -1,4 +1,4 @@
-//! Energy: what an account's CPU time costs at the power of a running CPU, and the bucket of its energy budget.
+//! Energy: what an account's CPU time costs at the power of a running CPU, the bucket of its energy budget, and the share the account runs in as its budget allows.
 
 /// The nanojoules of a millijoule.
 const NJ_PER_MJ: u64 = 1_000_000
@@ -26,6 +26,19 @@ fn Energy.of(budget_mj_per_h: u64, now_ns: u64) -> Energy {
 /// The millijoules the account has used.
 fn Energy.used_mj(self) -> u64 = self.used_nj / NJ_PER_MJ
 
+/// Takes the budget of `budget_mj_per_h` millijoules per hour, the bucket holding at most a whole hour of it, and full when the account had no budget.
+fn Energy.rebudget(mut self, budget_mj_per_h: u64) {
+    let full = budget_mj_per_h.saturating_mul(NJ_PER_MJ)
+    self.held_nj = match self.budget_mj_per_h == 0 {
+        true => full
+        false => self.held_nj.min(full)
+    }
+    self.budget_mj_per_h = budget_mj_per_h
+    if budget_mj_per_h == 0 {
+        self.throttled = false
+    }
+} Energy.rebudget
+
 /// Charges `cpu_ns` more of CPU time at `busy_mw` milliwatts at `now_ns`: the bucket refills at the budget per hour up to a whole hour's budget, then drains by the energy used; it throttles the account once empty, and lets it run in its class again once it holds a minute's budget.
 fn Energy.charge(mut self, cpu_ns: u64, busy_mw: u64, now_ns: u64) {
     let used = cpu_ns.saturating_mul(busy_mw) / 1_000
@@ -43,6 +56,38 @@ fn Energy.charge(mut self, cpu_ns: u64, busy_mw: u64, now_ns: u64) {
         self.throttled = false
     }
 } Energy.charge
+
+/// The shares of an account as they apply: those its share gives, those a change of its share gives at its next quiescence, and the one its executor runs in.
+struct Resharing derives Copy {
+    shares: Shares
+    pending: Option[Shares]
+    applied: task::Share
+} Resharing
+
+/// The shares of an account whose executor runs in its own share.
+fn Resharing.of(shares: Shares) -> Resharing = Resharing(shares: shares, pending: None, applied: shares.own)
+
+/// At the account's quiescence, takes the shares a change gave, rebudgeting `spent`, and runs `account` in the share its energy budget's state calls for.
+fn Resharing.settle(mut self, account: task::Account, mut spent: Spent) {
+    match mut self.pending.extract() {
+        Some(next) => {
+            self.shares = next
+            mut spent.energy.rebudget(next.energy_mj_per_h)
+        }
+        None => {
+        }
+    }
+    mut self.run(account, throttled: spent.energy.throttled)
+} Resharing.settle
+
+/// Runs `account` in its own share, or the `background` one while it is `throttled`, when its executor runs in another.
+fn Resharing.run(mut self, account: task::Account, throttled: bool) {
+    let wanted = self.shares.running(throttled)
+    if wanted != self.applied {
+        account.reshare(wanted)
+        self.applied = wanted
+    }
+} Resharing.run
 
 /// An account's energy and the CPU time charged to it so far.
 struct Spent derives Copy {
@@ -71,3 +116,24 @@ test buckets_throttle_until_a_minute_of_budget_refills for Energy.charge {
     mut unbudgeted.charge(cpu_ns: 10_000_000_000, busy_mw: 2_000, now_ns: 1)
     expect not unbudgeted.throttled and unbudgeted.used_mj() == 20_000
 } buckets_throttle_until_a_minute_of_budget_refills
+
+/// An account runs in the `background` share while throttled and in its own share otherwise, and a change of its share taken at quiescence also gives its energy budget.
+test accounts_run_in_the_share_their_budget_allows for Resharing.settle {
+    let world = testing::world()
+    let account = world.exec.split_on(task::Share(weight: 50, class: 2, reserve_ppm: 0), alloc: world.alloc)
+    let normal = Shares(own: task::Share(weight: 50, class: 2, reserve_ppm: 0), throttled: task::Share(weight: 50, class: 3, reserve_ppm: 0), class: os::CpuClass.Normal, energy_mj_per_h: 3_600)
+    var resharing = Resharing.of(normal)
+    var spent = Spent(energy: Energy.of(budget_mj_per_h: 3_600, now_ns: 0), charged_ns: 0)
+    mut spent.charge(used_ns: 2_000_000_000, busy_mw: 2_000, now_ns: 1)
+    mut resharing.settle(account, mut spent)
+    let throttled = resharing.applied
+    var unbudgeted = normal
+    unbudgeted.energy_mj_per_h = 0
+    unbudgeted.own = task::Share(weight: 80, class: 2, reserve_ppm: 0)
+    resharing.pending = Some(unbudgeted)
+    mut resharing.settle(account, mut spent)
+    let reshared = resharing.applied
+    take account.close()
+    expect throttled == normal.throttled and reshared == unbudgeted.own and not spent.energy.throttled
+} accounts_run_in_the_share_their_budget_allows
+

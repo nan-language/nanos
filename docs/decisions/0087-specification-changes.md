@@ -1,6 +1,6 @@
 # 0087. Specification changes
 
-Status: accepted
+Status: superseded by 0100
 
 ## Context
 

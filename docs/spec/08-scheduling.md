@@ -156,7 +156,7 @@ An account's **energy budget** is `Share.energy_mj_per_h` millijoules per hour: 
 
 | State | Event | Next | Effect |
 | --- | --- | --- | --- |
-| within budget | the bucket empties | throttled | the account's entities run as `background` (requires [N38](22-nan.md#n38)) |
+| within budget | the bucket empties | throttled | the account's entities run as `background` (requires [N42](22-nan.md#n42)) |
 | throttled | the bucket refills to one minute of budget | within budget | the account's entities run in their class again |
 
 `/live/accounts` shows each account's energy and state. An account without an energy budget is never throttled.

@@ -7,9 +7,10 @@ linear struct Principal {
     bucket: task::Cown[Energy]
 } Principal
 
-/// An open session: its principal, what its work runs on, and where its gauge is read and its end told.
+/// An open session: its principal, its share, what its work runs on, and where its gauge is read and its share and end told.
 struct Session {
     principal: ident::Principal
+    share: os::Share
     account: os::SessionAccount
     marks: task::Sender[Mark]
 } Session
@@ -140,8 +141,13 @@ fn Shared.open_session(
     memory_bytes: Option[u64],
     s: task::Scope,
     ) -> Option[os::SessionAccount] fails task::Cancelled uses wait {
-    match sessions.get(session) {
-        Some(kept) => return Some(kept.account)
+    match mut sessions.remove(session) {
+        Some(kept) => {
+            let account = kept.account
+            let reshared = try await self.reshare_session(mut principals, take kept, share)
+            discard mut sessions.insert(session, value: take reshared)
+            return Some(account)
+        }
         None => {
         }
     }
@@ -157,15 +163,36 @@ fn Shared.open_session(
     let bucket = principals.at(index).bucket.share()
     let busy_mw = self.machine.busy_mw()
     let clock = self.config.clock
-    let class = share.class
+    let shares = self.config.shares(share)
     let charging = Charging(gauges: self.gauges.share(), account: number)
     discard s.spawn(fn[take marked, take account, take cell, take bucket, take busy_mw, take charging]() fails task::Cancelled uses wait limits stack 8_192 {
-        try await gauge_session(take marked, take account, take cell, bucket, class, busy_mw, clock, charging)
+        try await gauge_session(take marked, take account, take cell, bucket, shares, busy_mw, clock, charging)
     })
     try await self.gauges.watch(session_name(session).as_str(), watch: marks.split(), alloc: self.config.alloc)
-    discard mut sessions.insert(session, value: Session(principal: take principal, account: given, marks: take marks))
+    discard mut sessions.insert(session, value: Session(principal: take principal, share: share, account: given, marks: take marks))
     return Some(given)
 } Shared.open_session
+
+/// The open session `kept`, which takes the share `share` when its principal's grant gives another: its gauge reshares its account, and its principal's energy bucket takes the share's budget.
+fn Shared.reshare_session(self, mut principals: mem::List[Principal], take kept: Session, share: os::Share) -> Session fails task::Cancelled uses wait {
+    if kept.share == share {
+        return kept
+    }
+    var session = kept
+    session.share = share
+    discard attempt await session.marks.send(Mark.Reshare(shares: self.config.shares(share)))
+    match principals.position(fn(each: Principal) => each.name == session.principal) {
+        Some(at) => {
+            let bucket = principals.at(at).bucket.share()
+            await when mut bucket {
+                mut bucket.rebudget(share.energy_mj_per_h)
+            }
+        }
+        None => {
+        }
+    }
+    return session
+} Shared.reshare_session
 
 /// The place in `principals` of `principal`, whose cell is split when it has none, of `memory_bytes`, or of its pool's size when `None`, from the pool the machine names, and whose energy bucket then holds `share`'s budget; `None` while every pool is at its top pressure level.
 fn Shared.principal_of(
@@ -264,13 +291,13 @@ fn Shared.close_session(
     }
 } Shared.close_session
 
-/// Answers each reading of a session's gauge from `marks` with the counters of its `account`, with the handler calls of its messages and the transfers that `charging` folded into it, and of its `cell`, charging the CPU time it ran since the last reading to its own energy and to its principal's `bucket` at the power `busy_mw` holds, until the marks end; then closes the account and the cell.
+/// Answers each reading of a session's gauge from `marks` with the counters of its `account`, with the handler calls of its messages and the transfers that `charging` folded into it, and of its `cell`, charging the CPU time it ran since the last reading to its own energy and to its principal's `bucket` at the power `busy_mw` holds, until the marks end; then closes the account and the cell. The account runs in its `shares`, those a change of its share gives from then on, its own share's while the bucket holds budget and the `background` one while it is spent.
 fn gauge_session(
     take marks: task::Receiver[Mark],
     take account: task::Account,
     take cell: mem::Budget,
     bucket: task::Cown[Energy],
-    class: os::CpuClass,
+    shares: Shares,
     busy_mw: mem::Shared[core::atomic::AtomicU64],
     clock: sys::Clock,
     charging: Charging,
@@ -279,9 +306,16 @@ fn gauge_session(
     defer take cell.close()
     var receiver = marks
     var spent = Spent(energy: Energy.of(budget_mj_per_h: 0, now_ns: now(clock)), charged_ns: 0)
+    var resharing = Resharing.of(shares)
+    var throttled = false
     loop {
         let reply = match try await mut receiver.receive() {
             Some(Mark.Read(reply: reply)) => reply
+            Some(Mark.Reshare(shares: next)) => {
+                resharing.shares = next
+                mut resharing.run(account, throttled)
+                continue
+            }
             Some(Mark.Began) or Some(Mark.Took(ns: _)) or Some(Mark.Charged(account: _, ns: _)) => continue
             Some(Mark.Ended) or None => return
         }
@@ -291,8 +325,9 @@ fn gauge_session(
         let power = busy_mw.contents().load()
         let at = now(clock)
         mut spent.charge(used_ns: used, busy_mw: power, now_ns: at)
-        let throttled = await when mut bucket => drained(mut bucket, cpu_ns: ran, busy_mw: power, now_ns: at)
-        let gauge = os::Gauge(intake: 0, memory: os::Usage(charged: u64.widen(cell.charged()), limit: u64.widen(cell.limit()), peak: u64.widen(cell.peak())), reserved: false, cpu_ns: used, read_bytes: folded.read_bytes, written_bytes: folded.written_bytes, energy_mj: spent.energy.used_mj(), throttled: throttled, class: class, bundle: ident::HashValue(bytes: Array[u8, 33].filled(0)), incarnation: 0, messages: 0, latency: Array[u64, 32].filled(0), traps: 0)
+        throttled = await when mut bucket => drained(mut bucket, cpu_ns: ran, busy_mw: power, now_ns: at)
+        mut resharing.run(account, throttled)
+        let gauge = os::Gauge(intake: 0, memory: os::Usage(charged: u64.widen(cell.charged()), limit: u64.widen(cell.limit()), peak: u64.widen(cell.peak())), reserved: false, cpu_ns: used, read_bytes: folded.read_bytes, written_bytes: folded.written_bytes, energy_mj: spent.energy.used_mj(), throttled: throttled, class: resharing.shares.class, bundle: ident::HashValue(bytes: Array[u8, 33].filled(0)), incarnation: 0, messages: 0, latency: Array[u64, 32].filled(0), traps: 0)
         discard attempt await reply.send(gauge)
     }
 } gauge_session
