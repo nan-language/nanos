@@ -59,6 +59,7 @@ pub open linear struct NvmeEnv derives Send {
     here: hw::PerCpu[u32]
     clock: sys::Clock
     alarm: devices::Alarm
+    meter: os::Meter
     alloc: mem::Alloc
 } NvmeEnv
 
@@ -69,9 +70,10 @@ pub closed enum Operation derives Copy, Eq, Encode {
     Flush(unit: u16)
 } Operation
 
-/// A request waiting for the controller, and the data a write carries.
+/// A request waiting for the controller, the account of the message that asked for it, and the data a write carries.
 pub closed struct Waiting derives Encode {
     pub request: u64
+    pub account: u32
     pub operation: Operation
     pub data: Option[mem::Bytes]
 } Waiting
@@ -97,7 +99,13 @@ impl Nvme: sys::Component[NvmeEnv, NvmeDevice]
 impl Nvme: sys::Resume[NvmeEnv, NvmeDevice]
 
 /// The Env over `function`: its registers mapped, attached to physical memory, the controller enabled over its admin pair, its namespaces identified, then an I/O pair per CPU up to those it grants, each created once the interrupt of its MSI-X entry is installed under the storm limit; `None` when the controller does not allow it, the function then handed back.
-pub fn NvmeEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[NvmeEnv] {
+pub fn NvmeEnv.of(
+    take function: hw::PciFunction,
+    clock: sys::Clock,
+    take alarm: devices::Alarm,
+    meter: os::Meter,
+    alloc: mem::Alloc,
+    ) -> Option[NvmeEnv] {
     var held = function
     let Ok(mapped) = attempt hw::Mmio[Controller].of_bar(mut held, index: 0, offset: 0) else {
         take held.release()
@@ -133,7 +141,7 @@ pub fn NvmeEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm:
         take held.release()
         return None
     }
-    return Some(NvmeEnv(identified: identified, function: take held, regs: take regs, admin: take control, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alarm: take alarm, alloc: alloc))
+    return Some(NvmeEnv(identified: identified, function: take held, regs: take regs, admin: take control, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alarm: take alarm, meter: meter, alloc: alloc))
 } NvmeEnv.of
 
 /// I/O pair `index` created with its pages and an interrupt on CPU `index`; `None`, nothing created, when there is no MSI-X entry for it or the controller refuses it.
@@ -171,7 +179,7 @@ fn lane_of(
 
 /// Disables the controller, then releases the interrupts, the registers and the pages, and hands the function back.
 pub fn NvmeEnv.abandon(take self) {
-    let NvmeEnv(identified: _, function: function, regs: regs, admin: control, lanes: lanes, here: _, clock: _, alarm: _, alloc: _) = self
+    let NvmeEnv(identified: _, function: function, regs: regs, admin: control, lanes: lanes, here: _, clock: _, alarm: _, meter: _, alloc: _) = self
     release_queues(take regs, take control, take lanes)
     take function.release()
 } NvmeEnv.abandon
@@ -335,7 +343,7 @@ fn Nvme.queue_request(
     let Some(request) = mut cx.postpone() else {
         return
     }
-    let waiting = Waiting(request: request, operation: operation, data: take data)
+    let waiting = Waiting(request: request, account: os::Header.current().account, operation: operation, data: take data)
     if self.lost {
         refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
         return
@@ -366,7 +374,10 @@ fn Nvme.completed(mut self, take pair: u16, mut env: NvmeEnv, mut cx: sys::Cx[Nv
     if self.tracks[lane].aborted {
         self.tracks[lane].aborted = false
     } else {
-        let Waiting(request: request, operation: operation, data: _) = mut self.tracks[lane].waiting.remove(0)
+        let Waiting(request: request, account: account, operation: operation, data: _) = mut self.tracks[lane].waiting.remove(0)
+        if done.status == 0 {
+            env.charge(account, operation)
+        }
         match operation {
             Operation.Read(unit: unit, block: _, count: count) => answer(request, result: read_outcome(done.status, mut env, lane, unit, count), alloc: env.alloc, mut cx)
             else => answer(request, result: outcome(done.status), alloc: env.alloc, mut cx)
@@ -416,9 +427,23 @@ fn answer[R: Encode](request: u64, take result: Result[R, devices::DeviceError],
     discard attempt mut cx.reply(request, reply)
 } answer
 
+/// Charges the bytes `operation` moved to the account `account`.
+fn NvmeEnv.charge(self, account: u32, operation: Operation) {
+    match operation {
+        Operation.Read(unit: unit, block: _, count: count) => {
+            discard self.meter.charge(account, bytes: u64.widen(count) * u64.widen(self.identified.units[usize.widen(unit)].block_bytes), written: false)
+        }
+        Operation.Write(unit: unit, block: _, count: count) => {
+            discard self.meter.charge(account, bytes: u64.widen(count) * u64.widen(self.identified.units[usize.widen(unit)].block_bytes), written: true)
+        }
+        Operation.Flush(unit: _) => {
+        }
+    }
+} NvmeEnv.charge
+
 /// Fails the request `waiting` holds with `error`.
 fn refuse(take waiting: Waiting, error: devices::DeviceError, alloc: mem::Alloc, mut cx: sys::Cx[NvmeDevice]) {
-    let Waiting(request: request, operation: operation, data: _) = waiting
+    let Waiting(request: request, account: _, operation: operation, data: _) = waiting
     match operation {
         Operation.Read(unit: _, block: _, count: _) => {
             let failed: Result[Untrusted[mem::Bytes], devices::DeviceError] = Err(error)

@@ -147,7 +147,7 @@ pub open linear struct Disk derives Send {
     segments: mem::List[hw::DmaShared[Segment]]
 } Disk
 
-/// The driver's Env: its function, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, its clock, its alarm and its cell.
+/// The driver's Env: its function, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, its clock, its alarm, the meter its transfers are charged through and its cell.
 pub open linear struct AhciEnv derives Send {
     function: hw::PciFunction
     abar: hw::Mmio[Hba]
@@ -156,6 +156,7 @@ pub open linear struct AhciEnv derives Send {
     signal: mem::Shared[hw::Signal[Unit]]
     clock: sys::Clock
     alarm: devices::Alarm
+    meter: os::Meter
     alloc: mem::Alloc
 } AhciEnv
 
@@ -171,9 +172,10 @@ pub closed enum Operation derives Copy, Eq, Encode {
     Flush
 } Operation
 
-/// A request waiting for its unit, whether its command is on the disk, and the data a write carries.
+/// A request waiting for its unit, the account of the message that asked for it, whether its command is on the disk, and the data a write carries.
 pub closed struct Waiting derives Encode {
     pub request: u64
+    pub account: u32
     pub unit: u16
     pub operation: Operation
     pub issued: bool
@@ -199,7 +201,13 @@ pub interrupt fn Interrupt.on_irq(mut self, take irq: hw::IrqContext) -> hw::Irq
 } Interrupt.on_irq
 
 /// The Env over `function`: its ABAR mapped, AHCI mode on, attached to physical memory, each port holding an ATA disk set up and identified, and the controller's interrupt on its MSI vector of CPU 0 under the storm limit; `None` when the controller does not allow it or holds no disk, the function then handed back.
-pub fn AhciEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[AhciEnv] {
+pub fn AhciEnv.of(
+    take function: hw::PciFunction,
+    clock: sys::Clock,
+    take alarm: devices::Alarm,
+    meter: os::Meter,
+    alloc: mem::Alloc,
+    ) -> Option[AhciEnv] {
     var held = function
     let Ok(window) = attempt hw::Mmio[Hba].of_bar(mut held, index: 5, offset: 0) else {
         take held.release()
@@ -240,12 +248,12 @@ pub fn AhciEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm:
     mut irq.limit(per_second: devices::STORM_LIMIT)
     mut abar.write(Hba.is, value: 0xFFFF_FFFF)
     mut abar.write(Hba.ghc, value: mut abar.read(Hba.ghc) | INTERRUPT_ENABLE)
-    return Some(AhciEnv(function: take held, abar: take abar, disks: take disks, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, alloc: alloc))
+    return Some(AhciEnv(function: take held, abar: take abar, disks: take disks, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, meter: meter, alloc: alloc))
 } AhciEnv.of
 
 /// Stops the ports, then releases the interrupt, the window and the buffers, and hands the function back.
 pub fn AhciEnv.abandon(take self) {
-    let AhciEnv(function: function, abar: abar, disks: disks, irq: irq, signal: _, clock: clock, alarm: _, alloc: _) = self
+    let AhciEnv(function: function, abar: abar, disks: disks, irq: irq, signal: _, clock: clock, alarm: _, meter: _, alloc: _) = self
     discard take irq.uninstall()
     release(take function, take abar, take disks, clock)
 } AhciEnv.abandon
@@ -597,7 +605,7 @@ fn Ahci.queue_request(
     let Some(request) = mut cx.postpone() else {
         return
     }
-    let waiting = Waiting(request: request, unit: unit, operation: operation, issued: false, data: take data)
+    let waiting = Waiting(request: request, account: os::Header.current().account, unit: unit, operation: operation, issued: false, data: take data)
     if self.lost {
         refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
         return
@@ -629,8 +637,11 @@ fn Ahci.completed(mut self, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
             at += 1
             continue
         }
-        let Waiting(request: request, unit: _, operation: operation, issued: _, data: _) = mut self.waiting.remove(at)
+        let Waiting(request: request, account: account, unit: _, operation: operation, issued: _, data: _) = mut self.waiting.remove(at)
         let failed = (errors & (1u32 << u32.fit(unit))) != 0 or (mut env.disks.at_mut(unit).regs.read(Port.tfd) & TASK_ERROR) != 0
+        if not failed {
+            env.charge(account, unit, operation)
+        }
         match operation {
             Operation.Read(block: _, count: blocks) => answer(request, result: read_outcome(failed, mut env, unit, count: blocks), alloc: env.alloc, mut cx)
             else => answer(request, result: outcome(failed), alloc: env.alloc, mut cx)
@@ -639,6 +650,21 @@ fn Ahci.completed(mut self, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
     }
     mut self.submit(mut env, mut cx)
 } Ahci.completed
+
+/// Charges the bytes `operation` moved on unit `unit` to the account `account`.
+fn AhciEnv.charge(self, account: u32, unit: usize, operation: Operation) {
+    let block_bytes = u64.widen(self.disks[unit].info.block_bytes)
+    match operation {
+        Operation.Read(block: _, count: count) => {
+            discard self.meter.charge(account, bytes: u64.widen(count) * block_bytes, written: false)
+        }
+        Operation.Write(block: _, count: count) => {
+            discard self.meter.charge(account, bytes: u64.widen(count) * block_bytes, written: true)
+        }
+        Operation.Flush => {
+        }
+    }
+} AhciEnv.charge
 
 /// Fails the command on unit `unit` with `device.timeout` once the time of the `handed`th it was issued has run out with the command still on its disk, resetting its port; when the port does not come back, resets the controller, failing every other request with `device.reset`.
 fn Ahci.expired(
@@ -682,7 +708,7 @@ fn answer[R: Encode](request: u64, take result: Result[R, devices::DeviceError],
 
 /// Fails the request `waiting` holds with `error`.
 fn refuse(take waiting: Waiting, error: devices::DeviceError, alloc: mem::Alloc, mut cx: sys::Cx[AhciDevice]) {
-    let Waiting(request: request, unit: _, operation: operation, issued: _, data: _) = waiting
+    let Waiting(request: request, account: _, unit: _, operation: operation, issued: _, data: _) = waiting
     match operation {
         Operation.Read(block: _, count: _) => {
             let failed: Result[Untrusted[mem::Bytes], devices::DeviceError] = Err(error)

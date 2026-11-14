@@ -1,11 +1,28 @@
-//! The core's metrics: each second, a sample of each instance charged anything in that second, held for `journal`.
+//! The core's metrics: the transfers drivers charge, folded into their accounts, and each second a sample of each instance charged anything in that second, held for `journal`.
 
 const SECOND_NS: u64 = 1_000_000_000
 
-/// What the core last read of an instance: its incarnation, its CPU time, energy and handler calls with their buckets in that incarnation, and the abandonments of its incarnations.
+/// Folds the bytes of each transfer `transfers` brings into its account through `gauges`, and samples each second the instances `gauges` reads into `backlog`; never ends unless cancelled.
+fn keep_metrics(gauges: runner::Gauges, take transfers: task::Receiver[os::Transfer], backlog: journal::Backlog, config: runner::Config) fails task::Cancelled uses wait {
+    var given = Some(take transfers)
+    try await task::scope(config.exec, body: fn[mut given](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(receiving) = mut given.extract() else {
+            return
+        }
+        let folding = gauges.share()
+        discard s.spawn(fn[take folding, take receiving]() fails task::Cancelled uses wait limits stack 8_192 {
+            try await folding.keep_transfers(take receiving)
+        })
+        try await sample_metrics(gauges, backlog, clock: config.clock, wall: config.wall, alloc: config.alloc)
+    })
+} keep_metrics
+
+/// What the core last read of an instance: its incarnation, its CPU time, bytes read and written, energy and handler calls with their buckets in that incarnation, and the abandonments of its incarnations.
 struct Seen derives Copy {
     incarnation: u64
     cpu_ns: u64
+    read_bytes: u64
+    written_bytes: u64
     energy_mj: u64
     messages: u64
     latency: Array[u64, 32]
@@ -30,7 +47,7 @@ fn sample_metrics(
                 continue
             }
             let before = seen.get(name)
-            discard mut seen.insert(text::String.of(name.as_str(), alloc), value: Seen(incarnation: gauge.incarnation, cpu_ns: gauge.cpu_ns, energy_mj: gauge.energy_mj, messages: gauge.messages, latency: gauge.latency, traps: gauge.traps))
+            discard mut seen.insert(text::String.of(name.as_str(), alloc), value: Seen(incarnation: gauge.incarnation, cpu_ns: gauge.cpu_ns, read_bytes: gauge.read_bytes, written_bytes: gauge.written_bytes, energy_mj: gauge.energy_mj, messages: gauge.messages, latency: gauge.latency, traps: gauge.traps))
             let Some(measured) = sampled(gauge, before, source: name.as_str(), time) else {
                 continue
             }
@@ -44,7 +61,7 @@ fn sample_metrics(
 
 /// The sample of the instance `source` over the second from `time`, as `gauge` reads it against what the core read before, `before`; `None` when it was charged nothing.
 fn sampled(gauge: os::Gauge, before: Option[Seen], source: Str, time: ident::WallTime) -> Option[journal::MetricSample] {
-    var base = Seen(incarnation: gauge.incarnation, cpu_ns: 0, energy_mj: 0, messages: 0, latency: Array[u64, 32].filled(0), traps: gauge.traps)
+    var base = Seen(incarnation: gauge.incarnation, cpu_ns: 0, read_bytes: 0, written_bytes: 0, energy_mj: 0, messages: 0, latency: Array[u64, 32].filled(0), traps: gauge.traps)
     var restarts: u64 = 0
     match before {
         Some(held) => {
@@ -60,31 +77,38 @@ fn sampled(gauge: os::Gauge, before: Option[Seen], source: Str, time: ident::Wal
     }
     let cpu_ns = gauge.cpu_ns.saturating_sub(base.cpu_ns)
     let messages = gauge.messages.saturating_sub(base.messages)
-    if cpu_ns == 0 and messages == 0 {
+    let read_bytes = gauge.read_bytes.saturating_sub(base.read_bytes)
+    let written_bytes = gauge.written_bytes.saturating_sub(base.written_bytes)
+    if cpu_ns == 0 and messages == 0 and read_bytes == 0 and written_bytes == 0 {
         return None
     }
     var latency = Array[u64, 32].filled(0)
     for bucket in 0..<32usize {
         latency[bucket] = gauge.latency[bucket].saturating_sub(base.latency[bucket])
     }
-    return Some(journal::MetricSample(source: ident::Moniker(text: text::Fixed[59].of(source)), time: time, interval_s: 1, bundle: gauge.bundle, cpu_ns: cpu_ns, messages: messages, intake_max: gauge.intake, memory_bytes: gauge.memory.charged, memory_peak_bytes: gauge.memory.peak, energy_mj: gauge.energy_mj.saturating_sub(base.energy_mj), traps: gauge.traps.saturating_sub(base.traps), restarts: restarts, latency: latency))
+    return Some(journal::MetricSample(source: ident::Moniker(text: text::Fixed[59].of(source)), time: time, interval_s: 1, bundle: gauge.bundle, cpu_ns: cpu_ns, messages: messages, intake_max: gauge.intake, memory_bytes: gauge.memory.charged, memory_peak_bytes: gauge.memory.peak, io_read_bytes: read_bytes, io_write_bytes: written_bytes, energy_mj: gauge.energy_mj.saturating_sub(base.energy_mj), traps: gauge.traps.saturating_sub(base.traps), restarts: restarts, latency: latency))
 } sampled
 
 test instances_charged_nothing_yield_no_sample for sampled {
     var latency = Array[u64, 32].filled(0)
     latency[2] = 5
-    let gauge = os::Gauge(intake: 3, memory: os::Usage(charged: 4_096, limit: 65_536, peak: 8_192), reserved: false, cpu_ns: 2_000_000, energy_mj: 4, throttled: false, class: os::CpuClass.Normal, bundle: ident::HashValue(bytes: Array[u8, 33].filled(1)), incarnation: 2, messages: 7, latency: latency, traps: 1)
-    let held = Seen(incarnation: 2, cpu_ns: 500_000, energy_mj: 1, messages: 4, latency: Array[u64, 32].filled(0), traps: 1)
-    let idle = sampled(gauge, before: Some(Seen(incarnation: 2, cpu_ns: 2_000_000, energy_mj: 4, messages: 7, latency: latency, traps: 1)), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0))
+    let gauge = os::Gauge(intake: 3, memory: os::Usage(charged: 4_096, limit: 65_536, peak: 8_192), reserved: false, cpu_ns: 2_000_000, read_bytes: 9_000, written_bytes: 2_000, energy_mj: 4, throttled: false, class: os::CpuClass.Normal, bundle: ident::HashValue(bytes: Array[u8, 33].filled(1)), incarnation: 2, messages: 7, latency: latency, traps: 1)
+    let held = Seen(incarnation: 2, cpu_ns: 500_000, read_bytes: 1_000, written_bytes: 2_000, energy_mj: 1, messages: 4, latency: Array[u64, 32].filled(0), traps: 1)
+    let idle = sampled(gauge, before: Some(Seen(incarnation: 2, cpu_ns: 2_000_000, read_bytes: 9_000, written_bytes: 2_000, energy_mj: 4, messages: 7, latency: latency, traps: 1)), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0))
     let Some(busy) = sampled(gauge, before: Some(held), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0)) else {
         expect false
         return
     }
-    let Some(restarted) = sampled(gauge, before: Some(Seen(incarnation: 1, cpu_ns: 9_000_000, energy_mj: 18, messages: 90, latency: latency, traps: 0)), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0)) else {
+    let Some(transferring) = sampled(gauge, before: Some(Seen(incarnation: 2, cpu_ns: 2_000_000, read_bytes: 9_000, written_bytes: 0, energy_mj: 4, messages: 7, latency: latency, traps: 1)), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0)) else {
+        expect false
+        return
+    }
+    let Some(restarted) = sampled(gauge, before: Some(Seen(incarnation: 1, cpu_ns: 9_000_000, read_bytes: 0, written_bytes: 0, energy_mj: 18, messages: 90, latency: latency, traps: 0)), source: "fat", time: ident::WallTime(utc_ns: 0, uncertainty_ns: 0)) else {
         expect false
         return
     }
     expect idle.is_none()
-    expect busy.cpu_ns == 1_500_000 and busy.messages == 3 and busy.latency[2] == 5 and busy.energy_mj == 3 and busy.restarts == 0 and busy.traps == 0
+    expect busy.cpu_ns == 1_500_000 and busy.messages == 3 and busy.latency[2] == 5 and busy.energy_mj == 3 and busy.restarts == 0 and busy.traps == 0 and busy.io_read_bytes == 8_000 and busy.io_write_bytes == 0
+    expect transferring.cpu_ns == 0 and transferring.io_write_bytes == 2_000
     expect restarted.cpu_ns == 2_000_000 and restarted.energy_mj == 4 and restarted.messages == 7 and restarted.restarts == 1 and restarted.traps == 1
 } instances_charged_nothing_yield_no_sample

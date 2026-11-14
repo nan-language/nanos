@@ -67,11 +67,26 @@ fn Shared.show(self, mut driver: Driver) fails task::Cancelled uses wait {
     try await os::publish(self.postings, path: instance_path(driver.moniker, alloc).as_str(), type: "os::LiveInstance", value: record, alloc)
 } Shared.show
 
-/// Where the gauges of the accounts are read, each through its watch, and the time each account's messages took to handle in other instances, by account number.
+/// Where the gauges of the accounts are read, each through its watch, and what was folded into each account from outside it, by account number.
 pub open struct Gauges derives Send {
     watches: task::Cown[mem::Map[text::String, task::Sender[Mark]]]
-    folds: task::Cown[mem::Map[u32, u64]]
+    folds: task::Cown[mem::Map[u32, Folded]]
 } Gauges
+
+/// What was folded into an account from outside it: the time its messages took to handle in other instances, and the bytes drivers read and wrote for it.
+struct Folded derives Copy {
+    ns: u64
+    read_bytes: u64
+    written_bytes: u64
+} Folded
+
+/// Nothing folded.
+const UNFOLDED: Folded = Folded(ns: 0, read_bytes: 0, written_bytes: 0)
+
+/// What was folded since `base` was.
+fn Folded.since(self, base: Folded) -> Folded {
+    return Folded(ns: self.ns.saturating_sub(base.ns), read_bytes: self.read_bytes.saturating_sub(base.read_bytes), written_bytes: self.written_bytes.saturating_sub(base.written_bytes))
+} Folded.since
 
 pub fn Gauges.empty(alloc: mem::Alloc) -> Gauges {
     return Gauges(watches: task::Cown.of(mem::Map.empty(alloc), alloc), folds: task::Cown.of(mem::Map.empty(alloc), alloc))
@@ -85,18 +100,76 @@ pub fn Gauges.share(self) -> Gauges {
 fn Gauges.fold(self, account: u32, ns: u64) fails task::Cancelled uses wait {
     let folds = self.folds.share()
     await when mut folds {
-        let held = folds.get(account)
-        if held.is_some() or (account & os::SESSION_ACCOUNTS) == 0 {
-            discard mut folds.insert(account, value: held.value_or(0).saturating_add(ns))
+        match folded_into(folds, account) {
+            Some(held) => {
+                discard mut folds.insert(account, value: Folded(ns: held.ns.saturating_add(ns), read_bytes: held.read_bytes, written_bytes: held.written_bytes))
+            }
+            None => {
+            }
         }
     }
 } Gauges.fold
+
+/// Folds the bytes of each transfer `transfers` brings into its account, unless that is the account of a session not open, until the transfers end.
+pub fn Gauges.keep_transfers(self, take transfers: task::Receiver[os::Transfer]) fails task::Cancelled uses wait {
+    let folds = self.folds.share()
+    var receiver = transfers
+    loop {
+        let Some(transfer) = try await mut receiver.receive() else {
+            return
+        }
+        await when mut folds {
+            match folded_into(folds, account: transfer.account) {
+                Some(held) => {
+                    let folded = match transfer.written {
+                        true => Folded(ns: held.ns, read_bytes: held.read_bytes, written_bytes: held.written_bytes.saturating_add(transfer.bytes))
+                        false => Folded(ns: held.ns, read_bytes: held.read_bytes.saturating_add(transfer.bytes), written_bytes: held.written_bytes)
+                    }
+                    discard mut folds.insert(transfer.account, value: folded)
+                }
+                None => {
+                }
+            }
+        }
+    }
+} Gauges.keep_transfers
+
+test transfers_fold_into_their_accounts_unless_closed_sessions for Gauges.keep_transfers {
+    let world = testing::world()
+    let gauges = Gauges.empty(world.alloc)
+    let session = os::SESSION_ACCOUNTS | 1
+    try await gauges.open_folds(session)
+    let task::Channel(sender: transferring, receiver: transfers) = task::Channel[os::Transfer].bounded(4, alloc: world.alloc)
+    let minted = os::MintedMeter.of(take transferring, alloc: world.alloc)
+    let meter = minted.mint()
+    let read = meter.charge(account: session, bytes: 4_096, written: false)
+    let written = meter.charge(account: session, bytes: 512, written: true)
+    let instance = meter.charge(account: 7, bytes: 1_024, written: true)
+    let closed = meter.charge(account: os::SESSION_ACCOUNTS | 2, bytes: 8, written: false)
+    take minted.close()
+    let stale = meter.charge(account: 7, bytes: 1, written: false)
+    try await gauges.keep_transfers(take transfers)
+    let in_session = try await gauges.folded(session)
+    let in_instance = try await gauges.folded(7)
+    let in_closed = try await gauges.folded(os::SESSION_ACCOUNTS | 2)
+    expect read and written and instance and closed and not stale
+    expect in_session.read_bytes == 4_096 and in_session.written_bytes == 512 and in_instance.written_bytes == 1_024 and in_instance.read_bytes == 0 and in_closed.read_bytes == 0
+} transfers_fold_into_their_accounts_unless_closed_sessions
+
+/// What `folds` holds of the account `account`, nothing for an instance's account it holds none of yet, `None` for the account of a session not open.
+fn folded_into(folds: mem::Map[u32, Folded], account: u32) -> Option[Folded] {
+    return match first folds.get(account) {
+        Some(held) => Some(held)
+        None if (account & os::SESSION_ACCOUNTS) == 0 => Some(UNFOLDED)
+        None => None
+    }
+} folded_into
 
 /// Opens the account `account` of a session to folds, with nothing folded into it.
 fn Gauges.open_folds(self, account: u32) fails task::Cancelled uses wait {
     let folds = self.folds.share()
     await when mut folds {
-        discard mut folds.insert(account, value: 0)
+        discard mut folds.insert(account, value: UNFOLDED)
     }
 } Gauges.open_folds
 
@@ -108,10 +181,10 @@ fn Gauges.end_folds(self, account: u32) fails task::Cancelled uses wait {
     }
 } Gauges.end_folds
 
-/// The time folded into the account `account` so far.
-fn Gauges.folded(self, account: u32) -> u64 fails task::Cancelled uses wait {
+/// What was folded into the account `account` so far.
+fn Gauges.folded(self, account: u32) -> Folded fails task::Cancelled uses wait {
     let folds = self.folds.share()
-    return await when folds => folds.get(account).value_or(0)
+    return await when folds => folds.get(account).value_or(UNFOLDED)
 } Gauges.folded
 
 /// The gauge of the running incarnation of the instance `instance`, `None` when none runs.

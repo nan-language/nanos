@@ -84,7 +84,7 @@ pub open linear struct Lane derives Send {
     signal: mem::Shared[hw::Signal[Unit]]
 } Lane
 
-/// The driver's Env: the unit's geometry, the features it accepted, its function, its common configuration, its queues, the CPU each handler runs on, its clock, its alarm and its cell.
+/// The driver's Env: the unit's geometry, the features it accepted, its function, its common configuration, its queues, the CPU each handler runs on, its clock, its alarm, the meter its transfers are charged through and its cell.
 pub open linear struct BlkEnv derives Send {
     info: devices::BlockInfo
     features: u32
@@ -94,6 +94,7 @@ pub open linear struct BlkEnv derives Send {
     here: hw::PerCpu[u32]
     clock: sys::Clock
     alarm: devices::Alarm
+    meter: os::Meter
     alloc: mem::Alloc
 } BlkEnv
 
@@ -104,9 +105,10 @@ pub closed enum Operation derives Copy, Eq, Encode {
     Flush
 } Operation
 
-/// A request waiting for the device, and the data a write carries.
+/// A request waiting for the device, the account of the message that asked for it, and the data a write carries.
 pub closed struct Waiting derives Encode {
     pub request: u64
+    pub account: u32
     pub operation: Operation
     pub data: Option[mem::Bytes]
 } Waiting
@@ -131,7 +133,13 @@ impl Blk: sys::Component[BlkEnv, BlkDevice]
 impl Blk: sys::Resume[BlkEnv, BlkDevice]
 
 /// The Env over `function`, set up as `RngEnv.of` sets up an entropy device with a queue for each CPU up to those the device offers; `None` when the device does not allow it, the function then handed back.
-pub fn BlkEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[BlkEnv] {
+pub fn BlkEnv.of(
+    take function: hw::PciFunction,
+    clock: sys::Clock,
+    take alarm: devices::Alarm,
+    meter: os::Meter,
+    alloc: mem::Alloc,
+    ) -> Option[BlkEnv] {
     var held = function
     let Some(found) = located(held, kind: BLOCK_TYPE) else {
         take held.release()
@@ -186,7 +194,7 @@ pub fn BlkEnv.of(take function: hw::PciFunction, clock: sys::Clock, take alarm: 
     }
     ready(mut regs)
     let info = devices::BlockInfo(units: 1, block_bytes: block_bytes, blocks: sectors * SECTOR_BYTES / u64.widen(block_bytes), max_transfer_bytes: TRANSFER_BYTES, zone_blocks: 0, cache: (accepted & FLUSH) != 0, fua: false, discards: false, read_only: (accepted & READ_ONLY) != 0)
-    return Some(BlkEnv(info: info, features: accepted, function: take held, common: take regs, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alarm: take alarm, alloc: alloc))
+    return Some(BlkEnv(info: info, features: accepted, function: take held, common: take regs, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alarm: take alarm, meter: meter, alloc: alloc))
 } BlkEnv.of
 
 /// Queue `index` enabled with its buffers and an interrupt on CPU `index` under the storm limit; `None`, nothing enabled, when the device has no such queue or no MSI-X entry or doorbell for it.
@@ -223,7 +231,7 @@ fn lane_of(
 
 /// Resets the device, then releases the interrupts, the windows and the buffers, and hands the function back.
 pub fn BlkEnv.abandon(take self) {
-    let BlkEnv(info: _, features: _, function: function, common: common, lanes: lanes, here: _, clock: _, alarm: _, alloc: _) = self
+    let BlkEnv(info: _, features: _, function: function, common: common, lanes: lanes, here: _, clock: _, alarm: _, meter: _, alloc: _) = self
     var regs = common
     reset(mut regs)
     for lane in take lanes {
@@ -370,7 +378,7 @@ fn Blk.queue_request(
     let Some(request) = mut cx.postpone() else {
         return
     }
-    let waiting = Waiting(request: request, operation: operation, data: take data)
+    let waiting = Waiting(request: request, account: os::Header.current().account, operation: operation, data: take data)
     if self.lost {
         refuse(take waiting, error: devices::DeviceError.Reset, alloc: env.alloc, mut cx)
         return
@@ -398,8 +406,11 @@ fn Blk.completed(mut self, take queue: u16, mut env: BlkEnv, mut cx: sys::Cx[Blk
     }
     self.tracks[lane].used = self.tracks[lane].used.wrapping_add(1)
     self.tracks[lane].busy = false
-    let Waiting(request: request, operation: operation, data: _) = mut self.tracks[lane].waiting.remove(0)
+    let Waiting(request: request, account: account, operation: operation, data: _) = mut self.tracks[lane].waiting.remove(0)
     let status = mut env.lanes.at_mut(lane).header.read_acquire(Header.status)
+    if outcome(status).is_ok() {
+        env.charge(account, operation)
+    }
     match operation {
         Operation.Read(block: _, count: count) => answer(request, result: read_outcome(status, mut env, lane, count), alloc: env.alloc, mut cx)
         else => answer(request, result: outcome(status), alloc: env.alloc, mut cx)
@@ -444,9 +455,23 @@ fn answer[R: Encode](request: u64, take result: Result[R, devices::DeviceError],
     discard attempt mut cx.reply(request, reply)
 } answer
 
+/// Charges the bytes `operation` moved to the account `account`.
+fn BlkEnv.charge(self, account: u32, operation: Operation) {
+    match operation {
+        Operation.Read(block: _, count: count) => {
+            discard self.meter.charge(account, bytes: u64.widen(count) * u64.widen(self.info.block_bytes), written: false)
+        }
+        Operation.Write(block: _, count: count) => {
+            discard self.meter.charge(account, bytes: u64.widen(count) * u64.widen(self.info.block_bytes), written: true)
+        }
+        Operation.Flush => {
+        }
+    }
+} BlkEnv.charge
+
 /// Fails the request `waiting` holds with `error`.
 fn refuse(take waiting: Waiting, error: devices::DeviceError, alloc: mem::Alloc, mut cx: sys::Cx[BlkDevice]) {
-    let Waiting(request: request, operation: operation, data: _) = waiting
+    let Waiting(request: request, account: _, operation: operation, data: _) = waiting
     match operation {
         Operation.Read(block: _, count: _) => {
             let failed: Result[Untrusted[mem::Bytes], devices::DeviceError] = Err(error)

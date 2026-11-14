@@ -66,6 +66,9 @@ const STORE_LIMIT: u64 = 67_108_864
 /// The log records instances hand to the core that it takes in at once.
 const LOG_ROOM: usize = 256
 
+/// The transfers drivers charge that wait for the core to fold them.
+const TRANSFER_ROOM: usize = 256
+
 /// How long after the core's start `store`, `keys`, `journal` and `policy` may take to run.
 const BASE_DEADLINE_NS: u64 = 30_000_000_000
 
@@ -90,6 +93,7 @@ struct Base derives Copy {
     plans_live: os::Live
     callers: os::Callers
     accounts: os::Accounts
+    meter: os::Meter
 } Base
 
 impl Base: runner::Components
@@ -351,7 +355,7 @@ fn Base.serve_blk(self, take world: nanos::World, take serving: runner::Serving)
     }
     match try await self.claimed(path, alloc) {
         Some(devices::Claimed.Pci(function)) => {
-            let Some(env) = drivers::virtio::BlkEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), alloc) else {
+            let Some(env) = drivers::virtio::BlkEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
             }
             return try await runner::Driven[drivers::virtio::Blk, drivers::virtio::BlkEnv, drivers::virtio::BlkDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::virtio::BlkEnv.abandon)
@@ -368,7 +372,7 @@ fn Base.serve_nvme(self, take world: nanos::World, take serving: runner::Serving
     }
     match try await self.claimed(path, alloc) {
         Some(devices::Claimed.Pci(function)) => {
-            let Some(env) = drivers::nvme::NvmeEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), alloc) else {
+            let Some(env) = drivers::nvme::NvmeEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
             }
             return try await runner::Driven[drivers::nvme::Nvme, drivers::nvme::NvmeEnv, drivers::nvme::NvmeDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::nvme::NvmeEnv.abandon)
@@ -458,7 +462,7 @@ fn Base.serve_ahci(self, take world: nanos::World, take serving: runner::Serving
     }
     match try await self.claimed(path, alloc) {
         Some(devices::Claimed.Pci(function)) => {
-            let Some(env) = drivers::ahci::AhciEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), alloc) else {
+            let Some(env) = drivers::ahci::AhciEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
             }
             return try await runner::Driven[drivers::ahci::Ahci, drivers::ahci::AhciEnv, drivers::ahci::AhciDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::ahci::AhciEnv.abandon)
@@ -1013,28 +1017,29 @@ fn run_base(
     let task::Channel(sender: posted, receiver: postings) = task::Channel[os::Posting].bounded(16, alloc: config.alloc)
     let task::Channel(sender: switched, receiver: switches) = task::Channel[power::Switching].bounded(1, alloc: config.alloc)
     let task::Channel(sender: accounted, receiver: accounting) = task::Channel[os::AccountOrder].bounded(16, alloc: config.alloc)
-    let lives = Roots.of(posted, switched, accounted, monikers: rings.monikers(), alloc: config.alloc)
+    let task::Channel(sender: transferred, receiver: transfers) = task::Channel[os::Transfer].bounded(TRANSFER_ROOM, alloc: config.alloc)
+    let lives = Roots.of(posted, switched, accounted, take transferred, monikers: rings.monikers(), alloc: config.alloc)
     defer take lives.close()
     let task::Channel(sender: tracings, receiver: traced) = task::Channel[mem::List[journal::TracedInstance]].bounded(1, alloc: config.alloc)
     let backlog = journal::Backlog.of(tracings, principals: rings.principals(), alloc: config.alloc)
     let feeding = journal::MintedFeed.of(backlog, alloc: config.alloc)
     defer take feeding.close()
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint())
     var requested = incoming
     let counters = Counters.of(requests.split(), alloc: config.alloc)
-    var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced, accounting: take accounting))
+    var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced, accounting: take accounting, transfers: take transfers))
     defer abandon_given(take given)
     try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested, mut pool](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders, logged: log_records, traced: tracing, accounting: account_orders)) = mut given.extract() else {
+        let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders, logged: log_records, traced: tracing, accounting: account_orders, transfers: transfer_records)) = mut given.extract() else {
             return
         }
         let origin = Origin.of(handoff, clock: config.clock, wall: config.wall)
         let gauges = runner::Gauges.empty(alloc: config.alloc)
         let reading = gauges.share()
-        let sampling = gauges.share()
-        discard s.spawn(fn[take sampling]() fails task::Cancelled uses wait limits stack 32_768 {
-            try await sample_metrics(sampling, backlog, clock: config.clock, wall: config.wall, alloc: config.alloc)
+        let metering = gauges.share()
+        discard s.spawn(fn[take metering, take transfer_records]() fails task::Cancelled uses wait limits stack 32_768 {
+            try await keep_metrics(metering, transfers: take transfer_records, backlog, config)
         })
         discard s.spawn(fn[take board, take reading]() fails task::Cancelled uses wait limits stack 32_768 {
             try await serve_board(take board, origin, machine, security: security_of(handoff, machine, alloc: config.alloc), cpus, gauges: reading, memory: counters, exec: config.exec, alloc: config.alloc)
@@ -1082,7 +1087,7 @@ fn run_base(
     })
 } run_base
 
-/// The root entries of what base instances reach of the core: the `/live` records they publish, the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`; the monikers of the instances calling them; the power switch; and the accounts of sessions.
+/// The root entries of what base instances reach of the core: the `/live` records they publish, the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`; the monikers of the instances calling them; the power switch; the accounts of sessions; and the drivers' meter.
 linear struct Roots {
     store: os::MintedLive
     devices: os::MintedLive
@@ -1093,21 +1098,23 @@ linear struct Roots {
     callers: os::MintedCallers
     switch: power::MintedSwitch
     accounts: os::MintedAccounts
+    meter: os::MintedMeter
 } Roots
 
 fn Roots.of(
     posted: task::Sender[os::Posting],
     switched: task::Sender[power::Switching],
     accounted: task::Sender[os::AccountOrder],
+    take transferred: task::Sender[os::Transfer],
     take monikers: task::Cown[mem::Map[u32, ident::Moniker]],
     alloc: mem::Alloc,
     ) -> Roots {
-    return Roots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), plans: os::MintedLive.of(posted, own: "/live/plans", alloc), callers: os::MintedCallers.of(take monikers, alloc), switch: power::MintedSwitch.of(switched, alloc), accounts: os::MintedAccounts.of(accounted, alloc))
+    return Roots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), plans: os::MintedLive.of(posted, own: "/live/plans", alloc), callers: os::MintedCallers.of(take monikers, alloc), switch: power::MintedSwitch.of(switched, alloc), accounts: os::MintedAccounts.of(accounted, alloc), meter: os::MintedMeter.of(take transferred, alloc))
 } Roots.of
 
 /// Revokes the root entries.
 fn Roots.close(take self) {
-    let Roots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, plans: planned, callers: calling, switch: switching, accounts: accounting) = self
+    let Roots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, plans: planned, callers: calling, switch: switching, accounts: accounting, meter: metering) = self
     take stored.close()
     take managed.close()
     take keyed.close()
@@ -1117,6 +1124,7 @@ fn Roots.close(take self) {
     take calling.close()
     take switching.close()
     take accounting.close()
+    take metering.close()
 } Roots.close
 
 /// Halts the kernel with `fault.base-not-running` and the first of `store`, `keys`, `journal` and `policy` that is not running 30 s after the core's start.
@@ -1176,7 +1184,7 @@ fn record_store_events(take reports: task::Receiver[store::service::Report], rin
 fn abandon_given(take given: Option[Given]) {
     match given {
         Some(left) => {
-            let Given(known: _, machine: _, keeper: kept, orders: _, store_events: _, postings: _, switches: _, logged: _, traced: _, accounting: _) = left
+            let Given(known: _, machine: _, keeper: kept, orders: _, store_events: _, postings: _, switches: _, logged: _, traced: _, accounting: _, transfers: _) = left
             take kept.release()
         }
         None => {
@@ -1184,7 +1192,7 @@ fn abandon_given(take given: Option[Given]) {
     }
 } abandon_given
 
-/// What the tasks of `run_base` take: the genesis record and the machine the runner takes, the keeper with the device root's orders, the events the store reports, the postings to the board, the orders of the power switch, the log records of instances, the instances `journal` traces, and the orders for the accounts of sessions.
+/// What the tasks of `run_base` take: the genesis record and the machine the runner takes, the keeper with the device root's orders, the events the store reports, the postings to the board, the orders of the power switch, the log records of instances, the instances `journal` traces, the orders for the accounts of sessions, and the transfers drivers charge.
 linear struct Given {
     known: runner::Known
     machine: Resources
@@ -1196,6 +1204,7 @@ linear struct Given {
     logged: task::Receiver[journal::Logged]
     traced: task::Receiver[mem::List[journal::TracedInstance]]
     accounting: task::Receiver[os::AccountOrder]
+    transfers: task::Receiver[os::Transfer]
 } Given
 
 /// The rights of `Control`, or every right when `every`.
@@ -1281,7 +1290,11 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     let task::Channel(sender: accounted, receiver: unaccounted) = task::Channel[os::AccountOrder].bounded(1, alloc)
     let accounts = os::MintedAccounts.of(accounted, alloc)
     defer take accounts.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint())
+    let task::Channel(sender: transferred, receiver: untransferred) = task::Channel[os::Transfer].bounded(1, alloc)
+    discard untransferred
+    let metering = os::MintedMeter.of(take transferred, alloc)
+    defer take metering.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint())
     let task::Channel(sender: logs, receiver: unlogged) = task::Channel[journal::Logged].bounded(1, alloc)
     discard unlogged
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, machine: Unkept(alloc: alloc), accounting: take unaccounted, config, postings: posted, logs, gauges: runner::Gauges.empty(alloc), tracings: take untraced, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
