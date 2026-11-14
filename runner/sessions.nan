@@ -1,4 +1,4 @@
-//! Sessions' accounts: the account and the cell of each session `link` opens, the sessions of one principal drawing through one cell and draining one energy bucket, the gauge of each session, and the CPU reservations of `Session` grants.
+//! Sessions' accounts: the account and the cell of each session `link` opens, the sessions of one principal drawing through one cell, draining one energy bucket and consuming together, the gauge of each session, and the CPU reservations of `Session` grants.
 
 /// A principal with open sessions: the cell they draw through and the energy bucket they drain.
 linear struct Principal {
@@ -14,12 +14,19 @@ struct Session {
     marks: task::Sender[Mark]
 } Session
 
+/// What the closed sessions of a principal consumed together.
+struct Consumption {
+    principal: ident::Principal
+    consumed: os::Consumed
+} Consumption
+
 /// Carries out each order `orders` brings for the accounts of sessions and the reservations of `Session` grants, running the gauge of each open session on a task of `s`, until the orders end.
 fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: task::Scope) fails task::Cancelled uses wait {
     let alloc = self.config.alloc
     var principals = mem::List[Principal].empty(alloc)
     defer close_principals(take principals)
     var sessions = mem::Map[u64, Session].empty(alloc)
+    var consumption = mem::List[Consumption].empty(alloc)
     var granted = mem::Map[u64, Admitted].empty(alloc)
     var receiver = orders
     loop {
@@ -28,7 +35,10 @@ fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: 
         }
         match order {
             os::AccountOrder.Open(session: session, principal: principal, share: share, memory_bytes: memory_bytes, done: done) => {
-                let given = try await self.open_session(mut principals, mut sessions, session, take principal, share, memory_bytes, s)
+                let given = match try await self.open_session(mut principals, mut sessions, session, take principal, share, memory_bytes, s) {
+                    Some(account) => Some(os::OpenedAccount(account: account, consumed: try await self.consumed(session, sessions, consumption)))
+                    None => None
+                }
                 discard attempt await done.send(given)
             }
             os::AccountOrder.Find(session: session, done: done) => {
@@ -39,7 +49,7 @@ fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: 
                 discard attempt await done.send(found)
             }
             os::AccountOrder.Close(session: session, done: done) => {
-                try await self.close_session(mut principals, mut sessions, session)
+                try await self.close_session(mut principals, mut sessions, mut consumption, session)
                 discard attempt await done.send(Unit)
             }
             os::AccountOrder.Reset(done: done) => {
@@ -48,8 +58,9 @@ fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: 
                     mut open.push(kept.key())
                 }
                 for session in open {
-                    try await self.close_session(mut principals, mut sessions, session)
+                    try await self.close_session(mut principals, mut sessions, mut consumption, session)
                 }
+                mut consumption.truncate(0)
                 discard attempt await done.send(Unit)
             }
             os::AccountOrder.Reserve(grants: grants, done: done) => {
@@ -178,14 +189,61 @@ fn Shared.principal_of(
     return Some(principals.len() - 1)
 } Shared.principal_of
 
-/// Closes the account of the session numbered `session`, and its principal's cell when no other session of its principal is open.
-fn Shared.close_session(self, mut principals: mem::List[Principal], mut sessions: mem::Map[u64, Session], session: u64) fails task::Cancelled uses wait {
+/// What the sessions of the principal of the open session numbered `session` consumed together: what `consumption` holds of its closed sessions with what the gauges of its open ones read.
+fn Shared.consumed(self, session: u64, sessions: mem::Map[u64, Session], consumption: mem::List[Consumption]) -> os::Consumed fails task::Cancelled uses wait {
+    var consumed = os::Consumed(cpu_ns: 0, energy_mj: 0)
+    let Some(kept) = sessions.get(session) else {
+        return consumed
+    }
+    match consumption.position(fn(each: Consumption) => each.principal == kept.principal) {
+        Some(at) => {
+            consumed = consumption[at].consumed
+        }
+        None => {
+        }
+    }
+    for open in sessions {
+        if open.value().principal != kept.principal {
+            continue
+        }
+        match try await self.gauges.read(session_name(open.key()).as_str(), alloc: self.config.alloc) {
+            Some(gauge) => {
+                consumed = consumed_with(consumed, gauge)
+            }
+            None => {
+            }
+        }
+    }
+    return consumed
+} Shared.consumed
+
+/// `consumed` with the CPU time and the energy `gauge` reads.
+fn consumed_with(consumed: os::Consumed, gauge: os::Gauge) -> os::Consumed {
+    return os::Consumed(cpu_ns: consumed.cpu_ns.saturating_add(gauge.cpu_ns), energy_mj: consumed.energy_mj.saturating_add(gauge.energy_mj))
+} consumed_with
+
+/// Closes the account of the session numbered `session`, adding what it consumed to what `consumption` holds of its principal, and its principal's cell when no other session of its principal is open.
+fn Shared.close_session(self, mut principals: mem::List[Principal], mut sessions: mem::Map[u64, Session], mut consumption: mem::List[Consumption], session: u64) fails task::Cancelled uses wait {
     let Some(closed) = mut sessions.remove(session) else {
         return
     }
-    try await self.gauges.unwatch(session_name(session).as_str(), alloc: self.config.alloc)
+    let name = session_name(session)
+    let last = try await self.gauges.read(name.as_str(), alloc: self.config.alloc)
+    try await self.gauges.unwatch(name.as_str(), alloc: self.config.alloc)
     try await self.gauges.end_folds(closed.account.number)
     discard attempt await closed.marks.send(Mark.Ended)
+    match last {
+        Some(gauge) => {
+            match consumption.position(fn(each: Consumption) => each.principal == closed.principal) {
+                Some(at) => {
+                    consumption[at].consumed = consumed_with(consumption[at].consumed, gauge)
+                }
+                None => mut consumption.push(Consumption(principal: ident::Principal(text: closed.principal.text), consumed: consumed_with(os::Consumed(cpu_ns: 0, energy_mj: 0), gauge)))
+            }
+        }
+        None => {
+        }
+    }
     for open in sessions {
         if open.value().principal == closed.principal {
             return
