@@ -4,6 +4,8 @@ const AMD: Slice[u8] = b"AuthenticAMD"
 
 const HYGON: Slice[u8] = b"HygonGenuine"
 
+const GENUINE_INTEL: Slice[u8] = b"GenuineIntel"
+
 const ARCH_CAPABILITIES: u32 = 0x10A
 
 const RDCL_NO: u64 = 1
@@ -14,6 +16,24 @@ const PM_ENABLE: u32 = 0x770
 const HWP_CAPABILITIES: u32 = 0x771
 
 const HWP_REQUEST: u32 = 0x774
+
+/// The MSRs of RAPL's package energy counter: Intel's unit and counter, then AMD's.
+const INTEL_POWER_UNIT: u32 = 0x606
+
+const INTEL_PACKAGE_ENERGY: u32 = 0x611
+
+const AMD_POWER_UNIT: u32 = 0xC001_0299
+
+const AMD_PACKAGE_ENERGY: u32 = 0xC001_029B
+
+/// The models of Intel family 6 whose package energy counter counts units of 2^-n joules: the cores from Sandy Bridge on and the Atoms from Goldmont on.
+const RAPL_MODELS: Slice[u8] = b"\x2A\x2D\x3A\x3E\x3C\x3F\x45\x46\x3D\x47\x4F\x56\x4E\x5E\x55\x8E\x9E\x66\x7D\x7E\x6A\x6C\x9D\xA5\xA6\x8C\x8D\xA7\x97\x9A\xBE\xB7\xBA\xBF\xAA\xAC\xB5\xBD\xC5\xC6\x8F\xCF\xAD\xAE\x8A\x5C\x5F\x7A\x86\x96\x9C\x57\x85"
+
+/// The MSRs of RAPL's package energy counter: the one giving its unit, 2^-n joules for the n of its bits 12:8, and the one counting that unit in its bits 31:0.
+pkg struct Rapl derives Copy, Eq {
+    unit: u32
+    energy: u32
+} Rapl
 
 /// An x86-64 microarchitecture level of the System V psABI: the instruction-set extensions code of that level uses.
 pkg enum Level derives Copy, Eq, Ord {
@@ -33,6 +53,7 @@ pkg struct Features derives Copy, Eq {
     pkg hwp: bool
     pkg meltdown_immune: bool
     pkg x2apic: bool
+    pkg rapl: Option[Rapl]
     pkg level: Level
     pkg smt: bool
     pkg topology: Topology
@@ -80,6 +101,7 @@ pkg fn Features.read(cpu: hw::Ring0) -> Features {
         hwp: bit(leaves.thermal.eax, at: 7) and bit(leaves.thermal.eax, at: 10),
         meltdown_immune: (capabilities & RDCL_NO) != 0 or vendor_of(leaves.basic, is: AMD) or vendor_of(leaves.basic, is: HYGON),
         x2apic: bit(leaves.features.ecx, at: 21),
+        rapl: rapl_of(leaves),
         level: level(leaves),
         smt: threads_per_core(cpu, max: basic.eax) > 1,
         topology: topology_of(cpu, max: basic.eax),
@@ -106,6 +128,39 @@ fn performance_request(capabilities: u64, preference: u8) -> u64 {
     let lowest = (capabilities >> 24) & 0xFF
     return lowest | (highest << 8) | (u64.widen(preference) << 24)
 } performance_request
+
+/// The RAPL counter leaves 0, 1 and `0x8000_0007` report: AMD's and Hygon's where leaf `0x8000_0007` sets EDX bit 14, Intel's on the family 6 models of `RAPL_MODELS`; `None` otherwise.
+fn rapl_of(leaves: Leaves) -> Option[Rapl] {
+    if vendor_of(leaves.basic, is: AMD) or vendor_of(leaves.basic, is: HYGON) {
+        return match bit(leaves.power.edx, at: 14) {
+            true => Some(Rapl(unit: AMD_POWER_UNIT, energy: AMD_PACKAGE_ENERGY))
+            false => None
+        }
+    }
+    let signature = leaves.features.eax
+    if not vendor_of(leaves.basic, is: GENUINE_INTEL) or ((signature >> 8) & 0xF) != 6 {
+        return None
+    }
+    let model = u8.truncate(((signature >> 12) & 0xF0) | ((signature >> 4) & 0xF))
+    for known in RAPL_MODELS {
+        if known == model {
+            return Some(Rapl(unit: INTEL_POWER_UNIT, energy: INTEL_PACKAGE_ENERGY))
+        }
+    }
+    return None
+} rapl_of
+
+/// The unit of the counter: n for 2^-n joules.
+pkg fn Rapl.unit_shift(self, cpu: hw::Ring0) -> u8 {
+    let units = trusted "CPUID enumerates RAPL, whose power unit MSR this is" { cpu.read_msr(self.unit) }
+    return u8.truncate((units >> 8) & 0x1F)
+} Rapl.unit_shift
+
+/// The count of the running CPU's package.
+pkg fn Rapl.count(self, cpu: hw::Ring0) -> u32 {
+    let counted = trusted "CPUID enumerates RAPL, whose package energy MSR this is" { cpu.read_msr(self.energy) }
+    return u32.truncate(counted)
+} Rapl.count
 
 /// Leaf `leaf` of the basic range, all zero beyond its highest leaf `max`.
 fn basic_leaf(cpu: hw::Ring0, max: u32, leaf: u32) -> hw::CpuidRegs {
@@ -283,6 +338,22 @@ test cache_sharing_rounds_up_to_a_power_of_two for sharing_shift {
     expect sharing_shift(0xC163) == 2
     expect sharing_shift(0x3_C163) == 4
 } cache_sharing_rounds_up_to_a_power_of_two
+
+/// RAPL is AMD's where leaf `0x8000_0007` reports it, which QEMU's `max` model does not, and Intel's on the models of the list.
+test rapl_counters_follow_the_vendor_and_model for rapl_of {
+    let max = qemu_max()
+    expect rapl_of(max).is_none()
+    var zen = max
+    zen.power.edx = 0x4000
+    expect rapl_of(zen) == Some(Rapl(unit: AMD_POWER_UNIT, energy: AMD_PACKAGE_ENERGY))
+    var kaby_lake = max
+    kaby_lake.basic = regs(eax: 0x16, ebx: 0x756E_6547, ecx: 0x6C65_746E, edx: 0x4965_6E69)
+    kaby_lake.features.eax = 0x9_06E9
+    expect rapl_of(kaby_lake) == Some(Rapl(unit: INTEL_POWER_UNIT, energy: INTEL_PACKAGE_ENERGY))
+    var silvermont = kaby_lake
+    silvermont.features.eax = 0x3_0678
+    expect rapl_of(silvermont).is_none()
+} rapl_counters_follow_the_vendor_and_model
 
 /// A request spans the CPU's lowest to highest performance, leaves the desired one to the hardware, and carries the preference.
 test requests_span_the_whole_range for performance_request {

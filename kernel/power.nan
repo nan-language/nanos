@@ -1,4 +1,4 @@
-//! Power off and reboot as the core carries them out, through the sandbox's exit port, the power settings it applies, and the energy-performance preferences it writes on a machine with HWP.
+//! Power off and reboot as the core carries them out, through the sandbox's exit port, the power settings it applies, the energy-performance preferences it writes on a machine with HWP, and its calibration of the power of a running CPU on a machine with RAPL.
 
 const EXIT_PORT: u16 = 0xF4
 
@@ -14,46 +14,159 @@ registers ExitPort {
 /// The time a CPU waits after writing its energy-performance preference before it writes another.
 const PREFERENCE_PACE_NS: u64 = 10_000_000
 
-/// Writes each CPU's energy-performance preference through `cpu`, on a machine with HWP, for as long as it runs.
-fn write_all_preferences(cpu: hw::Ring0, cpus: mem::Shared[sched::State], clock: sys::Clock, exec: task::Executor) fails task::Cancelled uses wait {
+/// The longest window between two samples of a package's energy counter that calibrates: shorter than the counter takes to wrap around below 4 kW.
+const CALIBRATION_WINDOW_NS: u64 = 60_000_000_000
+
+/// A sample of a package's energy counter: its count, the time the package's CPUs had spent on work, and when.
+struct Sample derives Copy, Eq {
+    count: u32
+    busy_ns: u64
+    at_ns: u64
+} Sample
+
+/// Tends each CPU through `cpu` from tasks pinned to it, for as long as it runs: writes its energy-performance preference on a machine with HWP, and calibrates the power of a running CPU from its package's RAPL counter `rapl` on a machine with RAPL.
+fn tend_cpus(
+    cpu: hw::Ring0,
+    cpus: mem::Shared[sched::State],
+    rapl: Option[cpu::Rapl],
+    clock: sys::Clock,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    let samples = task::Cown.of(mem::Map[u32, Sample].empty(alloc), alloc)
     try await task::scope(exec, body: fn(s: task::Scope) {
         for number in 0..<cpus.contents().count() {
-            let Some(wanted) = cpus.contents().wanted_by(number) else {
+            let wanted = cpus.contents().wanted_by(number)
+            let asked = match rapl {
+                Some(_) => cpus.contents().calibrated_by(number)
+                None => None
+            }
+            if wanted.is_none() and asked.is_none() {
                 continue
             }
-            discard s.spawn(fn[take wanted]() fails task::Cancelled uses wait limits stack 8_192 {
-                try await write_preferences(cpu, take wanted, number, clock, exec)
+            let kept = samples.share()
+            discard s.spawn(fn[take wanted, take asked, take kept]() fails task::Cancelled uses wait limits stack 8_192 {
+                try await tend(cpu, number, take wanted, take asked, rapl, cpus, samples: kept, clock, exec)
             })
         }
     })
-} write_all_preferences
+} tend_cpus
 
-/// Writes on CPU `number`, from a task pinned to it, each energy-performance preference the policy posts to `wanted` that differs from the one written, waiting 10 ms after each write; the CPU's performance states are handed to its hardware first.
-fn write_preferences(
+/// Runs on CPU `number`, from tasks pinned to it: the writer of each energy-performance preference the policy posts to `wanted`, and the calibration of the power of a running CPU each time the CPU asks for one through `asked`.
+fn tend(
     cpu: hw::Ring0,
-    take wanted: mem::Shared[hw::Signal[u8]],
     number: u32,
+    take wanted: Option[mem::Shared[hw::Signal[u8]]],
+    take asked: Option[mem::Shared[hw::Signal[Unit]]],
+    rapl: Option[cpu::Rapl],
+    cpus: mem::Shared[sched::State],
+    samples: task::Cown[mem::Map[u32, Sample]],
     clock: sys::Clock,
     exec: task::Executor,
     ) fails task::Cancelled uses wait {
     let account = exec.split(sched::pinned_share(number))
     defer take account.close()
-    try await task::scope(account.executor(), body: fn[take wanted](s: task::Scope) {
-        let posted = wanted.share()
-        discard s.spawn(fn[take posted]() fails task::Cancelled uses wait limits stack 4_096 {
-            cpu::enable_hwp(cpu)
-            var written: Option[u8] = None
-            loop {
-                let preference = try await posted.contents().wait()
-                if written != Some(preference) {
-                    cpu::request_preference(cpu, preference)
-                    written = Some(preference)
-                    try await clock.sleep_ns(PREFERENCE_PACE_NS)
+    try await task::scope(account.executor(), body: fn[take wanted, take asked](s: task::Scope) {
+        match wanted {
+            Some(signal) => {
+                let posted = signal.share()
+                discard s.spawn(fn[take posted]() fails task::Cancelled uses wait limits stack 4_096 {
+                    try await write_preferences(cpu, wanted: posted, clock)
+                })
+            }
+            None => {
+            }
+        }
+        match asked {
+            Some(signal) => {
+                let posted = signal.share()
+                let kept = samples.share()
+                match rapl {
+                    Some(counter) => {
+                        discard s.spawn(fn[take posted, take kept]() fails task::Cancelled uses wait limits stack 4_096 {
+                            try await calibrate(cpu, rapl: counter, asked: posted, number, cpus, samples: kept, clock)
+                        })
+                    }
+                    None => {
+                    }
                 }
             }
-        })
+            None => {
+            }
+        }
     })
+} tend
+
+/// Writes on the running CPU each energy-performance preference the policy posts to `wanted` that differs from the one written, waiting 10 ms after each write; the CPU's performance states are handed to its hardware first.
+fn write_preferences(cpu: hw::Ring0, wanted: mem::Shared[hw::Signal[u8]], clock: sys::Clock) fails task::Cancelled uses wait {
+    cpu::enable_hwp(cpu)
+    var written: Option[u8] = None
+    loop {
+        let preference = try await wanted.contents().wait()
+        if written != Some(preference) {
+            cpu::request_preference(cpu, preference)
+            written = Some(preference)
+            try await clock.sleep_ns(PREFERENCE_PACE_NS)
+        }
+    }
 } write_preferences
+
+/// Calibrates the power of a running CPU each time CPU `number`, the running one, asks for it through `asked`: from the energy its package's RAPL counter `rapl` counted since the package's last sample `samples` keeps.
+fn calibrate(
+    cpu: hw::Ring0,
+    rapl: cpu::Rapl,
+    asked: mem::Shared[hw::Signal[Unit]],
+    number: u32,
+    cpus: mem::Shared[sched::State],
+    samples: task::Cown[mem::Map[u32, Sample]],
+    clock: sys::Clock,
+    ) fails task::Cancelled uses wait {
+    let Some(place) = cpus.contents().place(number) else {
+        return
+    }
+    let shift = rapl.unit_shift(cpu)
+    loop {
+        try await asked.contents().wait()
+        let taken = Sample(count: rapl.count(cpu), busy_ns: cpus.contents().package_busy_ns(place.package_id), at_ns: rings::elapsed(clock))
+        let estimate = await when mut samples => estimated(mut samples, package_id: place.package_id, taken, shift)
+        match estimate {
+            Some(mw) => cpus.contents().calibrate(mw)
+            None => {
+            }
+        }
+    }
+} calibrate
+
+/// Takes `taken` as the last sample of the package `package_id` in `samples`; the power of a running CPU it gives against the one before.
+fn estimated(mut samples: mem::Map[u32, Sample], package_id: u32, taken: Sample, shift: u8) -> Option[u64] {
+    let before = samples.get(package_id)
+    discard mut samples.insert(package_id, value: taken)
+    let Some(last) = before else {
+        return None
+    }
+    return power_mw(before: last, after: taken, shift)
+} estimated
+
+/// The power of a running CPU over the window from `before` to `after`, samples of a package's energy counter counting units of 2^-`shift` joules: the energy counted over the time its CPUs spent on work; `None` for a window over 60 s, or in which the work took less than half of it.
+fn power_mw(before: Sample, after: Sample, shift: u8) -> Option[u64] {
+    let window = after.at_ns.saturating_sub(before.at_ns)
+    let ran = after.busy_ns.saturating_sub(before.busy_ns)
+    if window == 0 or window > CALIBRATION_WINDOW_NS or ran.saturating_mul(2) < window or shift > 31 {
+        return None
+    }
+    let counted = u64.widen(after.count.wrapping_sub(before.count))
+    let nj = (counted * 1_000_000_000) >> u32.widen(shift)
+    return Some(nj.saturating_mul(1_000) / ran)
+} power_mw
+
+/// 61 µJ units counted over a window of work give the power over that work, the counter wrapping around; a window over 60 s or idle more than half of the time gives none.
+test calibrations_divide_the_energy_by_the_work for power_mw {
+    let before = Sample(count: 0xFFFF_F000, busy_ns: 0, at_ns: 0)
+    let after = Sample(count: 0x0000_1000, busy_ns: 10_000_000, at_ns: 10_000_000)
+    expect power_mw(before, after, shift: 14) == Some(50_000)
+    expect power_mw(before, after: Sample(count: 0x1000, busy_ns: 4_000_000, at_ns: 10_000_000), shift: 14).is_none()
+    expect power_mw(before, after: Sample(count: 0x1000, busy_ns: 61_000_000_000, at_ns: 61_000_000_000), shift: 14).is_none()
+} calibrations_divide_the_energy_by_the_work
 
 /// Carries out each power off or reboot `orders` brings, and applies each setting of power to `cpus`, for as long as they come.
 fn switch_power(take orders: task::Receiver[power::Switching], cpus: mem::Shared[sched::State]) fails task::Cancelled uses wait {
@@ -81,7 +194,7 @@ test settings_apply_to_the_cores_state for switch_power {
     let world = testing::world()
     var places = mem::List[sched::Place].empty(world.alloc)
     mut places.push(sched::Place(package_id: 0, core: 0, cache: 0, node: 0))
-    let cpus = mem::Shared.of(sched::State.of(take places, clock: world.clock, idle_states: mem::List.empty(world.alloc), hwp: false, alloc: world.alloc), alloc: world.alloc)
+    let cpus = mem::Shared.of(sched::State.of(take places, clock: world.clock, idle_states: mem::List.empty(world.alloc), hwp: false, rapl: false, alloc: world.alloc), alloc: world.alloc)
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[power::Switching].bounded(1, alloc: world.alloc)
     let before = cpus.contents().busy_mw.contents().load()
     var preferences = Array[u8, 3].filled(10)
