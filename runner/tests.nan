@@ -16,6 +16,8 @@ protocol Counter {
     pub fn asleep() -> bool limits pure
     /// The cause of the handler call, as a header holds it.
     pub fn cause() -> u64 limits pure
+    /// The deadline of the handler call, as a header holds it.
+    pub fn deadline() -> u64 limits pure
     /// Adds `amount`, notes it again a minute later and spawns a keyed task, giving the total.
     pub fn echo(amount: u32) -> u64 limits recorded
     /// The pressure levels the tally was told of, in order, one decimal digit each.
@@ -133,6 +135,10 @@ fn Tally.cause(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 {
     return os::Header.current().cause
 } Tally.cause
 
+fn Tally.deadline(mut self, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 {
+    return os::Header.current().deadline
+} Tally.deadline
+
 fn Tally.echo(mut self, take amount: u32, mut env: TallyEnv, mut cx: sys::Cx[Counter]) -> u64 {
     self.total += u64.widen(amount)
     mut cx.after(ms: 60_000, send: Counter.note(amount: amount))
@@ -212,6 +218,7 @@ fn Spare.end_reservation(self, id: u64) {
 fn Spare.bind(
     self,
     executor: u64,
+    account: u32,
     reservation: u64,
     cpu: u32,
     group: u64,
@@ -220,6 +227,12 @@ fn Spare.bind(
 
 fn Spare.unbind(self, executor: u64) {
 } Spare.unbind
+
+fn Spare.lend(self, executor: u64, lender: u32) {
+} Spare.lend
+
+fn Spare.unlend(self, executor: u64) {
+} Spare.unlend
 
 /// Postings no board reads.
 fn unlogged(alloc: mem::Alloc) -> task::Sender[journal::Logged] {
@@ -394,6 +407,12 @@ fn cause_of(port: os::Port[Counter], alloc: mem::Alloc) -> u64 fails os::PortErr
     let reply = sys::Wire[Counter].cause(mut call)
     return try await port.call(take call, reply, alloc)
 } cause_of
+
+fn deadline_of(port: os::Port[Counter], alloc: mem::Alloc) -> u64 fails os::PortError[Never] uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Counter].deadline(mut call)
+    return try await port.call(take call, reply, alloc)
+} deadline_of
 
 fn divide(port: os::Port[Counter], by: u32, alloc: mem::Alloc) fails os::PortError[Never] uses wait {
     var call = sys::Encoded.empty(alloc)
@@ -681,6 +700,74 @@ fn granted_sessions(accounts: os::Accounts, machine: Squeezed, alloc: mem::Alloc
     return seen
 } granted_sessions
 
+/// Starts the tally and opens session 1, then has the tally handle calls: one sent under a deadline 10 s ahead, which its handler call takes, and one sent as session 1's work. Its handler's deadline, the task's own, and the account whose terms `machine` last lent the tally's account first.
+fn dispatched_terms(
+    core: Core,
+    accounts: os::Accounts,
+    machine: Squeezed,
+    clock: sys::Clock,
+    alloc: mem::Alloc,
+    ) -> Array[u64, 3] fails Failure uses wait {
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 2, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    var seen = Array[u64, 3].filled(0)
+    let at = now(clock) + 10_000_000_000
+    seen[0] = try await task::paced(clock, at_ns: at, body: fn[mut seen]() -> u64 fails Failure uses wait {
+        seen[1] = task::deadline_ns(clock).value_or(0)
+        return try await deadline_of(port, alloc)
+    })
+    discard try await accounts.open(1, principal: ident::Principal(text: text::Fixed[64].of("agent.tests")), grant: None, memory_bytes: Some(SESSION_BYTES), alloc)
+    discard try await sys::run_headed(os::Header.of_work(cause: 0, slot: 0).charged_to(os::SESSION_ACCOUNTS | 1).carried(), body: fn() -> u64 fails Failure uses wait {
+        return try await cause_of(port, alloc)
+    })
+    seen[2] = machine.lent.contents().load()
+    try await accounts.reset(alloc)
+    discard try await core.control.stop(named("tally"), alloc)
+    return seen
+} dispatched_terms
+
+test dispatches_take_the_deadline_and_terms_of_the_calls_they_serve for Shared.lend {
+    let world = testing::world()
+    let machine = Squeezed.of(world.alloc)
+    let seeing = machine.share()
+    let task::Channel(sender: accounted, receiver: accounting) = task::Channel[os::AccountOrder].bounded(4, alloc: world.alloc)
+    let minted = os::MintedAccounts.of(accounted, alloc: world.alloc)
+    defer take minted.close()
+    let accounts = minted.mint()
+    let seen = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: Counts.of(world.alloc), machine: machine.share(), take accounting, config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> Array[u64, 3] fails Failure uses wait {
+        return try await dispatched_terms(core, accounts, machine: seeing, clock: world.clock, alloc: world.alloc)
+    })
+    let Some(read) = seen else {
+        expect false
+        return
+    }
+    expect read[0] == read[1] and read[1] > 0
+    expect read[2] == u64.widen(os::SESSION_ACCOUNTS | 1)
+} dispatches_take_the_deadline_and_terms_of_the_calls_they_serve
+
+/// A queued call of the account `account` with the deadline `deadline`.
+fn queued_of(account: u32, deadline: u64, alloc: mem::Alloc) -> Queued {
+    let header = os::Header.of_work(cause: 0, slot: account).dispatched(deadline)
+    return Queued(call: os::Call(hash: sys::Wire[Counter].hash(), encoded: sys::Encoded.empty(alloc), reply: None, lease: os::Lease.free(alloc), header: header), since_ns: 0, redelivery: None)
+} queued_of
+
+/// A dispatch of account 1's call with a deadline at 500, behind which wait calls of accounts 2, at 100, 3, without one, and 4, at 100 too: account 2's call leads it, holding the earliest deadline first.
+test dispatches_lead_with_the_call_holding_the_earliest_deadline for leading_header {
+    let alloc = testing::world().alloc
+    var queue = mem::List[Queued].empty(alloc)
+    mut queue.push(queued_of(2, deadline: 100, alloc))
+    mut queue.push(queued_of(3, deadline: os::NO_DEADLINE, alloc))
+    mut queue.push(queued_of(4, deadline: 100, alloc))
+    let leading = leading_header(os::Header.of_work(cause: 0, slot: 1).dispatched(500), queue)
+    expect leading.account == 2 and leading.deadline == 100
+} dispatches_lead_with_the_call_holding_the_earliest_deadline
+
 test sessions_draw_on_their_grants_reservation_in_their_principals_group for Shared.open_session {
     let world = testing::world()
     let machine = Squeezed.of(world.alloc)
@@ -777,7 +864,7 @@ fn describing(core: Core, alloc: mem::Alloc) -> bool fails Failure uses wait {
     }
     var bundle = Array[u8, 33].filled(0)
     bundle[0] = 0x01
-    return volatile and described.schema.hash == sys::Wire[Counter].hash() and described.schema.operations.len() == 9 and described.bundle == ident::HashValue(bytes: bundle)
+    return volatile and described.schema.hash == sys::Wire[Counter].hash() and described.schema.operations.len() == 10 and described.bundle == ident::HashValue(bytes: bundle)
 } describing
 
 test controls_describe_instances_and_restore_only_checkpointed_ones for Shared.described {
@@ -1403,7 +1490,7 @@ test revoked_root_entries_make_their_copies_stale for Minted.revoke {
     var minted = Minted.none(alloc)
     mut minted.controls.push(GrantedControl(grant: 1, control: os::MintedControl.of(orders, grant: None, prefix: None, alloc)))
     mut minted.controls.push(GrantedControl(grant: 2, control: os::MintedControl.of(orders, grant: None, prefix: None, alloc)))
-    mut minted.ports.push(WiredPort(field: text::String.of("counter", alloc), grant: 1, port: os::MintedPort.of(intake, gate: os::Gate.of(alloc), protocols: os::Protocols(own: sys::Wire[Counter].hash(), serves: None), operations: None, credit: os::Credit(messages: 1, calls: 1), alloc)))
+    mut minted.ports.push(WiredPort(field: text::String.of("counter", alloc), grant: 1, port: os::MintedPort.of(intake, gate: os::Gate.of(alloc), protocols: os::Protocols(own: sys::Wire[Counter].hash(), serves: None), operations: None, credit: os::Credit(messages: 1, calls: 1), clock: testing::world().clock, alloc)))
     let control = minted.controls[0].control.mint(os::ControlRights(read: true, lifecycle: false, spawn: false, reserved: 0))
     let port = os::Port[Counter].of(minted.ports[0].port.handle())
     var grants = mem::Set[u64].empty(alloc)
@@ -1535,8 +1622,8 @@ test created_instances_answer_postponed_requests_until_deleted for Directory.cre
 } created_instances_answer_postponed_requests_until_deleted
 
 /// A directory holding the tally's endpoint, the root grant and a `Device` grant held by `inst.driver`, and the spec of `driver`, claiming that device and wired to the holder of the entropy role.
-fn claiming(alloc: mem::Alloc) -> Directory {
-    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc))
+fn claiming(clock: sys::Clock, alloc: mem::Alloc) -> Directory {
+    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc), clock: clock)
     let task::Channel(sender: intake, receiver: _) = task::Channel[os::Call].bounded(1, alloc)
     discard mut listed.endpoints.insert(named("tally"), value: Endpoint(intake: take intake, gate: os::Gate.of(alloc), protocols: os::Protocols(own: sys::Wire[Counter].hash(), serves: None)))
     discard mut listed.grants.insert(0, value: os::Grant(holder: system(), object: os::Object.Machine, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
@@ -1548,7 +1635,7 @@ fn claiming(alloc: mem::Alloc) -> Directory {
 test worlds_draw_randomness_only_under_a_random_grant for Directory.world {
     let world = testing::world()
     let alloc = world.alloc
-    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc))
+    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc), clock: testing::world().clock)
     discard mut listed.grants.insert(0, value: os::Grant(holder: ident::Principal(text: text::Fixed[64].of("inst.drawer")), object: os::Object.Random, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
     var bundle = Array[u8, 33].filled(0)
     bundle[0] = 0x01
@@ -1582,7 +1669,7 @@ test worlds_draw_randomness_only_under_a_random_grant for Directory.world {
 test worlds_claim_devices_and_wire_roles_once_assigned for Directory.world {
     let world = testing::world()
     let alloc = world.alloc
-    var listed = claiming(alloc)
+    var listed = claiming(world.clock, alloc)
     var bundle = Array[u8, 33].filled(0)
     bundle[0] = 0x01
     var spec = os::InstanceSpec.of(principal: system(), bundle: ident::HashValue(bytes: bundle), component: "runner::Tally", alloc)
@@ -1670,7 +1757,7 @@ test hibernation_needs_a_running_instance_whose_checkpoints_are_kept for Driver.
     expect kept == Some(served)
 } hibernation_needs_a_running_instance_whose_checkpoints_are_kept
 
-/// A machine whose pool's pressure level the test sets, waking those waiting for it to change, which keeps the runtime of the reservation it last ran, 0 once it ended, and the reservation and the group of the account it last bound, and whose running CPUs draw 2 W.
+/// A machine whose pool's pressure level the test sets, waking those waiting for it to change, which keeps the runtime of the reservation it last ran, 0 once it ended, the reservation and the group of the account it last bound, and the first account whose terms it lent an account since it last ran in its own, and whose running CPUs draw 2 W.
 struct Squeezed {
     alloc: mem::Alloc
     level: mem::Shared[core::atomic::AtomicU64]
@@ -1678,12 +1765,14 @@ struct Squeezed {
     running_ns: mem::Shared[core::atomic::AtomicU64]
     drawn: mem::Shared[core::atomic::AtomicU64]
     grouped: mem::Shared[core::atomic::AtomicU64]
+    lent: mem::Shared[core::atomic::AtomicU64]
+    lending: mem::Shared[core::atomic::AtomicBool]
 } Squeezed
 
 impl Squeezed: Machine
 
 fn Squeezed.of(alloc: mem::Alloc) -> Squeezed {
-    return Squeezed(alloc: alloc, level: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc), raised: mem::Shared.of(hw::Signal[Unit].empty(), alloc), running_ns: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc), drawn: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc), grouped: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc))
+    return Squeezed(alloc: alloc, level: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc), raised: mem::Shared.of(hw::Signal[Unit].empty(), alloc), running_ns: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc), drawn: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc), grouped: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc), lent: mem::Shared.of(core::atomic::AtomicU64.of(0), alloc), lending: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc))
 } Squeezed.of
 
 fn Squeezed.reserve(self, bytes: u64) -> Option[mem::Heap] = None
@@ -1709,6 +1798,7 @@ fn Squeezed.end_reservation(self, id: u64) {
 fn Squeezed.bind(
     self,
     executor: u64,
+    account: u32,
     reservation: u64,
     cpu: u32,
     group: u64,
@@ -1719,6 +1809,17 @@ fn Squeezed.bind(
 
 fn Squeezed.unbind(self, executor: u64) {
 } Squeezed.unbind
+
+fn Squeezed.lend(self, executor: u64, lender: u32) {
+    if not self.lending.contents().load() {
+        self.lent.contents().store(u64.widen(lender))
+        self.lending.contents().store(true)
+    }
+} Squeezed.lend
+
+fn Squeezed.unlend(self, executor: u64) {
+    self.lending.contents().store(false)
+} Squeezed.unlend
 
 /// The world's allocator, as the one pool, while it is below the top level.
 fn Squeezed.pool(self) -> Option[Pooled] {
@@ -1734,7 +1835,7 @@ fn Squeezed.settle(self, pool: u32) -> u8 {
 
 /// Another handle on the same pool.
 fn Squeezed.share(self) -> Squeezed {
-    return Squeezed(alloc: self.alloc, level: self.level.share(), raised: self.raised.share(), running_ns: self.running_ns.share(), drawn: self.drawn.share(), grouped: self.grouped.share())
+    return Squeezed(alloc: self.alloc, level: self.level.share(), raised: self.raised.share(), running_ns: self.running_ns.share(), drawn: self.drawn.share(), grouped: self.grouped.share(), lent: self.lent.share(), lending: self.lending.share())
 } Squeezed.share
 
 fn Squeezed.changed(self, seen: mem::List[u8]) -> mem::List[u8] fails task::Cancelled uses wait {

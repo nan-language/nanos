@@ -24,9 +24,9 @@ struct ForkRun {
     reaching: mem::Shared[core::atomic::AtomicBool]
 } ForkRun
 
-/// What a driver delivers to its instance's domain: a call with its header, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns.
+/// What a driver delivers to its instance's domain: a call with its header and the deadline of its dispatch, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns.
 enum Delivery {
-    Call(id: u64, hash: sys::ProtocolHash, encoded: sys::Encoded, request: bool, header: os::Header)
+    Call(id: u64, hash: sys::ProtocolHash, encoded: sys::Encoded, request: bool, header: os::Header, deadline: u64)
     SuspendAfter(ms: u32)
     Hold(order: HolderOrder)
     Stop
@@ -140,7 +140,7 @@ pub fn Driven.run(
     }
     try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival)))
     let out = stepper.outbox()
-    let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0)), alloc)
+    let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0), deadline: core::atomic::AtomicU64.of(os::NO_DEADLINE)), alloc)
     let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
     let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
     let telling = Telling(reports: reports.split(), marks: marks.split(), steps: steps.share(), finished: take finished, clock: clock, incarnation: incarnation, alloc: alloc)
@@ -475,11 +475,12 @@ fn Telling.tell(self, take report: Report) fails task::Cancelled uses wait {
     try await tell(self.reports, incarnation: self.incarnation, take report)
 } Telling.tell
 
-/// The steps of an instance's holder: how many it began and finished, and the count of finished steps the dispatcher waits for, 0 when it waits for none.
+/// The steps of an instance's holder: how many it began and finished, the count of finished steps the dispatcher waits for, 0 when it waits for none, and the deadline they take while the dispatcher serves a call, `os::NO_DEADLINE` for none.
 struct Steps {
     begun: core::atomic::AtomicU64
     done: core::atomic::AtomicU64
     wanted: core::atomic::AtomicU64
+    deadline: core::atomic::AtomicU64
 } Steps
 
 /// What the dispatcher of an instance's domain takes: the calls its driver delivers, the counts of finished steps the holder signals, and the schemas of the client protocols it serves.
@@ -509,7 +510,11 @@ fn dispatch[P: sys::Protocol and Send](
             fail Stopping.Asked
         }
         match delivery {
-            Delivery.Call(id: id, hash: hash, encoded: encoded, request: request, header: header) => try await serve_call(out, id, hash, take encoded, request, header, steps, mut signals, reports, incarnation, peers, alloc)
+            Delivery.Call(id: id, hash: hash, encoded: encoded, request: request, header: header, deadline: deadline) => {
+                steps.contents().deadline.store(deadline)
+                try await serve_call(out, id, hash, take encoded, request, header: header.dispatched(deadline), steps, mut signals, reports, incarnation, peers, alloc)
+                steps.contents().deadline.store(os::NO_DEADLINE)
+            }
             Delivery.SuspendAfter(ms: ms) => quiet.contents().store(u64.widen(ms))
             Delivery.Hold(order: order) => {
                 discard orders.give(take order)
@@ -610,7 +615,7 @@ fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept
     loop {
         discard counts.begun.fetch_add(1)
         let stepping = now(telling.clock)
-        let stepped = mut stepper.step()
+        let stepped = try await paced_step(mut stepper, deadline: counts.deadline.load(), clock: telling.clock)
         match charged_elsewhere(stepped, own) {
             Some(account) => try await mark(telling.marks, marked: Mark.Charged(account: account, ns: now(telling.clock).saturating_sub(stepping)))
             None => {
@@ -633,6 +638,16 @@ fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept
     try await mark(telling.marks, marked: Mark.Took(ns: now(telling.clock).saturating_sub(started)))
     return handled
 } call_handlers
+
+/// Steps `stepper` under the deadline `deadline` on `clock`, which cancels nothing, or under none for `os::NO_DEADLINE`.
+fn paced_step[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], deadline: u64, clock: sys::Clock) -> Option[sys::Handled] fails task::Cancelled uses wait {
+    if deadline == os::NO_DEADLINE {
+        return mut stepper.step()
+    }
+    return try await task::paced(clock, at_ns: deadline, body: fn[mut stepper]() -> Option[sys::Handled] {
+        return mut stepper.step()
+    })
+} paced_step
 
 /// The account a handled message is charged to when it is neither the running work's `own` nor the core's.
 fn charged_elsewhere(stepped: Option[sys::Handled], own: u32) -> Option[u32] {

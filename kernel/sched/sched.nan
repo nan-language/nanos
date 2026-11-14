@@ -59,17 +59,30 @@ pkg struct Place derives Copy, Eq {
     pkg node: u32
 } Place
 
-/// What the core tells the policy of an account: its executor's number, 0 for a free slot, the reservation its `latency` work draws on, none when 0, with the CPU running it, the group of accounts its entities share their weight with on each CPU, none when 0, and the times its work was made ready.
+/// What the core tells the policy of an account: its executor's number, 0 for a free slot, the account's own number, its instance's slot or its session's, the reservation its `latency` work draws on, none when 0, with the CPU running it, the group of accounts its entities share their weight with on each CPU, none when 0, the times its work was made ready, the class of its share when its work was last made ready, `UNSEEN` before, and what its work runs as while it dispatches other accounts' messages.
 pkg struct Terms derives Copy, Eq {
     pkg executor: u64
+    pkg account: u32
     pkg reservation: u64
     pkg cpu: u32
     pkg group: u64
     pkg wakeups: u64
+    pkg class: u8
+    pkg lent: Option[Lent]
 } Terms
 
+/// What the work of an account dispatching other accounts' messages runs as: the class it takes from them, and the reservation its `latency` work draws on, none when 0, with the CPU running it.
+pkg struct Lent derives Copy, Eq {
+    pkg class: u8
+    pkg reservation: u64
+    pkg cpu: u32
+} Lent
+
+/// The class of an account whose work was never made ready.
+const UNSEEN: u8 = 0xFF
+
 /// A free slot of the account terms.
-const FREE_TERMS: Terms = Terms(executor: 0, reservation: 0, cpu: 0, group: 0, wakeups: 0)
+const FREE_TERMS: Terms = Terms(executor: 0, account: 0, reservation: 0, cpu: 0, group: 0, wakeups: 0, class: UNSEEN, lent: None)
 
 /// A reservation a CPU runs: its number, 0 for a free slot, its runtime in each of its periods, the start of the current period, and the time its work ran in it.
 struct Reserved derives Copy, Eq {
@@ -182,23 +195,44 @@ pkg fn pinned_share(cpu: u32) -> task::Share
     return task::Share(weight: 1, class: PINNED, reserve_ppm: cpu)
 } pinned_share
 
-/// The class work of `task`'s account runs in under its `terms`: `latency` work drawing on no reservation runs as `normal`.
+/// The class work of `task`'s account runs in under its `terms`: the class it is lent while it dispatches other accounts' messages, else its share's, `latency` work drawing on no reservation running as `normal`.
 fn class_of(task: hw::TaskView, terms: Option[Terms]) -> u8 {
-    if task.share.class == LATENCY and reserved_cpu(terms).is_none() {
+    var class = task.share.class
+    match lent_of(terms) {
+        Some(lent) => {
+            if class_index(class).is_some() {
+                class = lent.class
+            }
+        }
+        None => {
+        }
+    }
+    if class == LATENCY and reserved_cpu(terms).is_none() {
         return NORMAL
     }
-    return task.share.class
+    return class
 } class_of
 
-/// The CPU running the reservation that the account of `terms` draws on, `None` when it draws on none.
+/// What the account of `terms` is lent, `None` while it dispatches no other account's message.
+fn lent_of(terms: Option[Terms]) -> Option[Lent] {
+    return match terms {
+        Some(held) => held.lent
+        None => None
+    }
+} lent_of
+
+/// The CPU running the reservation that the account of `terms` draws on, the one it is lent while it has one, `None` when it draws on none.
 fn reserved_cpu(terms: Option[Terms]) -> Option[u32] {
-    let Some(held) = terms else {
+    if reserved_id(terms) == 0 {
         return None
     }
-    if held.reservation == 0 {
-        return None
+    return match terms {
+        Some(held) => match held.lent {
+            Some(lent) => Some(lent.cpu)
+            None => Some(held.cpu)
+        }
+        None => None
     }
-    return Some(held.cpu)
 } reserved_cpu
 
 /// Whether work of `class` stays on the CPU it is placed on, where no steal takes it: `latency` work and core work for one CPU.
@@ -388,10 +422,11 @@ pkg fn State.unreserve(self, id: u64) {
     }
 } State.unreserve
 
-/// Takes the terms of the account whose executor is numbered `executor`: its `latency` work draws on the reservation numbered `reservation` that CPU `cpu` runs, none when 0, and its entities share their weight with those of the group `group`, none when 0; the times its work was made ready count on.
+/// Takes the terms of the account numbered `account` whose executor is numbered `executor`: its `latency` work draws on the reservation numbered `reservation` that CPU `cpu` runs, none when 0, and its entities share their weight with those of the group `group`, none when 0; the times its work was made ready count on.
 pkg fn State.bind(
     self,
     executor: u64,
+    account: u32,
     reservation: u64,
     cpu: u32,
     group: u64,
@@ -402,13 +437,14 @@ pkg fn State.bind(
             return table.with(t, body: fn(mut held: mem::List[Terms]) -> Option[usize] limits notrap, terminates, noalloc {
                 for terms in mut held {
                     if terms.executor == executor {
+                        terms.account = account
                         terms.reservation = reservation
                         terms.cpu = cpu
                         terms.group = group
                         return None
                     }
                 }
-                let fresh = Terms(executor: executor, reservation: reservation, cpu: cpu, group: group, wakeups: 0)
+                let fresh = Terms(executor: executor, account: account, reservation: reservation, cpu: cpu, group: group, wakeups: 0, class: UNSEEN, lent: None)
                 if slotted(mut held, value: fresh, same: fn(terms: Terms) => false, free: fn(terms: Terms) => terms.executor == 0) {
                     return None
                 }
@@ -514,21 +550,75 @@ fn State.terms(self, t: hw::IrqsDisabled, executor: u64) -> Option[Terms] limits
     })
 } State.terms
 
-/// The terms of the account whose executor is numbered `executor`, one more wakeup counted, `None` for one the state holds none of.
-fn State.woken(self, t: hw::IrqsDisabled, executor: u64) -> Option[Terms] limits notrap, terminates, noalloc {
-    if executor == 0 {
+/// The terms of the account of `task`, made ready: one more wakeup counted and its share's class seen; `None` for one the state holds none of.
+fn State.woken(self, t: hw::IrqsDisabled, task: hw::TaskView) -> Option[Terms] limits notrap, terminates, noalloc {
+    if task.executor == 0 {
         return None
     }
     return self.accounts.with(t, body: fn(mut held: mem::List[Terms]) -> Option[Terms] limits notrap, terminates, noalloc {
         for terms in mut held {
-            if terms.executor == executor {
+            if terms.executor == task.executor {
                 terms.wakeups = terms.wakeups.saturating_add(1)
+                terms.class = task.share.class
                 return Some(terms)
             }
         }
         return None
     })
 } State.woken
+
+/// Raises the terms the work of the account whose executor is numbered `executor` runs in while it dispatches messages of the account numbered `lender`: to that account's class when it ranks before, and to its reservation while the terms draw on none; nothing for an account whose work the policy never saw.
+pkg fn State.lend(self, executor: u64, lender: u32) {
+    let table = self.accounts
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        table.with(t, body: fn(mut held: mem::List[Terms]) limits notrap, terminates, noalloc {
+            var lending: Option[Terms] = None
+            for terms in held {
+                if terms.account == lender and terms.executor != 0 and terms.class != UNSEEN {
+                    lending = Some(terms)
+                }
+            }
+            let Some(by) = lending else {
+                return
+            }
+            for terms in mut held {
+                if terms.executor == executor {
+                    terms.lent = Some(raised(terms.lent, by))
+                }
+            }
+        })
+    })
+} State.lend
+
+/// Has the work of the account whose executor is numbered `executor` run in its own terms again.
+pkg fn State.unlend(self, executor: u64) {
+    let table = self.accounts
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap, terminates {
+        table.with(t, body: fn(mut held: mem::List[Terms]) limits notrap, terminates, noalloc {
+            for terms in mut held {
+                if terms.executor == executor {
+                    terms.lent = None
+                }
+            }
+        })
+    })
+} State.unlend
+
+/// `lent` raised by the account of `terms`: to its class when that ranks before, and to its reservation while `lent` draws on none.
+fn raised(lent: Option[Lent], by: Terms) -> Lent limits notrap, terminates, noalloc {
+    let Some(held) = lent else {
+        return Lent(class: by.class, reservation: by.reservation, cpu: by.cpu)
+    }
+    var next = held
+    if rank(by.class) < rank(held.class) {
+        next.class = by.class
+    }
+    if next.reservation == 0 and by.reservation != 0 {
+        next.reservation = by.reservation
+        next.cpu = by.cpu
+    }
+    return next
+} raised
 
 /// Marks every CPU started, from which on idle CPUs take work from others.
 pkg fn State.all_started(self) {
@@ -670,7 +760,7 @@ pkg fn Scheduler.of(take state: mem::Shared[State]) -> Scheduler = Scheduler(sta
 pkg fn Scheduler.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
     let state = self.state.contents()
     state.charge_running(t, task)
-    let terms = state.woken(t, executor: task.executor)
+    let terms = state.woken(t, task)
     let class = class_of(task, terms)
     var here = state.running_cpu(t)
     if not state.is_started(t, cpu: here) {
@@ -991,10 +1081,13 @@ fn Cpu.reservation(mut self, id: u64, now_ns: u64) -> Reserved limits notrap, te
     return Reserved(id: 0, runtime_ns: 0, period_ns: 0, since_ns: now_ns, used_ns: 0)
 } Cpu.reservation
 
-/// The number of the reservation the account of `terms` draws on, 0 for none.
+/// The number of the reservation the account of `terms` draws on, the one it is lent while it has one, 0 for none.
 fn reserved_id(terms: Option[Terms]) -> u64 {
     return match terms {
-        Some(held) => held.reservation
+        Some(held) => match held.lent {
+            Some(lent) => lent.reservation
+            None => held.reservation
+        }
         None => 0
     }
 } reserved_id
@@ -1190,7 +1283,7 @@ fn idle_cpu(alloc: mem::Alloc) -> Cpu {
 } idle_cpu
 
 /// The terms of an account of executor `executor` drawing on reservation 1 of CPU 0.
-fn reserved_terms(executor: u64) -> Option[Terms] = Some(Terms(executor: executor, reservation: 1, cpu: 0, group: 0, wakeups: 0))
+fn reserved_terms(executor: u64) -> Option[Terms] = Some(Terms(executor: executor, account: u32.truncate(executor), reservation: 1, cpu: 0, group: 0, wakeups: 0, class: LATENCY, lent: None))
 
 /// Reservation 1: `runtime_ns` of every 1 ms, its first period starting at 0.
 fn reservation_of(runtime_ns: u64) -> Reserved = Reserved(id: 1, runtime_ns: runtime_ns, period_ns: 1_000_000, since_ns: 0, used_ns: 0)
@@ -1474,8 +1567,8 @@ test reservations_run_their_runtime_on_their_cpu_each_period for Cpu.switch_to {
 /// Two sessions of a principal sharing a CPU divide their group's weight there: each runs as an account of half its weight beside one of the whole.
 test groups_divide_their_weight_on_each_cpu for Cpu.weight_of {
     var cpu = idle_cpu(testing::world().alloc)
-    let grouped = Some(Terms(executor: 1, reservation: 0, cpu: 0, group: 7, wakeups: 0))
-    let other = Some(Terms(executor: 2, reservation: 0, cpu: 0, group: 7, wakeups: 0))
+    let grouped = Some(Terms(executor: 1, account: 1, reservation: 0, cpu: 0, group: 7, wakeups: 0, class: NORMAL, lent: None))
+    let other = Some(Terms(executor: 2, account: 2, reservation: 0, cpu: 0, group: 7, wakeups: 0, class: NORMAL, lent: None))
     discard mut cpu.enqueue(view(executor: 1, class: NORMAL, weight: 100), terms: grouped, now_ns: 0)
     let alone = cpu.weight_of(view(executor: 1, class: NORMAL, weight: 100), group: 7)
     discard mut cpu.enqueue(view(executor: 2, class: NORMAL, weight: 100), terms: other, now_ns: 0)
@@ -1491,10 +1584,10 @@ test bound_accounts_count_their_wakes_and_reserved_ones_wake_on_their_cpu for Sc
     let state = policy.state.share()
     for other in 10u64..<30 {
         state.contents().reserve(id: other, cpu: 3, runtime_ns: 1_000, period_ns: 1_000_000)
-        state.contents().bind(executor: other, reservation: 0, cpu: 0, group: 0)
+        state.contents().bind(executor: other, account: u32.truncate(other), reservation: 0, cpu: 0, group: 0)
     }
     state.contents().reserve(id: 9, cpu: 3, runtime_ns: 500_000, period_ns: 1_000_000)
-    state.contents().bind(executor: 5, reservation: 9, cpu: 3, group: 0)
+    state.contents().bind(executor: 5, account: 5, reservation: 9, cpu: 3, group: 0)
     var task = view(executor: 5, class: LATENCY, weight: 100)
     task.last_cpu = Some(0)
     let placed = hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Placement limits notrap, terminates {
@@ -1507,3 +1600,35 @@ test bound_accounts_count_their_wakes_and_reserved_ones_wake_on_their_cpu for Sc
     expect placed.cpu == 3 and placed.bound and placed.key < key(CORE, value: 0)
     expect counted == 2 and forgotten == 0
 } bound_accounts_count_their_wakes_and_reserved_ones_wake_on_their_cpu
+
+/// The placement of a task of `executor`, a `normal` account, that last ran on CPU 0.
+fn placed_on(policy: Scheduler, executor: u64) -> hw::Placement {
+    var task = view(executor, class: NORMAL, weight: 100)
+    task.last_cpu = Some(0)
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Placement limits notrap, terminates {
+        return policy.place(t, task)
+    })
+} placed_on
+
+/// A `normal` account dispatching the messages of a `latency` one runs in the terms lent it: on the lender's reservation CPU, bound there and ahead of core work, until it runs in its own again; a lender whose work was never made ready lends nothing.
+test dispatching_accounts_run_in_the_terms_lent_them for State.lend {
+    let world = testing::world()
+    let policy = four_cpus(world.clock, alloc: world.alloc)
+    let state = policy.state.share()
+    state.contents().reserve(id: 9, cpu: 3, runtime_ns: 500_000, period_ns: 1_000_000)
+    state.contents().bind(executor: 5, account: 50, reservation: 9, cpu: 3, group: 0)
+    state.contents().bind(executor: 6, account: 60, reservation: 0, cpu: 0, group: 0)
+    state.contents().bind(executor: 7, account: 70, reservation: 0, cpu: 0, group: 0)
+    discard hw::without_irqs(fn(t: hw::IrqsDisabled) -> hw::Placement limits notrap, terminates {
+        return policy.place(t, task: view(executor: 5, class: LATENCY, weight: 100))
+    })
+    state.contents().lend(executor: 6, lender: 70)
+    let alone = placed_on(policy, executor: 6)
+    state.contents().lend(executor: 6, lender: 50)
+    let lent = placed_on(policy, executor: 6)
+    state.contents().unlend(6)
+    let returned = placed_on(policy, executor: 6)
+    expect not alone.bound and alone.key > key(CORE, value: 0)
+    expect lent.cpu == 3 and lent.bound and lent.key < key(CORE, value: 0)
+    expect not returned.bound and returned.key > key(CORE, value: 0)
+} dispatching_accounts_run_in_the_terms_lent_them

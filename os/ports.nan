@@ -79,13 +79,14 @@ pub closed struct Protocols derives Copy, Eq {
     pub serves: Option[sys::ProtocolHash]
 } Protocols
 
-/// Where a minted port's calls go: the target's intake, gate and protocols, the operations it may call, every one when `None`, and its credit.
+/// Where a minted port's calls go: the target's intake, gate and protocols, the operations it may call, every one when `None`, its credit, and the monotonic clock on which its senders' deadlines are read.
 struct Route {
     intake: task::Sender[Call]
     gate: Gate
     protocols: Protocols
     operations: Option[mem::Set[text::String]]
     credits: task::Cown[Credits]
+    clock: sys::Clock
     alloc: mem::Alloc
 } Route
 
@@ -101,6 +102,7 @@ struct Credits {
 struct Reached {
     intake: task::Sender[Call]
     credits: task::Cown[Credits]
+    clock: sys::Clock
     alloc: mem::Alloc
 } Reached
 
@@ -130,17 +132,18 @@ pub fn Gate.is_open(self) -> bool {
     return self.open.contents().load() == 1
 } Gate.is_open
 
-/// A port minted for one sender: its calls of the operations `operations` names, all when `None`, go to `intake` while `gate` is open, under `credit`, to an instance serving `protocols`.
+/// A port minted for one sender: its calls of the operations `operations` names, all when `None`, go to `intake` while `gate` is open, under `credit`, to an instance serving `protocols`, each carrying its sending task's deadline as `clock` reads it.
 pub fn MintedPort.of(
     intake: task::Sender[Call],
     gate: Gate,
     protocols: Protocols,
     take operations: Option[mem::Set[text::String]],
     credit: Credit,
+    clock: sys::Clock,
     alloc: mem::Alloc,
     ) -> MintedPort {
     let credits = task::Cown.of(Credits(messages: credit.messages, calls: credit.calls, waiting_messages: mem::List.empty(alloc), waiting_calls: mem::List.empty(alloc)), alloc)
-    let route = Route(intake: intake.split(), gate: gate.share(), protocols: protocols, operations: take operations, credits: take credits, alloc: alloc)
+    let route = Route(intake: intake.split(), gate: gate.share(), protocols: protocols, operations: take operations, credits: take credits, clock: clock, alloc: alloc)
     let minter = sys::Minter[PortHandle, Route, u8].of(take route, alloc)
     let root = minter.mint(0)
     return MintedPort(minter: take minter, root: root)
@@ -177,7 +180,7 @@ pub fn PortHandle.post(self, hash: sys::ProtocolHash, take call: sys::Encoded) f
         Err(Refusal.Stopped) => fail PortError.Stopped
     }
     let lease = try await Lease.acquire(reached.credits, request: false, alloc: reached.alloc)
-    let header = Header.sent(request: false, capabilities: call.handles.len() > 0)
+    let header = Header.sent(request: false, capabilities: call.handles.len() > 0, deadline_ns: task::deadline_ns(reached.clock))
     let sent = attempt await reached.intake.send(Call(hash: hash, encoded: take call, reply: None, lease: take lease, header: header))
     match sent {
         Ok(_) => {
@@ -202,7 +205,7 @@ pub fn Port.offer(self, take call: sys::Encoded) -> bool fails PortError[Never] 
     if not granted {
         return false
     }
-    let header = Header.sent(request: false, capabilities: call.handles.len() > 0)
+    let header = Header.sent(request: false, capabilities: call.handles.len() > 0, deadline_ns: task::deadline_ns(reached.clock))
     let sent = attempt await reached.intake.send(Call(hash: sys::Wire[P].hash(), encoded: take call, reply: None, lease: Lease(credits: credits.share(), request: false), header: header))
     return match sent {
         Ok(_) => true
@@ -239,7 +242,7 @@ pub fn PortHandle.request(self, hash: sys::ProtocolHash, take call: sys::Encoded
     }
     let lease = try await Lease.acquire(reached.credits, request: true, alloc)
     let task::Channel(sender: answer, receiver: answers) = task::Channel[Answer].bounded(1, alloc)
-    let header = Header.sent(request: true, capabilities: call.handles.len() > 0)
+    let header = Header.sent(request: true, capabilities: call.handles.len() > 0, deadline_ns: task::deadline_ns(reached.clock))
     let sent = attempt await reached.intake.send(Call(hash: hash, encoded: take call, reply: Some(take answer), lease: take lease, header: header))
     match sent {
         Ok(_) => {
@@ -276,7 +279,7 @@ fn PortHandle.reach(self, hash: sys::ProtocolHash, encoded: Slice[u8]) -> Result
         if not state.gate.is_open() {
             return Err(Refusal.Stopped)
         }
-        return Ok(Reached(intake: state.intake.split(), credits: state.credits.share(), alloc: state.alloc))
+        return Ok(Reached(intake: state.intake.split(), credits: state.credits.share(), clock: state.clock, alloc: state.alloc))
     })
     let Some(outcome) = reached else {
         return Err(Refusal.Revoked)
@@ -397,11 +400,12 @@ protocol Pinging {
 } Pinging
 
 test offers_take_the_credit_left_and_refuse_once_it_is_spent for Port.offer {
-    let alloc = testing::world().alloc
+    let world = testing::world()
+    let alloc = world.alloc
     let task::Channel(sender: intake, receiver: calls) = task::Channel[Call].bounded(4, alloc)
     let gate = Gate.of(alloc)
     gate.set(open: true)
-    let minted = MintedPort.of(intake, gate: gate.share(), protocols: Protocols(own: sys::Wire[Pinging].hash(), serves: None), operations: None, credit: Credit(messages: 1, calls: 1), alloc)
+    let minted = MintedPort.of(intake, gate: gate.share(), protocols: Protocols(own: sys::Wire[Pinging].hash(), serves: None), operations: None, credit: Credit(messages: 1, calls: 1), clock: world.clock, alloc)
     defer take minted.close()
     let Some(port) = Port[Pinging].of(minted.handle()) else {
         expect false

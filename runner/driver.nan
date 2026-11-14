@@ -198,7 +198,11 @@ fn Shared.drive[J: Journal and Send](
                 s.cancel()
                 return
             }
+            let dispatching = held.dispatching()
             try await self.take_input(mut held, take input, sender, journal, s)
+            if held.dispatching() != dispatching {
+                self.lend(held)
+            }
             try await mut held.settle()
             try await self.show(mut held)
             if held.deleted() {
@@ -778,7 +782,7 @@ fn Shared.start[J: Journal](
     let abandoner = mem::Shared.of(sys::Abandoner.new(), alloc: self.config.alloc)
     let serving = Serving(deliveries: take delivered, reports: sender.split(), marks: take marks, incarnation: driver.incarnation, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: driver.suspend_ms.value_or(0), keeping: keeping, restore: take restore, revival: revival, config: take config, forking: None)
     let executor = account.id()
-    self.bind(executor, reservation: driver.reservation, group: 0)
+    self.bind(executor, account: driver.slot, reservation: driver.reservation, group: 0)
     let exec = account.executor()
     let alloc = budget.alloc()
     let held = Held(budget: take budget, reserved: driver.spec.budget.reserved, account: take account, shares: self.config.shares(driver.spec.share), intake: driver.intake.share(), bundle: driver.spec.bundle, traps: driver.traps)
@@ -826,7 +830,7 @@ fn Shared.reshare(self, mut driver: Driver) fails task::Cancelled uses wait {
     }
     try await self.end_reservation(mut driver)
     discard try await self.admit(mut driver)
-    self.bind(executor, reservation: driver.reservation, group: 0)
+    self.bind(executor, account: driver.slot, reservation: driver.reservation, group: 0)
     try await self.gauges.reshare(driver.moniker.text.as_str(), shares: self.config.shares(driver.spec.share), alloc: self.config.alloc)
 } Shared.reshare
 
@@ -860,13 +864,62 @@ fn Shared.unbind(self, driver: Driver) {
     self.machine.unbind(domain.executor)
 } Shared.unbind
 
-/// Has the `latency` work of the account whose executor is numbered `executor` draw on `reservation`, or on none, and its work share its weight with the other accounts of the group `group`, none when 0.
-fn Shared.bind(self, executor: u64, reservation: Option[Admitted], group: u64) {
+/// Has the `latency` work of the account numbered `account`, whose executor is numbered `executor`, draw on `reservation`, or on none, and its work share its weight with the other accounts of the group `group`, none when 0.
+fn Shared.bind(
+    self,
+    executor: u64,
+    account: u32,
+    reservation: Option[Admitted],
+    group: u64,
+    ) {
     match reservation {
-        Some(admitted) => self.machine.bind(executor, reservation: admitted.id, cpu: admitted.cpu, group)
-        None => self.machine.bind(executor, reservation: 0, cpu: 0, group)
+        Some(admitted) => self.machine.bind(executor, account, reservation: admitted.id, cpu: admitted.cpu, group)
+        None => self.machine.bind(executor, account, reservation: 0, cpu: 0, group)
     }
 } Shared.bind
+
+/// Has the instance's account run in its own terms, raised while a call is dispatched by the accounts of that call and of the calls queued behind it, that of the call holding the earliest deadline first.
+fn Shared.lend(self, driver: Driver) {
+    let Some(domain) = driver.domain else {
+        return
+    }
+    self.machine.unlend(domain.executor)
+    match domain.outstanding {
+        Some(outstanding) => {
+            let header = outstanding.header
+            self.lend_from(domain.executor, account: leading_header(header, queue: driver.queue).account, own: driver.slot)
+            var last = header.account
+            self.lend_from(domain.executor, account: last, own: driver.slot)
+            for queued in driver.queue {
+                let account = queued.call.header.account
+                if account != last {
+                    self.lend_from(domain.executor, account, own: driver.slot)
+                    last = account
+                }
+            }
+        }
+        None => {
+        }
+    }
+} Shared.lend
+
+/// Raises the terms of the account whose executor is numbered `executor` by those of the account numbered `account`, unless that account is `own`.
+fn Shared.lend_from(self, executor: u64, account: u32, own: u32) {
+    if account != own {
+        self.machine.lend(executor, lender: account)
+    }
+} Shared.lend_from
+
+/// The header holding the earliest deadline among the dispatched call's `dispatched` and those of the calls `queue` holds, the first such.
+fn leading_header(dispatched: os::Header, queue: mem::List[Queued]) -> os::Header {
+    var held = dispatched
+    for queued in queue {
+        if queued.call.header.deadline < held.deadline {
+            held = queued.call.header
+        }
+    }
+    return held
+} leading_header
 
 /// The cell of a new incarnation: split at the specification's limit from the pool the machine names, `budget.memory-pressure` while every pool is at the top pressure level; or for a reserved instance from the store over its region, which its first start takes and later starts reuse, `budget.over-reservation` when no free range holds the region.
 fn Shared.cell(self, mut driver: Driver) -> Result[mem::Budget, text::Fixed[32]] fails task::Cancelled uses wait {
@@ -1611,6 +1664,17 @@ fn Driver.hold_order(self, take order: HolderOrder) fails task::Cancelled uses w
     }
 } Driver.hold_order
 
+/// The number of the call the running domain dispatches, `None` while it dispatches none.
+fn Driver.dispatching(self) -> Option[u64] {
+    let Some(domain) = self.domain else {
+        return None
+    }
+    return match domain.outstanding {
+        Some(outstanding) => Some(outstanding.id)
+        None => None
+    }
+} Driver.dispatching
+
 /// Delivers the next queued call at `now_ns` to a running domain with no call outstanding, beginning its span when its cause or the instance is traced.
 fn Driver.deliver(mut self, now_ns: u64) fails task::Cancelled uses wait {
     if self.hibernating.is_some() {
@@ -1652,7 +1716,7 @@ fn Driver.deliver(mut self, now_ns: u64) fails task::Cancelled uses wait {
     current.outstanding = Some(Outstanding(id: id, reply: take reply, lease: take lease, header: header, message: take message, span: span, redelivery: redelivery))
     let deliveries = current.deliveries.split()
     self.domain = Some(take current)
-    discard attempt await deliveries.send(Delivery.Call(id: id, hash: hash, encoded: take encoded, request: request, header: header))
+    discard attempt await deliveries.send(Delivery.Call(id: id, hash: hash, encoded: take encoded, request: request, header: header, deadline: leading_header(header, queue: self.queue).deadline))
 } Driver.deliver
 
 /// Whether the instance's handler calls are traced at `now_ns`.
