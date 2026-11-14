@@ -97,7 +97,7 @@ The **watermark** of a pool is w = 4·√(its size in KiB) KiB, rounded down to 
 | 1 | the runner calls `pressure(1)` on `store` when the pool holds its cell; `store` drops the clean entries of its store cache and blob cache |
 | 2 | it calls `pressure(2)` on every instance of the pool whose state implements `Pressure` |
 | 3 | it calls `pressure(3)` on them, and the pool's idle checkpointed instances hibernate in the order of [`mem.reclaim`](04-kernel.md#kernel-policies), least recently messaged first by default |
-| 4 | it calls `pressure(4)` on them, and the core makes an extra pool when the frame allocator holds a free range of at least 64 MiB beyond the core reserve; while every pool is at level 4, instance starts and limit increases fail with [`budget.memory-pressure`](18-link.md#codes) |
+| 4 | it calls `pressure(4)` on them, and the core makes an extra pool when the frame allocator holds a free range of at least 64 MiB beyond the core reserve; while every pool is at level 4, instance starts, limit increases and the requests of a session whose principal has no cell fail with [`budget.memory-pressure`](18-link.md#codes) |
 
 - w is 1 MiB for a pool of 64 MiB, 2,896 KiB for 512 MiB, 16 MiB for 16 GiB and 128 MiB for 1 TiB.
 - The core changes a pool's level only when a draw or a return carries its free memory across a threshold; pressure arms no timer (requires [N37](22-nan.md#n37)).

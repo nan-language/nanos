@@ -464,7 +464,7 @@ pub closed struct PlanConfig derives Encode {
 | `link.unclaimed` | the machine is unclaimed | [Sessions](#connections-and-sessions) |
 | `budget.attention` | the session's output budget is spent | [Budgets](#budgets) |
 | `budget.exhausted` | another session budget is spent | [Budgets](#budgets) |
-| `budget.memory-pressure` | memory pressure refuses an instance start or a limit increase | [Pressure](05-memory.md#pressure) |
+| `budget.memory-pressure` | memory pressure refuses an instance start, a limit increase or a principal cell | [Pressure](05-memory.md#pressure) |
 | `budget.over-reservation` | reserved memory exceeds RAM less the core reserve, or a CPU reservation fits on no CPU | [Reserved instances](05-memory.md#reserved-instances), [Shares and reservations](08-scheduling.md#shares-and-reservations) |
 | `budget.previews` | the principal's sessions run their maximum of previews | [Preview](14-changes.md#preview) |
 | `budget.query` | a query's cost bound exceeds the query budget | [Queries and selectors](#queries-and-selectors) |

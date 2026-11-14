@@ -89,6 +89,7 @@ struct Base derives Copy {
     sessions_live: os::Live
     plans_live: os::Live
     callers: os::Callers
+    accounts: os::Accounts
 } Base
 
 impl Base: runner::Components
@@ -673,7 +674,8 @@ fn Base.serve_link(self, take world: nanos::World, take serving: runner::Serving
     let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
         return runner::Ended.EnvIncomplete
     }
-    let env = link::Env.of(console, tree, keys: keyring, attendant, oversight, control, own, events, live: self.sessions_live, plans_live: self.plans_live, callers: self.callers, random: world.random, clock: world.clock, wall: self.wall, config, alloc)
+    try await self.accounts.reset(alloc)
+    let env = link::Env.of(console, tree, keys: keyring, attendant, oversight, control, accounts: self.accounts, own, events, live: self.sessions_live, plans_live: self.plans_live, callers: self.callers, random: world.random, clock: world.clock, wall: self.wall, config, alloc)
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
     mut peers.push(sys::Wire[store::service::Watcher].schema(alloc))
     return try await runner::Driven[link::Linker, link::Env, link::LinkSession].run(take env, exec: world.exec, alloc, take serving, take peers, release: fn(take ended: link::Env) limits stack 4_096 {
@@ -1008,23 +1010,22 @@ fn run_base(
     let reporting = store::service::MintedReporter.of(reported, alloc: config.alloc)
     defer take reporting.close()
     let task::Channel(sender: posted, receiver: postings) = task::Channel[os::Posting].bounded(16, alloc: config.alloc)
-    let lives = Roots.of(posted, monikers: rings.monikers(), alloc: config.alloc)
+    let task::Channel(sender: switched, receiver: switches) = task::Channel[power::Switching].bounded(1, alloc: config.alloc)
+    let task::Channel(sender: accounted, receiver: accounting) = task::Channel[os::AccountOrder].bounded(16, alloc: config.alloc)
+    let lives = Roots.of(posted, switched, accounted, monikers: rings.monikers(), alloc: config.alloc)
     defer take lives.close()
     let task::Channel(sender: tracings, receiver: traced) = task::Channel[mem::List[journal::TracedInstance]].bounded(1, alloc: config.alloc)
     let backlog = journal::Backlog.of(tracings, principals: rings.principals(), alloc: config.alloc)
     let feeding = journal::MintedFeed.of(backlog, alloc: config.alloc)
     defer take feeding.close()
-    let task::Channel(sender: switched, receiver: switches) = task::Channel[power::Switching].bounded(1, alloc: config.alloc)
-    let switching = power::MintedSwitch.of(switched, alloc: config.alloc)
-    defer take switching.close()
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: switching.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint())
     var requested = incoming
     let counters = Counters.of(requests.split(), alloc: config.alloc)
-    var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced))
+    var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced, accounting: take accounting))
     defer abandon_given(take given)
     try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested, mut pool](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders, logged: log_records, traced: tracing)) = mut given.extract() else {
+        let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders, logged: log_records, traced: tracing, accounting: account_orders)) = mut given.extract() else {
             return
         }
         let origin = Origin.of(handoff, clock: config.clock, wall: config.wall)
@@ -1066,8 +1067,8 @@ fn run_base(
         discard s.spawn(fn[take signal, take inputs]() fails task::Cancelled uses wait limits stack 8_192 {
             try await keeper::relay_slots(signal, take inputs)
         })
-        discard s.spawn(fn[take genesis, take resources, take gauges, take tracing]() fails task::Cancelled uses wait limits stack 32_768 {
-            discard try await runner::run(take genesis, components: base, journal: rings, machine: take resources, config, postings: posted, logs: logs.split(), gauges, tracings: take tracing, body: fn(core: runner::Core) fails task::Cancelled uses wait {
+        discard s.spawn(fn[take genesis, take resources, take account_orders, take gauges, take tracing]() fails task::Cancelled uses wait limits stack 32_768 {
+            discard try await runner::run(take genesis, components: base, journal: rings, machine: take resources, accounting: take account_orders, config, postings: posted, logs: logs.split(), gauges, tracings: take tracing, body: fn(core: runner::Core) fails task::Cancelled uses wait {
                 discard attempt await core.control.start(moniker("supervisor"), alloc: config.alloc)
                 try await watch_base(core.control, clock: config.clock, alloc: config.alloc)
                 let parked = hw::Signal[Unit].empty()
@@ -1080,7 +1081,7 @@ fn run_base(
     })
 } run_base
 
-/// The root entries of what base instances reach of the core's records: the `/live` records they publish, the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`, and the monikers of the instances calling them.
+/// The root entries of what base instances reach of the core: the `/live` records they publish, the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`; the monikers of the instances calling them; the power switch; and the accounts of sessions.
 linear struct Roots {
     store: os::MintedLive
     devices: os::MintedLive
@@ -1089,15 +1090,23 @@ linear struct Roots {
     sessions: os::MintedLive
     plans: os::MintedLive
     callers: os::MintedCallers
+    switch: power::MintedSwitch
+    accounts: os::MintedAccounts
 } Roots
 
-fn Roots.of(posted: task::Sender[os::Posting], take monikers: task::Cown[mem::Map[u32, ident::Moniker]], alloc: mem::Alloc) -> Roots {
-    return Roots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), plans: os::MintedLive.of(posted, own: "/live/plans", alloc), callers: os::MintedCallers.of(take monikers, alloc))
+fn Roots.of(
+    posted: task::Sender[os::Posting],
+    switched: task::Sender[power::Switching],
+    accounted: task::Sender[os::AccountOrder],
+    take monikers: task::Cown[mem::Map[u32, ident::Moniker]],
+    alloc: mem::Alloc,
+    ) -> Roots {
+    return Roots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), plans: os::MintedLive.of(posted, own: "/live/plans", alloc), callers: os::MintedCallers.of(take monikers, alloc), switch: power::MintedSwitch.of(switched, alloc), accounts: os::MintedAccounts.of(accounted, alloc))
 } Roots.of
 
 /// Revokes the root entries.
 fn Roots.close(take self) {
-    let Roots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, plans: planned, callers: calling) = self
+    let Roots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, plans: planned, callers: calling, switch: switching, accounts: accounting) = self
     take stored.close()
     take managed.close()
     take keyed.close()
@@ -1105,6 +1114,8 @@ fn Roots.close(take self) {
     take linked.close()
     take planned.close()
     take calling.close()
+    take switching.close()
+    take accounting.close()
 } Roots.close
 
 /// Halts the kernel with `fault.base-not-running` and the first of `store`, `keys`, `journal` and `policy` that is not running 30 s after the core's start.
@@ -1164,7 +1175,7 @@ fn record_store_events(take reports: task::Receiver[store::service::Report], rin
 fn abandon_given(take given: Option[Given]) {
     match given {
         Some(left) => {
-            let Given(known: _, machine: _, keeper: kept, orders: _, store_events: _, postings: _, switches: _, logged: _, traced: _) = left
+            let Given(known: _, machine: _, keeper: kept, orders: _, store_events: _, postings: _, switches: _, logged: _, traced: _, accounting: _) = left
             take kept.release()
         }
         None => {
@@ -1172,7 +1183,7 @@ fn abandon_given(take given: Option[Given]) {
     }
 } abandon_given
 
-/// What the tasks of `run_base` take: the genesis record and the machine the runner takes, the keeper with the device root's orders, the events the store reports, the postings to the board, the orders of the power switch, the log records of instances, and the instances `journal` traces.
+/// What the tasks of `run_base` take: the genesis record and the machine the runner takes, the keeper with the device root's orders, the events the store reports, the postings to the board, the orders of the power switch, the log records of instances, the instances `journal` traces, and the orders for the accounts of sessions.
 linear struct Given {
     known: runner::Known
     machine: Resources
@@ -1183,6 +1194,7 @@ linear struct Given {
     switches: task::Receiver[power::Switching]
     logged: task::Receiver[journal::Logged]
     traced: task::Receiver[mem::List[journal::TracedInstance]]
+    accounting: task::Receiver[os::AccountOrder]
 } Given
 
 /// The rights of `Control`, or every right when `every`.
@@ -1265,16 +1277,22 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     defer take switching.close()
     let naming = os::MintedCallers.of(rings.monikers(), alloc)
     defer take naming.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint())
+    let task::Channel(sender: accounted, receiver: unaccounted) = task::Channel[os::AccountOrder].bounded(1, alloc)
+    let accounts = os::MintedAccounts.of(accounted, alloc)
+    defer take accounts.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint())
     let task::Channel(sender: logs, receiver: unlogged) = task::Channel[journal::Logged].bounded(1, alloc)
     discard unlogged
-    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, machine: Unkept(alloc: alloc), config, postings: posted, logs, gauges: runner::Gauges.empty(alloc), tracings: take untraced, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
+    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, machine: Unkept(alloc: alloc), accounting: take unaccounted, config, postings: posted, logs, gauges: runner::Gauges.empty(alloc), tracings: take untraced, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)
         return started
     })
     expect started == Some(os::Lifecycle.Running)
 } supervisor_starts_from_the_image_genesis
+
+/// The size of the pool of `Unkept`.
+const UNKEPT_BYTES: u64 = 0x400_0000
 
 /// The machine of the tests running base instances without a memory keeper: one pool, the world's allocator, at level 0, no region to reserve, 2 W for a running CPU, and no latency tolerance kept.
 struct Unkept {
@@ -1285,7 +1303,7 @@ impl Unkept: runner::Machine
 
 fn Unkept.reserve(self, bytes: u64) -> Option[mem::Heap] = None
 
-fn Unkept.pool(self) -> Option[runner::Pooled] = Some(runner::Pooled(number: 0, alloc: self.alloc))
+fn Unkept.pool(self) -> Option[runner::Pooled] = Some(runner::Pooled(number: 0, alloc: self.alloc, bytes: UNKEPT_BYTES))
 
 fn Unkept.settle(self, pool: u32) -> u8 = 0
 

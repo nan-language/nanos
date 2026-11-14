@@ -1,0 +1,186 @@
+//! Sessions' accounts: the account and the cell of each session `link` opens, the sessions of one principal drawing through one cell and draining one energy bucket, and the gauge of each session.
+
+/// A principal with open sessions: the cell they draw through and the energy bucket they drain.
+linear struct Principal {
+    name: ident::Principal
+    cell: mem::Budget
+    bucket: task::Cown[Energy]
+} Principal
+
+/// An open session: its principal, what its work runs on, and where its gauge is read and its end told.
+struct Session {
+    principal: ident::Principal
+    account: os::SessionAccount
+    marks: task::Sender[Mark]
+} Session
+
+/// Carries out each order `orders` brings for the accounts of sessions, running the gauge of each open session on a task of `s`, until the orders end.
+fn Shared.keep_sessions(self, take orders: task::Receiver[os::AccountOrder], s: task::Scope) fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    var principals = mem::List[Principal].empty(alloc)
+    defer close_principals(take principals)
+    var sessions = mem::Map[u64, Session].empty(alloc)
+    var receiver = orders
+    loop {
+        let Some(order) = try await mut receiver.receive() else {
+            return
+        }
+        match order {
+            os::AccountOrder.Open(session: session, principal: principal, share: share, memory_bytes: memory_bytes, done: done) => {
+                let given = try await self.open_session(mut principals, mut sessions, session, take principal, share, memory_bytes, s)
+                discard attempt await done.send(given)
+            }
+            os::AccountOrder.Find(session: session, done: done) => {
+                let found = match sessions.get(session) {
+                    Some(kept) => Some(kept.account)
+                    None => None
+                }
+                discard attempt await done.send(found)
+            }
+            os::AccountOrder.Close(session: session, done: done) => {
+                try await self.close_session(mut principals, mut sessions, session)
+                discard attempt await done.send(Unit)
+            }
+            os::AccountOrder.Reset(done: done) => {
+                var open = mem::List[u64].empty(alloc)
+                for kept in sessions {
+                    mut open.push(kept.key())
+                }
+                for session in open {
+                    try await self.close_session(mut principals, mut sessions, session)
+                }
+                discard attempt await done.send(Unit)
+            }
+        }
+    }
+} Shared.keep_sessions
+
+/// Opens the account of the session numbered `session` of `principal`, with the share `share`, its cell split from its principal's, and its gauge on a task of `s`; gives the account of a session already open, and `None` when its principal has no cell.
+fn Shared.open_session(
+    self,
+    mut principals: mem::List[Principal],
+    mut sessions: mem::Map[u64, Session],
+    session: u64,
+    take principal: ident::Principal,
+    share: os::Share,
+    memory_bytes: Option[u64],
+    s: task::Scope,
+    ) -> Option[os::SessionAccount] fails task::Cancelled uses wait {
+    match sessions.get(session) {
+        Some(kept) => return Some(kept.account)
+        None => {
+        }
+    }
+    let Some(index) = try await self.principal_of(mut principals, principal: ident::Principal(text: principal.text), share, memory_bytes) else {
+        return None
+    }
+    let cell = principals.at(index).cell.alloc().split(principals.at(index).cell.limit())
+    let account = self.config.exec.split_on(self.config.share(share), alloc: cell.alloc())
+    let given = os::SessionAccount(exec: account.executor(), alloc: cell.alloc())
+    let task::Channel(sender: marks, receiver: marked) = task::Channel[Mark].bounded(1, alloc: self.config.alloc)
+    let bucket = principals.at(index).bucket.share()
+    let busy_mw = self.machine.busy_mw()
+    let clock = self.config.clock
+    let class = share.class
+    discard s.spawn(fn[take marked, take account, take cell, take bucket, take busy_mw]() fails task::Cancelled uses wait limits stack 8_192 {
+        try await gauge_session(take marked, take account, take cell, bucket, class, busy_mw, clock)
+    })
+    try await self.gauges.watch(session_name(session).as_str(), watch: marks.split(), alloc: self.config.alloc)
+    discard mut sessions.insert(session, value: Session(principal: take principal, account: given, marks: take marks))
+    return Some(given)
+} Shared.open_session
+
+/// The place in `principals` of `principal`, whose cell is split when it has none, of `memory_bytes`, or of its pool's size when `None`, from the pool the machine names, and whose energy bucket then holds `share`'s budget; `None` while every pool is at its top pressure level.
+fn Shared.principal_of(
+    self,
+    mut principals: mem::List[Principal],
+    take principal: ident::Principal,
+    share: os::Share,
+    memory_bytes: Option[u64],
+    ) -> Option[usize] fails task::Cancelled uses wait {
+    for index in 0..<principals.len() {
+        if principals.at(index).name == principal {
+            return Some(index)
+        }
+    }
+    let Some(pooled) = try await self.machine.pool() else {
+        return None
+    }
+    let cell = pooled.alloc.split(usize.widen(memory_bytes.value_or(pooled.bytes)))
+    let bucket = task::Cown.of(Energy.of(budget_mj_per_h: share.energy_mj_per_h, now_ns: now(self.config.clock)), alloc: self.config.alloc)
+    mut principals.push(Principal(name: take principal, cell: take cell, bucket: take bucket))
+    return Some(principals.len() - 1)
+} Shared.principal_of
+
+/// Closes the account of the session numbered `session`, and its principal's cell when no other session of its principal is open.
+fn Shared.close_session(self, mut principals: mem::List[Principal], mut sessions: mem::Map[u64, Session], session: u64) fails task::Cancelled uses wait {
+    let Some(closed) = mut sessions.remove(session) else {
+        return
+    }
+    try await self.gauges.unwatch(session_name(session).as_str(), alloc: self.config.alloc)
+    discard attempt await closed.marks.send(Mark.Ended)
+    for open in sessions {
+        if open.value().principal == closed.principal {
+            return
+        }
+    }
+    for index in 0..<principals.len() {
+        if principals.at(index).name == closed.principal {
+            let Principal(name: _, cell: cell, bucket: _) = mut principals.remove(index)
+            take cell.close()
+            return
+        }
+    }
+} Shared.close_session
+
+/// Answers each reading of a session's gauge from `marks` with the counters of its `account` and `cell`, charging the CPU time it ran since the last reading to its own energy and to its principal's `bucket` at the power `busy_mw` holds, until the marks end; then closes the account and the cell.
+fn gauge_session(
+    take marks: task::Receiver[Mark],
+    take account: task::Account,
+    take cell: mem::Budget,
+    bucket: task::Cown[Energy],
+    class: os::CpuClass,
+    busy_mw: mem::Shared[core::atomic::AtomicU64],
+    clock: sys::Clock,
+    ) fails task::Cancelled uses wait {
+    defer take account.close()
+    defer take cell.close()
+    var receiver = marks
+    var spent = Spent(energy: Energy.of(budget_mj_per_h: 0, now_ns: now(clock)), charged_ns: 0)
+    loop {
+        let reply = match try await mut receiver.receive() {
+            Some(Mark.Read(reply: reply)) => reply
+            Some(Mark.Began) or Some(Mark.Took(ns: _)) => continue
+            Some(Mark.Ended) or None => return
+        }
+        let used = account.used_ns()
+        let ran = used.saturating_sub(spent.charged_ns)
+        let power = busy_mw.contents().load()
+        let at = now(clock)
+        mut spent.charge(used_ns: used, busy_mw: power, now_ns: at)
+        let throttled = await when mut bucket => drained(mut bucket, cpu_ns: ran, busy_mw: power, now_ns: at)
+        let gauge = os::Gauge(intake: 0, memory: os::Usage(charged: u64.widen(cell.charged()), limit: u64.widen(cell.limit()), peak: u64.widen(cell.peak())), reserved: false, cpu_ns: used, energy_mj: spent.energy.used_mj(), throttled: throttled, class: class, bundle: ident::HashValue(bytes: Array[u8, 33].filled(0)), incarnation: 0, messages: 0, latency: Array[u64, 32].filled(0), traps: 0)
+        discard attempt await reply.send(gauge)
+    }
+} gauge_session
+
+/// Charges `cpu_ns` at `busy_mw` at `now_ns` to the energy bucket `bucket`; whether it is throttled.
+fn drained(mut bucket: Energy, cpu_ns: u64, busy_mw: u64, now_ns: u64) -> bool {
+    mut bucket.charge(cpu_ns, busy_mw, now_ns)
+    return bucket.throttled
+} drained
+
+/// The name of the account of the session numbered `session`: `s<n>`.
+fn session_name(session: u64) -> text::Fixed[24] {
+    var name = text::Fixed[24].of("s")
+    mut name.write(Dyn[Render].view(session), budget: 22)
+    return name
+} session_name
+
+/// Closes the cells of the principals left with open sessions.
+fn close_principals(take principals: mem::List[Principal]) {
+    for held in take principals {
+        let Principal(name: _, cell: cell, bucket: _) = held
+        take cell.close()
+    }
+} close_principals

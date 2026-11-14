@@ -33,9 +33,24 @@ pub closed struct Clocks derives Copy {
     pub wall: ident::Wall
 } Clocks
 
-/// Applies the plan `applying` names through `tree`, carrying out its commands through `control`, the policy deciding it again through `oversight`, telling `out` of each span it commits, each outbox entry it delivers, and its end.
+/// Applies the plan `applying` names through `tree`, carrying out its commands through `control`, the policy deciding it again through `oversight`, telling `moves` of each span it commits, each outbox entry it delivers, and its end.
 pub fn apply_plan(
     take applying: Applying,
+    tree: store::service::View,
+    control: os::Control,
+    oversight: os::Port[policy::Oversight],
+    clocks: Clocks,
+    moves: task::Sender[Moved],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    let outcome = try await applied(applying, tree, control, oversight, clocks, moves, alloc)
+    discard attempt await moves.send(take outcome)
+} apply_plan
+
+/// Applies the plan `applying` names as `apply_plan` does, as a domain on the account `charge` opens and drawing through its cell, telling `out` of how it goes on, and of its failure when the core opens no account or when it traps.
+fn apply_charged(
+    take applying: Applying,
+    take charge: Charge,
     tree: store::service::View,
     control: os::Control,
     oversight: os::Port[policy::Oversight],
@@ -44,9 +59,45 @@ pub fn apply_plan(
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
     let number = applying.number
-    let outcome = try await applied(applying, tree, control, oversight, clocks, out, alloc)
-    discard attempt await out.plan_moved(number, moved: take outcome)
-} apply_plan
+    let account = match try await open_account(take charge, alloc) {
+        Ok(open) => open
+        Err(failure) => {
+            discard attempt await out.plan_moved(number, moved: finish_as(PlanState.Failed, code: failure.code.as_str(), alloc))
+            return
+        }
+    }
+    var held = Some(take applying)
+    var trap: Option[sys::TrapKind] = None
+    try await task::scope(account.exec, body: fn[mut held, mut trap](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(plan) = mut held.extract() else {
+            return
+        }
+        let task::Channel(sender: moves, receiver: moving) = task::Channel[Moved].bounded(1, alloc)
+        let running = s.spawn(fn[take plan, take moves]() -> Option[sys::TrapKind] fails task::Cancelled uses wait limits stack 8_192 {
+            return match try await sys::Domain.run(fn[take plan, take moves]() fails task::Cancelled uses wait limits stack 65_536 {
+                try await apply_plan(take plan, tree, control, oversight, clocks, moves, alloc: account.alloc)
+            }, exec: account.exec, alloc: account.alloc) {
+                Ok(_) => None
+                Err(caught) => Some(caught.kind())
+            }
+        })
+        var receiver = moving
+        loop {
+            let Some(moved) = try await mut receiver.receive() else {
+                break
+            }
+            discard attempt await out.plan_moved(number, take moved)
+        }
+        trap = try await take running.join()
+    })
+    match trap {
+        Some(kind) => {
+            discard attempt await out.plan_moved(number, moved: finish_as(PlanState.Failed, code: trapped(kind, verb: "apply", alloc).code.as_str(), alloc))
+        }
+        None => {
+        }
+    }
+} apply_charged
 
 /// The end of applying `applying`.
 fn applied(
@@ -55,7 +106,7 @@ fn applied(
     control: os::Control,
     oversight: os::Port[policy::Oversight],
     clocks: Clocks,
-    out: sys::Outbox[LinkSession],
+    moves: task::Sender[Moved],
     alloc: mem::Alloc,
     ) -> Moved fails task::Cancelled uses wait {
     let acting = match first attempt await acting_on(tree, branch: applying.plan.effects.branch.as_str(), principal: ident::Principal(text: applying.plan.principal.text), session: applying.session, origins: labels_of(applying.plan.effects.taint, alloc), alloc) {
@@ -103,7 +154,7 @@ fn applied(
             Err(code) => return finish_as(PlanState.Failed, code: code.as_str(), alloc)
         }
         mut commits.push(commit)
-        match try await committed_span(applying, span, commit, acting, control, clocks, out, alloc) {
+        match try await committed_span(applying, span, commit, acting, control, clocks, moves, alloc) {
             Some(ended) => return ended
             None => {
             }
@@ -120,7 +171,7 @@ fn committed_span(
     acting: store::service::View,
     control: os::Control,
     clocks: Clocks,
-    out: sys::Outbox[LinkSession],
+    moves: task::Sender[Moved],
     alloc: mem::Alloc,
     ) -> Option[Moved] fails task::Cancelled uses wait {
     let watched = span.activations.position(fn(activation: Activation) => activation.kind != ActivationKind.Stop).is_some()
@@ -138,7 +189,7 @@ fn committed_span(
     if window_s > 0 {
         until = Some(ident::WallTime(utc_ns: started.utc_ns.saturating_add(i64.widen(window_s) * 1_000_000_000), uncertainty_ns: started.uncertainty_ns))
     }
-    discard attempt await out.plan_moved(applying.number, moved: Moved.Committed(span: span.span, commit: commit, until: until))
+    discard attempt await moves.send(Moved.Committed(span: span.span, commit: commit, until: until))
     for commanded in span.commands {
         match commanded.foreseen {
             Some(foreseen) => {
@@ -146,7 +197,7 @@ fn committed_span(
                     Command.Call(hash: _, reply: Some(_)) => {
                         match foreseen.reply {
                             Some(bytes) => {
-                                discard attempt await out.plan_moved(applying.number, moved: Moved.Replied(step: commanded.step, reply: copied_bytes(bytes, alloc)))
+                                discard attempt await moves.send(Moved.Replied(step: commanded.step, reply: copied_bytes(bytes, alloc)))
                             }
                             None => {
                             }
@@ -165,7 +216,7 @@ fn committed_span(
         }
         match try await carried_out(commanded, control, alloc) {
             Ok(Some(reply)) => {
-                discard attempt await out.plan_moved(applying.number, moved: Moved.Replied(step: commanded.step, reply: take reply))
+                discard attempt await moves.send(Moved.Replied(step: commanded.step, reply: take reply))
             }
             Ok(None) => {
             }
@@ -174,12 +225,12 @@ fn committed_span(
     }
     try await converged(tree_activations(span, alloc), commit, tree: acting, clocks, alloc)
     if health_s > 0 and not try await healthy(span.activations, window_s: health_s, tree: acting, clocks, alloc) {
-        return Some(try await reverted(applying, span, commit, acting, control, code: "plan.unhealthy", out, alloc))
+        return Some(try await reverted(applying, span, commit, acting, control, code: "plan.unhealthy", moves, alloc))
     }
     if confirm_s > 0 and not try await confirmed(applying.hash, within_s: confirm_s, tree: acting, clocks, alloc) {
-        return Some(try await reverted(applying, span, commit, acting, control, code: "plan.unconfirmed", out, alloc))
+        return Some(try await reverted(applying, span, commit, acting, control, code: "plan.unconfirmed", moves, alloc))
     }
-    return match try await deliver_outbox(applying, span, control, acting, clocks, out, alloc) {
+    return match try await deliver_outbox(applying, span, control, acting, clocks, moves, alloc) {
         Some(code) => Some(finish_as(PlanState.Failed, code: code.as_str(), alloc))
         None => None
     }
@@ -430,7 +481,7 @@ fn reverted(
     acting: store::service::View,
     control: os::Control,
     code: Str,
-    out: sys::Outbox[LinkSession],
+    moves: task::Sender[Moved],
     alloc: mem::Alloc,
     ) -> Moved fails task::Cancelled uses wait {
     match first attempt await acting.revert(commit, dry_run: false, alloc) {
@@ -448,7 +499,7 @@ fn reverted(
             None => {
             }
         }
-        try await told_cancelled(applying, span: span.span, from: 1, through: entries.len(), out, alloc)
+        try await told_cancelled(applying, span: span.span, from: 1, through: entries.len(), moves, alloc)
     }
     return finish_as(PlanState.Reverted, code, alloc)
 } reverted

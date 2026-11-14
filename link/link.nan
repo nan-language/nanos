@@ -1,6 +1,6 @@
 //! The `link` instance: the protocol through which agents and humans reach the system, served on the serial and port transports.
 
-/// The keys of the keyed tasks: the serial transport's reader, the one reading the facts of the ready record, the one handing lines to `console`, the one reading the principals' grants, the one telling the journal and `/live` of sessions, the one reverting the plans a restart interrupted, and those answering requests and writing to each connection, plus the slot of each.
+/// The keys of the keyed tasks: the serial transport's reader, the one reading the facts of the ready record, the one handing lines to `console`, the one reading the principals' grants, the one telling the journal and `/live` of sessions, the one reverting the plans a restart interrupted, those answering requests and writing to each connection, plus the slot of each, and those closing the account of each session, plus its number.
 const READING: u64 = 1
 
 const OPENING: u64 = 3
@@ -16,6 +16,8 @@ const RECOVERING: u64 = 7
 const ANSWERING: u64 = 0x1_0000_0000
 
 const WRITING: u64 = 0x4_0000_0000
+
+const RELEASING: u64 = 0x8_0000_0000
 
 /// The most requests running at once, each keeping the slot its keyed task's key names.
 const MOST_RUNNING: u64 = 256
@@ -107,6 +109,7 @@ pub open struct Env derives Send {
     attendant: os::Port[console::Console]
     oversight: os::Port[policy::Oversight]
     control: os::Control
+    accounts: os::Accounts
     own: os::PortHandle
     events: journal::Source
     live: os::Live
@@ -172,6 +175,7 @@ pub fn Env.of(
     attendant: os::Port[console::Console],
     oversight: os::Port[policy::Oversight],
     control: os::Control,
+    accounts: os::Accounts,
     own: os::PortHandle,
     events: journal::Source,
     live: os::Live,
@@ -183,7 +187,7 @@ pub fn Env.of(
     config: LinkConfig,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(console: console, tree: tree, keys: keys, attendant: attendant, oversight: oversight, control: control, own: own, events: events, live: live, plans_live: plans_live, callers: callers, random: random, clock: clock, wall: wall, config: config, clients: mem::List.empty(alloc), uploads: mem::List.empty(alloc), alloc: alloc)
+    return Env(console: console, tree: tree, keys: keys, attendant: attendant, oversight: oversight, control: control, accounts: accounts, own: own, events: events, live: live, plans_live: plans_live, callers: callers, random: random, clock: clock, wall: wall, config: config, clients: mem::List.empty(alloc), uploads: mem::List.empty(alloc), alloc: alloc)
 } Env.of
 
 pub fn Linker.start(mut env: Env) -> Linker {
@@ -361,8 +365,19 @@ fn Linker.spawn_answer(
     let tree = env.tree
     let budget = self.budget_of(session)
     let reader = self.principal_of_session(session)
-    mut cx.spawn(key: ANSWERING + slot, run: fn[take request, take reader](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 65_536 {
-        let block = try await answer(request, tree, budget, reader, alloc)
+    let charge = self.charge_of(session, accounts: env.accounts)
+    let verb = request.verb
+    let failed = Block.of(Verdict.Failed, id: request.id.as_str(), verb: verb.as_str(), operand: first_operand(request, alloc).as_str(), alloc)
+    mut cx.spawn(key: ANSWERING + slot, run: fn[take request, take reader, take charge, take failed](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 16_384 {
+        let block = match try await open_account(take charge, alloc) {
+            Ok(account) => match try await sys::Domain.run(fn[take request, take reader]() -> Block fails task::Cancelled uses wait limits stack 65_536 {
+                return try await answer(request, tree, budget, reader, alloc: account.alloc)
+            }, exec: account.exec, alloc: account.alloc) {
+                Ok(answered) => answered
+                Err(trap) => take failed.failing(trapped(trap.kind(), verb: verb.as_str(), alloc), alloc)
+            }
+            Err(failure) => take failed.failing(take failure, alloc)
+        }
         discard attempt await out.responded(number, take block)
     })
     mut cx.after(ms: u64.widen(self.config.pending_ms), send: LinkSession.due(number: number))

@@ -46,7 +46,7 @@ pub closed struct Share derives Copy, Eq, Encode {
 ```
 
 - By default the class is `Normal` (`Share.class`), the weight 100 (`Share.weight`), there is no reservation (`Share.runtime_us` and `Share.period_us` are 0) and no energy budget (`Share.energy_mj_per_h` is 0).
-- An instance's share is the `share` field of its specification ([`/sys`](13-tree.md#sys)); a session's account takes the share of its principal's `Session` grant ([sessions as authority](09-authority.md#sessions-as-authority)), which the principal's sessions hold together: on each CPU, the entities of its sessions divide the grant's weight equally.
+- An instance's share is the `share` field of its specification ([`/sys`](13-tree.md#sys)); a session's account takes the share of its principal's `Session` grant ([sessions as authority](09-authority.md#sessions-as-authority)), which the principal's sessions hold together: on each CPU, the entities of its sessions divide the grant's weight equally (requires [N38](22-nan.md#n38)).
 - Each account's executor carries its share. `Executor.split(Share)` returns a `CpuBudget` whose weight, reservation runtime and energy budget it moves from the splitting account's share, returns them when the `CpuBudget` closes, and fails when the splitting account lacks them (requires [N8](22-nan.md#n8)).
 - A **reservation** is the `runtime_us` of CPU time in every `period_us` that a `latency` share gives.
 
