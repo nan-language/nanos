@@ -1,6 +1,6 @@
 //! The task of an instance's domain: it builds the Env, starts or restores the component, serves the calls its driver delivers, one at a time, keeps its checkpoints, and hands its driver the replies the component gives postponed requests.
 
-/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, which its hibernation image gives a revival, the instance's configuration record, and for a fork what it runs and where it tells what it saw.
+/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, which its hibernation image gives a revival, the instance's configuration record, for a fork what it runs and where it tells what it saw, and otherwise the instance's flight recorder.
 pub open struct Serving {
     deliveries: task::Receiver[Delivery]
     reports: task::Sender[Input]
@@ -14,6 +14,7 @@ pub open struct Serving {
     revival: bool
     config: Option[Untrusted[mem::Bytes]]
     forking: Option[ForkRun]
+    recorder: Option[Recorder]
 } Serving
 
 /// What a fork's domain runs: the call it handles, or none for its start or resumption, where it tells what its run saw, the tape of its clock and random source, and whether its ports reached another instance.
@@ -32,9 +33,9 @@ enum Delivery {
     Stop
 } Delivery
 
-/// What the task of an instance's domain tells its driver: among others, how a hibernation it was ordered ended, with the image it took or none when the instance serves on.
+/// What the task of an instance's domain tells its driver: among others, that it runs, with the names of its component's operations by number, and how a hibernation it was ordered ended, with the image it took or none when the instance serves on.
 enum Report {
-    Running(from: journal::StartedFrom)
+    Running(from: journal::StartedFrom, operations: mem::List[text::String])
     Hibernation(image: Option[Image])
     Taken(id: u64)
     Postponed(id: u64)
@@ -111,7 +112,7 @@ pub fn Driven.run(
     if serving.forking.is_some() {
         return try await Driven[S, Env, P].forked(take env, exec, alloc, take serving, release)
     }
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: revival, config: _, forking: _) = serving
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: revival, config: _, forking: _, recorder: recorder) = serving
     let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
@@ -131,19 +132,24 @@ pub fn Driven.run(
         Err(_) => {
         }
     }
+    let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0), deadline: core::atomic::AtomicU64.of(os::NO_DEADLINE), posted: hw::SpinLock.of(None), operations: operation_names(sys::Wire[P].operations(alloc), alloc)), alloc)
+    let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
+    let telling = Telling(reports: reports.split(), marks: marks.split(), steps: steps.share(), finished: take finished, clock: clock, incarnation: incarnation, recorder: take recorder, alloc: alloc)
+    let resuming = telling.begin(call: SystemCall.Resume)
     mut stepper.resumed(resumed_for(reason, revival))
+    telling.end_system(resuming)
     discard mut stepper.start_keyed()
-    match mut stepper.health() {
+    let probing = telling.begin(call: SystemCall.Health)
+    let health = mut stepper.health()
+    telling.end_system(probing)
+    match health {
         sys::HealthReply.Healthy => {
         }
         sys::HealthReply.Unhealthy(_) => return Ended.Unhealthy
     }
-    try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival)))
+    try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival), operations: names_in(steps.contents().operations, alloc)))
     let out = stepper.outbox()
-    let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0), deadline: core::atomic::AtomicU64.of(os::NO_DEADLINE)), alloc)
     let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
-    let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
-    let telling = Telling(reports: reports.split(), marks: marks.split(), steps: steps.share(), finished: take finished, clock: clock, incarnation: incarnation, alloc: alloc)
     var given = Some(Given(deliveries: take deliveries, finishes: take finishes, peers: take peers))
     var image: Option[Image] = None
     let looped = attempt await task::scope(exec, body: fn[mut stepper, mut given, mut due_at, mut holding, mut image](s: task::Scope) fails Stopping uses wait {
@@ -261,7 +267,7 @@ fn Driven.forked(
     take serving: Serving,
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
-    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, revival: _, config: _, forking: forking) = serving
+    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, revival: _, config: _, forking: forking, recorder: _) = serving
     let Some(ForkRun(call: call, reporting: reporting, tape: tape, reaching: reaching)) = forking else {
         release(take env)
         return Ended.Stopped
@@ -459,7 +465,7 @@ fn checkpoint[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], kee
     return false
 } checkpoint
 
-/// What the holder of an instance's domain tells and counts through: the driver's inputs for the incarnation `incarnation`, the marks of its watch, the steps it counts for the dispatcher with the signal of those finished, the monotonic clock, and the allocator of the domain.
+/// What the holder of an instance's domain tells and counts through: the driver's inputs for the incarnation `incarnation`, the marks of its watch, the steps it counts for the dispatcher with the signal of those finished, the monotonic clock, the instance's flight recorder, and the allocator of the domain.
 struct Telling {
     reports: task::Sender[Input]
     marks: task::Sender[Mark]
@@ -467,21 +473,139 @@ struct Telling {
     finished: task::Sender[u64]
     clock: sys::Clock
     incarnation: u64
+    recorder: Option[Recorder]
     alloc: mem::Alloc
 } Telling
+
+/// A system interface call the holder began: the monotonic time it did, and what the flight recorder takes of it.
+struct Began derives Copy {
+    time: u64
+    taken: Taken
+} Began
+
+/// Notes in the flight recorder that the holder calls the system interface `call`.
+fn Telling.begin(self, call: SystemCall) -> Began {
+    let began = Began(time: now(self.clock), taken: Taken.system(call, cause: os::Header.current().cause))
+    match self.recorder {
+        Some(recorder) => recorder.begin(time: began.time, taken: began.taken)
+        None => {
+        }
+    }
+    return began
+} Telling.begin
+
+/// Records in the flight recorder the end of the system interface call `began`.
+fn Telling.end_system(self, began: Began) {
+    match self.recorder {
+        Some(recorder) => recorder.end(run_ns: now(self.clock).saturating_sub(began.time), taken: Some(began.taken))
+        None => {
+        }
+    }
+} Telling.end_system
+
+/// Notes in the flight recorder that a step of the holder begins at `began`, on the call the dispatcher posted when one waits.
+fn Telling.begin_step(self, began: u64) {
+    match self.recorder {
+        Some(recorder) => recorder.begin(time: began, taken: self.steps.contents().posted_taken())
+        None => {
+        }
+    }
+} Telling.begin_step
+
+/// Records in the flight recorder the end of the handler call begun at `began`, which took the input `taken`.
+fn Telling.end_taken(self, began: u64, taken: Taken) {
+    match self.recorder {
+        Some(recorder) => recorder.end(run_ns: now(self.clock).saturating_sub(began), taken: Some(taken))
+        None => {
+        }
+    }
+} Telling.end_taken
+
+/// Records in the flight recorder the end of the step begun at `began`, which handled `stepped`.
+fn Telling.end_step(self, began: u64, stepped: Option[sys::Handled]) {
+    match self.recorder {
+        Some(recorder) => recorder.end(run_ns: now(self.clock).saturating_sub(began), taken: self.steps.contents().taken_by(stepped))
+        None => {
+        }
+    }
+} Telling.end_step
 
 /// Tells the driver `report`.
 fn Telling.tell(self, take report: Report) fails task::Cancelled uses wait {
     try await tell(self.reports, incarnation: self.incarnation, take report)
 } Telling.tell
 
-/// The steps of an instance's holder: how many it began and finished, the count of finished steps the dispatcher waits for, 0 when it waits for none, and the deadline they take while the dispatcher serves a call, `os::NO_DEADLINE` for none.
+/// The steps of an instance's holder: how many it began and finished, the count of finished steps the dispatcher waits for, 0 when it waits for none, the deadline they take while the dispatcher serves a call, `os::NO_DEADLINE` for none, the call posted to the component until a step takes it, and the names of the component's operations by number.
 struct Steps {
     begun: core::atomic::AtomicU64
     done: core::atomic::AtomicU64
     wanted: core::atomic::AtomicU64
     deadline: core::atomic::AtomicU64
+    posted: hw::SpinLock[Option[Posted]]
+    operations: mem::List[text::String]
 } Steps
+
+/// The number of the component's operation that the call `encoding` calls, unknown when none has its name.
+fn Steps.operation_of(self, encoding: Slice[u8], alloc: mem::Alloc) -> u8 {
+    let name = operation_of(encoding, alloc)
+    return match self.operations.position(fn(each: text::String) => each.as_str() == name.as_str()) {
+        Some(number) => u8.saturate(number)
+        None => UNKNOWN_OPERATION
+    }
+} Steps.operation_of
+
+/// A call posted to the component: the header the step handling it gives, and what the flight recorder takes of it.
+struct Posted derives Copy {
+    header: sys::Header
+    taken: Taken
+} Posted
+
+/// Holds `posted` as the call posted to the component, or none.
+fn Steps.post(self, posted: Option[Posted]) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        self.posted.with(t, body: fn(mut held: Option[Posted]) limits notrap, terminates, noalloc {
+            held = posted
+        })
+    })
+} Steps.post
+
+/// What the flight recorder takes of the call posted to the component, which the next step most likely handles; nothing known when none is posted.
+fn Steps.posted_taken(self) -> Taken {
+    let posted = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Posted] limits notrap {
+        return self.posted.with(t, body: fn(mut held: Option[Posted]) -> Option[Posted] limits notrap, terminates, noalloc {
+            return held
+        })
+    })
+    return match posted {
+        Some(call) => call.taken
+        None => Taken.unknown()
+    }
+} Steps.posted_taken
+
+/// What the flight recorder takes of the message a step handled: the call posted to the component when its header is the call's, which the step takes, else a message that moved; none when the step handled nothing.
+fn Steps.taken_by(self, stepped: Option[sys::Handled]) -> Option[Taken] {
+    let Some(handled) = stepped else {
+        return None
+    }
+    let claimed = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Posted] limits notrap {
+        return self.posted.with(t, body: fn(mut held: Option[Posted]) -> Option[Posted] limits notrap, terminates, noalloc {
+            let Some(call) = held else {
+                return None
+            }
+            if handled.header != Some(call.header) {
+                return None
+            }
+            held = None
+            return Some(call)
+        })
+    })
+    let Some(call) = claimed else {
+        return Some(Taken.moved(handled.header, operation: handled.operation))
+    }
+    var taken = call.taken
+    taken.operation = u8.saturate(handled.operation)
+    return Some(taken)
+} Steps.taken_by
 
 /// What the dispatcher of an instance's domain takes: the calls its driver delivers, the counts of finished steps the holder signals, and the schemas of the client protocols it serves.
 struct Given {
@@ -540,9 +664,12 @@ fn serve_call[P: sys::Protocol and Send](
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
     let work = header.handled_by(os::Header.current().sender)
+    let counts = steps.contents()
+    counts.post(Some(Posted(header: work.carried(), taken: Taken.encoded(header, encoding: encoded.bytes.view(), request, operation: counts.operation_of(encoded.bytes.view(), alloc)))))
     let outcome = attempt await sys::run_headed(work.carried(), body: fn() -> Option[sys::Encoded] fails sys::CallError[Never] uses wait {
         return try await sys::Wire[P].serve(out, request: id, hash, peers: peers.view(), raw: Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc)
     })
+    steps.contents().post(None)
     if not request {
         if outcome.is_ok() {
             try await finish_step(steps.contents(), mut signals)
@@ -598,10 +725,14 @@ fn idle[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], quiet: core::
             break
         }
     }
+    let suspending = telling.begin(call: SystemCall.Suspend)
     mut stepper.suspend()
+    telling.end_system(suspending)
     try await telling.tell(report: Report.Suspended)
     try await stepper.incoming()
+    let waking = telling.begin(call: SystemCall.Wake)
     mut stepper.wake()
+    telling.end_system(waking)
     try await telling.tell(report: Report.Woken)
 } idle
 
@@ -615,7 +746,9 @@ fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept
     loop {
         discard counts.begun.fetch_add(1)
         let stepping = now(telling.clock)
+        telling.begin_step(stepping)
         let stepped = try await paced_step(mut stepper, deadline: counts.deadline.load(), clock: telling.clock)
+        telling.end_step(stepping, stepped)
         match charged_elsewhere(stepped, own) {
             Some(account) => try await mark(telling.marks, marked: Mark.Charged(account: account, ns: now(telling.clock).saturating_sub(stepping)))
             None => {
@@ -854,3 +987,12 @@ fn hand_all(replies: mem::Shared[hw::SpinLock[mem::Bounded[Handed, QUEUED_REPLIE
         try await tell(reports, incarnation, take report)
     }
 } hand_all
+
+/// The names of `operations`, in their order.
+fn operation_names(operations: mem::List[sys::OperationSchema], alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    for operation in operations {
+        mut names.push(text::String.of(operation.name.as_str(), alloc))
+    }
+    return names
+} operation_names

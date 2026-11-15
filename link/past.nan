@@ -8,11 +8,12 @@ const CHAIN_LINKS: usize = 32
 /// The most trace records `why` reads back for the causes it follows.
 const TRACED: u64 = 4_096
 
-/// `history <path|commit>`: the commits writing under a path, newest first, or a commit's record and its changes.
+/// `history <path|commit|moniker>`: the commits writing under a path, newest first, a commit's record and its changes, or the inputs of an instance, read through `control`.
 fn history(
     request: Request,
     subject: Str,
     tree: store::service::View,
+    control: os::Control,
     reader: ident::Principal,
     alloc: mem::Alloc,
     ) -> Block fails task::Cancelled uses wait {
@@ -36,7 +37,7 @@ fn history(
         }
     }
     if not subject.starts_with("/") {
-        return try await moniker_history(request, subject, tree, alloc)
+        return try await moniker_history(request, subject, tree, control, alloc)
     }
     let Some(path) = path_of(subject, alloc) else {
         return failed_block(id, verb, operand: subject, failure: Failure.of("request.invalid-operand", subject, alloc).expecting("a path, a moniker or a commit", found: subject, alloc), alloc)
@@ -52,13 +53,32 @@ fn history(
     return block
 } history
 
-/// `history <moniker>`: an `input` record per input header of the instance's flight recorder, which holds none until the instance's recorder is armed; a moniker naming no instance fails with the nearest monikers as fixes.
-fn moniker_history(request: Request, subject: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+/// `history <moniker>`: an `input` record per input header of the instance's flight recorder, oldest first, read through `control`; a moniker naming no instance the session reads fails with the nearest monikers as fixes.
+fn moniker_history(
+    request: Request,
+    subject: Str,
+    tree: store::service::View,
+    control: os::Control,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
     let id = request.id.as_str()
     let verb = request.verb.as_str()
     let monikers = try await names_below(tree, path: "/sys/instances", alloc)
-    if monikers.position(fn(each: text::String) => each.as_str() == subject).is_some() {
-        return Block.of(Verdict.Ok, id, verb, operand: subject, alloc)
+    match first moniker_of(subject) {
+        Some(moniker) if monikers.position(fn(each: text::String) => each.as_str() == subject).is_some() => {
+            let inputs = match first attempt await control.inputs(take moniker, alloc) {
+                Ok(held) => held
+                Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+                Err(failed) => return failed_block(id, verb, operand: subject, failure: Failure.of(failed.code().as_str(), subject, alloc), alloc)
+            }
+            var block = Block.of(Verdict.Ok, id, verb, operand: subject, alloc)
+            for input in inputs {
+                mut block.records.push(input_record(input, alloc))
+            }
+            return block
+        }
+        else => {
+        }
     }
     var failure = Failure.of("request.unknown-name", subject, alloc)
     for candidate in nearest(subject, among: monikers, alloc) {
@@ -68,6 +88,26 @@ fn moniker_history(request: Request, subject: Str, tree: store::service::View, a
     }
     return failed_block(id, verb, operand: subject, take failure, alloc)
 } moniker_history
+
+/// `input <seq>, cause, sender, operation, size, hash`: the sender `kernel` for the core, without the operation when it is unknown.
+fn input_record(input: os::Input, alloc: mem::Alloc) -> Record {
+    let header = input.header
+    var record = Record.of("input", alloc)
+    mut record.subject(Dyn[Render].view(header.seq))
+    mut record.field("cause", value: Dyn[Render].view(os::Header.of_work(cause: header.cause, slot: 0).named_cause()))
+    match input.sender {
+        Some(sender) => mut record.field("sender", value: Dyn[Render].view(sender))
+        None => mut record.rendered("sender", rendered: "kernel", alloc)
+    }
+    match input.operation {
+        Some(name) => mut record.rendered("operation", rendered: name.as_str(), alloc)
+        None => {
+        }
+    }
+    mut record.field("size", value: Dyn[Render].view(header.size))
+    mut record.field("hash", value: Dyn[Render].view(header.hash))
+    return record
+} input_record
 
 /// `commit #<n>, time, principal, session, plan, cause`, its intent in an envelope.
 fn commit_record(meta: store::CommitMeta, reader: ident::Principal, alloc: mem::Alloc) -> Record {

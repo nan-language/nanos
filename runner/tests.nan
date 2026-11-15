@@ -1129,6 +1129,94 @@ test trapped_instances_restart_and_keep_their_intake for run {
     expect started == 2 and trapped == 1
 } trapped_instances_restart_and_keep_their_intake
 
+/// The inputs the tally's flight recorder held after a trap, and after 15 inputs more.
+struct RecordedInputs {
+    trapped: mem::List[os::Input]
+    later: mem::List[os::Input]
+} RecordedInputs
+
+/// Adds 5, notes 3 and divides the tally by 0, which traps and restarts it, adds 1 and reads its inputs; then notes 14 times, adds 1 and reads them again.
+fn record_tally(core: Core, alloc: mem::Alloc) -> RecordedInputs fails Failure uses wait {
+    discard try await core.control.start(named("tally"), alloc)
+    let Some(minted) = try await core.port(named("tally"), credit: os::Credit(messages: 16, calls: 2)) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    defer take minted.close()
+    let Some(port) = os::Port[Counter].of(minted.handle()) else {
+        fail Failure.Control(os::ControlError.Missing)
+    }
+    discard try await add(port, amount: 5, alloc)
+    try await note(port, amount: 3, alloc)
+    try await divide(port, by: 0, alloc)
+    discard try await add(port, amount: 1, alloc)
+    let trapped = try await core.control.inputs(named("tally"), alloc)
+    for _ in 0..<14u32 {
+        try await note(port, amount: 1, alloc)
+    }
+    discard try await add(port, amount: 1, alloc)
+    return RecordedInputs(trapped: take trapped, later: try await core.control.inputs(named("tally"), alloc))
+} record_tally
+
+/// The operations of `inputs`, in order, each followed by a space.
+fn operations_of(inputs: mem::List[os::Input], alloc: mem::Alloc) -> text::String {
+    var names = text::String.empty(alloc)
+    for input in inputs {
+        match input.operation {
+            Some(name) => mut names.append(name.as_str())
+            None => mut names.append("?")
+        }
+        mut names.push(' ')
+    }
+    return names
+} operations_of
+
+test flight_recorders_keep_the_last_inputs_across_incarnations for Shared.inputs {
+    let world = testing::world()
+    let counts = Counts.of(world.alloc)
+    let read = try await run(one_tally(world.alloc, adjust: unchanged), components: Tallies(), journal: counts, machine: Spare(alloc: world.alloc, holds: true), accounting: unaccounted(world.alloc), config: configured(world), postings: unread(world.alloc), logs: unlogged(world.alloc), gauges: Gauges.empty(world.alloc), tracings: untraced(world.alloc), body: fn(core: Core) -> RecordedInputs fails Failure uses wait {
+        return try await record_tally(core, alloc: world.alloc)
+    })
+    let Some(RecordedInputs(trapped: trapped, later: later)) = read else {
+        expect false
+        return
+    }
+    var call = sys::Encoded.empty(world.alloc)
+    discard sys::Wire[Counter].add(mut call, amount: 5)
+    let operations = operations_of(trapped, alloc: world.alloc)
+    expect operations.as_str() == "resume health add note divide resume health add "
+    var seq: u64 = 0
+    for input in trapped {
+        expect input.header.seq == seq and input.sender.is_none()
+        seq += 1
+    }
+    let Some(added) = trapped.get(2) else {
+        expect false
+        return
+    }
+    expect added.header.flags.request and added.header.flags.encoded and not added.header.flags.system
+    expect added.header.hash == ident::xxh3_64(call.bytes.view()) and u64.widen(added.header.size) == u64.widen(call.bytes.len())
+    let Some(divided) = trapped.get(4) else {
+        expect false
+        return
+    }
+    expect divided.header.outcome == os::InputOutcome.Trapped.to_bits() and not divided.header.flags.request
+    let Some(resumed) = trapped.get(5) else {
+        expect false
+        return
+    }
+    expect resumed.header.flags.system and resumed.header.outcome == os::InputOutcome.Returned.to_bits() and resumed.header.hash == 0
+    expect later.len() == 16
+    let Some(oldest) = later.get(0) else {
+        expect false
+        return
+    }
+    let Some(newest) = later.get(15) else {
+        expect false
+        return
+    }
+    expect oldest.header.seq == 7 and newest.header.seq == 22 and newest.operation.is_some()
+} flight_recorders_keep_the_last_inputs_across_incarnations
+
 fn fragile(mut spec: os::InstanceSpec) {
     spec.restart.intensity = 1
 } fragile
@@ -1623,7 +1711,7 @@ test created_instances_answer_postponed_requests_until_deleted for Directory.cre
 
 /// A directory holding the tally's endpoint, the root grant and a `Device` grant held by `inst.driver`, and the spec of `driver`, claiming that device and wired to the holder of the entropy role.
 fn claiming(clock: sys::Clock, alloc: mem::Alloc) -> Directory {
-    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc), clock: clock)
+    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc), slots: mem::Map.empty(alloc), clock: clock)
     let task::Channel(sender: intake, receiver: _) = task::Channel[os::Call].bounded(1, alloc)
     discard mut listed.endpoints.insert(named("tally"), value: Endpoint(intake: take intake, gate: os::Gate.of(alloc), protocols: os::Protocols(own: sys::Wire[Counter].hash(), serves: None)))
     discard mut listed.grants.insert(0, value: os::Grant(holder: system(), object: os::Object.Machine, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
@@ -1635,7 +1723,7 @@ fn claiming(clock: sys::Clock, alloc: mem::Alloc) -> Directory {
 test worlds_draw_randomness_only_under_a_random_grant for Directory.world {
     let world = testing::world()
     let alloc = world.alloc
-    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc), clock: testing::world().clock)
+    var listed = Directory(grants: mem::Map.empty(alloc), endpoints: mem::Map.empty(alloc), roles: mem::Map.empty(alloc), slots: mem::Map.empty(alloc), clock: testing::world().clock)
     discard mut listed.grants.insert(0, value: os::Grant(holder: ident::Principal(text: text::Fixed[64].of("inst.drawer")), object: os::Object.Random, rights: mem::Set.empty(alloc), caveats: os::Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1)))
     var bundle = Array[u8, 33].filled(0)
     bundle[0] = 0x01

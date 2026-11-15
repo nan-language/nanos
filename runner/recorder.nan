@@ -1,0 +1,229 @@
+//! Flight recorders: the headers of the last inputs each instance's handler calls took, kept across its incarnations.
+
+/// How many inputs a flight recorder holds the headers of.
+const RECORDED_INPUTS: u64 = 16
+
+/// The operation number of an input whose handler call ended before telling what it took.
+const UNKNOWN_OPERATION: u8 = 0xFF
+
+/// The flight recorder of an instance, which its driver holds and the holders of its incarnations write.
+pub open struct Recorder {
+    ring: mem::Shared[hw::SpinLock[Ring]]
+} Recorder
+
+/// The headers of an instance's last inputs, each at its number modulo 16, the number of inputs it took, and the header of the handler call running, which takes the next number once it ends having handled an input.
+struct Ring {
+    headers: Array[os::InputHeader, 16]
+    taken: u64
+    running: Option[os::InputHeader]
+} Ring
+
+/// What a handler call took: its cause as a header holds it, the slot of its sender, the XXH3-64 and the bytes of its encoding, both 0 for an input that moved without one, its operation's number, and its flags.
+struct Taken derives Copy {
+    cause: u64
+    sender: u32
+    hash: u64
+    size: u32
+    operation: u8
+    flags: os::InputFlags
+} Taken
+
+/// The system interface calls a holder makes, by the operation number an input of one records.
+enum SystemCall derives Copy, Eq {
+    Resume
+    Health
+    Pressure
+    Suspend
+    Wake
+} SystemCall
+
+/// A recorder that has recorded nothing.
+fn Recorder.of(alloc: mem::Alloc) -> Recorder {
+    let empty = os::InputHeader.from_bits(Array[u8, 48].filled(0))
+    return Recorder(ring: mem::Shared.of(hw::SpinLock.of(Ring(headers: Array[os::InputHeader, 16].filled(empty), taken: 0, running: None)), alloc))
+} Recorder.of
+
+fn Recorder.share(self) -> Recorder {
+    return Recorder(ring: self.ring.share())
+} Recorder.share
+
+/// Notes that a handler call began at the monotonic time `time` on what `taken` tells of its input.
+fn Recorder.begin(self, time: u64, taken: Taken) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        self.ring.contents().with(t, body: fn(mut ring: Ring) limits notrap, terminates, noalloc {
+            ring.running = Some(header_of(seq: ring.taken, time, taken, run_ns: 0, outcome: os::InputOutcome.Running))
+        })
+    })
+} Recorder.begin
+
+/// Ends the running handler call after `run_ns`, recording its input as `taken` tells it and returned, or recording none when it handled nothing.
+fn Recorder.end(self, run_ns: u64, taken: Option[Taken]) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        self.ring.contents().with(t, body: fn(mut ring: Ring) limits notrap, terminates, noalloc {
+            let Some(running) = mut ring.running.extract() else {
+                return
+            }
+            let Some(input) = taken else {
+                return
+            }
+            mut ring.keep(header_of(seq: running.seq, time: running.time, taken: input, run_ns, outcome: os::InputOutcome.Returned))
+        })
+    })
+} Recorder.end
+
+/// Records the input of the handler call running as trapped, its domain abandoned.
+fn Recorder.trapped(self) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        self.ring.contents().with(t, body: fn(mut ring: Ring) limits notrap, terminates, noalloc {
+            let Some(running) = mut ring.running.extract() else {
+                return
+            }
+            var trapped = running
+            trapped.outcome = os::InputOutcome.Trapped.to_bits()
+            mut ring.keep(trapped)
+        })
+    })
+} Recorder.trapped
+
+/// The headers of the last 16 inputs, oldest first, that of the handler call running last.
+fn Recorder.headers(self, alloc: mem::Alloc) -> mem::List[os::InputHeader] {
+    let Extent(taken: taken, running: running) = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Extent limits notrap {
+        return self.ring.contents().with(t, body: fn(mut ring: Ring) -> Extent limits notrap, terminates, noalloc {
+            return Extent(taken: ring.taken, running: ring.running)
+        })
+    })
+    let kept = match running {
+        Some(_) => RECORDED_INPUTS - 1
+        None => RECORDED_INPUTS
+    }
+    var headers = mem::List[os::InputHeader].empty(alloc)
+    for seq in taken.saturating_sub(kept)..<taken {
+        mut headers.push(self.header(seq))
+    }
+    match running {
+        Some(header) => mut headers.push(header)
+        None => {
+        }
+    }
+    return headers
+} Recorder.headers
+
+/// How many inputs a recorder took, and the header of the handler call running.
+struct Extent derives Copy {
+    taken: u64
+    running: Option[os::InputHeader]
+} Extent
+
+/// The header the recorder holds at the place of the input `seq`.
+fn Recorder.header(self, seq: u64) -> os::InputHeader {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> os::InputHeader limits notrap {
+        return self.ring.contents().with(t, body: fn(mut ring: Ring) -> os::InputHeader limits notrap, terminates, noalloc {
+            return ring.headers[slot_of(seq)]
+        })
+    })
+} Recorder.header
+
+/// Keeps `header` as the input of its number, the oldest one giving way.
+fn Ring.keep(mut self, header: os::InputHeader) limits notrap, terminates, noalloc {
+    self.headers[slot_of(header.seq)] = header
+    self.taken = header.seq.saturating_add(1)
+} Ring.keep
+
+fn slot_of(seq: u64) -> usize = usize.widen(seq % RECORDED_INPUTS)
+
+fn header_of(
+    seq: u64,
+    time: u64,
+    taken: Taken,
+    run_ns: u64,
+    outcome: os::InputOutcome,
+    ) -> os::InputHeader limits notrap, terminates, noalloc {
+    return os::InputHeader(seq: seq, time: time, cause: taken.cause, hash: taken.hash, sender: taken.sender, size: taken.size, run_us: u32.saturate(run_ns / 1_000), operation: taken.operation, flags: taken.flags, outcome: outcome.to_bits(), reserved: 0)
+} header_of
+
+/// What a handler call took of a message handled with the header `header` and the operation numbered `operation`, which moved without an encoding: its cause and its sender, the instance doing the work that sent it.
+fn Taken.moved(header: Option[sys::Header], operation: u16) -> Taken {
+    let sent = match header {
+        Some(carried) => os::Header.from_bits(carried.bytes)
+        None => os::Header.of_work(cause: 0, slot: 0)
+    }
+    return Taken(cause: sent.cause, sender: sent.sender, hash: 0, size: 0, operation: u8.saturate(operation), flags: os::InputFlags.from_bits(0))
+} Taken.moved
+
+/// What a handler call took of the encoded call `encoding` of the operation numbered `operation`, made with the header `header`, a request when `request`.
+fn Taken.encoded(header: os::Header, encoding: Slice[u8], request: bool, operation: u8) -> Taken {
+    return Taken(cause: header.cause, sender: header.sender, hash: ident::xxh3_64(encoding), size: u32.saturate(encoding.len()), operation: operation, flags: os::InputFlags(request: request, encoded: true, redelivered: header.flags.redelivered, system: false, reserved: 0))
+} Taken.encoded
+
+/// What the holder's call of the system interface `call` takes, the holder doing the work of the cause `cause` as a header holds it.
+fn Taken.system(call: SystemCall, cause: u64) -> Taken {
+    return Taken(cause: cause, sender: 0, hash: 0, size: 0, operation: call.number(), flags: os::InputFlags(request: false, encoded: false, redelivered: false, system: true, reserved: 0))
+} Taken.system
+
+/// What is known of an input before its handler call takes it: nothing.
+fn Taken.unknown() -> Taken = Taken(cause: 0, sender: 0, hash: 0, size: 0, operation: UNKNOWN_OPERATION, flags: os::InputFlags.from_bits(0))
+
+fn SystemCall.number(self) -> u8 {
+    return match self {
+        SystemCall.Resume => 0
+        SystemCall.Health => 1
+        SystemCall.Pressure => 2
+        SystemCall.Suspend => 3
+        SystemCall.Wake => 4
+    }
+} SystemCall.number
+
+/// The name of the system interface call numbered `number`, `None` for no such number.
+fn system_call_name(number: u8) -> Option[text::Fixed[8]] {
+    return match number {
+        0 => Some(text::Fixed[8].of("resume"))
+        1 => Some(text::Fixed[8].of("health"))
+        2 => Some(text::Fixed[8].of("pressure"))
+        3 => Some(text::Fixed[8].of("suspend"))
+        4 => Some(text::Fixed[8].of("wake"))
+        else => None
+    }
+} system_call_name
+
+/// A copy of `names` drawn through `alloc`.
+fn names_in(names: mem::List[text::String], alloc: mem::Alloc) -> mem::List[text::String] {
+    var copy = mem::List[text::String].empty(alloc)
+    for name in names {
+        mut copy.push(text::String.of(name.as_str(), alloc))
+    }
+    return copy
+} names_in
+
+/// The inputs the flight recorder of the instance `driver` holds, oldest first, each sender named by the moniker of its slot and each operation by its name.
+fn Shared.inputs(self, driver: Driver) -> mem::List[os::Input] fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    let headers = driver.recorder.headers(alloc)
+    let directory = self.directory.share()
+    let senders = await when directory => directory.senders_of(headers, alloc)
+    var inputs = mem::List[os::Input].empty(alloc)
+    for header in headers {
+        let sender = match senders.get(header.sender) {
+            Some(found) => Some(ident::Moniker(text: found.text))
+            None => None
+        }
+        mut inputs.push(os::Input(header: header, sender: take sender, operation: input_operation(header, operations: driver.operations, alloc)))
+    }
+    return inputs
+} Shared.inputs
+
+/// The name of the operation of the input `header` records: of the system interface it called, or among `operations`; `None` when unknown.
+fn input_operation(header: os::InputHeader, operations: mem::List[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    if header.operation == UNKNOWN_OPERATION {
+        return None
+    }
+    if header.flags.system {
+        return match system_call_name(header.operation) {
+            Some(name) => Some(text::String.of(name.as_str(), alloc))
+            None => None
+        }
+    }
+    return match operations.get(usize.widen(header.operation)) {
+        Some(name) => Some(text::String.of(name.as_str(), alloc))
+        None => None
+    }
+} input_operation

@@ -144,7 +144,11 @@ fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
         }
         match order {
             HolderOrder.Hibernate(idle: only_idle) => return Some(only_idle)
-            HolderOrder.Pressure(level: level) => mut stepper.pressure(level)
+            HolderOrder.Pressure(level: level) => {
+                let pressing = telling.begin(call: SystemCall.Pressure)
+                mut stepper.pressure(level)
+                telling.end_system(pressing)
+            }
             HolderOrder.Snapshot(reply: reply) => {
                 discard attempt await reply.send(state_copy(stepper, alloc))
             }
@@ -166,7 +170,7 @@ fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
             }
             HolderOrder.Replay(call: call, header: header, branch: branch, redirect: redirect, recorded: recorded, tape: tape) => {
                 tape.replay(recorded)
-                let outcome = try await replayed(mut stepper, take call, header, branch: branch.as_str(), redirect, mut holding, s, alloc)
+                let outcome = try await replayed(mut stepper, take call, header, branch: branch.as_str(), redirect, mut holding, telling, s)
                 tape.pass()
                 try await telling.tell(report: Report.Replayed(outcome: take outcome))
             }
@@ -189,7 +193,7 @@ fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
     }
 } carry_out
 
-/// Replays `call` on the paused component behind `stepper` under `header`, its Views of `main` reaching `branch` through `redirect` until its handler returns: a task of `s` posts it, and the holder calls the handlers of the messages its intake holds, starting the keyed tasks they spawn, until it handles the call. Keeps in `holding` the messages and keyed tasks the call's handler gave, setting the other messages aside, and gives them with the encoding of its reply; `request.invalid-operand` when `branch` is no branch name, `port.stopped` when the call could not be served.
+/// Replays `call` on the paused component behind `stepper` under `header`, its Views of `main` reaching `branch` through `redirect` until its handler returns: a task of `s` posts it, and the holder calls the handlers of the messages its intake holds, starting the keyed tasks they spawn, until it handles the call, recording each handler call through `telling`. Keeps in `holding` the messages and keyed tasks the call's handler gave, setting the other messages aside, and gives them with the encoding of its reply; `request.invalid-operand` when `branch` is no branch name, `port.stopped` when the call could not be served.
 fn replayed[S, Env: Any, P: sys::Protocol and Send](
     mut stepper: sys::Stepper[S, Env, P],
     take call: os::ForkCall,
@@ -197,18 +201,27 @@ fn replayed[S, Env: Any, P: sys::Protocol and Send](
     branch: Str,
     redirect: store::service::Redirect,
     mut holding: Holding[P],
+    telling: Telling,
     s: task::Scope,
-    alloc: mem::Alloc,
     ) -> Result[os::Replayed, os::ControlError] fails task::Cancelled uses wait {
+    let alloc = telling.alloc
     if not redirect.set(branch: Some(branch)) {
         return Err(os::ControlError.Invalid)
     }
     let failed = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
     let task::Channel(sender: answering, receiver: answered) = task::Channel[Option[mem::Bytes]].bounded(1, alloc)
+    let counts = telling.steps.contents()
+    var taken = Taken.encoded(header, encoding: call.encoded.view(), request: false, operation: counts.operation_of(call.encoded.view(), alloc))
+    counts.post(Some(Posted(header: header.carried(), taken: taken)))
     serve_replayed(stepper.outbox(), waker: stepper.waker(), take call, carried: header.carried(), answering: Answering(failed: failed.share(), replies: take answering), s, alloc)
+    var replaying: Option[u64] = None
     loop {
         try await stepper.incoming()
-        let Some(handled) = mut stepper.step() else {
+        let stepping = now(telling.clock)
+        telling.begin_step(stepping)
+        let stepped = mut stepper.step()
+        let Some(handled) = stepped else {
+            telling.end_step(stepping, stepped)
             if failed.contents().load() {
                 break
             }
@@ -219,10 +232,14 @@ fn replayed[S, Env: Any, P: sys::Protocol and Send](
             None => false
         }
         if replay {
+            taken.operation = u8.saturate(handled.operation)
+            replaying = Some(stepping)
             break
         }
+        telling.end_step(stepping, stepped)
         start_unkept(mut stepper, kept: holding.tasks, alloc)
     }
+    counts.post(None)
     discard redirect.set(branch: None)
     if failed.contents().load() {
         return Err(os::ControlError.Stopped)
@@ -231,6 +248,14 @@ fn replayed[S, Env: Any, P: sys::Protocol and Send](
     let reply = match try await mut receiver.receive() {
         Some(found) => found
         None => None
+    }
+    match replaying {
+        Some(began) => {
+            taken.flags.request = reply.is_some()
+            telling.end_taken(began, taken)
+        }
+        None => {
+        }
     }
     let sent = mut holding.keep_sent(mut stepper, cause: header.cause, alloc)
     let spawns = mut holding.keep_tasks(stepper, alloc)
