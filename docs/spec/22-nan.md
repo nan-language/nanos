@@ -487,3 +487,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a kernel reads its own interface hash.
 - **Chapters:** [10](10-code.md), [13](13-tree.md).
 - **Issue:** [nan-language/nan#231](https://github.com/nan-language/nan/issues/231).
+
+## N46
+
+**Encodings of the inputs a step takes.**
+
+- **Language 1:** a step gives the header and the operation's number of the message it handles (NaN 26 §Steppers), and a message a keyed task posts reaches the handler without its holder holding it.
+- **NaN OS requires:** a step gives the encoding of the message it handles, whoever posted it.
+- **Chapters:** [10](10-code.md), [17](17-observability.md).
+- **Issue:** [nan-language/nan#232](https://github.com/nan-language/nan/issues/232).
