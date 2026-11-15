@@ -460,3 +460,30 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** an account whose class and weight change while its tasks run.
 - **Chapters:** [06](06-execution.md), [08](08-scheduling.md).
 - **Issue:** [nan-language/nan#220](https://github.com/nan-language/nan/issues/220).
+
+## N43
+
+**Artefacts of bundles.**
+
+- **Language 1:** a bundle build writes the `.nbun` alone, holding the lowered image but neither the artefacts nor the code roots of the packages it was lowered from (NaN 30 §Bundles), and no command gives them.
+- **NaN OS requires:** the bundle build also writes the artefacts of the bundle's final closure, std included.
+- **Chapters:** [10](10-code.md).
+- **Issue:** [nan-language/nan#229](https://github.com/nan-language/nan/issues/229).
+
+## N44
+
+**The toolchain on NaN OS.**
+
+- **Language 1:** the NaN toolchain is a NaN program whose platform package declares only the Linux and Windows targets (NaN 38 §NaN toolchain).
+- **NaN OS requires:** a build of the toolchain for the nanos targets, as a host-compatible job whose world reaches the workspace and the user directory through `sys::Fs`, with `check` in verify mode, `test` and `build` against a kernel's interface.
+- **Chapters:** [10](10-code.md), [20](20-base.md).
+- **Issue:** [nan-language/nan#230](https://github.com/nan-language/nan/issues/230).
+
+## N45
+
+**A kernel's interface hash.**
+
+- **Language 1:** a kernel exporting its load ABI holds its interface hash in its image (NaN 30 §Interface files), and no operation gives it to the kernel.
+- **NaN OS requires:** a kernel reads its own interface hash.
+- **Chapters:** [10](10-code.md), [13](13-tree.md).
+- **Issue:** [nan-language/nan#231](https://github.com/nan-language/nan/issues/231).

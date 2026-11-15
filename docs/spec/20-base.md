@@ -233,7 +233,7 @@ A generation ships five jobs, admitted bundles of provenance `vendor` that the p
 
 | Job | Does | Input → result | Started by |
 | --- | --- | --- | --- |
-| `nan` | the NaN toolchain over a store tree: `check` in verify mode (requires [N26](22-nan.md#n26)), `test`, `build` and lowering; only on a machine with at least 4 GiB of RAM ([derived defaults](01-machines.md#derived-defaults)) | `NanRequest { command, tree, scope }` → `NanReport { verdict, records }` | `admission`, `run` |
+| `nan` | the NaN toolchain over a store tree: `check` in verify mode (requires [N26](22-nan.md#n26)), `test`, `build` and lowering (requires [N44](22-nan.md#n44)); only on a machine with at least 4 GiB of RAM ([derived defaults](01-machines.md#derived-defaults)) | `NanRequest { command, tree, scope }` → `NanReport { verdict, records }` | `admission`, `run` |
 | `scrub` | verifies the store's checksums and blob identities ([scrub](12-store-format.md#scrub)) and the whole retained [audit chain](17-observability.md#audit-chain) | → `ScrubReport` | `store`'s `scrub`, `run` |
 | `selftest` | checks that every base instance is `converged`, `/live/memory` sums to RAM, the policy record verifies, every grant lies within its parent and every specification's bundle is admitted | → a list of `Check { name, passed, detail }` | `run` |
 | `bench` | measures the requirements of [Performance](21-performance.md#measurement) | `BenchRequest` → `BenchReport` | `run` |

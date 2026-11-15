@@ -54,8 +54,8 @@ pub closed struct Signed derives Encode {
 } Signed
 ```
 
-- `artefacts` holds one artefact per package of the closure, std included, in byte order of code root hash.
-- `images` holds at most one image per level, toolchain and support table. `toolchain` is a [toolchain hash](https://github.com/nan-language/nan/blob/main/docs/spec/36-builds.md#toolchain-hash); `support` is the hash of the support-routine table the image imports, and an image loads only into a kernel exporting a table with that hash, the running kernel's being `LiveBoot.support` ([/live](13-tree.md#live); requires [N6](22-nan.md#n6)).
+- `artefacts` holds one artefact per package of the closure, std included, in byte order of code root hash (requires [N43](22-nan.md#n43)).
+- `images` holds at most one image per level, toolchain and support table. `toolchain` is a [toolchain hash](https://github.com/nan-language/nan/blob/main/docs/spec/36-builds.md#toolchain-hash); `support` is the hash of the support-routine table the image imports, and an image loads only into a kernel exporting a table with that hash, the running kernel's being `LiveBoot.support` ([/live](13-tree.md#live); requires [N6](22-nan.md#n6), [N45](22-nan.md#n45)).
 - `X86v1` to `X86v4` are the x86-64 microarchitecture levels 1 to 4 of the System V psABI, `Armv80` is Armv8.0-A and `Armv82` Armv8.2-A with the dot product instructions. A machine's level is `Machine.level` ([measured facts](01-machines.md#measured-facts)); an image runs on a machine of its level or above (requires [N17](22-nan.md#n17)).
 - The **bundle hash** is the hash of kind `bundle` of the bundle's encoding with `signatures` empty; each entry of `signatures` is a `bundle` signature ([signatures](09-authority.md#signatures)).
 
