@@ -1,0 +1,132 @@
+//! Entry of the bundler: `key <seed file>` prints the public key of the 32-byte seed the file holds, writing a random one first when the file is missing; `bundle <root> <images dir> <interface file> <builder> <seed file> <out>` writes to `out` the bundle file of the bundle build of `root` against the interface file, certified by the principal `builder` with the key of the seed, and prints its code hash and blob id.
+
+const USAGE: Slice[u8] = b"usage: bundler key <seed file> | bundler bundle <root> <images dir> <interface file> <builder> <seed file> <out>\n"
+
+/// The status of a run its arguments do not fit.
+const MISUSED: u8 = 2
+
+pub closed enum BundlerError derives Render {
+    File(sys::fs::FsError) from
+    Stdio(sys::StdioError) from
+    Revoked(sys::Revoked) from
+    /// A seed file not holding 32 bytes.
+    Seed
+    /// A bundle build whose outputs do not decode.
+    Malformed
+    Cancelled(task::Cancelled) from
+} BundlerError
+
+fn main(take world: host::World) -> u8 fails BundlerError uses wait {
+    let alloc = world.alloc
+    let arguments = arguments_of(world.args, alloc)
+    let Some(command) = arguments.get(0) else {
+        try await world.stdio.write_err(USAGE)
+        return MISUSED
+    }
+    if command.as_str() == "key" and arguments.len() == 2 {
+        let key = try await seed_key(world.fs, random: world.random, path: arguments[1].as_str(), alloc)
+        try await world.stdio.write_out(ident::key_text(key.public_key().bytes).as_str().as_bytes())
+        try await world.stdio.write_out(b"\n")
+        return 0
+    }
+    if command.as_str() == "bundle" and arguments.len() == 7 {
+        try await bundle(world, arguments, alloc)
+        return 0
+    }
+    try await world.stdio.write_err(USAGE)
+    return MISUSED
+} main
+
+/// Writes the bundle file the arguments `bundle <root> <images dir> <interface file> <builder> <seed file> <out>` name, and prints its code hash and blob id.
+fn bundle(world: host::World, arguments: mem::List[text::String], alloc: mem::Alloc) fails BundlerError uses wait {
+    let root = arguments[1].as_str()
+    let images = arguments[2].as_str()
+    let image = try await world.fs.read_all(output_path(images, root, extension: ".nbun", alloc).as_str(), alloc)
+    let artefacts = try await world.fs.read_all(output_path(images, root, extension: ".narts", alloc).as_str(), alloc)
+    let interface_file = try await world.fs.read_all(arguments[3].as_str(), alloc)
+    let Some(builder) = principal_of(arguments[4].as_str(), alloc) else {
+        fail BundlerError.Malformed
+    }
+    let key = try await seed_key(world.fs, random: world.random, path: arguments[5].as_str(), alloc)
+    let Some(made) = code::Bundle.made(root, image: image.view(), artefacts: artefacts.view(), interface_file: interface_file.view(), alloc) else {
+        fail BundlerError.Malformed
+    }
+    let code::Made(bundle: unsigned, code: code_hash) = made
+    var made_bundle = unsigned
+    var blob_ids = mem::List[ident::HashValue].empty(alloc)
+    var toolchain = code_hash
+    for each in made_bundle.images {
+        mut blob_ids.push(ident::HashValue.of_content(each.bytes.view()))
+        toolchain = each.toolchain
+    }
+    made_bundle.certificate = Some(code::Certificate.of(take builder, code: code_hash, toolchain, images: take blob_ids, key, alloc))
+    var encoded = mem::Bytes.empty(alloc)
+    mem::wire::Codec[code::Bundle].encode(made_bundle, out: mut encoded)
+    try await world.fs.write_all(arguments[6].as_str(), data: encoded.view())
+    try await world.stdio.write_out(b"code ")
+    try await world.stdio.write_out(code_hash.full_form().as_str().as_bytes())
+    try await world.stdio.write_out(b"\nblob ")
+    try await world.stdio.write_out(ident::HashValue.of_content(encoded.view()).full_form().as_str().as_bytes())
+    try await world.stdio.write_out(b"\n")
+} bundle
+
+/// The command line's arguments, each as text, an argument that is not UTF-8 as the empty text.
+validator fn arguments_of(raw: Untrusted[mem::List[mem::Bytes]], alloc: mem::Alloc) -> mem::List[text::String] {
+    var arguments = mem::List[text::String].empty(alloc)
+    for argument in raw.inspect() {
+        let text = match attempt text::String.try_from_utf8(argument.view(), alloc) {
+            Ok(valid) => valid
+            Err(_) => text::String.empty(alloc)
+        }
+        mut arguments.push(take text)
+    }
+    return arguments
+} arguments_of
+
+/// The path of the file of extension `extension` a bundle build of `root` writes into the directory `images`.
+fn output_path(images: Str, root: Str, extension: Str, alloc: mem::Alloc) -> text::String {
+    var path = text::String.of(images, alloc)
+    mut path.push('/')
+    mut path.append(root)
+    mut path.append(extension)
+    return path
+} output_path
+
+/// The principal named `name`, `None` for a name of no principal.
+fn principal_of(take name: Str, alloc: mem::Alloc) -> Option[ident::Principal] {
+    return match attempt ident::Principal.parse(Untrusted.of(take name), alloc) {
+        Ok(principal) => Some(take principal)
+        Err(_) => None
+    }
+} principal_of
+
+/// The key of the 32-byte seed the file `path` holds, the file first written with a seed drawn from `random` when it is missing.
+fn seed_key(fs: sys::Fs, random: sys::Random, path: Str, alloc: mem::Alloc) -> core::crypto::SecretKey fails BundlerError uses wait {
+    let held = match first attempt await fs.read_all(path, alloc) {
+        Ok(found) => found
+        Err(sys::fs::FsError.NotFound) => {
+            var drawn = Array[u8, 32].filled(0)
+            try random.fill(mut drawn.view_mut())
+            try await fs.write_all(path, data: drawn.view())
+            return core::crypto::SecretKey.of_seed(drawn)
+        }
+        Err(other) => fail other
+    }
+    let Some(seed) = seed_of(held.view()) else {
+        fail BundlerError.Seed
+    }
+    return core::crypto::SecretKey.of_seed(seed)
+} seed_key
+
+/// The seed a seed file holds, `None` unless it holds exactly 32 bytes.
+validator fn seed_of(raw: Untrusted[Slice[u8]]) -> Option[Array[u8, 32]] {
+    let bytes = raw.inspect()
+    if bytes.len() != 32 {
+        return None
+    }
+    var seed = Array[u8, 32].filled(0)
+    for at in 0..<32usize {
+        seed[at] = bytes[at]
+    }
+    return Some(seed)
+} seed_of

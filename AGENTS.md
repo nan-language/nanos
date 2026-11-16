@@ -18,6 +18,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `bootfmt/` | The `bootfmt` package: the boot record, the handoff record and the kernel image |
 | `acpi/` | The `acpi` package: the ACPI tables NaN OS reads |
 | `crypto/` | The `crypto` package: XChaCha20-Poly1305 sealing and BLAKE3 key derivation on secret values |
+| `code/` | The `code` package: the records of bundle files and their code hash, and making a bundle from what a bundle build writes |
 | `os/` | The `os` package: the records instances and the core share, message headers, and the capability kinds `Port`, `Control`, `Live`, `Callers`, `Accounts` and `Meter` |
 | `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints, dead letters, flight recorders, forks, pauses, replays and hibernations, and the accounts of sessions |
 | `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |
@@ -35,7 +36,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `console/` | The `console` package: the `console` instance, sharing the console UART with the link |
 | `loader/` | The `loader` package |
 | `kernel/` | The `kernel` package |
-| `tools/` | The `install`, `sandbox` and `transcripts` scripts |
+| `tools/` | The `install`, `sandbox` and `transcripts` scripts, and in `bundler/` the host program making bundle files |
 | `docs/` | Documentation: the specification in `docs/spec/`, ADRs in `docs/decisions/` |
 
 One row per top-level directory; deeper only where the tree alone would not tell an agent where a change belongs.
@@ -52,6 +53,8 @@ One row per top-level directory; deeper only where the tree alone would not tell
 | `tools/sandbox start [<instance>]` | Boot NaN OS under QEMU from a fresh copy of the working tree, its serial console on standard output |
 | `tools/sandbox reset [<instance>]` | Delete a sandbox instance |
 | `tools/transcripts [<instance>]` | Boot a fresh sandbox instance and run each link transcript of `link/transcripts/` on its serial console |
+| `nan run bundler -- key <seed file>` | Print the public key of a builder's seed file, writing a random seed when it is missing |
+| `nan run bundler -- bundle <root> <images dir> <interface file> <builder> <seed file> <out>` | Write the bundle file of the bundle build of `root`, certified by `builder` with the seed's key, and print its code hash and blob id |
 
 Run `nan` from the repository root. A scope is a package, module or item path, a `.nan` file or a `file:line`; omitted at the root, it is the whole workspace.
 

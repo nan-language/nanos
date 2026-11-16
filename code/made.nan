@@ -1,0 +1,355 @@
+//! Making a bundle from what a bundle build writes: its image, the artefacts of its closure and the interface file of the kernel it was built against, each in the forms of NaN's canonical encoding.
+
+const ARTEFACT_MAGIC: Slice[u8] = b"NART"
+
+const INTERFACE_MAGIC: Slice[u8] = b"NLIF"
+
+/// The format version of the artefacts and interface files read.
+const FORMAT_VERSION: u64 = 1
+
+/// The keys of an interface file's toolchain hash, target and codegen level.
+const TOOLCHAIN_PART: u64 = 1
+
+const TARGET_PART: u64 = 2
+
+const LEVEL_PART: u64 = 6
+
+/// A uvar read from bytes, and the offset after it.
+struct Uvar derives Copy {
+    value: u64
+    end: usize
+} Uvar
+
+/// The content of a bytes form: its first offset and the offset after it.
+struct Span derives Copy {
+    start: usize
+    end: usize
+} Span
+
+/// An artefact and the hash of its code root.
+struct Rooted {
+    code_root: ident::HashValue
+    artefact: mem::Bytes
+} Rooted
+
+/// What an interface file tells of the images built against it: the toolchain that built its kernel and the codegen level they are lowered at.
+struct Interface derives Copy {
+    toolchain: ident::HashValue
+    level: Level
+} Interface
+
+/// The bundle of the root package `root` whose bundle build wrote `image` against the interface file `interface_file`, and the artefacts of its closure as `.narts` lists them, with the code hash of its closure; `None` when the artefacts or the interface file do not decode.
+pub validator fn Bundle.made(
+    root: Str,
+    image: Untrusted[Slice[u8]],
+    artefacts: Untrusted[Slice[u8]],
+    interface_file: Untrusted[Slice[u8]],
+    alloc: mem::Alloc,
+    ) -> Option[Made] {
+    let Some(rooted) = rooted_artefacts(artefacts.inspect(), alloc) else {
+        return None
+    }
+    let Some(lowered) = interface_of(interface_file.inspect()) else {
+        return None
+    }
+    var code_roots = mem::List[ident::HashValue].empty(alloc)
+    var held = mem::List[mem::Bytes].empty(alloc)
+    for each in take rooted {
+        let Rooted(code_root: code_root, artefact: artefact) = each
+        mut code_roots.push(code_root)
+        mut held.push(take artefact)
+    }
+    let code = CodeId(root: text::String.of(root, alloc), code_roots: take code_roots).hash(alloc)
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(image.inspect())
+    var images = mem::List[Image].empty(alloc)
+    mut images.push(Image(level: lowered.level, toolchain: lowered.toolchain, support: ident::HashValue.of_content(interface_file.inspect()), bytes: take bytes))
+    return Some(Made(bundle: Bundle(root: text::String.of(root, alloc), artefacts: take held, images: take images, certificate: None, signatures: mem::List.empty(alloc)), code: code))
+} Bundle.made
+
+/// The artefacts the list `listed` holds, each with the hash of its code root, in byte order of that hash; `None` when the list or an artefact does not decode.
+fn rooted_artefacts(listed: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[Rooted]] {
+    let Some(count) = uvar_at(listed, at: 0) else {
+        return None
+    }
+    var rooted = mem::List[Rooted].empty(alloc)
+    var at = count.end
+    for _ in 0..<count.value {
+        let Some(span) = bytes_at(listed, at) else {
+            return None
+        }
+        let Some(artefact) = copy_of(listed, span, alloc) else {
+            return None
+        }
+        let Some(code_root) = code_root_of(artefact.view()) else {
+            return None
+        }
+        var place: usize = 0
+        while place < rooted.len() and rooted[place].code_root < code_root {
+            place += 1
+        }
+        mut rooted.insert(place, value: Rooted(code_root: code_root, artefact: take artefact))
+        at = span.end
+    }
+    if at != listed.len() {
+        return None
+    }
+    return Some(take rooted)
+} rooted_artefacts
+
+/// The hash of the code root the artefact `artefact` holds; `None` when it is no artefact of the format version read.
+fn code_root_of(artefact: Slice[u8]) -> Option[ident::HashValue] {
+    let Some(magic) = artefact.prefix(4) else {
+        return None
+    }
+    if magic != ARTEFACT_MAGIC {
+        return None
+    }
+    let Some(version) = uvar_at(artefact, at: 4) else {
+        return None
+    }
+    if version.value != FORMAT_VERSION {
+        return None
+    }
+    let Some(span) = bytes_at(artefact, at: version.end) else {
+        return None
+    }
+    let Some(parts) = artefact.split_at(span.start) else {
+        return None
+    }
+    let Some(code_root) = parts.tail.prefix(span.end - span.start) else {
+        return None
+    }
+    return Some(ident::HashValue.of_content(code_root))
+} code_root_of
+
+/// The toolchain and codegen level the interface file `raw` records; `None` when it is no interface file of the format version read, or lacks either.
+fn interface_of(raw: Slice[u8]) -> Option[Interface] {
+    let Some(magic) = raw.prefix(4) else {
+        return None
+    }
+    if magic != INTERFACE_MAGIC {
+        return None
+    }
+    let Some(version) = uvar_at(raw, at: 4) else {
+        return None
+    }
+    let Some(count) = uvar_at(raw, at: version.end) else {
+        return None
+    }
+    if version.value != FORMAT_VERSION {
+        return None
+    }
+    var toolchain: Option[ident::HashValue] = None
+    var arm = false
+    var level: Option[Level] = None
+    var at = count.end
+    for _ in 0..<count.value {
+        let Some(key) = uvar_at(raw, at) else {
+            return None
+        }
+        let Some(span) = bytes_at(raw, at: key.end) else {
+            return None
+        }
+        let Some(parts) = raw.split_at(span.start) else {
+            return None
+        }
+        let Some(content) = parts.tail.prefix(span.end - span.start) else {
+            return None
+        }
+        if key.value == TOOLCHAIN_PART {
+            toolchain = hash_of(content)
+        } else if key.value == TARGET_PART {
+            arm = content.prefix(7) == Some(b"aarch64")
+        } else if key.value == LEVEL_PART {
+            level = level_named(content, arm)
+        }
+        at = span.end
+    }
+    let Some(hash) = toolchain else {
+        return None
+    }
+    let Some(named) = level else {
+        return None
+    }
+    return Some(Interface(toolchain: hash, level: named))
+} interface_of
+
+/// The codegen level of the name an interface file gives it, the base set of AArch64 when `arm`, else of x86_64, for the empty name.
+fn level_named(name: Slice[u8], arm: bool) -> Option[Level] {
+    if name.len() == 0 {
+        return match arm {
+            true => Some(Level.Armv80)
+            false => Some(Level.X86v1)
+        }
+    }
+    if name == b"x86_64-v2" {
+        return Some(Level.X86v2)
+    }
+    if name == b"x86_64-v3" {
+        return Some(Level.X86v3)
+    }
+    if name == b"x86_64-v4" {
+        return Some(Level.X86v4)
+    }
+    if name == b"aarch64-dotprod" {
+        return Some(Level.Armv82)
+    }
+    return None
+} level_named
+
+/// The hash whose 33 bytes `bytes` holds; `None` for any other bytes.
+fn hash_of(bytes: Slice[u8]) -> Option[ident::HashValue] {
+    if bytes.len() != 33 or bytes[0] != 0x01 {
+        return None
+    }
+    var held = Array[u8, 33].filled(0x01)
+    for at in 1..<33usize {
+        held[at] = bytes[at]
+    }
+    return Some(ident::HashValue(bytes: held))
+} hash_of
+
+/// The uvar at offset `at` of `bytes`, which writes it without redundant groups.
+fn uvar_at(bytes: Slice[u8], at: usize) -> Option[Uvar] {
+    var value: u64 = 0
+    var shift: u32 = 0
+    var next = at
+    loop {
+        if next >= bytes.len() or shift > 63 {
+            return None
+        }
+        let byte = bytes[next]
+        next += 1
+        let group = u64.widen(byte & 0x7F)
+        if shift == 63 and group > 1 {
+            return None
+        }
+        value = value | (group << shift)
+        if (byte & 0x80) == 0 {
+            if byte == 0 and next - at > 1 {
+                return None
+            }
+            return Some(Uvar(value: value, end: next))
+        }
+        shift += 7
+    }
+} uvar_at
+
+/// The content of the bytes form at offset `at` of `bytes`.
+fn bytes_at(bytes: Slice[u8], at: usize) -> Option[Span] {
+    let Some(length) = uvar_at(bytes, at) else {
+        return None
+    }
+    let size = usize.widen(length.value)
+    if size > bytes.len() - length.end {
+        return None
+    }
+    return Some(Span(start: length.end, end: length.end + size))
+} bytes_at
+
+/// A copy of the content `span` marks in `bytes`.
+fn copy_of(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let Some(parts) = bytes.split_at(span.start) else {
+        return None
+    }
+    let Some(content) = parts.tail.prefix(span.end - span.start) else {
+        return None
+    }
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(content)
+    return Some(take copy)
+} copy_of
+
+/// Appends `value` as a uvar.
+fn push_uvar(mut out: mem::Bytes, value: u64) {
+    var left = value
+    loop {
+        let group = u8.truncate(left & 0x7F)
+        left = left >> 7
+        if left == 0 {
+            mut out.push(group)
+            return
+        }
+        mut out.push(group | 0x80)
+    }
+} push_uvar
+
+/// Appends `bytes` as a bytes form.
+fn push_bytes(mut out: mem::Bytes, bytes: Slice[u8]) {
+    push_uvar(mut out, value: u64.widen(bytes.len()))
+    mut out.append(bytes)
+} push_bytes
+
+/// An artefact of the code root `code_root`, with an empty attestation file and no section.
+fn artefact_of(code_root: Slice[u8], magic: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var artefact = mem::Bytes.empty(alloc)
+    mut artefact.append(magic)
+    push_uvar(mut artefact, value: FORMAT_VERSION)
+    push_bytes(mut artefact, bytes: code_root)
+    push_bytes(mut artefact, bytes: b"")
+    push_uvar(mut artefact, value: 0)
+    return artefact
+} artefact_of
+
+/// An interface file of a kernel built by `toolchain` for x86_64 at the codegen level `level`.
+fn interface_file_of(toolchain: ident::HashValue, level: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var file = mem::Bytes.empty(alloc)
+    mut file.append(INTERFACE_MAGIC)
+    push_uvar(mut file, value: FORMAT_VERSION)
+    push_uvar(mut file, value: 3)
+    push_uvar(mut file, value: TOOLCHAIN_PART)
+    push_bytes(mut file, bytes: toolchain.bytes.view())
+    push_uvar(mut file, value: TARGET_PART)
+    push_bytes(mut file, bytes: b"x86_64-bare")
+    push_uvar(mut file, value: LEVEL_PART)
+    push_bytes(mut file, bytes: level)
+    return file
+} interface_file_of
+
+test bundles_hold_their_closure_by_code_root_beside_the_image_lowered_against_an_interface for Bundle.made {
+    let alloc = testing::world().alloc
+    let toolchain = ident::HashValue.of_content(b"toolchain")
+    var listed = mem::Bytes.empty(alloc)
+    push_uvar(mut listed, value: 2)
+    push_bytes(mut listed, bytes: artefact_of(b"root of hello", magic: ARTEFACT_MAGIC, alloc).view())
+    push_bytes(mut listed, bytes: artefact_of(b"root of core", magic: ARTEFACT_MAGIC, alloc).view())
+    let interface_file = interface_file_of(toolchain, level: b"x86_64-v3", alloc)
+    let Some(Made(bundle: bundle, code: code)) = Bundle.made("hello", image: Untrusted.of(b"image"), artefacts: Untrusted.of(listed.view()), interface_file: Untrusted.of(interface_file.view()), alloc) else {
+        expect false
+        return
+    }
+    var low = ident::HashValue.of_content(b"root of hello")
+    var high = ident::HashValue.of_content(b"root of core")
+    if high < low {
+        let swapped = low
+        low = high
+        high = swapped
+    }
+    var code_roots = mem::List[ident::HashValue].empty(alloc)
+    mut code_roots.push(low)
+    mut code_roots.push(high)
+    let expected = CodeId(root: text::String.of("hello", alloc), code_roots: take code_roots).hash(alloc)
+    expect code == expected and bundle.artefacts.len() == 2 and bundle.certificate.is_none() and bundle.signatures.len() == 0
+    let Some(earliest) = bundle.artefacts.get(0) else {
+        expect false
+        return
+    }
+    let first_root = code_root_of(earliest.view())
+    expect first_root == Some(low)
+    let Some(lowered) = bundle.images.get(0) else {
+        expect false
+        return
+    }
+    expect lowered.level == Level.X86v3 and lowered.toolchain == toolchain and lowered.support == ident::HashValue.of_content(interface_file.view())
+    var wrong = mem::Bytes.empty(alloc)
+    push_uvar(mut wrong, value: 1)
+    push_bytes(mut wrong, bytes: artefact_of(b"root", magic: b"NBUN", alloc).view())
+    let refused = Bundle.made("hello", image: Untrusted.of(b""), artefacts: Untrusted.of(wrong.view()), interface_file: Untrusted.of(interface_file.view()), alloc)
+    let Some(cut) = listed.view().prefix(9) else {
+        expect false
+        return
+    }
+    let truncated = Bundle.made("hello", image: Untrusted.of(b""), artefacts: Untrusted.of(take cut), interface_file: Untrusted.of(interface_file.view()), alloc)
+    expect refused.is_none() and truncated.is_none()
+} bundles_hold_their_closure_by_code_root_beside_the_image_lowered_against_an_interface
