@@ -1,0 +1,943 @@
+//! Reading package artefacts: what admission judges of each package, from the forms of NaN's canonical encoding.
+
+const MANIFEST_PART: u64 = 2
+
+const REQUIRES_PART: u64 = 5
+
+const LEDGER_PART: u64 = 8
+
+/// The last part of every code root; the one after it, its protocols, is absent when it declares none.
+const LAST_ROOT_PART: u64 = 10
+
+const SEALS_PART: u64 = 3
+
+const SIGNATURE_SECTION: u64 = 1
+
+const CERTIFICATE_SECTION: u64 = 4
+
+const PROVENANCE_SECTION: u64 = 5
+
+/// The positions in NaN's ledger table of the validator, whose entry is a trust escape only when declassifying, and of the grant.
+const VALIDATOR_KIND: u64 = 4
+
+const GRANT_KIND: u64 = 6
+
+const LF: u8 = 0x0A
+
+/// What admission reads of a package artefact.
+pub closed struct Artefact {
+    /// The hash of its code root.
+    pub code_root: ident::HashValue
+    pub name: text::String
+    pub targets: mem::List[text::String]
+    /// The other packages whose items its requires-set names, in byte order.
+    pub required: mem::List[text::String]
+    pub escapes: mem::List[Escape]
+    pub seals: mem::List[Seal]
+    /// Its publisher's signatures, absent from an unpublished artefact.
+    pub publisher: Option[Publisher]
+    /// The author principals its provenance names.
+    pub authors: mem::List[text::String]
+} Artefact
+
+/// A trust escape: the canonical path of the item holding it, its ledger kind and, for a grant, the authority it grants: `device`, `priv` or `capability`.
+pub closed struct Escape {
+    pub item: text::String
+    pub kind: text::Fixed[16]
+    pub authority: Option[text::Fixed[16]]
+} Escape
+
+/// A seal: its principal, the canonical path of the item it seals, the packages holding the items of its closure entries, in byte order, and its signature when it holds one.
+pub closed struct Seal {
+    pub principal: text::String
+    pub item: text::String
+    pub packages: mem::List[text::String]
+    pub signature: Option[KeyedSignature]
+} Seal
+
+/// The publisher's signatures: of the artefact, and of the certificate it gives the artefact as builder.
+pub closed struct Publisher {
+    pub principal: text::String
+    pub artefact: KeyedSignature
+    pub certificate: KeyedSignature
+} Publisher
+
+/// A signature in NaN's form: the public key beside it, the signature, and the message it signs.
+pub closed struct KeyedSignature {
+    pub key: Array[u8, 32]
+    pub signature: ident::Signature
+    pub message: mem::Bytes
+} KeyedSignature
+
+/// A record's field: the offset of its key, its key and the span of its content.
+struct Field derives Copy {
+    start: usize
+    key: u64
+    content: Span
+} Field
+
+/// A record's fields, keys strictly increasing, and the offset after it.
+struct Record {
+    fields: mem::List[Field]
+    end: usize
+} Record
+
+/// The name and targets a manifest declares.
+struct Declared {
+    name: text::String
+    targets: mem::List[text::String]
+} Declared
+
+/// What an artefact's sections hold.
+struct Published {
+    publisher: Option[Publisher]
+    authors: mem::List[text::String]
+} Published
+
+/// What admission reads of the artefact `raw`; `None` when it is no artefact of the format version read, does not decode, or its certificate names another publisher than its signature or lacks its code root.
+pub validator fn Artefact.read(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[Artefact] {
+    let outcome = attempt read_artefact(raw.inspect(), alloc)
+    return match outcome {
+        Ok(artefact) => Some(take artefact)
+        Err(_) => None
+    }
+} Artefact.read
+
+/// Whether every signature the artefact holds verifies by the key beside it.
+pub fn Artefact.verifies(self) -> bool {
+    match self.publisher {
+        Some(publisher) => {
+            if not publisher.artefact.verifies() or not publisher.certificate.verifies() {
+                return false
+            }
+        }
+        None => {
+        }
+    }
+    for seal in self.seals {
+        match seal.signature {
+            Some(signed) => {
+                if not signed.verifies() {
+                    return false
+                }
+            }
+            None => {
+            }
+        }
+    }
+    return true
+} Artefact.verifies
+
+pub fn KeyedSignature.verifies(self) -> bool {
+    return core::crypto::PublicKey(bytes: self.key).verify(self.message.view(), signature: core::crypto::Signature(bytes: self.signature.bytes))
+} KeyedSignature.verifies
+
+/// Whether `name` names a package of std: those the reserved std aliases name and the platform packages.
+pub fn is_std(name: Str) -> bool {
+    let named = name.as_bytes()
+    return named == b"core" or named == b"mem" or named == b"text" or named == b"task" or named == b"sys" or named == b"hw" or named == b"boot" or named == b"host" or named == b"nanos" or named == b"testing" or named == b"linux_platform" or named == b"windows_platform" or named == b"macos_platform" or named == b"uefi_platform" or named == b"bare_platform"
+} is_std
+
+fn read_artefact(bytes: Slice[u8], alloc: mem::Alloc) -> Artefact fails core::DecodeError {
+    let Some(magic) = bytes.prefix(4) else {
+        fail core::DecodeError.Invalid
+    }
+    if magic != ARTEFACT_MAGIC {
+        fail core::DecodeError.Invalid
+    }
+    let Some(version) = uvar_at(bytes, at: 4) else {
+        fail core::DecodeError.Invalid
+    }
+    if version.value != FORMAT_VERSION {
+        fail core::DecodeError.Invalid
+    }
+    let root = try form_at(bytes, at: version.end)
+    let attestation = try form_at(bytes, at: root.end)
+    let sections = try record_at(bytes, at: attestation.end, alloc)
+    if sections.end != bytes.len() {
+        fail core::DecodeError.Invalid
+    }
+    let parts = try record_in(bytes, span: root, alloc)
+    let protocols = parts.len() == usize.widen(LAST_ROOT_PART) + 1 and parts[usize.widen(LAST_ROOT_PART)].key == LAST_ROOT_PART + 1
+    if not numbered(parts, count: LAST_ROOT_PART) and not protocols {
+        fail core::DecodeError.Invalid
+    }
+    let code_root = try hash_of_content(bytes, span: root)
+    let declared = try declared_in(bytes, span: try field(parts, key: MANIFEST_PART), alloc)
+    let required = try required_in(bytes, span: try field(parts, key: REQUIRES_PART), name: declared.name.as_str(), alloc)
+    let escapes = try escapes_in(bytes, span: try field(parts, key: LEDGER_PART), alloc)
+    let attested = try record_in(bytes, span: attestation, alloc)
+    if not numbered(attested, count: SEALS_PART) {
+        fail core::DecodeError.Invalid
+    }
+    let seals = try seals_in(bytes, span: try field(attested, key: SEALS_PART), alloc)
+    let attestation_hash = try hash_of_content(bytes, span: attestation)
+    let published = try published_in(bytes, sections: sections.fields, name: declared.name.as_str(), code_root, attestation: attestation_hash, alloc)
+    let Declared(name: name, targets: targets) = declared
+    let Published(publisher: publisher, authors: authors) = published
+    return Artefact(code_root: code_root, name: take name, targets: take targets, required: take required, escapes: take escapes, seals: take seals, publisher: take publisher, authors: take authors)
+} read_artefact
+
+/// The name and targets the manifest whose text form fills `span` of `bytes` declares, in canonical format.
+fn declared_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> Declared fails core::DecodeError {
+    let manifest = try text_in(bytes, span, alloc)
+    let lines = manifest.as_bytes()
+    var name: Option[text::String] = None
+    var targets = mem::List[text::String].empty(alloc)
+    var at: usize = 0
+    while at < lines.len() {
+        var end = at
+        while end < lines.len() and lines[end] != LF {
+            end += 1
+        }
+        let Some(parts) = lines.split_at(at) else {
+            fail core::DecodeError.Invalid
+        }
+        let Some(line) = parts.tail.prefix(end - at) else {
+            fail core::DecodeError.Invalid
+        }
+        if name.is_none() and line.prefix(8) == Some(b"package ") and line.len() > 10 and line[line.len() - 2] == b' ' and line[line.len() - 1] == b'{' {
+            let Some(rest) = line.split_at(8) else {
+                fail core::DecodeError.Invalid
+            }
+            let Some(word) = rest.tail.prefix(line.len() - 10) else {
+                fail core::DecodeError.Invalid
+            }
+            name = Some(try text_of(word, alloc))
+        } else if name.is_some() and line.prefix(12) == Some(b"    targets ") {
+            let Some(rest) = line.split_at(12) else {
+                fail core::DecodeError.Invalid
+            }
+            try push_listed(mut targets, listed: rest.tail, alloc)
+        }
+        at = end + 1
+    }
+    let Some(declared) = name else {
+        fail core::DecodeError.Invalid
+    }
+    return Declared(name: take declared, targets: take targets)
+} declared_in
+
+/// Appends each name of the list `listed`, its names separated by a comma and a space.
+fn push_listed(mut names: mem::List[text::String], listed: Slice[u8], alloc: mem::Alloc) fails core::DecodeError {
+    var start: usize = 0
+    var at: usize = 0
+    while at <= listed.len() {
+        if at == listed.len() or listed[at] == b',' {
+            let Some(parts) = listed.split_at(start) else {
+                fail core::DecodeError.Invalid
+            }
+            let Some(name) = parts.tail.prefix(at - start) else {
+                fail core::DecodeError.Invalid
+            }
+            mut names.push(try text_of(name, alloc))
+            start = at + 2
+            at = start
+        } else {
+            at += 1
+        }
+    }
+} push_listed
+
+/// The other packages than `name` whose items the requires-set filling `span` of `bytes` names, in byte order.
+fn required_in(bytes: Slice[u8], span: Span, name: Str, alloc: mem::Alloc) -> mem::List[text::String] fails core::DecodeError {
+    var required = mem::List[text::String].empty(alloc)
+    for entry in try records_in(bytes, span, alloc) {
+        let path = try text_in(bytes, span: try field(entry, key: 1), alloc)
+        let Some(owner) = path.as_str().slice_bytes(0, end: package_end(path.as_str())) else {
+            fail core::DecodeError.Invalid
+        }
+        if owner != name {
+            insert_name(mut required, name: owner, alloc)
+        }
+    }
+    return required
+} required_in
+
+/// The trust escapes of the ledger filling `span` of `bytes`, in its order.
+fn escapes_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> mem::List[Escape] fails core::DecodeError {
+    var escapes = mem::List[Escape].empty(alloc)
+    for entry in try records_in(bytes, span, alloc) {
+        if not numbered(entry, count: 5) {
+            fail core::DecodeError.Invalid
+        }
+        let item = try text_in(bytes, span: entry[0].content, alloc)
+        let position = try uvar_in(bytes, span: entry[1].content)
+        let texts = try texts_in(bytes, span: entry[4].content, alloc)
+        let Some(kind) = ledger_kind(position) else {
+            fail core::DecodeError.Invalid
+        }
+        let lead = match texts.get(0) {
+            Some(text) => text.as_str()
+            None => ""
+        }
+        if is_escape(position, lead) {
+            var authority: Option[text::Fixed[16]] = None
+            if position == GRANT_KIND {
+                authority = Some(text::Fixed[16].of(lead))
+            }
+            mut escapes.push(Escape(item: take item, kind: kind, authority: authority))
+        }
+    }
+    return escapes
+} escapes_in
+
+/// The seals the list filling `span` of `bytes` records.
+fn seals_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> mem::List[Seal] fails core::DecodeError {
+    var seals = mem::List[Seal].empty(alloc)
+    for record in try records_in(bytes, span, alloc) {
+        let signed = numbered(record, count: 7)
+        if not numbered(record, count: 5) and not signed {
+            fail core::DecodeError.Invalid
+        }
+        let principal = try text_in(bytes, span: record[0].content, alloc)
+        let item = try text_in(bytes, span: record[1].content, alloc)
+        let item_hash = try hash_in(bytes, span: record[2].content)
+        let closure_hash = try hash_in(bytes, span: record[3].content)
+        var packages = mem::List[text::String].empty(alloc)
+        for entry in try records_in(bytes, span: record[4].content, alloc) {
+            if not numbered(entry, count: 3) {
+                fail core::DecodeError.Invalid
+            }
+            let path = try text_in(bytes, span: entry[1].content, alloc)
+            let Some(owner) = path.as_str().slice_bytes(0, end: package_end(path.as_str())) else {
+                fail core::DecodeError.Invalid
+            }
+            insert_name(mut packages, name: owner, alloc)
+        }
+        var signature: Option[KeyedSignature] = None
+        if signed {
+            let message = seal_message(principal.as_str(), item: item.as_str(), item_hash, closure_hash, alloc)
+            signature = Some(KeyedSignature(key: try key_in(bytes, span: record[6].content), signature: try signature_in(bytes, span: record[5].content), message: take message))
+        }
+        mut seals.push(Seal(principal: take principal, item: take item, packages: take packages, signature: take signature))
+    }
+    return seals
+} seals_in
+
+/// What the sections `sections` of the artefact of package `name`, code root `code_root` and attestation file of hash `attestation` hold: none, or exactly the publisher's signature, its certificate as builder of the artefact, and the provenance.
+fn published_in(
+    bytes: Slice[u8],
+    sections: mem::List[Field],
+    name: Str,
+    code_root: ident::HashValue,
+    attestation: ident::HashValue,
+    alloc: mem::Alloc,
+    ) -> Published fails core::DecodeError {
+    if sections.len() == 0 {
+        return Published(publisher: None, authors: mem::List.empty(alloc))
+    }
+    if sections.len() != 3 or sections[0].key != SIGNATURE_SECTION or sections[1].key != CERTIFICATE_SECTION or sections[2].key != PROVENANCE_SECTION {
+        fail core::DecodeError.Invalid
+    }
+    let signature = try record_in(bytes, span: sections[0].content, alloc)
+    let certificate = try record_in(bytes, span: sections[1].content, alloc)
+    let provenance = try record_in(bytes, span: sections[2].content, alloc)
+    if not numbered(signature, count: 3) or not numbered(certificate, count: 5) or not numbered(provenance, count: 2) {
+        fail core::DecodeError.Invalid
+    }
+    let principal = try text_in(bytes, span: signature[0].content, alloc)
+    let key = try key_in(bytes, span: signature[1].content)
+    let certifier = try text_in(bytes, span: certificate[0].content, alloc)
+    if certifier.as_str() != principal.as_str() or try key_in(bytes, span: certificate[1].content) != key {
+        fail core::DecodeError.Invalid
+    }
+    discard try hash_in(bytes, span: certificate[2].content)
+    if not try lists_root(bytes, span: certificate[3].content, name, code_root) {
+        fail core::DecodeError.Invalid
+    }
+    let authors = try texts_in(bytes, span: provenance[0].content, alloc)
+    let lock = try form_at(bytes, at: provenance[1].content.start)
+    if lock.end != provenance[1].content.end {
+        fail core::DecodeError.Invalid
+    }
+    var certified = mem::Bytes.empty(alloc)
+    mut certified.append(b"nan certificate 1\n")
+    push_uvar(mut certified, value: 4)
+    let Some(parts) = bytes.split_at(certificate[0].start) else {
+        fail core::DecodeError.Invalid
+    }
+    let Some(fields) = parts.tail.prefix(certificate[4].start - certificate[0].start) else {
+        fail core::DecodeError.Invalid
+    }
+    mut certified.append(fields)
+    let message = artefact_message(principal.as_str(), key, code_root, attestation, provenance: try hash_of_content(bytes, span: sections[2].content), alloc)
+    let artefact = KeyedSignature(key: key, signature: try signature_in(bytes, span: signature[2].content), message: take message)
+    let certifying = KeyedSignature(key: key, signature: try signature_in(bytes, span: certificate[4].content), message: take certified)
+    return Published(publisher: Some(Publisher(principal: take principal, artefact: take artefact, certificate: take certifying)), authors: take authors)
+} published_in
+
+/// Whether the list of pairs of a package name and a code root hash filling `span` of `bytes` pairs `name` with `code_root`.
+fn lists_root(bytes: Slice[u8], span: Span, name: Str, code_root: ident::HashValue) -> bool fails core::DecodeError {
+    let Some(count) = uvar_at(bytes, at: span.start) else {
+        fail core::DecodeError.Invalid
+    }
+    var listed = false
+    var at = count.end
+    for _ in 0..<count.value {
+        let owner = try form_at(bytes, at)
+        let hash = try form_at(bytes, at: owner.end)
+        let Some(parts) = bytes.split_at(owner.start) else {
+            fail core::DecodeError.Invalid
+        }
+        let Some(named) = parts.tail.prefix(owner.end - owner.start) else {
+            fail core::DecodeError.Invalid
+        }
+        let Some(rest) = bytes.split_at(hash.start) else {
+            fail core::DecodeError.Invalid
+        }
+        let Some(hashed) = rest.tail.prefix(hash.end - hash.start) else {
+            fail core::DecodeError.Invalid
+        }
+        let Some(root) = hash_of(hashed) else {
+            fail core::DecodeError.Invalid
+        }
+        listed = listed or (named == name.as_bytes() and root == code_root)
+        at = hash.end
+    }
+    if at != span.end {
+        fail core::DecodeError.Invalid
+    }
+    return listed
+} lists_root
+
+/// NaN's message of a publisher's signature: `nan artefact 1`, the principal, the key form of its key, and the full forms of the hashes of the code root, of the attestation file and of the provenance section, each followed by LF.
+fn artefact_message(
+    principal: Str,
+    key: Array[u8, 32],
+    code_root: ident::HashValue,
+    attestation: ident::HashValue,
+    provenance: ident::HashValue,
+    alloc: mem::Alloc,
+    ) -> mem::Bytes {
+    var message = mem::Bytes.empty(alloc)
+    mut message.append(b"nan artefact 1\n")
+    push_line(mut message, line: principal.as_bytes())
+    let key_form = ident::key_text(key)
+    push_line(mut message, line: key_form.as_str().as_bytes())
+    let root_form = code_root.full_form()
+    push_line(mut message, line: root_form.as_str().as_bytes())
+    let attestation_form = attestation.full_form()
+    push_line(mut message, line: attestation_form.as_str().as_bytes())
+    let provenance_form = provenance.full_form()
+    push_line(mut message, line: provenance_form.as_str().as_bytes())
+    return message
+} artefact_message
+
+/// NaN's seal message: `nan seal 1`, the principal, the canonical path of the sealed item and the full forms of its sealed item hash and closure hash, each followed by LF.
+fn seal_message(
+    principal: Str,
+    item: Str,
+    item_hash: ident::HashValue,
+    closure_hash: ident::HashValue,
+    alloc: mem::Alloc,
+    ) -> mem::Bytes {
+    var message = mem::Bytes.empty(alloc)
+    mut message.append(b"nan seal 1\n")
+    push_line(mut message, line: principal.as_bytes())
+    push_line(mut message, line: item.as_bytes())
+    let item_form = item_hash.full_form()
+    push_line(mut message, line: item_form.as_str().as_bytes())
+    let closure_form = closure_hash.full_form()
+    push_line(mut message, line: closure_form.as_str().as_bytes())
+    return message
+} seal_message
+
+fn push_line(mut out: mem::Bytes, line: Slice[u8]) {
+    mut out.append(line)
+    mut out.push(LF)
+} push_line
+
+/// The name of the ledger kind at position `position` of NaN's ledger table.
+fn ledger_kind(position: u64) -> Option[text::Fixed[16]] {
+    let name = match position {
+        0 => "trusted"
+        1 => "assume"
+        2 => "foreign"
+        3 => "landing"
+        4 => "validator"
+        5 => "decoder"
+        6 => "grant"
+        7 => "waiver"
+        8 => "todo"
+        9 => "dbg"
+        10 => "class"
+        11 => "undo"
+        12 => "confined"
+        else => return None
+    }
+    return Some(text::Fixed[16].of(name))
+} ledger_kind
+
+/// Whether an entry of the ledger kind at `position`, whose first text is `lead`, is a trust escape.
+fn is_escape(position: u64, lead: Str) -> bool {
+    if position == VALIDATOR_KIND {
+        return lead == "declassifying"
+    }
+    return position != 7 and position != 8 and position != 9 and position != 12
+} is_escape
+
+/// The length of the name of the package whose item the canonical path `path` names.
+fn package_end(path: Str) -> usize {
+    return path.find("::").value_or(path.byte_len())
+} package_end
+
+/// Inserts `name` into `names`, which it keeps in byte order and without repeats.
+fn insert_name(mut names: mem::List[text::String], name: Str, alloc: mem::Alloc) {
+    var place: usize = 0
+    while place < names.len() and names[place].as_bytes() < name.as_bytes() {
+        place += 1
+    }
+    if place < names.len() and names[place].as_str() == name {
+        return
+    }
+    mut names.insert(place, value: text::String.of(name, alloc))
+} insert_name
+
+/// Whether the keys of `fields` are exactly 1 to `count`.
+fn numbered(fields: mem::List[Field], count: u64) -> bool {
+    if u64.widen(fields.len()) != count {
+        return false
+    }
+    var key: u64 = 1
+    for each in fields {
+        if each.key != key {
+            return false
+        }
+        key += 1
+    }
+    return true
+} numbered
+
+/// The content of the field `key` of `fields`.
+fn field(fields: mem::List[Field], key: u64) -> Span fails core::DecodeError {
+    for each in fields {
+        if each.key == key {
+            return each.content
+        }
+    }
+    fail core::DecodeError.Invalid
+} field
+
+/// The record at offset `at` of `bytes`.
+fn record_at(bytes: Slice[u8], at: usize, alloc: mem::Alloc) -> Record fails core::DecodeError {
+    let Some(count) = uvar_at(bytes, at) else {
+        fail core::DecodeError.Invalid
+    }
+    var fields = mem::List[Field].empty(alloc)
+    var next = count.end
+    var last: u64 = 0
+    for _ in 0..<count.value {
+        let Some(key) = uvar_at(bytes, at: next) else {
+            fail core::DecodeError.Invalid
+        }
+        if key.value <= last {
+            fail core::DecodeError.Invalid
+        }
+        let content = try form_at(bytes, at: key.end)
+        mut fields.push(Field(start: next, key: key.value, content: content))
+        last = key.value
+        next = content.end
+    }
+    return Record(fields: take fields, end: next)
+} record_at
+
+/// The fields of the record filling `span` of `bytes`.
+fn record_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> mem::List[Field] fails core::DecodeError {
+    let Record(fields: fields, end: end) = try record_at(bytes, at: span.start, alloc)
+    if end != span.end {
+        fail core::DecodeError.Invalid
+    }
+    return fields
+} record_in
+
+/// The fields of each record of the list filling `span` of `bytes`.
+fn records_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> mem::List[mem::List[Field]] fails core::DecodeError {
+    let Some(count) = uvar_at(bytes, at: span.start) else {
+        fail core::DecodeError.Invalid
+    }
+    var records = mem::List[mem::List[Field]].empty(alloc)
+    var at = count.end
+    for _ in 0..<count.value {
+        let Record(fields: fields, end: end) = try record_at(bytes, at, alloc)
+        if end > span.end {
+            fail core::DecodeError.Invalid
+        }
+        mut records.push(take fields)
+        at = end
+    }
+    if at != span.end {
+        fail core::DecodeError.Invalid
+    }
+    return records
+} records_in
+
+/// The texts of the list filling `span` of `bytes`.
+fn texts_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> mem::List[text::String] fails core::DecodeError {
+    let Some(count) = uvar_at(bytes, at: span.start) else {
+        fail core::DecodeError.Invalid
+    }
+    var texts = mem::List[text::String].empty(alloc)
+    var at = count.end
+    for _ in 0..<count.value {
+        let form = try form_at(bytes, at)
+        if form.end > span.end {
+            fail core::DecodeError.Invalid
+        }
+        mut texts.push(try text_in(bytes, span: Span(start: at, end: form.end), alloc))
+        at = form.end
+    }
+    if at != span.end {
+        fail core::DecodeError.Invalid
+    }
+    return texts
+} texts_in
+
+/// The content of the bytes form at offset `at` of `bytes`.
+fn form_at(bytes: Slice[u8], at: usize) -> Span fails core::DecodeError {
+    let Some(span) = bytes_at(bytes, at) else {
+        fail core::DecodeError.Invalid
+    }
+    return span
+} form_at
+
+/// The content of the bytes form filling `span` of `bytes`.
+fn form_in(bytes: Slice[u8], span: Span) -> Span fails core::DecodeError {
+    let inner = try form_at(bytes, at: span.start)
+    if inner.end != span.end {
+        fail core::DecodeError.Invalid
+    }
+    return inner
+} form_in
+
+/// The uvar filling `span` of `bytes`.
+fn uvar_in(bytes: Slice[u8], span: Span) -> u64 fails core::DecodeError {
+    let Some(read) = uvar_at(bytes, at: span.start) else {
+        fail core::DecodeError.Invalid
+    }
+    if read.end != span.end {
+        fail core::DecodeError.Invalid
+    }
+    return read.value
+} uvar_in
+
+/// The text whose text form fills `span` of `bytes`.
+fn text_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> text::String fails core::DecodeError {
+    let inner = try form_in(bytes, span)
+    let Some(parts) = bytes.split_at(inner.start) else {
+        fail core::DecodeError.Invalid
+    }
+    let Some(content) = parts.tail.prefix(inner.end - inner.start) else {
+        fail core::DecodeError.Invalid
+    }
+    return try text_of(content, alloc)
+} text_in
+
+/// The text whose UTF-8 bytes are `utf8`.
+fn text_of(utf8: Slice[u8], alloc: mem::Alloc) -> text::String fails core::DecodeError {
+    return match attempt text::String.try_from_utf8(utf8, alloc) {
+        Ok(text) => text
+        Err(_) => fail core::DecodeError.Invalid
+    }
+} text_of
+
+/// The hash whose bytes form fills `span` of `bytes`.
+fn hash_in(bytes: Slice[u8], span: Span) -> ident::HashValue fails core::DecodeError {
+    let inner = try form_in(bytes, span)
+    let Some(parts) = bytes.split_at(inner.start) else {
+        fail core::DecodeError.Invalid
+    }
+    let Some(content) = parts.tail.prefix(inner.end - inner.start) else {
+        fail core::DecodeError.Invalid
+    }
+    let Some(hash) = hash_of(content) else {
+        fail core::DecodeError.Invalid
+    }
+    return hash
+} hash_in
+
+/// The hash of the content of `span` of `bytes`.
+fn hash_of_content(bytes: Slice[u8], span: Span) -> ident::HashValue fails core::DecodeError {
+    let Some(parts) = bytes.split_at(span.start) else {
+        fail core::DecodeError.Invalid
+    }
+    let Some(content) = parts.tail.prefix(span.end - span.start) else {
+        fail core::DecodeError.Invalid
+    }
+    return ident::HashValue.of_content(content)
+} hash_of_content
+
+/// The public key whose bytes form fills `span` of `bytes`.
+fn key_in(bytes: Slice[u8], span: Span) -> Array[u8, 32] fails core::DecodeError {
+    let inner = try form_in(bytes, span)
+    let Some(parts) = bytes.split_at(inner.start) else {
+        fail core::DecodeError.Invalid
+    }
+    let Some(content) = parts.tail.prefix(32) else {
+        fail core::DecodeError.Invalid
+    }
+    if inner.end - inner.start != 32 {
+        fail core::DecodeError.Invalid
+    }
+    var key = Array[u8, 32].filled(0)
+    for at in 0..<32usize {
+        key[at] = content[at]
+    }
+    return key
+} key_in
+
+/// The signature whose bytes form fills `span` of `bytes`.
+fn signature_in(bytes: Slice[u8], span: Span) -> ident::Signature fails core::DecodeError {
+    let inner = try form_in(bytes, span)
+    let Some(parts) = bytes.split_at(inner.start) else {
+        fail core::DecodeError.Invalid
+    }
+    let Some(content) = parts.tail.prefix(64) else {
+        fail core::DecodeError.Invalid
+    }
+    if inner.end - inner.start != 64 {
+        fail core::DecodeError.Invalid
+    }
+    var signature = Array[u8, 64].filled(0)
+    for at in 0..<64usize {
+        signature[at] = content[at]
+    }
+    return ident::Signature(bytes: signature)
+} signature_in
+
+/// The manifest of the package of the artefacts the tests read.
+const METER_MANIFEST: Str = "//! Running totals.\n\npackage meter {\n    language 1\n    targets x86_64-nanos, aarch64-nanos\n    dep units \"../units\"\n} meter\n"
+
+/// Appends the field `key` of content `content`.
+fn push_field(mut out: mem::Bytes, key: u64, content: Slice[u8]) {
+    push_uvar(mut out, value: key)
+    push_bytes(mut out, bytes: content)
+} push_field
+
+/// `bytes` as a bytes form.
+fn form_of(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var form = mem::Bytes.empty(alloc)
+    push_bytes(mut form, bytes)
+    return form
+} form_of
+
+/// `value` as a uvar.
+fn uvar_of(value: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var form = mem::Bytes.empty(alloc)
+    push_uvar(mut form, value)
+    return form
+} uvar_of
+
+/// Appends a requires-set entry naming `path`.
+fn push_entry(mut out: mem::Bytes, path: Str, alloc: mem::Alloc) {
+    push_uvar(mut out, value: 1)
+    push_field(mut out, key: 1, content: form_of(path.as_bytes(), alloc).view())
+} push_entry
+
+/// Appends a ledger entry of kind `kind` held by `item`, whose one text is `lead`.
+fn push_ledger_entry(
+    mut out: mem::Bytes,
+    item: Str,
+    kind: u64,
+    lead: Str,
+    alloc: mem::Alloc,
+    ) {
+    push_uvar(mut out, value: 5)
+    push_field(mut out, key: 1, content: form_of(item.as_bytes(), alloc).view())
+    push_field(mut out, key: 2, content: uvar_of(kind, alloc).view())
+    push_field(mut out, key: 3, content: form_of(b"meter/meter.nan", alloc).view())
+    push_field(mut out, key: 4, content: uvar_of(4, alloc).view())
+    var texts = uvar_of(1, alloc)
+    push_bytes(mut texts, bytes: lead.as_bytes())
+    push_field(mut out, key: 5, content: texts.view())
+} push_ledger_entry
+
+/// Appends a closure entry naming the interface of `path`.
+fn push_closure_entry(mut out: mem::Bytes, path: Str, alloc: mem::Alloc) {
+    push_uvar(mut out, value: 3)
+    push_field(mut out, key: 1, content: uvar_of(0, alloc).view())
+    push_field(mut out, key: 2, content: form_of(path.as_bytes(), alloc).view())
+    push_field(mut out, key: 3, content: form_of(ident::HashValue.of_content(path.as_bytes()).bytes.view(), alloc).view())
+} push_closure_entry
+
+/// The code root of `meter`: its requires-set names items of `core`, `units` and its own, and its ledger holds a trusted block, a parsing and a declassifying validator, a device grant and a `todo`.
+fn meter_root(alloc: mem::Alloc) -> mem::Bytes {
+    var entries = uvar_of(4, alloc)
+    push_entry(mut entries, path: "core::Option", alloc)
+    push_entry(mut entries, path: "units::Metres", alloc)
+    push_entry(mut entries, path: "meter::total", alloc)
+    push_entry(mut entries, path: "core::Result", alloc)
+    var ledger = uvar_of(5, alloc)
+    push_ledger_entry(mut ledger, item: "meter::total", kind: 0, lead: "the sum stays below 2000", alloc)
+    push_ledger_entry(mut ledger, item: "meter::parse", kind: 4, lead: "parsing", alloc)
+    push_ledger_entry(mut ledger, item: "meter::decode", kind: 4, lead: "declassifying", alloc)
+    push_ledger_entry(mut ledger, item: "meter", kind: 6, lead: "device", alloc)
+    push_ledger_entry(mut ledger, item: "meter::later", kind: 8, lead: "count laps", alloc)
+    var root = uvar_of(LAST_ROOT_PART, alloc)
+    push_field(mut root, key: 1, content: uvar_of(1, alloc).view())
+    push_field(mut root, key: MANIFEST_PART, content: form_of(METER_MANIFEST.as_bytes(), alloc).view())
+    for part in 3..<REQUIRES_PART {
+        push_field(mut root, key: part, content: uvar_of(0, alloc).view())
+    }
+    push_field(mut root, key: REQUIRES_PART, content: entries.view())
+    for part in 6..<LEDGER_PART {
+        push_field(mut root, key: part, content: uvar_of(0, alloc).view())
+    }
+    push_field(mut root, key: LEDGER_PART, content: ledger.view())
+    for part in 9..=LAST_ROOT_PART {
+        push_field(mut root, key: part, content: uvar_of(0, alloc).view())
+    }
+    return root
+} meter_root
+
+/// The attestation file of `meter`: one seal of `meter::total` by `human.alice` with the key of `seed`, whose closure entries name items of `units` and `core`.
+fn meter_attestation(seed: Array[u8, 32], alloc: mem::Alloc) -> mem::Bytes {
+    let key = core::crypto::SecretKey.of_seed(seed)
+    let item_hash = ident::HashValue.of_content(b"item")
+    let closure_hash = ident::HashValue.of_content(b"closure")
+    var message = mem::Bytes.empty(alloc)
+    mut message.append(b"nan seal 1\nhuman.alice\nmeter::total\n")
+    let item_form = item_hash.full_form()
+    mut message.append(item_form.as_str().as_bytes())
+    mut message.append(b"\n")
+    let closure_form = closure_hash.full_form()
+    mut message.append(closure_form.as_str().as_bytes())
+    mut message.append(b"\n")
+    var entries = uvar_of(2, alloc)
+    push_closure_entry(mut entries, path: "units::Metres", alloc)
+    push_closure_entry(mut entries, path: "core::Option", alloc)
+    var seal = uvar_of(7, alloc)
+    push_field(mut seal, key: 1, content: form_of(b"human.alice", alloc).view())
+    push_field(mut seal, key: 2, content: form_of(b"meter::total", alloc).view())
+    push_field(mut seal, key: 3, content: form_of(item_hash.bytes.view(), alloc).view())
+    push_field(mut seal, key: 4, content: form_of(closure_hash.bytes.view(), alloc).view())
+    push_field(mut seal, key: 5, content: entries.view())
+    push_field(mut seal, key: 6, content: form_of(key.sign(message.view()).bytes.view(), alloc).view())
+    push_field(mut seal, key: 7, content: form_of(key.public_key().bytes.view(), alloc).view())
+    var seals = uvar_of(1, alloc)
+    mut seals.append(seal.view())
+    var attestation = uvar_of(3, alloc)
+    push_field(mut attestation, key: 1, content: form_of(ident::HashValue.of_content(b"toolchain").bytes.view(), alloc).view())
+    push_field(mut attestation, key: 2, content: form_of(ident::HashValue.of_content(b"sources").bytes.view(), alloc).view())
+    push_field(mut attestation, key: SEALS_PART, content: seals.view())
+    return attestation
+} meter_attestation
+
+/// The sections `human.alice` writes publishing `meter` with the key of `seed`, its certificate naming `certifier`, and `human.bob` its author.
+fn meter_sections(
+    root: Slice[u8],
+    attestation: Slice[u8],
+    seed: Array[u8, 32],
+    certifier: Str,
+    alloc: mem::Alloc,
+    ) -> mem::Bytes {
+    let key = core::crypto::SecretKey.of_seed(seed)
+    let public = key.public_key().bytes
+    var provenance = uvar_of(2, alloc)
+    var authors = uvar_of(1, alloc)
+    push_bytes(mut authors, bytes: b"human.bob")
+    push_field(mut provenance, key: 1, content: authors.view())
+    push_field(mut provenance, key: 2, content: uvar_of(0, alloc).view())
+    var message = mem::Bytes.empty(alloc)
+    mut message.append(b"nan artefact 1\nhuman.alice\n")
+    let key_form = ident::key_text(public)
+    mut message.append(key_form.as_str().as_bytes())
+    mut message.append(b"\n")
+    push_full_form(mut message, hashed: root)
+    push_full_form(mut message, hashed: attestation)
+    push_full_form(mut message, hashed: provenance.view())
+    var signature = uvar_of(3, alloc)
+    push_field(mut signature, key: 1, content: form_of(b"human.alice", alloc).view())
+    push_field(mut signature, key: 2, content: form_of(public.view(), alloc).view())
+    push_field(mut signature, key: 3, content: form_of(key.sign(message.view()).bytes.view(), alloc).view())
+    var pairs = uvar_of(1, alloc)
+    push_bytes(mut pairs, bytes: b"meter")
+    push_bytes(mut pairs, bytes: ident::HashValue.of_content(root).bytes.view())
+    var certified = mem::Bytes.empty(alloc)
+    push_field(mut certified, key: 1, content: form_of(certifier.as_bytes(), alloc).view())
+    push_field(mut certified, key: 2, content: form_of(public.view(), alloc).view())
+    push_field(mut certified, key: 3, content: form_of(ident::HashValue.of_content(b"toolchain").bytes.view(), alloc).view())
+    push_field(mut certified, key: 4, content: pairs.view())
+    var statement = mem::Bytes.empty(alloc)
+    mut statement.append(b"nan certificate 1\n")
+    push_uvar(mut statement, value: 4)
+    mut statement.append(certified.view())
+    var certificate = uvar_of(5, alloc)
+    mut certificate.append(certified.view())
+    push_field(mut certificate, key: 5, content: form_of(key.sign(statement.view()).bytes.view(), alloc).view())
+    var sections = uvar_of(3, alloc)
+    push_field(mut sections, key: SIGNATURE_SECTION, content: signature.view())
+    push_field(mut sections, key: CERTIFICATE_SECTION, content: certificate.view())
+    push_field(mut sections, key: PROVENANCE_SECTION, content: provenance.view())
+    return sections
+} meter_sections
+
+/// Appends the full form of the hash of `hashed` and LF.
+fn push_full_form(mut out: mem::Bytes, hashed: Slice[u8]) {
+    let full = ident::HashValue.of_content(hashed).full_form()
+    mut out.append(full.as_str().as_bytes())
+    mut out.append(b"\n")
+} push_full_form
+
+/// The artefact of code root `root`, attestation file `attestation` and sections `sections`.
+fn assembled(root: Slice[u8], attestation: Slice[u8], sections: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var artefact = mem::Bytes.empty(alloc)
+    mut artefact.append(ARTEFACT_MAGIC)
+    push_uvar(mut artefact, value: FORMAT_VERSION)
+    push_bytes(mut artefact, bytes: root)
+    push_bytes(mut artefact, bytes: attestation)
+    mut artefact.append(sections)
+    return artefact
+} assembled
+
+test published_artefacts_give_their_package_escapes_seals_and_signatures for Artefact.read {
+    let alloc = testing::world().alloc
+    let seed = Array[u8, 32].filled(7)
+    let root = meter_root(alloc)
+    let attestation = meter_attestation(seed, alloc)
+    var artefact = assembled(root.view(), attestation: attestation.view(), sections: meter_sections(root.view(), attestation: attestation.view(), seed, certifier: "human.alice", alloc).view(), alloc)
+    let Some(read) = Artefact.read(Untrusted.of(artefact.view()), alloc) else {
+        expect false
+        return
+    }
+    expect read.code_root == ident::HashValue.of_content(root.view()) and read.name.as_str() == "meter" and read.targets.len() == 2 and read.targets[1].as_str() == "aarch64-nanos"
+    expect read.required.len() == 2 and read.required[0].as_str() == "core" and read.required[1].as_str() == "units"
+    expect read.escapes.len() == 3 and read.escapes[0].kind.as_str() == "trusted" and read.escapes[1].item.as_str() == "meter::decode" and read.escapes[2].kind.as_str() == "grant"
+    expect read.escapes[2].authority == Some(text::Fixed[16].of("device")) and read.escapes[0].authority.is_none()
+    expect read.seals.len() == 1 and read.seals[0].principal.as_str() == "human.alice" and read.seals[0].item.as_str() == "meter::total" and read.seals[0].signature.is_some()
+    expect read.seals[0].packages.len() == 2 and read.seals[0].packages[0].as_str() == "core" and read.seals[0].packages[1].as_str() == "units"
+    expect read.authors.len() == 1 and read.authors[0].as_str() == "human.bob" and read.publisher.is_some()
+    expect read.verifies()
+    let last = artefact.len() - 30
+    artefact[last] = artefact[last] ^ 1
+    let Some(forged) = Artefact.read(Untrusted.of(artefact.view()), alloc) else {
+        expect false
+        return
+    }
+    expect not forged.verifies()
+} published_artefacts_give_their_package_escapes_seals_and_signatures
+
+test artefacts_not_decoding_or_certified_by_another_than_their_publisher_are_refused for Artefact.read {
+    let alloc = testing::world().alloc
+    let seed = Array[u8, 32].filled(7)
+    let root = meter_root(alloc)
+    let attestation = meter_attestation(seed, alloc)
+    let misnamed = assembled(root.view(), attestation: attestation.view(), sections: meter_sections(root.view(), attestation: attestation.view(), seed, certifier: "human.carol", alloc).view(), alloc)
+    var reserved = uvar_of(1, alloc)
+    push_field(mut reserved, key: 2, content: b"")
+    let cached = assembled(root.view(), attestation: attestation.view(), sections: reserved.view(), alloc)
+    let unpublished = assembled(root.view(), attestation: attestation.view(), sections: uvar_of(0, alloc).view(), alloc)
+    let Some(cut) = unpublished.view().prefix(unpublished.len() - 1) else {
+        expect false
+        return
+    }
+    let refused_misnamed = Artefact.read(Untrusted.of(misnamed.view()), alloc)
+    let refused_cached = Artefact.read(Untrusted.of(cached.view()), alloc)
+    let refused_cut = Artefact.read(Untrusted.of(take cut), alloc)
+    expect refused_misnamed.is_none() and refused_cached.is_none() and refused_cut.is_none()
+    let Some(plain) = Artefact.read(Untrusted.of(unpublished.view()), alloc) else {
+        expect false
+        return
+    }
+    expect plain.publisher.is_none() and plain.authors.len() == 0 and plain.verifies()
+} artefacts_not_decoding_or_certified_by_another_than_their_publisher_are_refused
