@@ -168,7 +168,7 @@ Admits, lowers again and removes bundles ([Code](10-code.md)).
 | `lower` | `bundle: HashValue` | — | `code.no-image`, `code.recheck-failed` | `recorded` |
 | `remove` | `bundle: HashValue` | — | `code.in-use` | `recorded` |
 
-The plan step `install` runs `admit`, and [toolchain updates](10-code.md#toolchain-updates) run `lower`. Wiring: a View of `/sys/code`; ports to `store`, `keys`, `policy` and `journal`; a `Control` grant with `spawn` to run the `nan` job.
+The plan step `install` runs `admit`, and [toolchain updates](10-code.md#toolchain-updates) run `lower`. Wiring: a View of `/sys/code`; Views reading `/sys/instances` and `/live/instances`, where `remove` finds the specifications and running instances naming a code hash; ports to `store`, `keys`, `policy` and `journal`; a `Control` grant with `spawn` to run the `nan` job.
 
 ## `boot`
 

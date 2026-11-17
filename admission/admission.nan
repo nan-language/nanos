@@ -1,7 +1,10 @@
-//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, and uploads the image it takes as a draft blob.
+//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, and uploads the image it takes as a draft blob; and it removes admitted bundles no instance uses.
 
 /// The keys of the keyed tasks serving requests start here.
 const SERVING: u64 = 0x1_0000_0000
+
+/// The children of a dir each listing of it reads.
+const PAGE: u32 = 64
 
 /// The bytes one read of the bundle blob takes, and one append of the image's draft gives.
 const CHUNK_BYTES: u32 = 1_048_576
@@ -10,13 +13,17 @@ const CHUNK_BYTES: u32 = 1_048_576
 pub protocol Admitting {
     /// Admits the bundle blob `bundle` reads alone, for the plan of base commit `base`: its admission record, the image it takes uploaded as a draft blob.
     pub fn admit(bundle: store::service::View, base: ident::CommitId) -> code::Admission fails Refusal limits recorded
+    /// Removes `/sys/code/<bundle>`: the admission record, bundle and image of the code hash `bundle`, unless a specification or a running instance names it.
+    pub fn remove(bundle: ident::HashValue) fails Refusal limits recorded
     /// The keyed task serving request `request` gives its reply.
     fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Admitting
 
-/// The Env of `admission`: its View of `/sys/code`, its ports to `keys` and `policy`, the machine it judges for and the nanos target of its architecture, and its cell.
+/// The Env of `admission`: its View of `/sys/code`, its reading Views of `/sys/instances` and `/live/instances`, its ports to `keys` and `policy`, the machine it judges for and the nanos target of its architecture, and its cell.
 pub open struct Env derives Send {
     code: store::service::View
+    specs: store::service::View
+    running: store::service::View
     keys: os::Port[keys::Keys]
     oversight: os::Port[policy::Oversight]
     machine: Machine
@@ -32,13 +39,15 @@ impl Admitter: sys::Component[Env, Admitting]
 
 pub fn Env.of(
     code: store::service::View,
+    specs: store::service::View,
+    running: store::service::View,
     keys: os::Port[keys::Keys],
     oversight: os::Port[policy::Oversight],
     machine: Machine,
     target: Str,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(code: code, keys: keys, oversight: oversight, machine: machine, target: text::Fixed[16].of(target), alloc: alloc)
+    return Env(code: code, specs: specs, running: running, keys: keys, oversight: oversight, machine: machine, target: text::Fixed[16].of(target), alloc: alloc)
 } Env.of
 
 pub fn Admitter.start(mut env: Env) -> Admitter = Admitter()
@@ -61,6 +70,19 @@ pub fn Admitter.admit(
     })
     fail Refusal.Unavailable
 } Admitter.admit
+
+pub fn Admitter.remove(mut self, take bundle: ident::HashValue, mut env: Env, mut cx: sys::Cx[Admitting]) fails Refusal {
+    let Some(request) = mut cx.postpone() else {
+        fail Refusal.Unavailable
+    }
+    let users = Users(code: env.code, specs: env.specs, running: env.running, alloc: env.alloc)
+    let alloc = env.alloc
+    mut cx.spawn(key: SERVING + request, run: fn(out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 32_768 {
+        let outcome = try await users.removed(bundle)
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail Refusal.Unavailable
+} Admitter.remove
 
 fn Admitter.answered(
     mut self,
@@ -186,6 +208,85 @@ fn Judge.upload(self, image: Slice[u8], expected: ident::HashValue) -> Option[Re
         Err(failure) => Some(try refusal_of(take failure))
     }
 } Judge.upload
+
+/// What a removal's keyed task reaches: the Env's Views of `/sys/code`, `/sys/instances` and `/live/instances`.
+struct Users derives Copy {
+    code: store::service::View
+    specs: store::service::View
+    running: store::service::View
+    alloc: mem::Alloc
+} Users
+
+/// Removes `/sys/code/<bundle>`: `code.in-use` naming the first specification or running instance whose bundle is `bundle`, the store's refusal when the delete fails.
+fn Users.removed(self, bundle: ident::HashValue) -> Result[Unit, Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    match first try await self.user(self.specs, bundle, live: false) {
+        Ok(Some(moniker)) => return Err(Refusal.InUse(moniker: take moniker))
+        Ok(None) => {
+        }
+        Err(refusal) => return Err(take refusal)
+    }
+    match first try await self.user(self.running, bundle, live: true) {
+        Ok(Some(moniker)) => return Err(Refusal.InUse(moniker: take moniker))
+        Ok(None) => {
+        }
+        Err(refusal) => return Err(take refusal)
+    }
+    var path = text::String.of("/", alloc)
+    mut path.append(bundle.full_form().as_str())
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Delete(path: ident::Path(text: take path)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+    return match first attempt await self.code.commit(take transaction, typed: false, alloc) {
+        Ok(_) => Ok(Unit)
+        Err(failure) => Err(try refusal_of(take failure))
+    }
+} Users.removed
+
+/// The moniker of the first child of `view` naming `bundle`: an `os::InstanceSpec`, or an `os::LiveInstance` when `live`; the store's refusal when the View cannot be read.
+fn Users.user(self, view: store::service::View, bundle: ident::HashValue, live: bool) -> Result[Option[text::String], Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await view.list(ident::Path(text: text::String.of("/", alloc)), take after, limit: PAGE, alloc) {
+            Ok(found) => found
+            Err(failure) => return Err(try refusal_of(take failure))
+        }
+        for entry in listing.entries {
+            var path = text::String.of("/", alloc)
+            mut path.append(entry.name.as_str())
+            let node = match first attempt await view.get(ident::Path(text: take path), at: None, alloc) {
+                Ok(found) => found
+                Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+                Err(_) => continue
+            }
+            let Some(raw) = node.value else {
+                continue
+            }
+            if names(raw.view(), bundle, live, alloc) {
+                return Ok(Some(text::String.of(entry.name.as_str(), alloc)))
+            }
+        }
+        let Some(next) = listing.next else {
+            return Ok(None)
+        }
+        after = Some(take next)
+    }
+} Users.user
+
+/// Whether `raw`, an `os::InstanceSpec`, or an `os::LiveInstance` when `live`, names the bundle `bundle`.
+fn names(raw: Untrusted[Slice[u8]], bundle: ident::HashValue, live: bool, alloc: mem::Alloc) -> bool {
+    if live {
+        return match attempt mem::wire::Codec[os::LiveInstance].decode(raw, alloc) {
+            Ok(instance) => instance.bundle == bundle
+            Err(_) => false
+        }
+    }
+    return match attempt mem::wire::Codec[os::InstanceSpec].decode(raw, alloc) {
+        Ok(spec) => spec.bundle == bundle
+        Err(_) => false
+    }
+} names
 
 /// A blob read whole: its id and its bytes.
 struct Blob {
