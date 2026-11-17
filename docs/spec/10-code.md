@@ -158,6 +158,7 @@ pub closed struct Field derives Encode {
 pub closed struct Program derives Encode {
     pub input: Option[HashValue] // schema hashes of a typed main
     pub output: Option[HashValue]
+    pub class: text::String // the class its digest declares
 } Program
 
 pub closed struct Escape derives Encode {

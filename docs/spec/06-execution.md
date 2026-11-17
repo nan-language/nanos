@@ -293,9 +293,9 @@ A job's bundle holds one program, whose entry has one of two forms (requires [N1
 | `stdin` | `Option[HashValue]` | none | the blob the runner places at `/state/<moniker>/stdin`, which the job reads as its standard input, then end of input |
 | `wiring`, `grants`, `budget`, `share`, `placement`, `handlers` | as `InstanceSpec` | as `InstanceSpec` | |
 | `restart` | `Restart` | `temporary` | |
-| `branch` | `text::String` | `main` | the branch its writes commit to |
+| `branch` | `Option[text::String]` | `main` | the branch its writes commit to |
 | `deadline_s` | `Option[u32]` | none | the job is cancelled this many seconds after its start |
-| `keep_h` | `u32` | 24 | hours its `/state/<moniker>/` subtree and its branch are kept after its end |
+| `keep_h` | `Option[u32]` | 24 | hours its `/state/<moniker>/` subtree and its branch are kept after its end |
 
 ### Worlds
 

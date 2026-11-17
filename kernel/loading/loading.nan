@@ -1,0 +1,168 @@
+//! Jobs in the shared space: the loader the core keeps, loading the image of each job's bundle and unloading it once the job ends, and the runs of jobs' `main`.
+
+/// A capability having the core load bundle images and unload them.
+pkg struct Loading {
+} Loading
+
+impl Loading: sys::Kind[Loads, u8]
+
+/// Where the core takes the orders of loading.
+struct Loads {
+    orders: task::Sender[LoadOrder]
+} Loads
+
+/// What the core does with a bundle: load an image and tell `loaded` of a load of it and the number its bundle is kept under, or the code of the failure; or unload the bundle kept under `number`.
+pkg enum LoadOrder {
+    Load(image: mem::Bytes, loaded: task::Sender[Result[Loaded, text::Fixed[32]]])
+    Unload(number: u64)
+} LoadOrder
+
+/// A bundle the core loaded: the number it is kept under and a load of it.
+pkg struct Loaded {
+    number: u64
+    load: sys::load::Load
+} Loaded
+
+/// A bundle the core keeps loaded, under its number.
+linear struct Kept {
+    number: u64
+    bundle: sys::load::Bundle
+} Kept
+
+/// The root entry of the loading capabilities the core mints, revoked when it closes.
+pkg linear struct MintedLoading {
+    minter: sys::Minter[Loading, Loads, u8]
+} MintedLoading
+
+pkg fn MintedLoading.of(orders: task::Sender[LoadOrder], alloc: mem::Alloc) -> MintedLoading {
+    return MintedLoading(minter: sys::Minter[Loading, Loads, u8].of(Loads(orders: orders.split()), alloc))
+} MintedLoading.of
+
+pkg fn MintedLoading.mint(self) -> Loading {
+    return self.minter.mint(0)
+} MintedLoading.mint
+
+pkg fn MintedLoading.close(take self) {
+    let MintedLoading(minter: minter) = self
+    take minter.close()
+} MintedLoading.close
+
+/// Carries out the orders of loading through `loader` until they end, then unloads the bundles it keeps.
+pkg fn load_bundles(take orders: task::Receiver[LoadOrder], take loader: sys::load::Loader, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var kept = mem::List[Kept].empty(alloc)
+    defer unload_all(take kept)
+    var next: u64 = 0
+    var receiver = orders
+    loop {
+        let Some(order) = try await mut receiver.receive() else {
+            return
+        }
+        match order {
+            LoadOrder.Load(image: image, loaded: loaded) => {
+                next += 1
+                let outcome = loaded_bundle(loader, image: image.view(), number: next, mut kept, alloc)
+                discard attempt await loaded.send(take outcome)
+            }
+            LoadOrder.Unload(number: number) => {
+                match kept.position(fn(held: Kept) => held.number == number) {
+                    Some(at) => {
+                        let Kept(number: _, bundle: bundle) = mut kept.remove(at)
+                        take bundle.unload()
+                    }
+                    None => {
+                    }
+                }
+            }
+        }
+    }
+} load_bundles
+
+/// Loads the bundle whose image is `image` through `loader`, keeping it in `kept` under `number`, and gives a load of it, or the code of the failure.
+fn loaded_bundle(
+    loader: sys::load::Loader,
+    image: Slice[u8],
+    number: u64,
+    mut kept: mem::List[Kept],
+    alloc: mem::Alloc,
+    ) -> Result[Loaded, text::Fixed[32]] {
+    let placed = trusted "admission took the image as one the toolchain built against the kernel's interface, and the runner checked its blob id against the one admission recorded" { attempt loader.prepare_unverified(image, alloc) }
+    let prepared = match placed {
+        Ok(given) => given
+        Err(failed) => return Err(load_code(failed))
+    }
+    let bundle = match attempt take prepared.load() {
+        Ok(published) => published
+        Err(failed) => return Err(load_code(failed))
+    }
+    let load = bundle.share()
+    mut kept.push(Kept(number: number, bundle: take bundle))
+    return Ok(Loaded(number: number, load: take load))
+} loaded_bundle
+
+/// Unloads the bundles `kept` holds.
+fn unload_all(take kept: mem::List[Kept]) {
+    for each in take kept {
+        let Kept(number: _, bundle: bundle) = each
+        take bundle.unload()
+    }
+} unload_all
+
+/// The code of a load's failure: `code.no-image` for an image built against another interface, `code.registry-duplicate` for a contribution whose key or unique field another entry has, `code.malformed` otherwise.
+fn load_code(failed: sys::load::LoadError) -> text::Fixed[32] {
+    return text::Fixed[32].of(match failed {
+        sys::load::LoadError.Interface => "code.no-image"
+        sys::load::LoadError.DuplicateKey or sys::load::LoadError.DuplicateUnique => "code.registry-duplicate"
+        else => "code.malformed"
+    })
+} load_code
+
+/// Runs the job `main` of the bundle whose image is `image` on `world` with `input`, in a domain run of `domain` through `exec` and `alloc`: the core loads the image, then unloads it once `main` ends. A job whose image does not load fails with the load's code, one whose bundle has no job entry with `code.malformed`, and one whose input does not decode with `instance.input-mismatch`.
+pkg fn Loading.run_job(
+    self,
+    take image: mem::Bytes,
+    take input: mem::Bytes,
+    take world: nanos::World,
+    domain: sys::Abandoner,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    ) -> os::JobOutcome fails task::Cancelled uses wait {
+    let Some(orders) = sys::reach(self, body: fn(state: Loads, record: u8) => state.orders.split()) else {
+        return failed_job("port.revoked", alloc)
+    }
+    let task::Channel(sender: loaded, receiver: loading) = task::Channel[Result[Loaded, text::Fixed[32]]].bounded(1, alloc)
+    match attempt await orders.send(LoadOrder.Load(image: take image, loaded: take loaded)) {
+        Ok(_) => {
+        }
+        Err(task::SendError.Closed) => return failed_job("port.server-stopped", alloc)
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+    }
+    var receiver = loading
+    let Some(replied) = try await mut receiver.receive() else {
+        return failed_job("port.server-stopped", alloc)
+    }
+    let Loaded(number: number, load: load) = match replied {
+        Ok(given) => given
+        Err(code) => return failed_job(code.as_str(), alloc)
+    }
+    let ran = attempt await nanos::run(load, take world, take input, domain, exec, alloc)
+    discard attempt await orders.send(LoadOrder.Unload(number: number))
+    return match ran {
+        Ok(nanos::Ended.Returned(bytes)) => os::JobOutcome.Returned(bytes: take bytes)
+        Ok(nanos::Ended.Failed(text)) => os::JobOutcome.Failed(text: take text)
+        Ok(nanos::Ended.Cancelled) or Ok(nanos::Ended.Abandoned) => os::JobOutcome.Cancelled(reason: text::String.empty(alloc))
+        Ok(nanos::Ended.Trapped(trap)) => os::JobOutcome.Trapped(text: trap_text(trap, alloc))
+        Ok(nanos::Ended.Undecodable) => failed_job("instance.input-mismatch", alloc)
+        Err(nanos::RunError.NoJob) => failed_job("code.malformed", alloc)
+        Err(nanos::RunError.Cancelled(cancelled)) => fail cancelled
+    }
+} Loading.run_job
+
+/// A job's failure with the code `code`.
+fn failed_job(code: Str, alloc: mem::Alloc) -> os::JobOutcome {
+    return os::JobOutcome.Failed(text: text::String.of(code, alloc))
+} failed_job
+
+/// The report of `trap`: its kind's code.
+fn trap_text(trap: sys::Trap, alloc: mem::Alloc) -> text::String {
+    return text::String.of(journal::trap_code(trap.kind()).as_str(), alloc)
+} trap_text

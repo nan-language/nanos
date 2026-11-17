@@ -55,7 +55,7 @@ One row per top-level directory; deeper only where the tree alone would not tell
 | `tools/sandbox reset [<instance>]` | Delete a sandbox instance |
 | `tools/transcripts [<instance>]` | Boot a fresh sandbox instance and run each link transcript of `link/transcripts/` on its serial console |
 | `nan run bundler -- key <seed file>` | Print the public key of a builder's seed file, writing a random seed when it is missing |
-| `nan run bundler -- bundle <root> <images dir> <interface file> <builder> <seed file> <out>` | Write the bundle file of the bundle build of `root`, certified by `builder` with the seed's key, and print its code hash and blob id |
+| `nan run bundler -- bundle <root> <images dir> <interface file> <builder> <seed file> <out> [<vendor> <vendor seed file>]` | Write the bundle file of the bundle build of `root`, certified by `builder` with the seed's key and signed by `vendor` with its seed's key when given, and print its code hash and blob id |
 
 Run `nan` from the repository root. A scope is a package, module or item path, a `.nan` file or a `file:line`; omitted at the root, it is the whole workspace.
 

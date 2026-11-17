@@ -40,19 +40,7 @@ fn Directory.state_view(
     alloc: mem::Alloc,
     ) -> Option[store::service::View] {
     let rights = store::service::Rights(read: true, write: true, admin: false, secret_read: false, own: true, reserved: 0)
-    for granted in minted.views {
-        if granted.grant == STATE_GRANT {
-            return Some(granted.view.mint(rights))
-        }
-    }
-    let Some(endpoint) = self.endpoints.get(ident::Moniker(text: text::Fixed[59].of(STORE_MONIKER))) else {
-        return None
-    }
-    let port = os::MintedPort.of(endpoint.intake, gate: endpoint.gate, protocols: endpoint.protocols, operations: None, credit: os::Credit(messages: 64, calls: 64), clock: self.clock, alloc)
-    let root = store::service::MintedView.of(store: port.handle(), prefix: ident::Path(text: text::String.of("/state", alloc)), branch: "main", redirect: None, take principal, instance: Some(take moniker), alloc)
-    let view = root.mint(rights)
-    mut minted.views.push(GrantedView(grant: STATE_GRANT, port: take port, view: take root))
-    return Some(view)
+    return self.own_view(mut minted, grant: STATE_GRANT, prefix: "/state", branch: "main", rights, take moniker, take principal, alloc)
 } Directory.state_view
 
 /// What `/state` gives the start of an instance: no checkpoint to restore, with the keeping of checkpoints for a checkpointed instance that has none, and without for a volatile one or when `store` has no specification or takes no calls; the latest checkpoint, with the keeping of later ones; the checkpoint a revival's hibernation image stands for, with the keeping of later ones when `store` takes calls; or a latest checkpoint or image that cannot be read.
@@ -62,6 +50,30 @@ enum Restoring {
     Revived(keeping: Option[Keeping], checkpoint: os::Checkpoint)
     Unreadable
 } Restoring
+
+/// What a start keeps checkpoints through and restores.
+struct Restored {
+    keeping: Option[Keeping]
+    restore: Option[os::Checkpoint]
+} Restored
+
+/// What the start of the instance `driver` runs keeps checkpoints through and restores, as `restoring` gives it, its incarnation raised to that of a checkpoint it restores from `/state`; `None` once the start gave up on a checkpoint or image it cannot read.
+fn Shared.restored[J: Journal](self, mut driver: Driver, revival: bool, journal: J) -> Option[Restored] fails task::Cancelled uses wait {
+    match try await self.restoring(mut driver, revival) {
+        Restoring.Fresh(keeping: kept) => return Some(Restored(keeping: kept, restore: None))
+        Restoring.From(keeping: kept, checkpoint: saved) => {
+            if saved.incarnation > driver.incarnation {
+                driver.incarnation = saved.incarnation
+            }
+            return Some(Restored(keeping: Some(kept), restore: Some(take saved)))
+        }
+        Restoring.Revived(keeping: kept, checkpoint: saved) => return Some(Restored(keeping: kept, restore: Some(take saved)))
+        Restoring.Unreadable => {
+            try await self.give_up(mut driver, journal, cause: driver.cause)
+            return None
+        }
+    }
+} Shared.restored
 
 /// What the start of the instance `driver` runs restores: for a `revival`, its hibernation image when hibernation memory keeps it; otherwise from `/state`, a copy of the checkpoint a restore read, added as its latest, or its latest, which also stands as an image hibernation memory does not keep.
 fn Shared.restoring(self, mut driver: Driver, revival: bool) -> Restoring fails task::Cancelled uses wait {
@@ -243,7 +255,7 @@ fn state_dir(moniker: ident::Moniker, name: Str, alloc: mem::Alloc) -> ident::Pa
     return ident::Path(text: take text)
 } state_dir
 
-/// Has the `/state` subtree of the instance `driver` runs expire `REMOVED_KEEP_NS` from now, its specification being removed.
+/// Has the `/state` subtree of the instance `driver` runs expire `REMOVED_KEEP_NS` from now, its specification being removed, or for a job its `keep_h` hours from now.
 fn Shared.retire_state(self, mut driver: Driver) fails task::Cancelled uses wait {
     let alloc = self.config.alloc
     let directory = self.directory.share()
@@ -251,8 +263,12 @@ fn Shared.retire_state(self, mut driver: Driver) fails task::Cancelled uses wait
     let Some(view) = state else {
         return
     }
+    let keep_ns = match driver.job {
+        Some(job) => i64.widen(job.contents().order.keep_h) * 3_600_000_000_000
+        None => REMOVED_KEEP_NS
+    }
     let removed = self.config.wall.now(self.config.clock)
-    let expires = ident::WallTime(utc_ns: removed.utc_ns.saturating_add(REMOVED_KEEP_NS), uncertainty_ns: removed.uncertainty_ns)
+    let expires = ident::WallTime(utc_ns: removed.utc_ns.saturating_add(keep_ns), uncertainty_ns: removed.uncertainty_ns)
     try await set_expiry(view, path: state_root(ident::Moniker(text: driver.moniker.text), alloc), at: Some(expires), alloc)
 } Shared.retire_state
 

@@ -71,13 +71,16 @@ const ADMISSION_LIMIT: u64 = 67_108_864
 /// The log records instances hand to the core that it takes in at once.
 const LOG_ROOM: usize = 256
 
+/// The orders of loading that wait for the core to carry them out.
+const LOAD_ROOM: usize = 16
+
 /// The transfers drivers charge that wait for the core to fold them.
 const TRANSFER_ROOM: usize = 256
 
 /// How long after the core's start `store`, `keys`, `journal` and `policy` may take to run.
 const BASE_DEADLINE_NS: u64 = 30_000_000_000
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the hash of the support routines the image exports, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, the switch of the machine's power, and where `link` publishes `/live/sessions` and learns the instances calling it.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the hash of the support routines the image exports, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, the switch of the machine's power, where `link` publishes `/live/sessions` and learns the instances calling it, and the loader of jobs' bundles.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
@@ -100,6 +103,7 @@ struct Base derives Copy {
     callers: os::Callers
     accounts: os::Accounts
     meter: os::Meter
+    loading: loading::Loading
 } Base
 
 impl Base: runner::Components
@@ -325,6 +329,18 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     return try await runner::Driven[supervisor::Supervision, supervisor::Env, supervisor::Supervisor].run(take env, exec, alloc, take serving, take peers, release: fn(take ended: supervisor::Env) limits stack 512 {
     })
 } Base.serve
+
+fn Base.run_job(
+    self,
+    take image: mem::Bytes,
+    take input: mem::Bytes,
+    take world: nanos::World,
+    domain: sys::Abandoner,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    ) -> os::JobOutcome fails task::Cancelled uses wait {
+    return try await self.loading.run_job(take image, take input, take world, domain, exec, alloc)
+} Base.run_job
 
 /// Serves the base driver `component`.
 fn Base.serve_driver(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
@@ -1059,7 +1075,7 @@ fn boot_record(handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::
     return store::service::TypedValue(type: store::TypeRef.of(BOOT_STATE_TYPE, schema: mem::wire::Codec[bootfmt::BootState].schema_hash(), alloc), bytes: take bytes)
 } boot_record
 
-/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames`, prints each event `rings` record, holds the board of `/live`, `machine` its first record, and writes each CPU's energy-performance preference through `cpu` on a machine with HWP; it never ends unless cancelled.
+/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames`, prints each event `rings` record, holds the board of `/live`, `machine` its first record, writes each CPU's energy-performance preference through `cpu` on a machine with HWP, and loads jobs' bundles through `loader`; it never ends unless cancelled.
 fn run_base(
     cpu: hw::Ring0,
     rapl: Option[cpu::Rapl],
@@ -1077,34 +1093,30 @@ fn run_base(
     mut frames: frames::Frames,
     take cells: frames::PoolCells,
     fixed: frames::Fixed,
+    take loader: sys::load::Loader,
     ) fails task::Cancelled uses wait {
     let task::Channel(sender: requests, receiver: incoming) = task::Channel[MemoryRequest].bounded(1, alloc: config.alloc)
     var pool = cells
     defer take pool.close()
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
-    let minted = devices::MintedRoot.of(orders, alloc: config.alloc)
-    defer take minted.close()
     let task::Channel(sender: reported, receiver: reports) = task::Channel[store::service::Report].bounded(16, alloc: config.alloc)
-    let reporting = store::service::MintedReporter.of(reported, alloc: config.alloc)
-    defer take reporting.close()
     let task::Channel(sender: posted, receiver: postings) = task::Channel[os::Posting].bounded(16, alloc: config.alloc)
     let task::Channel(sender: switched, receiver: switches) = task::Channel[power::Switching].bounded(1, alloc: config.alloc)
     let task::Channel(sender: accounted, receiver: accounting) = task::Channel[os::AccountOrder].bounded(16, alloc: config.alloc)
     let task::Channel(sender: transferred, receiver: transfers) = task::Channel[os::Transfer].bounded(TRANSFER_ROOM, alloc: config.alloc)
-    let lives = Roots.of(posted, switched, accounted, take transferred, monikers: rings.monikers(), alloc: config.alloc)
-    defer take lives.close()
+    let task::Channel(sender: loads, receiver: load_orders) = task::Channel[loading::LoadOrder].bounded(LOAD_ROOM, alloc: config.alloc)
     let task::Channel(sender: tracings, receiver: traced) = task::Channel[mem::List[journal::TracedInstance]].bounded(1, alloc: config.alloc)
     let backlog = journal::Backlog.of(tracings, principals: rings.principals(), alloc: config.alloc)
-    let feeding = journal::MintedFeed.of(backlog, alloc: config.alloc)
-    defer take feeding.close()
+    let lives = Roots.of(orders, reported, posted, switched, accounted, take transferred, loads, backlog, monikers: rings.monikers(), alloc: config.alloc)
+    defer take lives.close()
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: bundle, support: support, boot: boot, isa: isa, reporter: reporting.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: feeding.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint())
+    let base = Base(root: lives.root.mint(claim: false), claims: lives.root.mint(claim: true), bundle: bundle, support: support, boot: boot, isa: isa, reporter: lives.reporter.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: lives.feed.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint(), loading: lives.loading.mint())
     var requested = incoming
     let counters = Counters.of(requests.split(), alloc: config.alloc)
-    var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced, accounting: take accounting, transfers: take transfers))
+    var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced, accounting: take accounting, transfers: take transfers, loads: take load_orders, loader: take loader))
     defer abandon_given(take given)
     try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested, mut pool](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders, logged: log_records, traced: tracing, accounting: account_orders, transfers: transfer_records)) = mut given.extract() else {
+        let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders, logged: log_records, traced: tracing, accounting: account_orders, transfers: transfer_records, loads: bundle_orders, loader: bundles)) = mut given.extract() else {
             return
         }
         let origin = Origin.of(handoff, clock: config.clock, wall: config.wall)
@@ -1131,6 +1143,9 @@ fn run_base(
         })
         discard s.spawn(fn[take log_records]() fails task::Cancelled uses wait limits stack 16_384 {
             try await hold_logs(take log_records, backlog)
+        })
+        discard s.spawn(fn[take bundle_orders, take bundles]() fails task::Cancelled uses wait limits stack 16_384 {
+            try await loading::load_bundles(orders: take bundle_orders, loader: take bundles, alloc: config.alloc)
         })
         let signal = held.slot_signal()
         let task::Channel(sender: inputs, receiver: received) = task::Channel[keeper::Input].bounded(16, alloc: config.alloc)
@@ -1160,8 +1175,11 @@ fn run_base(
     })
 } run_base
 
-/// The root entries of what base instances reach of the core: the `/live` records they publish, the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`; the monikers of the instances calling them; the power switch; the accounts of sessions; and the drivers' meter.
+/// The root entries of what base instances reach of the core: the device root, where the store reports its events, the feed of the core rings, the `/live` records they publish, the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`; the monikers of the instances calling them; the power switch; the accounts of sessions; the drivers' meter; and the loading of jobs' bundles.
 linear struct Roots {
+    root: devices::MintedRoot
+    reporter: store::service::MintedReporter
+    feed: journal::MintedFeed
     store: os::MintedLive
     devices: os::MintedLive
     keys: os::MintedLive
@@ -1172,22 +1190,30 @@ linear struct Roots {
     switch: power::MintedSwitch
     accounts: os::MintedAccounts
     meter: os::MintedMeter
+    loading: loading::MintedLoading
 } Roots
 
 fn Roots.of(
+    orders: task::Sender[devices::RootOrder],
+    reported: task::Sender[store::service::Report],
     posted: task::Sender[os::Posting],
     switched: task::Sender[power::Switching],
     accounted: task::Sender[os::AccountOrder],
     take transferred: task::Sender[os::Transfer],
+    loads: task::Sender[loading::LoadOrder],
+    backlog: journal::Backlog,
     take monikers: task::Cown[mem::Map[u32, ident::Moniker]],
     alloc: mem::Alloc,
     ) -> Roots {
-    return Roots(store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), plans: os::MintedLive.of(posted, own: "/live/plans", alloc), callers: os::MintedCallers.of(take monikers, alloc), switch: power::MintedSwitch.of(switched, alloc), accounts: os::MintedAccounts.of(accounted, alloc), meter: os::MintedMeter.of(take transferred, alloc))
+    return Roots(root: devices::MintedRoot.of(orders, alloc), reporter: store::service::MintedReporter.of(reported, alloc), feed: journal::MintedFeed.of(backlog, alloc), store: os::MintedLive.of(posted, own: "/live/store", alloc), devices: os::MintedLive.of(posted, own: "/live/devices", alloc), keys: os::MintedLive.of(posted, own: "/live/security/keys", alloc), boot: os::MintedLive.of(posted, own: "/live/boot", alloc), sessions: os::MintedLive.of(posted, own: "/live/sessions", alloc), plans: os::MintedLive.of(posted, own: "/live/plans", alloc), callers: os::MintedCallers.of(take monikers, alloc), switch: power::MintedSwitch.of(switched, alloc), accounts: os::MintedAccounts.of(accounted, alloc), meter: os::MintedMeter.of(take transferred, alloc), loading: loading::MintedLoading.of(loads, alloc))
 } Roots.of
 
 /// Revokes the root entries.
 fn Roots.close(take self) {
-    let Roots(store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, plans: planned, callers: calling, switch: switching, accounts: accounting, meter: metering) = self
+    let Roots(root: rooted, reporter: reporting, feed: feeding, store: stored, devices: managed, keys: keyed, boot: booted, sessions: linked, plans: planned, callers: calling, switch: switching, accounts: accounting, meter: metering, loading: loads) = self
+    take rooted.close()
+    take reporting.close()
+    take feeding.close()
     take stored.close()
     take managed.close()
     take keyed.close()
@@ -1198,6 +1224,7 @@ fn Roots.close(take self) {
     take switching.close()
     take accounting.close()
     take metering.close()
+    take loads.close()
 } Roots.close
 
 /// Halts the kernel with `fault.base-not-running` and the first of `store`, `keys`, `journal` and `policy` that is not running 30 s after the core's start.
@@ -1257,7 +1284,7 @@ fn record_store_events(take reports: task::Receiver[store::service::Report], rin
 fn abandon_given(take given: Option[Given]) {
     match given {
         Some(left) => {
-            let Given(known: _, machine: _, keeper: kept, orders: _, store_events: _, postings: _, switches: _, logged: _, traced: _, accounting: _, transfers: _) = left
+            let Given(known: _, machine: _, keeper: kept, orders: _, store_events: _, postings: _, switches: _, logged: _, traced: _, accounting: _, transfers: _, loads: _, loader: _) = left
             take kept.release()
         }
         None => {
@@ -1265,7 +1292,7 @@ fn abandon_given(take given: Option[Given]) {
     }
 } abandon_given
 
-/// What the tasks of `run_base` take: the genesis record and the machine the runner takes, the keeper with the device root's orders, the events the store reports, the postings to the board, the orders of the power switch, the log records of instances, the instances `journal` traces, the orders for the accounts of sessions, and the transfers drivers charge.
+/// What the tasks of `run_base` take: the genesis record and the machine the runner takes, the keeper with the device root's orders, the events the store reports, the postings to the board, the orders of the power switch, the log records of instances, the instances `journal` traces, the orders for the accounts of sessions, the transfers drivers charge, and the orders of loading with the loader carrying them out.
 linear struct Given {
     known: runner::Known
     machine: Resources
@@ -1278,6 +1305,8 @@ linear struct Given {
     traced: task::Receiver[mem::List[journal::TracedInstance]]
     accounting: task::Receiver[os::AccountOrder]
     transfers: task::Receiver[os::Transfer]
+    loads: task::Receiver[loading::LoadOrder]
+    loader: sys::load::Loader
 } Given
 
 /// The rights of `Control`, or every right when `every`.
@@ -1367,7 +1396,11 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard untransferred
     let metering = os::MintedMeter.of(take transferred, alloc)
     defer take metering.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), support: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint())
+    let task::Channel(sender: loading, receiver: unloaded) = task::Channel[loading::LoadOrder].bounded(1, alloc)
+    discard unloaded
+    let loads = loading::MintedLoading.of(loading, alloc)
+    defer take loads.close()
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), support: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint(), loading: loads.mint())
     let task::Channel(sender: logs, receiver: unlogged) = task::Channel[journal::Logged].bounded(1, alloc)
     discard unlogged
     let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, machine: Unkept(alloc: alloc), accounting: take unaccounted, config, postings: posted, logs, gauges: runner::Gauges.empty(alloc), tracings: take untraced, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
