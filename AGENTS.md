@@ -18,7 +18,8 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `bootfmt/` | The `bootfmt` package: the boot record, the handoff record and the kernel image |
 | `acpi/` | The `acpi` package: the ACPI tables NaN OS reads |
 | `crypto/` | The `crypto` package: XChaCha20-Poly1305 sealing and BLAKE3 key derivation on secret values |
-| `code/` | The `code` package: the records of bundle files and their code hash, and making a bundle from what a bundle build writes |
+| `code/` | The `code` package: the records of bundle files, their code hash and their admission, reading their artefacts, and making a bundle from what a bundle build writes |
+| `admission/` | The `admission` package: the `admission` instance, judging bundles by the steps of admission |
 | `os/` | The `os` package: the records instances and the core share, message headers, and the capability kinds `Port`, `Control`, `Live`, `Callers`, `Accounts` and `Meter` |
 | `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints, dead letters, flight recorders, forks, pauses, replays and hibernations, and the accounts of sessions |
 | `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |

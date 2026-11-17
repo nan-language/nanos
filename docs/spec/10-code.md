@@ -61,13 +61,15 @@ pub closed struct Signed derives Encode {
 
 ### Signatures and provenance
 
-These parts of a bundle's artefacts carry signed facts that provenance and admission read (requires [N15](22-nan.md#n15)):
+These parts of a bundle's artefacts carry signed facts that provenance and admission read, in NaN's forms ([NaN 30 §Sections](https://github.com/nan-language/nan/blob/main/docs/spec/30-artefacts.md#sections); requires [N15](22-nan.md#n15)):
 
 | Part | Holds |
 | --- | --- |
-| an artefact's signature section ([NaN 30 §Reserved sections](https://github.com/nan-language/nan/blob/main/docs/spec/30-artefacts.md#reserved-sections)) | `review` signatures, each with its principal; the object of kind `review` is the 33-byte code root hash |
+| an artefact's signature section | the publisher's signature of NaN's artefact message, with the publisher's principal and public key: the package's `review` signature |
 | an artefact's provenance section | the principals who are the package's **authors** |
-| the signature field of each seal record of an artefact's attestation file ([NaN 31 §Seals](https://github.com/nan-language/nan/blob/main/docs/spec/31-trust.md#seals)) | a `seal` signature by the seal's principal; the object of kind `seal` is the seal record's encoding without its signature field |
+| the signature fields of each seal record of an artefact's attestation file ([NaN 31 §Seals](https://github.com/nan-language/nan/blob/main/docs/spec/31-trust.md#seals)) | a `seal` signature by the seal's principal of NaN's seal message, with its public key |
+
+Each of these signatures verifies when it verifies by the key beside it, as NaN's artefacts and seals verify, and that key is the signer's as [signatures](09-authority.md#signatures) states.
 
 A bundle's `certificate` is a **check certificate**, part of NaN OS's bundle format:
 
@@ -81,17 +83,17 @@ pub closed struct Certificate derives Encode {
 } Certificate
 ```
 
-It states that `builder` checked the closure of code hash `code` in verify mode with `toolchain` and found no error, and lowered the listed images. Its `signature` is a `certificate` signature; the object of kind `certificate` is the certificate's encoding with `signature` set to zero bytes. A seal is accepted when it is current ([NaN 31 §Seals](https://github.com/nan-language/nan/blob/main/docs/spec/31-trust.md#seals)) and its signature verifies. An image of the bundle file is **trusted** when the bundle carries a `bundle` signature by a `vendor.*` principal, or a certificate by a builder the [policy](19-oversight.md#policy) trusts lists the image's blob id.
+It states that `builder` checked the closure of code hash `code` with `toolchain` under NaN's release gate ([NaN 31 §Release gate](https://github.com/nan-language/nan/blob/main/docs/spec/31-trust.md#release-gate)) and found neither an error nor incompleteness, so each seal of the closure is current, and lowered the listed images. Its `signature` is a `certificate` signature; the object of kind `certificate` is the certificate's encoding with `signature` set to zero bytes. A seal is accepted when it is current ([NaN 31 §Seals](https://github.com/nan-language/nan/blob/main/docs/spec/31-trust.md#seals)), as the check of [admission](#admission) step 4 decides, and its signature verifies. An image of the bundle file is **trusted** when the bundle carries a `bundle` signature by a `vendor.*` principal, or a certificate by a builder the [policy](19-oversight.md#policy) trusts lists the image's blob id.
 
 ## Admission
 
 **Admission** is the plan step `install <bundle blob path or blob id>` ([steps](14-changes.md#steps)), which a plan's principal may take while it holds an `Instance` grant with `spawn` or `update` (`auth.denied`). The `admission` instance runs these steps during the preview, for the bundle and for the activations of the plan; each failure refuses the plan:
 
 1. **Decode.** The blob decodes as the canonical encoding of a `Bundle` and each artefact decodes (`code.malformed`). The root package declares the nanos target of the machine's architecture (`code.target-mismatch`).
-2. **Closure.** The bundle holds exactly one artefact per package name, and every `dep` directive of every package resolves to the artefact of that package's name (`code.closure-incomplete`).
+2. **Closure.** The bundle holds exactly one artefact per package name, and every package an artefact's requires-set names is one of them (`code.closure-incomplete`).
 3. **Signatures.** Every signature of the bundle, its certificate, its signature sections and its seals verifies against a principal record as [signatures](09-authority.md#signatures) states (`auth.bad-signature`).
 4. **Check.** On a machine running the [`nan` job](20-base.md#jobs), admission checks the closure in verify mode: well-formedness, every obligation decided anew and every example run, whatever the requires-sets (requires [N26](22-nan.md#n26)); an error fails with `code.check-failed`, the NaN diagnostic in its because chain. On any other machine, the bundle needs a certificate for its code hash by a builder the policy trusts (`code.unsigned`).
-5. **Requires-sets.** Each requires-set entry naming an item of the platform package or a kernel-implemented std item is satisfied, as [NaN 29 §Requires-sets](https://github.com/nan-language/nan/blob/main/docs/spec/29-identity-versioning.md#requires-sets) defines, when the running kernel image's releases replace the bundle's (`code.requires-unsatisfied`).
+5. **Requires-sets.** Each requires-set entry naming an item of the platform package or a kernel-implemented std item is satisfied, as [NaN 29 §Requires-sets](https://github.com/nan-language/nan/blob/main/docs/spec/29-identity-versioning.md#requires-sets) defines, by the running kernel image's releases: the interface file an image is lowered against records them, so they hold for every image step 13 takes.
 6. **Seals.** Every trust escape of the closure outside the std packages of the toolchain of step 4 carries an accepted seal by one of the policy's `sealers` ([policy](19-oversight.md#policy)) (`code.seal-missing`). A `device` or `priv` grant needs one by a `vendor.*`, `human.*` or `owner` principal, except a `device` grant confined to IOMMU domains on a machine with `iommu` (`code.seal-rejected`). No accepted seal is by an author of the sealed item's package or of a package holding an item of its closure entries (`code.seal-same-author`).
 7. **Authority.** Admission computes the closure summary ([NaN 14 §Authority summaries](https://github.com/nan-language/nan/blob/main/docs/spec/14-authority.md#authority-summaries)), whose entries include the OS capability kinds (requires [N27](22-nan.md#n27)). The [effect set](14-changes.md#the-effect-set) lists it, and for an `update`, as widenings, the entries the running bundle's summary lacks; the [policy](19-oversight.md#policy) decides the approvals they need.
 8. **Schemas.** For each instance an `update` step activates, the new component's state schema equals the running one, accepts its schema tree ([NaN 29 §Encode class](https://github.com/nan-language/nan/blob/main/docs/spec/29-identity-versioning.md#encode-class)), or is covered by a `migrate` of the new bundle from the running schema hash (requires [N5](22-nan.md#n5), [N20](22-nan.md#n20)); otherwise `code.schema-incompatible`. The step's **migration class** is `identical`, `additive` or `migrated` accordingly.
@@ -184,7 +186,7 @@ pub closed struct Lowered derives Encode {
 } Lowered
 ```
 
-`Provenance` is the type of [provenance](09-authority.md#provenance), and the other named types are those of [identifiers](02-identifiers.md#types). `admission` rewrites `image` when it lowers again, and `provenance` and `shared` when it recomputes them ([provenance](09-authority.md#provenance)). The revocation of a key whose signature an admission relied on runs admission again for that bundle ([rotation and revocation](09-authority.md#rotation-and-revocation)); when it refuses the bundle, its instances stop and enter `failed` with the refusal's code. The operation `remove` of `admission` ([admission](20-base.md#admission)) deletes the dir; it fails with `code.in-use` while a spec or a job names the code hash.
+`Provenance` is the type of [provenance](09-authority.md#provenance), and the other named types are those of [identifiers](02-identifiers.md#types). `admitted` is the base commit of the plan admitting the bundle. `admission` rewrites `image` when it lowers again, and `provenance` and `shared` when it recomputes them ([provenance](09-authority.md#provenance)). The revocation of a key whose signature an admission relied on runs admission again for that bundle ([rotation and revocation](09-authority.md#rotation-and-revocation)); when it refuses the bundle, its instances stop and enter `failed` with the refusal's code. The operation `remove` of `admission` ([admission](20-base.md#admission)) deletes the dir; it fails with `code.in-use` while a spec or a job names the code hash.
 
 ## Loading
 
@@ -279,10 +281,9 @@ A **toolchain update** installs a new bundle of the `nan` program and makes it t
 | --- | --- | --- |
 | `code.malformed` | the bundle or one of its artefacts does not decode canonically | [Admission](#admission) |
 | `code.target-mismatch` | the root declares no nanos target of the machine's architecture | [Admission](#admission) |
-| `code.closure-incomplete` | a package is missing or present twice, or a `dep` resolves to no artefact | [Admission](#admission) |
+| `code.closure-incomplete` | a package is missing or present twice, or a requires-set names a package without an artefact | [Admission](#admission) |
 | `code.check-failed` | verify mode found an error | [Admission](#admission) |
 | `code.unsigned` | no toolchain and no certificate by a trusted builder | [Admission](#admission) |
-| `code.requires-unsatisfied` | the kernel's releases do not satisfy a requires-set | [Admission](#admission) |
 | `code.seal-missing` | a trust escape has no accepted seal by an accepted sealer | [Admission](#admission) |
 | `code.seal-rejected` | a `device` or `priv` grant sealed by neither a vendor nor a human | [Admission](#admission) |
 | `code.seal-same-author` | a seal by an author of what it seals | [Admission](#admission) |

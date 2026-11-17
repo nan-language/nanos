@@ -456,7 +456,7 @@ NaN OS hashes an object of kind K as the hash of the UTF-8 bytes of K and LF, fo
 | --- | --- | --- |
 | `record`, `secret`, `stream`, `ephemeral`, `dir`, `entry`, `run`, `transaction` | nodes, dir digests and transactions | [11-store](11-store.md#identity) |
 | `manifest` | generation manifests | [03-boot](03-boot.md#generations-and-manifests) |
-| `code`, `bundle`, `review`, `seal`, `certificate` | bundles and their signed parts | [10-code](10-code.md#artefacts-and-bundles) |
+| `code`, `bundle`, `certificate` | bundles and their signed parts | [10-code](10-code.md#artefacts-and-bundles) |
 | `plan`, `read-set` | plans and their read sets | [14-changes](14-changes.md#the-plan-hash) |
 | `approval`, `policy` | approval decisions and the policy | [19-oversight](19-oversight.md#approvals) |
 | `request` | signed requests: the owner key and loader requests of the boot record, and requests sent outside a session | [03-boot](03-boot.md#claim-at-boot), [19-oversight](19-oversight.md#emergency-controls) |
@@ -465,7 +465,7 @@ NaN OS hashes an object of kind K as the hash of the UTF-8 bytes of K and LF, fo
 
 Records hashed under one kind differ in their field keys, so their `mem::wire` encodings never coincide.
 
-A **signature** over an object is the Ed25519 signature (RFC 8032, pure Ed25519, no context) of the object's 33-byte hash, held in a `Signature`. The object's kind is the signature's **purpose**, so a signature over one kind of object is invalid for every other kind; [signatures](09-authority.md#signatures) lists each purpose's signers.
+A **signature** over an object is the Ed25519 signature (RFC 8032, pure Ed25519, no context) of the object's 33-byte hash, held in a `Signature`. The object's kind is the signature's **purpose**, so a signature over one kind of object is invalid for every other kind; [signatures](09-authority.md#signatures) lists each purpose's signers. The purposes `review` and `seal` are NaN's: their signatures sign NaN's artefact and seal messages ([10-code](10-code.md#signatures-and-provenance)).
 
 ## Text forms of binary values
 

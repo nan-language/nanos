@@ -1,0 +1,233 @@
+//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, and uploads the image it takes as a draft blob.
+
+/// The keys of the keyed tasks serving requests start here.
+const SERVING: u64 = 0x1_0000_0000
+
+/// The bytes one read of the bundle blob takes, and one append of the image's draft gives.
+const CHUNK_BYTES: u32 = 1_048_576
+
+/// What `admission` serves.
+pub protocol Admitting {
+    /// Admits the bundle blob `bundle` reads alone, for the plan of base commit `base`: its admission record, the image it takes uploaded as a draft blob.
+    pub fn admit(bundle: store::service::View, base: ident::CommitId) -> code::Admission fails Refusal limits recorded
+    /// The keyed task serving request `request` gives its reply.
+    fn answered(request: u64, reply: sys::Encoded) limits traceless
+} Admitting
+
+/// The Env of `admission`: its View of `/sys/code`, its ports to `keys` and `policy`, the machine it judges for and the nanos target of its architecture, and its cell.
+pub open struct Env derives Send {
+    code: store::service::View
+    keys: os::Port[keys::Keys]
+    oversight: os::Port[policy::Oversight]
+    machine: Machine
+    target: text::Fixed[16]
+    alloc: mem::Alloc
+} Env
+
+/// The state of `admission`: none, each admission running as a keyed task.
+pub closed struct Admitter derives Render, Encode {
+} Admitter
+
+impl Admitter: sys::Component[Env, Admitting]
+
+pub fn Env.of(
+    code: store::service::View,
+    keys: os::Port[keys::Keys],
+    oversight: os::Port[policy::Oversight],
+    machine: Machine,
+    target: Str,
+    alloc: mem::Alloc,
+    ) -> Env {
+    return Env(code: code, keys: keys, oversight: oversight, machine: machine, target: text::Fixed[16].of(target), alloc: alloc)
+} Env.of
+
+pub fn Admitter.start(mut env: Env) -> Admitter = Admitter()
+
+pub fn Admitter.admit(
+    mut self,
+    take bundle: store::service::View,
+    take base: ident::CommitId,
+    mut env: Env,
+    mut cx: sys::Cx[Admitting],
+    ) -> code::Admission fails Refusal {
+    let Some(request) = mut cx.postpone() else {
+        fail Refusal.Unavailable
+    }
+    let judge = Judge(code: env.code, keys: env.keys, oversight: env.oversight, machine: env.machine, target: env.target, alloc: env.alloc)
+    let alloc = env.alloc
+    mut cx.spawn(key: SERVING + request, run: fn[take bundle](out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 65_536 {
+        let outcome = try await judge.admitted(bundle, base)
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail Refusal.Unavailable
+} Admitter.admit
+
+fn Admitter.answered(
+    mut self,
+    take request: u64,
+    take reply: sys::Encoded,
+    mut env: Env,
+    mut cx: sys::Cx[Admitting],
+    ) {
+    discard attempt mut cx.reply(request, reply)
+    mut cx.cancel(key: SERVING + request)
+} Admitter.answered
+
+/// What an admission's keyed task reaches: the Env's View, ports, machine and target.
+struct Judge derives Copy {
+    code: store::service::View
+    keys: os::Port[keys::Keys]
+    oversight: os::Port[policy::Oversight]
+    machine: Machine
+    target: text::Fixed[16]
+    alloc: mem::Alloc
+} Judge
+
+/// The admission record of the bundle blob `bundle` reads, for the plan of base commit `base`, the image it takes uploaded as a draft blob.
+fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId) -> Result[code::Admission, Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let blob = match first try await read_blob(bundle, alloc) {
+        Ok(read) => read
+        Err(refusal) => return Err(take refusal)
+    }
+    let decoded = match first Decoded.of(blob.bytes.view(), target: self.target.as_str(), alloc) {
+        Ok(made) => made
+        Err(refusal) => return Err(take refusal)
+    }
+    let former = try await self.holds(code_hash: decoded.code, blob: blob.id)
+    let signers = match first decoded.signers(alloc) {
+        Ok(listed) => listed
+        Err(refusal) => return Err(take refusal)
+    }
+    for signer in signers {
+        match first try await self.verified(signer, former) {
+            Some(refusal) => return Err(take refusal)
+            None => {
+            }
+        }
+    }
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[policy::Oversight].trust(mut call)
+    let trust = match first attempt await self.oversight.call(take call, reply, alloc) {
+        Ok(given) => given
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return Err(Refusal.Unavailable)
+    }
+    let judged = match first decoded.judged(trust, machine: self.machine, admitted: base, alloc) {
+        Ok(made) => made
+        Err(refusal) => return Err(take refusal)
+    }
+    let Judged(admission: admission, image: chosen) = judged
+    match first try await self.upload(decoded.bundle.images[chosen].bytes.view(), expected: admission.image.image) {
+        Some(refusal) => return Err(take refusal)
+        None => {
+        }
+    }
+    return Ok(take admission)
+} Judge.admitted
+
+/// Whether `/sys/code/<code hash>/bundle` holds the blob `blob`, whose signatures a former key then verifies.
+fn Judge.holds(self, code_hash: ident::HashValue, blob: ident::HashValue) -> bool fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var path = text::String.of("/", alloc)
+    let full = code_hash.full_form()
+    mut path.append(full.as_str())
+    mut path.append("/bundle")
+    return match first attempt await self.code.get(ident::Path(text: take path), at: None, alloc) {
+        Ok(node) => node.hash == Some(blob)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => false
+    }
+} Judge.holds
+
+/// The refusal `keys` gives `signer`, `None` once it verifies.
+fn Judge.verified(self, signer: Signer, former: bool) -> Option[Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var call = sys::Encoded.empty(alloc)
+    let outcome = match signer {
+        Signer.Object(principal: principal, kind: kind, subject: subject, signature: signature) => attempt await self.keys.call(take call, reply: sys::Wire[keys::Keys].verify(mut call, principal: ident::Principal(text: principal.text), kind: text::String.of(kind.as_str(), alloc), subject, signature, former), alloc)
+        Signer.Key(principal: principal, kind: kind, key: key) => attempt await self.keys.call(take call, reply: sys::Wire[keys::Keys].verify_key(mut call, principal: ident::Principal(text: principal.text), kind: text::String.of(kind.as_str(), alloc), key, former), alloc)
+    }
+    return match first outcome {
+        Ok(_) => None
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(os::PortError.Failed(keys::KeysFailure.BadSignature)) => Some(Refusal.BadSignature(signer: text::String.of(signer.principal().text.as_str(), alloc)))
+        Err(_) => Some(Refusal.Unavailable)
+    }
+} Judge.verified
+
+/// Uploads `image` as a draft blob of the id `expected`, the refusal of the store when it fails.
+fn Judge.upload(self, image: Slice[u8], expected: ident::HashValue) -> Option[Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let draft = match first attempt await self.code.draft(alloc) {
+        Ok(opened) => opened
+        Err(failure) => return Some(try refusal_of(take failure))
+    }
+    var at: usize = 0
+    while at < image.len() {
+        let Some(parts) = image.split_at(at) else {
+            return Some(Refusal.Malformed)
+        }
+        let size = usize.widen(CHUNK_BYTES).min(image.len() - at)
+        let Some(chunk) = parts.tail.prefix(size) else {
+            return Some(Refusal.Malformed)
+        }
+        var bytes = mem::Bytes.empty(alloc)
+        mut bytes.append(chunk)
+        match first attempt await self.code.draft_append(draft, take bytes, alloc) {
+            Ok(_) => {
+            }
+            Err(failure) => return Some(try refusal_of(take failure))
+        }
+        at += size
+    }
+    return match first attempt await self.code.draft_close(draft, expected: Some(expected), alloc) {
+        Ok(_) => None
+        Err(failure) => Some(try refusal_of(take failure))
+    }
+} Judge.upload
+
+/// A blob read whole: its id and its bytes.
+struct Blob {
+    id: ident::HashValue
+    bytes: Untrusted[mem::Bytes]
+} Blob
+
+/// The blob `view` reads alone.
+fn read_blob(view: store::service::View, alloc: mem::Alloc) -> Result[Blob, Refusal] fails task::Cancelled uses wait {
+    let root = ident::Path(text: text::String.of("/", alloc))
+    let node = match first attempt await view.get(take root, at: None, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(try refusal_of(take failure))
+    }
+    let Some(id) = node.hash else {
+        return Err(Refusal.Malformed)
+    }
+    var bytes = Untrusted.of(mem::Bytes.empty(alloc))
+    while u64.widen(bytes.byte_len()) < node.size {
+        let read = match first attempt await view.read(ident::Path(text: text::String.of("/", alloc)), at: Some(node.version), offset: u64.widen(bytes.byte_len()), length: CHUNK_BYTES, alloc) {
+            Ok(given) => given
+            Err(failure) => return Err(try refusal_of(take failure))
+        }
+        if read.byte_len() == 0 {
+            return Err(Refusal.Malformed)
+        }
+        mut bytes.append(read.view())
+    }
+    return Ok(Blob(id: id, bytes: take bytes))
+} read_blob
+
+/// The refusal a View's failure `failure` gives, its cancellation failing the task.
+fn refusal_of(take failure: store::service::ViewError) -> Refusal fails task::Cancelled {
+    return match failure {
+        store::service::ViewError.Failed(stored) => Refusal.Store(take stored)
+        store::service::ViewError.Cancelled(cancelled) => fail cancelled
+        else => Refusal.Unavailable
+    }
+} refusal_of
+
+fn reply_of[T: Encode](outcome: Result[T, Refusal], alloc: mem::Alloc) -> sys::Encoded {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Result[T, Refusal]].encode(outcome, out: mut bytes)
+    return sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc))
+} reply_of

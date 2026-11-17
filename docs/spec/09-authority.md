@@ -57,8 +57,8 @@ Private keys and the keyring master key exist on the machine only inside `keys` 
 | --- | --- | --- |
 | `manifest` | a [generation manifest](03-boot.md#generations-and-manifests) | `vendor.*`, `owner` |
 | `bundle` | a [bundle](10-code.md#bundle-file) | `vendor.*` |
-| `review` | a package's code root hash ([signatures and provenance](10-code.md#signatures-and-provenance)) | the policy's reviewers |
-| `seal` | a seal | the policy's sealers |
+| `review` | a package's artefact, as NaN's artefact message ([signatures and provenance](10-code.md#signatures-and-provenance)) | the policy's reviewers |
+| `seal` | a seal, as NaN's seal message | the policy's sealers |
 | `certificate` | a check certificate | the policy's builders |
 | `request` | a signed request: an owner key or loader replacement request ([owner key requests](03-boot.md#owner-key-requests), [loader replacement](03-boot.md#loader-replacement)), or a request sent outside a session ([emergency controls](19-oversight.md#emergency-controls)) | `owner` for owner key and loader requests; the principal an `OversightRequest` names |
 | `approval` | an approval decision ([approvals](19-oversight.md#approvals)) | `human.*`, `owner` |
@@ -66,7 +66,7 @@ Private keys and the keyring master key exist on the machine only inside `keys` 
 | `handshake` | a session challenge's `HelloProof` ([connections and sessions](18-link.md#connections-and-sessions)); the 32-byte Noise_IK handshake hash ([network transports of the link](16-network.md#network-transports-of-the-link)) | the principal opening the session; the link key |
 | `anchor` | an [audit anchor](17-observability.md#audit-chain) | audit key |
 
-A signature verifies against the signer's current key; a `former` key also verifies the `bundle`, `review`, `seal` and `certificate` signatures of a bundle blob held at `/sys/code/<hash>/bundle` ([admission record](10-code.md#admission-record)). A signature that does not verify fails with `auth.bad-signature`. `keys` verifies signatures (`verify`) for any instance holding a port to it; a `former` key counts only when the call's `former` is true, which `admission` sets only for such a blob.
+A signature verifies against the signer's current key; a `former` key also verifies the `bundle`, `review`, `seal` and `certificate` signatures of a bundle blob held at `/sys/code/<hash>/bundle` ([admission record](10-code.md#admission-record)). A signature that does not verify fails with `auth.bad-signature`. `keys` verifies signatures (`verify`) for any instance holding a port to it, and for a `review` or `seal` signature, which signs NaN's message with the public key beside it, that this key is the signer's (`verify_key`); a `former` key counts only when the call's `former` is true, which `admission` sets only for such a blob.
 
 ### Rotation and revocation
 

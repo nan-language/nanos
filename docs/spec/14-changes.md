@@ -56,7 +56,7 @@ A **plan** is a list of steps with options, previewed together and applied by it
 | `write <path> <value>` | `recorded` | writes a record or blob node, creating missing parent dirs |
 | `write <path>.<field> <value>` | `recorded` | writes one field of a record node, keeping its other fields |
 | `delete <path>` | `recorded` | removes the node and its subtree |
-| `install <path or hash>` | `recorded` | admits the [bundle](10-code.md#artefacts-and-bundles) blob at the path or with the hash and writes `/sys/code/<hash>` ([admission](10-code.md#admission)) |
+| `install <path or hash>` | `recorded` | admits the [bundle](10-code.md#artefacts-and-bundles) blob at the path, or the bundle of an admitted code hash, and writes `/sys/code/<hash>` ([admission](10-code.md#admission)) |
 | `start <moniker>`, `stop <moniker>` | `restorable` | write `InstanceSpec.stopped` ([instance specifications](06-execution.md#instance-specifications)) |
 | `update <moniker> <hash>` | `restorable` | sets the [instance](06-execution.md#instances)'s bundle; its activation is a live update ([live update](10-code.md#live-update)) |
 | `grant <spec>` | `recorded` | writes `/sys/grants/<id>` from a construction literal of a grant without its generated fields ([grants](09-authority.md#grants)) |

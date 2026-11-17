@@ -25,6 +25,8 @@ pub protocol Keys {
         signature: ident::Signature,
         former: bool,
         ) fails KeysFailure limits traceless
+    /// Verifies that `key`, the public key beside a signature of NaN's of the purpose `kind`, `review` or `seal`, is the current key of `principal`, or, when `former` holds, a key a rotation replaced.
+    pub fn verify_key(principal: ident::Principal, kind: text::String, key: Array[u8, 32], former: bool) fails KeysFailure limits traceless
     /// Enrolls the `human.*`, `agent.*`, `builder.*` or `vendor.*` principal `principal` with the Ed25519 public key `key`, writing its record and `/data/<principal>`.
     pub fn enroll(principal: ident::Principal, key: Array[u8, 32]) fails KeysFailure limits recorded
     /// A new Ed25519 key pair for the child principal `child`: its public key and its private seed, of which `keys` keeps no copy.
@@ -176,6 +178,27 @@ pub fn Keyring.verify(
     })
     fail KeysFailure.Unavailable
 } Keyring.verify
+
+pub fn Keyring.verify_key(
+    mut self,
+    take principal: ident::Principal,
+    take kind: text::String,
+    take key: Array[u8, 32],
+    take former: bool,
+    mut env: Env,
+    mut cx: sys::Cx[Keys],
+    ) fails KeysFailure {
+    let principals = env.principals
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail KeysFailure.Unavailable
+    }
+    mut cx.spawn(key: SERVING + request, run: fn[take principal, take kind](out: sys::Outbox[Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        let outcome = try await verify_key(principals, principal, kind: kind.as_str(), key, former, alloc)
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail KeysFailure.Unavailable
+} Keyring.verify_key
 
 pub fn Keyring.enroll(
     mut self,
@@ -407,6 +430,50 @@ fn verify(
     former: bool,
     alloc: mem::Alloc,
     ) -> Result[Unit, KeysFailure] fails task::Cancelled uses wait {
+    let keys = match first try await signing_keys(principals, principal, kind, former, alloc) {
+        Ok(held) => held
+        Err(failure) => return Err(take failure)
+    }
+    for key in keys {
+        if signature.verifies(key, object: subject) {
+            return Ok(Unit)
+        }
+    }
+    return Err(KeysFailure.BadSignature)
+} verify
+
+/// Verifies that `key` is a key of `principal` for NaN's signatures of the purpose `kind`, as the operation `verify_key` states.
+fn verify_key(
+    principals: store::service::View,
+    principal: ident::Principal,
+    kind: Str,
+    key: Array[u8, 32],
+    former: bool,
+    alloc: mem::Alloc,
+    ) -> Result[Unit, KeysFailure] fails task::Cancelled uses wait {
+    if kind != "review" and kind != "seal" {
+        return Err(KeysFailure.BadSignature)
+    }
+    let keys = match first try await signing_keys(principals, principal, kind, former, alloc) {
+        Ok(held) => held
+        Err(failure) => return Err(take failure)
+    }
+    for each in keys {
+        if each == key {
+            return Ok(Unit)
+        }
+    }
+    return Err(KeysFailure.BadSignature)
+} verify_key
+
+/// The keys whose signatures of the purpose `kind` are `principal`'s: its current key and, when `former` holds and the purpose admits them, the keys a rotation replaced; `auth.bad-signature` when it signs no such purpose or has no record.
+fn signing_keys(
+    principals: store::service::View,
+    principal: ident::Principal,
+    kind: Str,
+    former: bool,
+    alloc: mem::Alloc,
+    ) -> Result[mem::List[Array[u8, 32]], KeysFailure] fails task::Cancelled uses wait {
     if not signs(principal, kind) {
         return Err(KeysFailure.BadSignature)
     }
@@ -415,24 +482,19 @@ fn verify(
         Err(KeysFailure.UnknownName) => return Err(KeysFailure.BadSignature)
         Err(failure) => return Err(take failure)
     }
+    var keys = mem::List[Array[u8, 32]].empty(alloc)
     match record.key {
-        Some(key) => {
-            if signature.verifies(key, object: subject) {
-                return Ok(Unit)
-            }
-        }
+        Some(key) => mut keys.push(key)
         None => {
         }
     }
     if former and admits_former(kind) {
         for key in record.former {
-            if signature.verifies(key, object: subject) {
-                return Ok(Unit)
-            }
+            mut keys.push(key)
         }
     }
-    return Err(KeysFailure.BadSignature)
-} verify
+    return Ok(take keys)
+} signing_keys
 
 /// Writes the record of `principal` holding `key` and makes `/data/<principal>`, `auth.name-taken` when it has a record.
 fn enroll(

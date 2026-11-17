@@ -83,6 +83,7 @@ Keys and signatures ([keys and signatures](09-authority.md#keys-and-signatures))
 | Operation | Arguments | Result | Failures | Reversibility |
 | --- | --- | --- | --- | --- |
 | `verify` | `principal: Principal`, `kind: text`, `subject: HashValue`, `signature: Signature`, `former: bool` | — | `auth.bad-signature` | `none` |
+| `verify_key` | `principal: Principal`, `kind: text`, `key: Array[u8, 32]`, `former: bool` | — | `auth.bad-signature` | `none` |
 | `enroll` | `principal: Principal`, `key: Array[u8, 32]` | — | `auth.name-taken` | `recorded` |
 | `issue` | `child: Principal` | its public key and private seed, once | — | `none` |
 | `rotate` | `principal` and its new key, or `link` or `audit` | — | — | `recorded`; `irreversible{erase}` for `link` and `audit` |
@@ -110,9 +111,10 @@ Decides subjects and keeps approvals ([Oversight](19-oversight.md)). Its configu
 | `approve` | `approval`, `principal`, a signed `ApprovalDecision` or a console decision, the channel | the approval's state | `auth.bad-signature`, `policy.not-approver`, `policy.decision-mismatch`, `policy.not-pending`, `policy.constraint-refused`, `policy.channel` | `recorded` |
 | `withdraw` | `approval` | — | `policy.not-pending` | `recorded` |
 | `explain` | `principal`, a subject | each rule it matches and the decision | — | `none` |
+| `trust` | — | the `reviewers`, `sealers` and `builders` of the policy it decides by, and its `agent_shared_space` | — | `none` |
 | `propose` | `candidate: Policy` | the approval id | `policy.version`, `policy.pattern`, `policy.agent-approver`, `policy.preset-unavailable`, `policy.ask-limit` | `recorded` |
 
-- `link` and `console` hold `decide`, `ask`, `approve` and `withdraw`; `explain` answers any session about its own principal.
+- `link` and `console` hold `decide`, `ask`, `approve` and `withdraw`, and `admission` holds `trust`; `explain` answers any session about its own principal.
 - Its checkpoint holds the agent budgets' counters, the first uses and the ask counts.
 - Wiring: Views of `/sys/policy`, `/sys/approvals`, `/sys/principals` and `/sys/config/policy`; ports to `keys`, `journal` and `console`.
 
@@ -162,7 +164,7 @@ Admits, lowers again and removes bundles ([Code](10-code.md)).
 
 | Operation | Arguments | Result | Failures | Reversibility |
 | --- | --- | --- | --- | --- |
-| `admit` | `bundle: HashValue`, a blob the store holds | the admission record | the codes of [admission](10-code.md#admission) | `recorded` |
+| `admit` | `bundle: View`, reading the bundle blob alone, and `base: CommitId` | the admission record | the codes of [admission](10-code.md#admission) | `recorded` |
 | `lower` | `bundle: HashValue` | — | `code.no-image`, `code.recheck-failed` | `recorded` |
 | `remove` | `bundle: HashValue` | — | `code.in-use` | `recorded` |
 

@@ -1,0 +1,618 @@
+//! Judging a bundle by the steps of admission: decoding it and its closure, then, once `keys` has verified its signatures and the policy given its trust, its check, seals, authority, provenance and placement, and image, into its admission record.
+
+/// Why admission refuses a bundle, or could not judge it.
+pub closed enum Refusal derives Eq, Render, Encode {
+    Malformed
+    TargetMismatch
+    ClosureIncomplete(name: text::String)
+    BadSignature(signer: text::String)
+    Unsigned
+    SealMissing(item: text::String)
+    SealRejected(item: text::String)
+    SealSameAuthor(item: text::String)
+    NoImage(level: code::Level, support: ident::HashValue)
+    Store(store::service::Failure)
+    Unavailable
+} Refusal
+
+/// The machine admission judges for: its codegen level, the hash of the support routines its kernel exports, and whether it has `iommu`.
+pub closed struct Machine derives Copy {
+    pub level: code::Level
+    pub support: ident::HashValue
+    pub iommu: bool
+} Machine
+
+/// A bundle file decoded and its closure found complete: its bundle, its artefacts read, in its order, the position of its root's, its code hash and its bundle hash.
+pub closed struct Decoded {
+    pub bundle: code::Bundle
+    pub artefacts: mem::List[code::Artefact]
+    pub root: usize
+    pub code: ident::HashValue
+    pub hash: ident::HashValue
+} Decoded
+
+/// A signature `keys` verifies: one of an object of NaN OS by its hash, or the key beside one of NaN's.
+pub closed enum Signer {
+    Object(principal: ident::Principal, kind: text::Fixed[16], subject: ident::HashValue, signature: ident::Signature)
+    Key(principal: ident::Principal, kind: text::Fixed[16], key: Array[u8, 32])
+} Signer
+
+/// The principal whose signature `keys` verifies.
+pub fn Signer.principal(self) -> ident::Principal {
+    return match self {
+        Signer.Object(principal: principal, kind: _, subject: _, signature: _) => ident::Principal(text: principal.text)
+        Signer.Key(principal: principal, kind: _, key: _) => ident::Principal(text: principal.text)
+    }
+} Signer.principal
+
+/// What judging a bundle gives: its admission record, and the position in the bundle of the image it takes.
+pub closed struct Judged {
+    pub admission: code::Admission
+    pub image: usize
+} Judged
+
+pub fn Refusal.code(self) -> text::Fixed[32] {
+    return match self {
+        Refusal.Malformed => text::Fixed[32].of("code.malformed")
+        Refusal.TargetMismatch => text::Fixed[32].of("code.target-mismatch")
+        Refusal.ClosureIncomplete(name: _) => text::Fixed[32].of("code.closure-incomplete")
+        Refusal.BadSignature(signer: _) => text::Fixed[32].of("auth.bad-signature")
+        Refusal.Unsigned => text::Fixed[32].of("code.unsigned")
+        Refusal.SealMissing(item: _) => text::Fixed[32].of("code.seal-missing")
+        Refusal.SealRejected(item: _) => text::Fixed[32].of("code.seal-rejected")
+        Refusal.SealSameAuthor(item: _) => text::Fixed[32].of("code.seal-same-author")
+        Refusal.NoImage(level: _, support: _) => text::Fixed[32].of("code.no-image")
+        Refusal.Store(failure) => failure.code()
+        Refusal.Unavailable => text::Fixed[32].of("port.server-stopped")
+    }
+} Refusal.code
+
+/// The bundle file `raw` decoded, steps 1 and 2: it decodes canonically, each of its artefacts reads, in byte order of code root, its root declares the nanos target `target`, and its artefacts name each package once and every package their requires-sets name.
+pub validator fn Decoded.of(raw: Untrusted[Slice[u8]], target: Str, alloc: mem::Alloc) -> Result[Decoded, Refusal] {
+    let Ok(decoded) = attempt mem::wire::Codec[code::Bundle].decode(raw, alloc) else {
+        return Err(Refusal.Malformed)
+    }
+    let bytes = raw.inspect()
+    var again = mem::Bytes.empty(alloc)
+    mem::wire::Codec[code::Bundle].encode(decoded, out: mut again)
+    if again.view() != bytes {
+        return Err(Refusal.Malformed)
+    }
+    var artefacts = mem::List[code::Artefact].empty(alloc)
+    var code_roots = mem::List[ident::HashValue].empty(alloc)
+    for each in decoded.artefacts {
+        let Some(read) = code::Artefact.read(Untrusted.of(each.view()), alloc) else {
+            return Err(Refusal.Malformed)
+        }
+        if code_roots.len() > 0 and read.code_root <= code_roots[code_roots.len() - 1] {
+            return Err(Refusal.Malformed)
+        }
+        mut code_roots.push(read.code_root)
+        mut artefacts.push(take read)
+    }
+    var root: Option[usize] = None
+    for at in 0..<artefacts.len() {
+        for earlier in 0..<at {
+            if artefacts[earlier].name.as_str() == artefacts[at].name.as_str() {
+                return Err(Refusal.ClosureIncomplete(name: text::String.of(artefacts[at].name.as_str(), alloc)))
+            }
+        }
+        if artefacts[at].name.as_str() == decoded.root.as_str() {
+            root = Some(at)
+        }
+    }
+    let Some(rooted) = root else {
+        return Err(Refusal.ClosureIncomplete(name: text::String.of(decoded.root.as_str(), alloc)))
+    }
+    var targeted = false
+    for each in artefacts[rooted].targets {
+        targeted = targeted or each.as_str() == target
+    }
+    if not targeted {
+        return Err(Refusal.TargetMismatch)
+    }
+    for artefact in artefacts {
+        for wanted in artefact.required {
+            if named(artefacts, name: wanted.as_str()).is_none() {
+                return Err(Refusal.ClosureIncomplete(name: text::String.of(wanted.as_str(), alloc)))
+            }
+        }
+    }
+    let code_hash = code::CodeId(root: text::String.of(decoded.root.as_str(), alloc), code_roots: take code_roots).hash(alloc)
+    let code::Bundle(root: name, artefacts: held, images: images, certificate: certificate, signatures: signatures) = decoded
+    let unsigned = code::Bundle(root: take name, artefacts: take held, images: take images, certificate: take certificate, signatures: mem::List.empty(alloc))
+    var encoded = mem::Bytes.empty(alloc)
+    mem::wire::Codec[code::Bundle].encode(unsigned, out: mut encoded)
+    let bundle_hash = ident::HashValue.of_object(ident::Kind.Bundle, bytes: encoded.view())
+    let code::Bundle(root: kept_name, artefacts: kept, images: kept_images, certificate: kept_certificate, signatures: _) = unsigned
+    let bundle = code::Bundle(root: take kept_name, artefacts: take kept, images: take kept_images, certificate: take kept_certificate, signatures: take signatures)
+    return Ok(Decoded(bundle: take bundle, artefacts: take artefacts, root: rooted, code: code_hash, hash: bundle_hash))
+} Decoded.of
+
+/// The signatures `keys` verifies for step 3, once each of NaN's signatures the artefacts hold verifies by the key beside it: each bundle signature, the certificate's, and the key of each publisher's and signed seal's signature; `auth.bad-signature` naming the signer of one that does not verify or whose principal NaN OS cannot name.
+pub fn Decoded.signers(self, alloc: mem::Alloc) -> Result[mem::List[Signer], Refusal] {
+    var signers = mem::List[Signer].empty(alloc)
+    for signed in self.bundle.signatures {
+        mut signers.push(Signer.Object(principal: ident::Principal(text: signed.principal.text), kind: text::Fixed[16].of("bundle"), subject: self.hash, signature: signed.signature))
+    }
+    match self.bundle.certificate {
+        Some(certificate) => {
+            mut signers.push(Signer.Object(principal: ident::Principal(text: certificate.builder.text), kind: text::Fixed[16].of("certificate"), subject: certificate.object(alloc), signature: certificate.signature))
+        }
+        None => {
+        }
+    }
+    for artefact in self.artefacts {
+        match artefact.publisher {
+            Some(publisher) => {
+                if not publisher.artefact.verifies() or not publisher.certificate.verifies() {
+                    return Err(Refusal.BadSignature(signer: text::String.of(publisher.principal.as_str(), alloc)))
+                }
+                let Some(principal) = principal_of(publisher.principal.as_str(), alloc) else {
+                    return Err(Refusal.BadSignature(signer: text::String.of(publisher.principal.as_str(), alloc)))
+                }
+                mut signers.push(Signer.Key(principal: take principal, kind: text::Fixed[16].of("review"), key: publisher.artefact.key))
+            }
+            None => {
+            }
+        }
+        for seal in artefact.seals {
+            match seal.signature {
+                Some(signed) => {
+                    let principal = principal_of(seal.principal.as_str(), alloc)
+                    if not signed.verifies() or principal.is_none() {
+                        return Err(Refusal.BadSignature(signer: text::String.of(seal.principal.as_str(), alloc)))
+                    }
+                    let Some(sealer) = principal else {
+                        return Err(Refusal.Malformed)
+                    }
+                    mut signers.push(Signer.Key(principal: take sealer, kind: text::Fixed[16].of("seal"), key: signed.key))
+                }
+                None => {
+                }
+            }
+        }
+    }
+    return Ok(take signers)
+} Decoded.signers
+
+/// The admission record of the decoded bundle, whose signatures `keys` verified, under the policy's trust `trust`, on `machine`, admitted by the plan of base commit `admitted`: steps 4, 6, 7, 12 and 13 of a program bundle.
+pub fn Decoded.judged(
+    self,
+    trust: policy::Trust,
+    machine: Machine,
+    admitted: ident::CommitId,
+    alloc: mem::Alloc,
+    ) -> Result[Judged, Refusal] {
+    let Some(certificate) = self.bundle.certificate else {
+        return Err(Refusal.Unsigned)
+    }
+    if certificate.code != self.code or not policy::matches_any(trust.builders, principal: certificate.builder.text.as_str(), alloc) {
+        return Err(Refusal.Unsigned)
+    }
+    let root = self.artefacts[self.root]
+    if root.entries.len() != 1 or root.entries[0].as_str() != "main" {
+        return Err(Refusal.Malformed)
+    }
+    let vendor = self.bundle.signatures.len() > 0
+    var escapes = mem::List[code::Escape].empty(alloc)
+    var reviewed = true
+    var vouched = true
+    var escaping = false
+    for artefact in self.artefacts {
+        if code::is_std(artefact.name.as_str()) {
+            continue
+        }
+        reviewed = reviewed and reviews(artefact, trust, alloc)
+        for escape in artefact.escapes {
+            escaping = true
+            var sealers = mem::List[ident::Principal].empty(alloc)
+            match self.sealers(artefact, item: escape.item.as_str(), trust, alloc) {
+                Ok(found) => {
+                    sealers = found
+                }
+                Err(refusal) => return Err(take refusal)
+            }
+            let vouching = any_vouching(sealers)
+            match escape.authority {
+                Some(granted) => {
+                    if (granted.as_str() == "device" or granted.as_str() == "priv") and not vouching {
+                        return Err(Refusal.SealRejected(item: text::String.of(escape.item.as_str(), alloc)))
+                    }
+                }
+                None => {
+                }
+            }
+            vouched = vouched and vouching
+            var by_reviewer = false
+            for sealer in sealers {
+                by_reviewer = by_reviewer or policy::matches_any(trust.reviewers, principal: sealer.text.as_str(), alloc)
+            }
+            reviewed = reviewed and by_reviewer
+            if not recorded(escapes, item: escape.item.as_str(), kind: escape.kind.as_str()) {
+                mut escapes.push(code::Escape(item: text::String.of(escape.item.as_str(), alloc), kind: text::String.of(escape.kind.as_str(), alloc), sealers: take sealers))
+            }
+        }
+    }
+    let provenance = match vendor {
+        true => os::Provenance.Vendor
+        false => match reviewed {
+            true => os::Provenance.Reviewed
+            false => os::Provenance.Agent
+        }
+    }
+    let placeable = provenance != os::Provenance.Agent or (not escaping and trust.agent_shared_space and machine.iommu)
+    let Some(chosen) = self.image(certificate, vendor, machine, alloc) else {
+        return Err(Refusal.NoImage(level: machine.level, support: machine.support))
+    }
+    let image = self.bundle.images[chosen]
+    let lowered = code::Lowered(level: image.level, toolchain: image.toolchain, support: image.support, image: ident::HashValue.of_content(image.bytes.view()), code_bytes: u64.widen(image.bytes.len()))
+    let program = match root.main {
+        Some(main) => Some(code::Program(input: self.schema_of(main.input, alloc), output: self.schema_of(Some(main.output), alloc)))
+        None => None
+    }
+    let admission = code::Admission(root: text::String.of(root.name.as_str(), alloc), packages: self.packages(alloc), components: mem::List.empty(alloc), program: take program, authority: self.summary(alloc), escapes: take escapes, contributions: mem::List.empty(alloc), provenance: provenance, shared: placeable and vouched, check: code::CodeCheck.Certified(builder: ident::Principal(text: certificate.builder.text), toolchain: certificate.toolchain), image: take lowered, admitted: admitted)
+    return Ok(Judged(admission: take admission, image: chosen))
+} Decoded.judged
+
+/// The principals whose seals of the item `item` of `artefact` admission accepts, of the policy's sealers, and who author neither its package nor a package holding an item of the seal's closure entries: step 6, `code.seal-missing` when no sealer the policy names sealed it, `code.seal-same-author` when only authors did.
+fn Decoded.sealers(
+    self,
+    artefact: code::Artefact,
+    item: Str,
+    trust: policy::Trust,
+    alloc: mem::Alloc,
+    ) -> Result[mem::List[ident::Principal], Refusal] {
+    var accepted = false
+    var sealers = mem::List[ident::Principal].empty(alloc)
+    for seal in artefact.seals {
+        if seal.item.as_str() != item or seal.signature.is_none() or not policy::matches_any(trust.sealers, principal: seal.principal.as_str(), alloc) {
+            continue
+        }
+        accepted = true
+        var authoring = self.authored(artefact.name.as_str(), principal: seal.principal.as_str())
+        for holder in seal.packages {
+            authoring = authoring or self.authored(holder.as_str(), principal: seal.principal.as_str())
+        }
+        if not authoring {
+            match principal_of(seal.principal.as_str(), alloc) {
+                Some(sealer) => mut sealers.push(take sealer)
+                None => {
+                }
+            }
+        }
+    }
+    if sealers.len() > 0 {
+        return Ok(take sealers)
+    }
+    if accepted {
+        return Err(Refusal.SealSameAuthor(item: text::String.of(item, alloc)))
+    }
+    return Err(Refusal.SealMissing(item: text::String.of(item, alloc)))
+} Decoded.sealers
+
+/// Whether the provenance of the package named `name` names `principal` among its authors.
+fn Decoded.authored(self, name: Str, principal: Str) -> bool {
+    let Some(at) = named(self.artefacts, name) else {
+        return false
+    }
+    for author in self.artefacts[at].authors {
+        if author.as_str() == principal {
+            return true
+        }
+    }
+    return false
+} Decoded.authored
+
+/// The position of the image step 13 takes: a trusted image, of the vendor's bundle or listed by the certificate `certificate`, whose support routines are the machine's kernel's, at the machine's level or else the highest lower one of its architecture.
+fn Decoded.image(
+    self,
+    certificate: code::Certificate,
+    vendor: bool,
+    machine: Machine,
+    alloc: mem::Alloc,
+    ) -> Option[usize] {
+    var chosen: Option[usize] = None
+    for at in 0..<self.bundle.images.len() {
+        let image = self.bundle.images[at]
+        let arm = image.level >= code::Level.Armv80
+        let fits = image.support == machine.support and arm == (machine.level >= code::Level.Armv80) and image.level <= machine.level
+        var certified = vendor
+        let blob = ident::HashValue.of_content(image.bytes.view())
+        for listed in certificate.images {
+            certified = certified or listed == blob
+        }
+        let higher = match chosen {
+            Some(earlier) => image.level > self.bundle.images[earlier].level
+            None => true
+        }
+        if fits and certified and higher {
+            chosen = Some(at)
+        }
+    }
+    return chosen
+} Decoded.image
+
+/// The packages of the closure: each name, code root, authors NaN OS can name, and the principal of its review signature.
+fn Decoded.packages(self, alloc: mem::Alloc) -> mem::List[code::Package] {
+    var packages = mem::List[code::Package].empty(alloc)
+    for artefact in self.artefacts {
+        var authors = mem::List[ident::Principal].empty(alloc)
+        for author in artefact.authors {
+            match principal_of(author.as_str(), alloc) {
+                Some(principal) => mut authors.push(take principal)
+                None => {
+                }
+            }
+        }
+        var reviewers = mem::List[ident::Principal].empty(alloc)
+        match artefact.publisher {
+            Some(publisher) => {
+                match principal_of(publisher.principal.as_str(), alloc) {
+                    Some(principal) => mut reviewers.push(take principal)
+                    None => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        mut packages.push(code::Package(name: text::String.of(artefact.name.as_str(), alloc), code_root: artefact.code_root, authors: take authors, reviewers: take reviewers))
+    }
+    return packages
+} Decoded.packages
+
+/// The closure summary: each entry of the authority summary of each package of the closure but the root and std, led by the package's name, in byte order.
+fn Decoded.summary(self, alloc: mem::Alloc) -> mem::List[text::String] {
+    var summary = mem::List[text::String].empty(alloc)
+    for at in 0..<self.artefacts.len() {
+        let artefact = self.artefacts[at]
+        if at == self.root or code::is_std(artefact.name.as_str()) {
+            continue
+        }
+        for entry in artefact.authority {
+            var line = text::String.of(artefact.name.as_str(), alloc)
+            mut line.append(" ")
+            mut line.append(entry.as_str())
+            var place: usize = 0
+            while place < summary.len() and summary[place].as_bytes() < line.as_bytes() {
+                place += 1
+            }
+            mut summary.insert(place, value: take line)
+        }
+    }
+    return summary
+} Decoded.summary
+
+/// The schema hash of a `main`'s input or result of type `typed`: that of a scalar, or of a named type whose tree a code root of the closure records; `None` for `Unit` and for a type no code root records.
+fn Decoded.schema_of(self, typed: Option[code::Typed], alloc: mem::Alloc) -> Option[ident::HashValue] {
+    match typed {
+        Some(code::Typed.Scalar(position: position)) => {
+            return scalar_schema(position)
+        }
+        Some(code::Typed.Named(path: path)) => {
+            for artefact in self.artefacts {
+                for tree in artefact.trees {
+                    if tree.path.as_str() == path.as_str() {
+                        return Some(tree.schema)
+                    }
+                }
+            }
+        }
+        else => {
+        }
+    }
+    return None
+} Decoded.schema_of
+
+/// Whether the package of `artefact` carries a review signature by one of the policy's reviewers.
+fn reviews(artefact: code::Artefact, trust: policy::Trust, alloc: mem::Alloc) -> bool {
+    return match artefact.publisher {
+        Some(publisher) => policy::matches_any(trust.reviewers, principal: publisher.principal.as_str(), alloc)
+        None => false
+    }
+} reviews
+
+/// Whether one of `sealers` is a `vendor.*`, `human.*` or `owner` principal.
+fn any_vouching(sealers: mem::List[ident::Principal]) -> bool {
+    for sealer in sealers {
+        let name = sealer.text.as_str()
+        if name == "owner" or name.starts_with("vendor.") or name.starts_with("human.") {
+            return true
+        }
+    }
+    return false
+} any_vouching
+
+/// Whether `escapes` records the trust escape of kind `kind` held by `item`.
+fn recorded(escapes: mem::List[code::Escape], item: Str, kind: Str) -> bool {
+    for escape in escapes {
+        if escape.item.as_str() == item and escape.kind.as_str() == kind {
+            return true
+        }
+    }
+    return false
+} recorded
+
+/// The schema hash of the scalar at `position` in NaN's scalar table, floats aside.
+fn scalar_schema(position: u64) -> Option[ident::HashValue] {
+    let schema = match position {
+        0 => mem::wire::Codec[u8].schema_hash()
+        1 => mem::wire::Codec[u16].schema_hash()
+        2 => mem::wire::Codec[u32].schema_hash()
+        3 => mem::wire::Codec[u64].schema_hash()
+        4 => mem::wire::Codec[i8].schema_hash()
+        5 => mem::wire::Codec[i16].schema_hash()
+        6 => mem::wire::Codec[i32].schema_hash()
+        7 => mem::wire::Codec[i64].schema_hash()
+        8 => mem::wire::Codec[usize].schema_hash()
+        9 => mem::wire::Codec[isize].schema_hash()
+        12 => mem::wire::Codec[bool].schema_hash()
+        13 => mem::wire::Codec[char].schema_hash()
+        else => return None
+    }
+    if schema.bytes[0] != 0x01 {
+        return None
+    }
+    return Some(ident::HashValue(bytes: schema.bytes))
+} scalar_schema
+
+/// The artefact of the package named `name` among `artefacts`.
+fn named(artefacts: mem::List[code::Artefact], name: Str) -> Option[usize] {
+    for at in 0..<artefacts.len() {
+        if artefacts[at].name.as_str() == name {
+            return Some(at)
+        }
+    }
+    return None
+} named
+
+/// The principal NaN OS names by the text `principal`, when it names one.
+fn principal_of(take principal: Str, alloc: mem::Alloc) -> Option[ident::Principal] {
+    return match attempt ident::Principal.parse(Untrusted.of(take principal), alloc) {
+        Ok(parsed) => Some(take parsed)
+        Err(_) => None
+    }
+} principal_of
+
+/// A seal of `item` by `principal`, whose closure entries name items of `holder`.
+fn seal_of(principal: Str, item: Str, holder: Str, alloc: mem::Alloc) -> code::Seal {
+    var packages = mem::List[text::String].empty(alloc)
+    mut packages.push(text::String.of(holder, alloc))
+    let signature = code::KeyedSignature(key: Array[u8, 32].filled(0), signature: ident::Signature(bytes: Array[u8, 64].filled(0)), message: mem::Bytes.empty(alloc))
+    return code::Seal(principal: text::String.of(principal, alloc), item: text::String.of(item, alloc), packages: take packages, signature: Some(take signature))
+} seal_of
+
+/// The texts `joined` separates by `|`.
+fn texts_of(joined: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var texts = mem::List[text::String].empty(alloc)
+    let bytes = joined.as_bytes()
+    var start: usize = 0
+    for at in 0..=bytes.len() {
+        if at == bytes.len() or bytes[at] == b'|' {
+            match joined.slice_bytes(start, end: at) {
+                Some(text) => {
+                    if text.byte_len() > 0 {
+                        mut texts.push(text::String.of(text, alloc))
+                    }
+                }
+                None => {
+                }
+            }
+            start = at + 1
+        }
+    }
+    return texts
+} texts_of
+
+/// The artefact of package `name`, of the code root of that name, targeting `x86_64-nanos`: its trust escapes, seals and authors, the entries of its authority summary joined by `|`, and its `main`.
+fn artefact_of(
+    name: Str,
+    take escapes: mem::List[code::TrustEscape],
+    take seals: mem::List[code::Seal],
+    authors: Str,
+    authority: Str,
+    take main: Option[code::Main],
+    alloc: mem::Alloc,
+    ) -> code::Artefact {
+    var entries = mem::List[text::String].empty(alloc)
+    if main.is_some() {
+        mut entries.push(text::String.of("main", alloc))
+    }
+    return code::Artefact(code_root: ident::HashValue.of_content(name.as_bytes()), name: text::String.of(name, alloc), targets: texts_of("x86_64-nanos", alloc), entries: take entries, required: mem::List.empty(alloc), escapes: take escapes, authority: texts_of(authority, alloc), main: take main, trees: mem::List.empty(alloc), seals: take seals, publisher: None, authors: texts_of(authors, alloc))
+} artefact_of
+
+/// An image at `level` against the support routines `support`, its bytes `bytes`.
+fn image_of(level: code::Level, support: ident::HashValue, bytes: Slice[u8], alloc: mem::Alloc) -> code::Image {
+    var held = mem::Bytes.empty(alloc)
+    mut held.append(bytes)
+    return code::Image(level: level, toolchain: ident::HashValue.of_content(b"toolchain"), support: support, bytes: take held)
+} image_of
+
+/// The bundle of `hello`, whose `main` takes a `u32` and gives a `u64`, over `units`, holding a trust escape of kind `kind` and authority `granted` that `sealer` sealed and `human.bob` authored, and `core`; images at levels 1, 3 and 4, the certificate of `builder` listing the first two.
+fn hello_of(
+    sealer: Str,
+    kind: Str,
+    granted: Option[Str],
+    builder: Str,
+    alloc: mem::Alloc,
+    ) -> Decoded {
+    let support = ident::HashValue.of_content(b"kernel interface")
+    var escapes = mem::List[code::TrustEscape].empty(alloc)
+    let authority = match granted {
+        Some(name) => Some(text::Fixed[16].of(name))
+        None => None
+    }
+    mut escapes.push(code::TrustEscape(item: text::String.of("units::raw", alloc), kind: text::Fixed[16].of(kind), authority: authority))
+    var seals = mem::List[code::Seal].empty(alloc)
+    mut seals.push(seal_of(sealer, item: "units::raw", holder: "core", alloc))
+    var core_escapes = mem::List[code::TrustEscape].empty(alloc)
+    mut core_escapes.push(code::TrustEscape(item: text::String.of("core::Option", alloc), kind: text::Fixed[16].of("decoder"), authority: None))
+    var artefacts = mem::List[code::Artefact].empty(alloc)
+    mut artefacts.push(artefact_of("hello", escapes: mem::List.empty(alloc), seals: mem::List.empty(alloc), authors: "", authority: "capability \"sys::Log\"", main: Some(code::Main(input: Some(code::Typed.Scalar(position: 2)), output: code::Typed.Scalar(position: 3))), alloc))
+    mut artefacts.push(artefact_of("units", take escapes, take seals, authors: "human.bob", authority: "alloc|escape trusted \"units::raw\"", main: None, alloc))
+    mut artefacts.push(artefact_of("core", escapes: take core_escapes, seals: mem::List.empty(alloc), authors: "", authority: "alloc", main: None, alloc))
+    var images = mem::List[code::Image].empty(alloc)
+    mut images.push(image_of(code::Level.X86v1, support, bytes: b"baseline", alloc))
+    mut images.push(image_of(code::Level.X86v3, support, bytes: b"haswell", alloc))
+    mut images.push(image_of(code::Level.X86v4, support, bytes: b"avx-512", alloc))
+    var listed = mem::List[ident::HashValue].empty(alloc)
+    mut listed.push(ident::HashValue.of_content(b"baseline"))
+    mut listed.push(ident::HashValue.of_content(b"haswell"))
+    let code_hash = ident::HashValue.of_content(b"code of hello")
+    let certificate = code::Certificate(builder: ident::Principal(text: text::Fixed[64].of(builder)), code: code_hash, toolchain: ident::HashValue.of_content(b"toolchain"), images: take listed, signature: ident::Signature(bytes: Array[u8, 64].filled(0)))
+    let bundle = code::Bundle(root: text::String.of("hello", alloc), artefacts: mem::List.empty(alloc), images: take images, certificate: Some(take certificate), signatures: mem::List.empty(alloc))
+    return Decoded(bundle: take bundle, artefacts: take artefacts, root: 0, code: code_hash, hash: ident::HashValue.of_content(b"bundle of hello"))
+} hello_of
+
+/// The trust of the presets, its sealers widened to `builder.**` when `builders_seal`.
+fn trust_of(builders_seal: bool, alloc: mem::Alloc) -> policy::Trust {
+    var sealers = texts_of("owner|human.**|vendor.**", alloc)
+    if builders_seal {
+        mut sealers.push(text::String.of("builder.**", alloc))
+    }
+    return policy::Trust(reviewers: texts_of("owner|human.**", alloc), sealers: take sealers, builders: texts_of("builder.**", alloc), agent_shared_space: false)
+} trust_of
+
+/// Whether `judged` is a refusal of code `code`.
+fn refused_with(judged: Result[Judged, Refusal], code: Str) -> bool {
+    return match judged {
+        Ok(_) => false
+        Err(refusal) => refusal.code().as_str() == code
+    }
+} refused_with
+
+test certified_programs_take_their_best_trusted_image_and_record_their_closure for Decoded.judged {
+    let alloc = testing::world().alloc
+    let machine = Machine(level: code::Level.X86v3, support: ident::HashValue.of_content(b"kernel interface"), iommu: true)
+    let decoded = hello_of("vendor.acme", kind: "trusted", granted: None, builder: "builder.ci", alloc)
+    let outcome = decoded.judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 7), alloc)
+    let Ok(judged) = outcome else {
+        expect false
+        return
+    }
+    let Judged(admission: admission, image: chosen) = judged
+    expect chosen == 1 and admission.image.level == code::Level.X86v3 and admission.image.image == ident::HashValue.of_content(b"haswell") and admission.image.code_bytes == 7
+    expect admission.authority.len() == 2 and admission.authority[0].as_str() == "units alloc" and admission.authority[1].as_str() == "units escape trusted \"units::raw\""
+    expect admission.escapes.len() == 1 and admission.escapes[0].item.as_str() == "units::raw" and admission.escapes[0].sealers.len() == 1
+    expect admission.provenance == os::Provenance.Agent and not admission.shared and admission.packages.len() == 3 and admission.admitted == ident::CommitId(number: 7)
+    let u32_schema = scalar_schema(2)
+    let u64_schema = scalar_schema(3)
+    let typed = match admission.program {
+        Some(program) => program.input == u32_schema and program.output == u64_schema and u32_schema.is_some()
+        None => false
+    }
+    expect typed
+} certified_programs_take_their_best_trusted_image_and_record_their_closure
+
+test escapes_sealed_by_strangers_or_authors_and_grants_sealed_by_builders_are_refused for Decoded.judged {
+    let alloc = testing::world().alloc
+    let machine = Machine(level: code::Level.X86v3, support: ident::HashValue.of_content(b"kernel interface"), iommu: true)
+    let older = Machine(level: code::Level.X86v3, support: ident::HashValue.of_content(b"older kernel"), iommu: true)
+    let stranger = refused_with(hello_of("agent.ops", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), alloc), code: "code.seal-missing")
+    let author = refused_with(hello_of("human.bob", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), alloc), code: "code.seal-same-author")
+    let unvouched = refused_with(hello_of("builder.ci", kind: "grant", granted: Some("device"), builder: "builder.ci", alloc).judged(trust_of(true, alloc), machine, admitted: ident::CommitId(number: 1), alloc), code: "code.seal-rejected")
+    let uncertified = refused_with(hello_of("vendor.acme", kind: "trusted", granted: None, builder: "human.ann", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), alloc), code: "code.unsigned")
+    let imageless = refused_with(hello_of("vendor.acme", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine: older, admitted: ident::CommitId(number: 1), alloc), code: "code.no-image")
+    expect stranger and author and unvouched and uncertified and imageless
+} escapes_sealed_by_strangers_or_authors_and_grants_sealed_by_builders_are_refused
