@@ -3,13 +3,19 @@
 /// The most grants one scan of `/sys/grants` gives.
 const GRANTS_SCANNED: u32 = 256
 
+/// The most admitted bundles one listing of `/sys/code` gives.
+const CODE_LISTED: u32 = 1_024
+
+/// The type of an admission record.
+const ADMISSION_TYPE: Str = "code::Admission"
+
 /// What a tree step makes: its writes, in order, and the nodes they read with the commit that last wrote each, `#0` for an absent one.
 pub closed struct Made derives Encode {
     pub writes: mem::List[store::Write]
     pub reads: mem::List[NodeRead]
 } Made
 
-/// The writes of the tree step `written` against the head of `view`, of the plan's branch `branch`, after checking it against `holding` at the UTC time `now_utc`; values are JSON when `json`, and a grant written without the commit granting it names `base`.
+/// The writes of the tree step `written` against the head of `view`, of the plan's branch `branch`, after checking it against `holding` at the UTC time `now_utc`; values are JSON when `json`, a grant written without the commit granting it names `base`, and `admitting` admits the bundles it installs for the plan of base `base`.
 pub fn materialize(
     written: Written,
     view: store::service::View,
@@ -18,6 +24,7 @@ pub fn materialize(
     now_utc: i64,
     json: bool,
     base: ident::CommitId,
+    admitting: os::Port[admission::Admitting],
     alloc: mem::Alloc,
     ) -> Result[Made, Failure] fails task::Cancelled uses wait {
     let made = match written.step {
@@ -28,6 +35,7 @@ pub fn materialize(
         Step.Grant(spec: spec) => try await made_grant(spec.as_str(), view, holding, now_utc, json, base, alloc)
         Step.Revoke(grant: number) => try await made_revoke(number, view, holding, now_utc, alloc)
         Step.Revert(commit: commit) => try await made_revert(commit, view, alloc)
+        Step.Install(target: target) => try await made_install(target.as_str(), view, holding, now_utc, base, admitting, alloc)
         else => return Err(Failure.of("request.invalid-operand", subject: written.text.as_str(), alloc).expecting("a tree step", found: written.text.as_str(), alloc))
     }
     let done = match made {
@@ -576,6 +584,145 @@ fn made_revoke(
     }
     return Ok(Made(writes: take writes, reads: take reads))
 } made_revoke
+
+/// `install <path or hash>`: the admission record `admitting` gives the bundle blob at the path, or of the admitted code hash the hash names, read alone through `view`, for the plan of base `base`, with that blob and the image it takes, at `/sys/code/<code hash>`, once `holding` gives an `Instance` grant with `spawn` or `update` at the UTC time `now_utc`.
+fn made_install(
+    target: Str,
+    view: store::service::View,
+    holding: Holding,
+    now_utc: i64,
+    base: ident::CommitId,
+    admitting: os::Port[admission::Admitting],
+    alloc: mem::Alloc,
+    ) -> Result[Made, Failure] fails task::Cancelled uses wait {
+    if not holding.installs(now_utc) {
+        return Err(denied(target, right: "instance.spawn", alloc))
+    }
+    let path = match try await bundle_path(target, view, alloc) {
+        Ok(found) => found
+        Err(failure) => return Err(take failure)
+    }
+    let node = match try await node_at(view, path: path.as_str(), alloc) {
+        Ok(Some(found)) => found
+        Ok(None) => return Err(Failure.of("request.unknown-name", subject: target, alloc).expecting("a bundle blob", found: target, alloc))
+        Err(failure) => return Err(take failure)
+    }
+    let Some(bundle_id) = node.hash else {
+        return Err(Failure.of("request.invalid-operand", subject: target, alloc).expecting("a bundle blob", found: "another node", alloc))
+    }
+    if node.kind != store::NodeKind.Blob {
+        return Err(Failure.of("request.invalid-operand", subject: target, alloc).expecting("a bundle blob", found: "another node", alloc))
+    }
+    let Some(named) = path_of(path.as_str(), alloc) else {
+        return Err(Failure.of("request.invalid-operand", subject: target, alloc).expecting("a path", found: target, alloc))
+    }
+    let bundle = match first attempt view.read_only() {
+        Ok(readable) => match first attempt readable.below(take named, alloc) {
+            Ok(narrowed) => narrowed
+            Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: target, alloc))
+        }
+        Err(_) => return Err(Failure.of("port.revoked", subject: target, alloc))
+    }
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[admission::Admitting].admit(mut call, bundle, base)
+    let record = match first attempt await admitting.call(take call, reply, alloc) {
+        Ok(given) => given
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(os::PortError.Failed(refused_by)) => return Err(install_failure(refused_by, target, alloc))
+        Err(_) => return Err(Failure.of("port.server-stopped", subject: "admission", alloc))
+    }
+    var code_roots = mem::List[ident::HashValue].empty(alloc)
+    for held in record.packages {
+        mut code_roots.push(held.code_root)
+    }
+    let code_hash = code::CodeId(root: text::String.of(record.root.as_str(), alloc), code_roots: take code_roots).hash(alloc)
+    var dir = text::String.of("/sys/code/", alloc)
+    let full = code_hash.full_form()
+    mut dir.append(full.as_str())
+    var writes = mem::List[store::Write].empty(alloc)
+    var reads = mem::List[NodeRead].empty(alloc)
+    mut reads.push(NodeRead(path: ident::Path(text: take path), commit: node.version))
+    match try await node_at(view, path: dir.as_str(), alloc) {
+        Ok(Some(held)) => mut reads.push(NodeRead(path: ident::Path(text: text::String.of(dir.as_str(), alloc)), commit: held.version))
+        Ok(None) => {
+            mut reads.push(NodeRead(path: ident::Path(text: text::String.of(dir.as_str(), alloc)), commit: ident::CommitId(number: 0)))
+            mut writes.push(store::Write.Make(path: ident::Path(text: text::String.of(dir.as_str(), alloc)), declaration: store::Declaration.Dir(store::DirDecl(element: None, ephemeral: false, secret: false, numbered: false, keep: None))))
+        }
+        Err(failure) => return Err(take failure)
+    }
+    let image = record.image.image
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[code::Admission].encode(record, out: mut bytes)
+    mut writes.push(store::Write.Put(path: child_path(dir.as_str(), name: "admission", alloc), value: store::Value.Record(type: store::TypeRef.of(ADMISSION_TYPE, schema: mem::wire::Codec[code::Admission].schema_hash(), alloc), bytes: take bytes, secret: false)))
+    mut writes.push(store::Write.Put(path: child_path(dir.as_str(), name: "bundle", alloc), value: store::Value.Blob(bundle_id)))
+    mut writes.push(store::Write.Put(path: child_path(dir.as_str(), name: "image", alloc), value: store::Value.Blob(image)))
+    return Ok(Made(writes: take writes, reads: take reads))
+} made_install
+
+/// The path of the bundle blob `target` names: itself when it is a path, else `/sys/code/<hash>/bundle` for the admitted code hash its full or short form names.
+fn bundle_path(target: Str, view: store::service::View, alloc: mem::Alloc) -> Result[text::String, Failure] fails task::Cancelled uses wait {
+    if target.starts_with("/") {
+        return Ok(text::String.of(target, alloc))
+    }
+    let Some(named) = ident::HashText.parse(target) else {
+        return Err(Failure.of("request.invalid-operand", subject: target, alloc).expecting("a bundle blob's path or a code hash", found: target, alloc))
+    }
+    let listing = match first attempt await view.list(ident::Path(text: text::String.of("/sys/code", alloc)), after: None, limit: CODE_LISTED, alloc) {
+        Ok(codes) => codes
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(Failure.of(failed.code().as_str(), subject: "/sys/code", alloc))
+    }
+    var found: Option[text::String] = None
+    for entry in listing.entries {
+        let Some(ident::HashText.Full(hash)) = ident::HashText.parse(entry.name.as_str()) else {
+            continue
+        }
+        if named.names(hash) {
+            if found.is_some() {
+                return Err(Failure.of("request.ambiguous-name", subject: target, alloc).expecting("a hash naming one admitted bundle", found: target, alloc))
+            }
+            var path = text::String.of("/sys/code/", alloc)
+            mut path.append(entry.name.as_str())
+            mut path.append("/bundle")
+            found = Some(take path)
+        }
+    }
+    let Some(path) = found else {
+        return Err(Failure.of("request.unknown-name", subject: target, alloc).expecting("the code hash of an admitted bundle", found: target, alloc))
+    }
+    return Ok(take path)
+} bundle_path
+
+/// The failure of an `install` of `target` that admission refuses with `refused_by`, naming what it refuses, and for `code.no-image` expecting the machine's level and its kernel's support routines.
+fn install_failure(refused_by: admission::Refusal, target: Str, alloc: mem::Alloc) -> Failure {
+    let code = refused_by.code()
+    match refused_by {
+        admission::Refusal.NoImage(level: level, support: support) => {
+            var expected = text::String.of("an image at Machine.level ", alloc)
+            mut expected.write(Dyn[Render].view(level), budget: 16)
+            mut expected.append(" for LiveBoot.support ")
+            let form = support.full_form()
+            mut expected.append(form.as_str())
+            return Failure.of(code.as_str(), subject: target, alloc).expecting(expected.as_str(), found: "none", alloc)
+        }
+        else => {
+        }
+    }
+    return match refused_by {
+        admission::Refusal.ClosureIncomplete(name: name) => Failure.of(code.as_str(), subject: name.as_str(), alloc)
+        admission::Refusal.BadSignature(signer: signer) => Failure.of(code.as_str(), subject: signer.as_str(), alloc)
+        admission::Refusal.SealMissing(item: item) or admission::Refusal.SealRejected(item: item) or admission::Refusal.SealSameAuthor(item: item) => Failure.of(code.as_str(), subject: item.as_str(), alloc)
+        else => Failure.of(code.as_str(), subject: target, alloc)
+    }
+} install_failure
+
+/// The path of the child `name` of the dir at `dir`.
+fn child_path(dir: Str, name: Str, alloc: mem::Alloc) -> ident::Path {
+    var path = text::String.of(dir, alloc)
+    mut path.push('/')
+    mut path.append(name)
+    return ident::Path(text: take path)
+} child_path
 
 /// `revert #<n>`: the writes restoring what the commit wrote, three-way checked against the commits after it.
 fn made_revert(commit: ident::CommitId, view: store::service::View, alloc: mem::Alloc) -> Result[Made, Failure] fails task::Cancelled uses wait {
