@@ -223,7 +223,7 @@ pub fn Hosting.close(take self) {
 pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     let Hosting(serving: serving, schema: schema, operations: operations, exec: exec, alloc: alloc, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
     defer take replier.close()
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: _, config: _, forking: _, recorder: recorder) = serving
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: _, updated: updated, config: _, forking: _, recorder: recorder) = serving
     var held = instance
     defer take held.abandon()
     let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0), deadline: core::atomic::AtomicU64.of(os::NO_DEADLINE), posted: hw::SpinLock.of(None), operations: take operations), alloc)
@@ -233,13 +233,13 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
         Some(saved) => Some(saved.number)
         None => None
     }
-    let began = match attempt await begin_hosted(mut held, restored: restored.is_some(), telling) {
+    let began = match attempt await begin_hosted(mut held, restored: restored.is_some(), updated, telling) {
         Ok(healthy) => healthy
         Err(nanos::InstanceError.Cancelled(cancelled)) => fail cancelled
         Err(nanos::InstanceError.Ended) => false
     }
     if began {
-        try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival: false), operations: names_in(steps.contents().operations, alloc)))
+        try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival: false, updated), operations: names_in(steps.contents().operations, alloc)))
         let inbox = held.inbox()
         let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
         var given = Some(HostedGiven(deliveries: take deliveries, finishes: take finishes))
@@ -269,8 +269,8 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
         })
         match looped {
             Err(Stopping.Cancelled(cancelled)) => fail cancelled
-            Err(Stopping.Asked) => {
-                match attempt await stop_hosted(mut held, keeping, dirty: due_at.is_some(), schema, telling) {
+            Err(Stopping.Asked(hand: hand)) => {
+                match attempt await stop_hosted(mut held, keeping, dirty: due_at.is_some(), hand, schema, telling) {
                     Err(nanos::InstanceError.Cancelled(cancelled)) => fail cancelled
                     else => {
                     }
@@ -298,12 +298,13 @@ struct HostedGiven {
     finishes: task::Receiver[u64]
 } HostedGiven
 
-/// Calls the instance's `resume`, with reason `Restored` when it restored a checkpoint, starts its keyed tasks and asks its health; whether it is healthy.
-fn begin_hosted(mut instance: nanos::Instance, restored: bool, telling: Telling) -> bool fails nanos::InstanceError uses wait {
-    let reason = match restored {
+/// Calls the instance's `resume`, with reason `Updated` for an update and `Restored` when it restored a checkpoint, starts its keyed tasks and asks its health; whether it is healthy.
+fn begin_hosted(mut instance: nanos::Instance, restored: bool, updated: bool, telling: Telling) -> bool fails nanos::InstanceError uses wait {
+    let started = match restored {
         true => sys::ResumeReason.Restored
         false => sys::ResumeReason.Started
     }
+    let reason = resumed_for(started, revival: false, updated)
     let resuming = telling.begin(call: SystemCall.Resume)
     try await mut instance.resumed(reason)
     telling.end_system(resuming)
@@ -332,7 +333,7 @@ fn dispatch_hosted(
     var signals = finishes
     loop {
         let Some(delivery) = try await mut receiver.receive() else {
-            fail Stopping.Asked
+            fail Stopping.Asked(hand: false)
         }
         match delivery {
             Delivery.Call(id: id, hash: hash, encoded: encoded, request: request, header: header, deadline: deadline) => {
@@ -353,7 +354,7 @@ fn dispatch_hosted(
             }
             Delivery.SuspendAfter(ms: ms) => quiet.contents().store(u64.widen(ms))
             Delivery.Hold(order: order) => try await take order.refuse()
-            Delivery.Stop => fail Stopping.Asked
+            Delivery.Stop(hand: hand) => fail Stopping.Asked(hand: hand)
         }
     }
 } dispatch_hosted
@@ -456,11 +457,12 @@ fn keep_hosted(instance: nanos::Instance, keeping: Keeping, schema: ident::HashV
     return try await keep_checkpoint(keeping, take bytes, schema: mem::wire::SchemaHash(bytes: schema.bytes), telling)
 } keep_hosted
 
-/// Ends the instance's service once told to stop: handles every message that waits and keeps a checkpoint when the state is `dirty` or it handled one, then tells the driver it ends.
+/// Ends the instance's service once told to stop: handles every message that waits, keeps a checkpoint when the state is `dirty` or it handled one, hands the driver the encoding of the state when `hand`, then tells the driver it ends.
 fn stop_hosted(
     mut instance: nanos::Instance,
     keeping: Option[Keeping],
     dirty: bool,
+    hand: bool,
     schema: ident::HashValue,
     telling: Telling,
     ) fails nanos::InstanceError uses wait {
@@ -471,6 +473,10 @@ fn stop_hosted(
         }
         else => {
         }
+    }
+    if hand {
+        let state = try await instance.checkpoint()
+        try await telling.tell(report: Report.Handed(state: take state, schema: schema))
     }
     try await telling.tell(report: Report.Ending)
 } stop_hosted

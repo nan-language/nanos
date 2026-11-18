@@ -1,0 +1,175 @@
+//! Live updates: an instance moving to the bundle its specification names restarts under it from its old code's encoding of its state, resuming with reason `Updated`, and goes back to its old bundle from the same encoding when the new code fails before its probation ends.
+
+/// How long an update's probation lasts, in seconds.
+const PROBATION_S: u64 = 60
+
+/// A live update of an instance: the code hash and the description of the component it ran before, the old code's encoding of its state once handed, and whether the update was reverted, the old bundle running again from that encoding.
+struct Updating {
+    old: ident::HashValue
+    hosted: Option[mem::Box[Hosted]]
+    handed: Option[PreUpdate]
+    reverted: bool
+} Updating
+
+/// The old code's encoding of an instance's state as an update stopped it, and the schema of that state.
+struct PreUpdate {
+    state: mem::Bytes
+    schema: ident::HashValue
+} PreUpdate
+
+/// Starts a live update of the instance to the bundle the specification `renewed` names: on a task of `s`, reads the description of the instance's component in that bundle, which the driver takes as `Input.Redescribed`; a specification of the base bundle needs none.
+fn Shared.update(
+    self,
+    mut driver: Driver,
+    take renewed: mem::Box[os::InstanceSpec],
+    sender: task::Sender[Input],
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    let bundle = renewed.contents().bundle
+    let base = bundle == self.config.base
+    let component = text::String.of(renewed.contents().component.as_str(), alloc)
+    let directory = self.directory.share()
+    let codes = await when directory => directory.own_view(mut driver.minted, grant: CODE_GRANT, prefix: "/sys/code", branch: "main", rights: store::service::Rights.reading(), moniker: ident::Moniker(text: driver.moniker.text), principal: ident::Principal(text: text::Fixed[64].of("system")), alloc)
+    let inputs = sender.split()
+    discard s.spawn(fn[take renewed, take component, take inputs]() fails task::Cancelled uses wait limits stack 65_536 {
+        var described: Result[Option[mem::Box[Hosted]], os::ControlError] = Ok(None)
+        if not base {
+            described = match codes {
+                Some(code) => match try await hosted_of(code, bundle, component: component.as_str(), alloc) {
+                    Ok(hosted) => Ok(Some(mem::Heap.of(alloc).boxed(take hosted)))
+                    Err(failure) => Err(take failure)
+                }
+                None => Err(os::ControlError.Invalid)
+            }
+        }
+        discard attempt await inputs.send(Input.Redescribed(spec: take renewed, described: take described))
+    })
+} Shared.update
+
+/// Moves the instance to the bundle the specification `renewed` names, its component there as `described` gives it: a running instance stops, handing its state, and restarts under the new bundle from it. A component the bundle lacks, or one serving another protocol than the instance's, leaves the instance on its old bundle.
+fn Shared.redescribed[J: Journal](
+    self,
+    mut driver: Driver,
+    take renewed: mem::Box[os::InstanceSpec],
+    take described: Result[Option[mem::Box[Hosted]], os::ControlError],
+    journal: J,
+    ) fails task::Cancelled uses wait {
+    let Ok(hosted) = described else {
+        return
+    }
+    let Some(serving) = protocols_of(self.components, spec: driver.spec, hosted: driver.hosted) else {
+        return
+    }
+    let Some(serves) = protocols_of(self.components, spec: renewed.contents(), hosted) else {
+        return
+    }
+    if serves.own != serving.own {
+        return
+    }
+    let old = driver.spec.bundle
+    var before: Option[mem::Box[Hosted]] = None
+    match mut driver.hosted.extract() {
+        Some(running) => {
+            before = Some(take running)
+        }
+        None => {
+        }
+    }
+    driver.hosted = hosted
+    if driver.hosted.is_some() {
+        let directory = self.directory.share()
+        await when directory => directory.read_code(mut driver, alloc: self.config.alloc)
+    }
+    discard mut driver.specify(spec: take renewed.into_contents())
+    if driver.lifecycle != Some(os::Lifecycle.Running) {
+        return
+    }
+    driver.updating = Some(mem::Heap.of(self.config.alloc).boxed(Updating(old: old, hosted: take before, handed: None, reverted: false)))
+    try await self.stop(mut driver, then: Then.Update, journal)
+} Shared.redescribed
+
+/// Whether a start of the instance restores the old code's encoding of its state for an update.
+fn Driver.handing(self) -> bool {
+    return match self.updating {
+        Some(updating) => updating.contents().handed.is_some()
+        None => false
+    }
+} Driver.handing
+
+/// What a start under an update keeps checkpoints through, `keeping`, and restores at `time`: a copy of the old code's encoding of the state, which the update keeps for a revert; the update ends with the start that follows its revert.
+fn Driver.handed_restored(mut self, keeping: Option[Keeping], time: ident::WallTime) -> Option[Restored] {
+    var state = mem::Bytes.empty(self.alloc)
+    var schema: Option[ident::HashValue] = None
+    var old = self.spec.bundle
+    var reverted = false
+    match self.updating {
+        Some(boxed) => {
+            let updating = boxed.contents()
+            match updating.handed {
+                Some(handed) => {
+                    mut state.append(handed.state.view())
+                    schema = Some(handed.schema)
+                }
+                None => {
+                }
+            }
+            old = updating.old
+            reverted = updating.reverted
+        }
+        None => {
+        }
+    }
+    if reverted {
+        self.updating = None
+    }
+    let Some(encoded) = schema else {
+        return Some(Restored(keeping: keeping, restore: None, updated: false))
+    }
+    return Some(Restored(keeping: keeping, restore: Some(os::Checkpoint(number: 0, incarnation: self.incarnation, bundle: old, schema: encoded, time: time, state: take state)), updated: true))
+} Driver.handed_restored
+
+/// Keeps `state`, the old code's encoding of the instance's state of schema `schema`, for the update under way.
+fn Driver.handed(mut self, take state: mem::Bytes, schema: ident::HashValue) {
+    let Some(boxed) = mut self.updating.extract() else {
+        return
+    }
+    var updating = take boxed.into_contents()
+    var kept = mem::Bytes.empty(self.alloc)
+    mut kept.append(state.view())
+    updating.handed = Some(PreUpdate(state: take kept, schema: schema))
+    self.updating = Some(mem::Heap.of(self.alloc).boxed(take updating))
+} Driver.handed
+
+/// Reverts the update under way once its new code failed: the specification's bundle and the component's description go back to the old bundle's, which restarts from the old code's encoding of the state; whether there was one to revert.
+fn Driver.revert(mut self, alloc: mem::Alloc) -> bool {
+    let Some(boxed) = mut self.updating.extract() else {
+        return false
+    }
+    var updating = take boxed.into_contents()
+    if updating.reverted or updating.handed.is_none() {
+        return false
+    }
+    self.spec.bundle = updating.old
+    self.hosted = mut updating.hosted.extract()
+    updating.reverted = true
+    self.updating = Some(mem::Heap.of(alloc).boxed(take updating))
+    return true
+} Driver.revert
+
+/// Has the driver end the probation of the update its incarnation `incarnation` started once it passes, on a task of `s`.
+fn Shared.probation(self, s: task::Scope, inputs: task::Sender[Input], incarnation: u64) {
+    let clock = self.config.clock
+    let telling = inputs.split()
+    discard s.spawn(fn[take telling]() fails task::Cancelled uses wait limits stack 8_192 {
+        try await clock.sleep_ns(PROBATION_S * 1_000_000_000)
+        discard attempt await telling.send(Input.Probated(incarnation: incarnation))
+    })
+} Shared.probation
+
+/// Ends the probation of the update the incarnation `incarnation` started, unless another incarnation runs: the old code's encoding of the state is dropped.
+fn Driver.probated(mut self, incarnation: u64) {
+    if incarnation == self.incarnation {
+        self.updating = None
+    }
+} Driver.probated

@@ -43,11 +43,12 @@ fn Directory.state_view(
     return self.own_view(mut minted, grant: STATE_GRANT, prefix: "/state", branch: "main", rights, take moniker, take principal, alloc)
 } Directory.state_view
 
-/// What `/state` gives the start of an instance: no checkpoint to restore, with the keeping of checkpoints for a checkpointed instance that has none, and without for a volatile one or when `store` has no specification or takes no calls; the latest checkpoint, with the keeping of later ones; the checkpoint a revival's hibernation image stands for, with the keeping of later ones when `store` takes calls; or a latest checkpoint or image that cannot be read.
+/// What `/state` gives the start of an instance: no checkpoint to restore, with the keeping of checkpoints for a checkpointed instance that has none, and without for a volatile one or when `store` has no specification or takes no calls; the latest checkpoint, with the keeping of later ones; the checkpoint a revival's hibernation image stands for, with the keeping of later ones when `store` takes calls; the old code's encoding of the state an update restores, with the keeping of checkpoints for a checkpointed instance; or a latest checkpoint or image that cannot be read.
 enum Restoring {
     Fresh(keeping: Option[Keeping])
     From(keeping: Keeping, checkpoint: os::Checkpoint)
     Revived(keeping: Option[Keeping], checkpoint: os::Checkpoint)
+    Handed(keeping: Option[Keeping])
     Unreadable
 } Restoring
 
@@ -55,33 +56,56 @@ enum Restoring {
 struct Restored {
     keeping: Option[Keeping]
     restore: Option[os::Checkpoint]
+    updated: bool
 } Restored
 
 /// What the start of the instance `driver` runs keeps checkpoints through and restores, as `restoring` gives it, its incarnation raised to that of a checkpoint it restores from `/state`; `None` once the start gave up on a checkpoint or image it cannot read.
 fn Shared.restored[J: Journal](self, mut driver: Driver, revival: bool, journal: J) -> Option[Restored] fails task::Cancelled uses wait {
-    match try await self.restoring(mut driver, revival) {
-        Restoring.Fresh(keeping: kept) => return Some(Restored(keeping: kept, restore: None))
-        Restoring.From(keeping: kept, checkpoint: saved) => {
-            if saved.incarnation > driver.incarnation {
-                driver.incarnation = saved.incarnation
-            }
-            return Some(Restored(keeping: Some(kept), restore: Some(take saved)))
-        }
-        Restoring.Revived(keeping: kept, checkpoint: saved) => return Some(Restored(keeping: kept, restore: Some(take saved)))
-        Restoring.Unreadable => {
-            try await self.give_up(mut driver, journal, cause: driver.cause)
-            return None
-        }
+    let restoring = try await self.restoring(mut driver, revival)
+    if restoring.unreadable() {
+        try await self.give_up(mut driver, journal, cause: driver.cause)
+        return None
     }
+    return mut driver.restored_from(take restoring, time: self.config.wall.now(self.config.clock))
 } Shared.restored
 
-/// What the start of the instance `driver` runs restores: for a `revival`, its hibernation image when hibernation memory keeps it; otherwise from `/state`, a copy of the checkpoint a restore read, added as its latest, or its latest, which also stands as an image hibernation memory does not keep.
+/// Whether the start gave up on a checkpoint or image it cannot read.
+fn Restoring.unreadable(self) -> bool {
+    return match self {
+        Restoring.Unreadable => true
+        else => false
+    }
+} Restoring.unreadable
+
+/// What the start of the instance keeps checkpoints through and restores as `restoring` gives it, at `time` for the old code's encoding of its state an update restores; its incarnation raised to that of a checkpoint it restores from `/state`.
+fn Driver.restored_from(mut self, take restoring: Restoring, time: ident::WallTime) -> Option[Restored] {
+    match restoring {
+        Restoring.Fresh(keeping: kept) => return Some(Restored(keeping: kept, restore: None, updated: false))
+        Restoring.From(keeping: kept, checkpoint: saved) => {
+            if saved.incarnation > self.incarnation {
+                self.incarnation = saved.incarnation
+            }
+            return Some(Restored(keeping: Some(kept), restore: Some(take saved), updated: false))
+        }
+        Restoring.Revived(keeping: kept, checkpoint: saved) => return Some(Restored(keeping: kept, restore: Some(take saved), updated: false))
+        Restoring.Handed(keeping: kept) => return mut self.handed_restored(keeping: kept, time)
+        Restoring.Unreadable => return None
+    }
+} Driver.restored_from
+
+/// What the start of the instance `driver` runs restores: under an update, the old code's encoding of its state; for a `revival`, its hibernation image when hibernation memory keeps it; otherwise from `/state`, a copy of the checkpoint a restore read, added as its latest, or its latest, which also stands as an image hibernation memory does not keep.
 fn Shared.restoring(self, mut driver: Driver, revival: bool) -> Restoring fails task::Cancelled uses wait {
     if driver.spec.durability.class != os::DurabilityClass.Checkpointed {
+        if driver.handing() {
+            return Restoring.Handed(keeping: None)
+        }
         return Restoring.Fresh(keeping: None)
     }
     let alloc = self.config.alloc
     let kept = try await self.keeping(mut driver)
+    if driver.handing() {
+        return Restoring.Handed(keeping: kept)
+    }
     if revival {
         match mut driver.image.extract() {
             Some(image) => {

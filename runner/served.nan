@@ -1,6 +1,6 @@
 //! The task of an instance's domain: it builds the Env, starts or restores the component, serves the calls its driver delivers, one at a time, keeps its checkpoints, and hands its driver the replies the component gives postponed requests.
 
-/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept and the checkpoint it restores, which its hibernation image gives a revival, the instance's configuration record, for a fork what it runs and where it tells what it saw, and otherwise the instance's flight recorder.
+/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept, the checkpoint it restores, which its hibernation image gives a revival and the old code's encoding of its state an update, whether it starts as an update, the instance's configuration record, for a fork what it runs and where it tells what it saw, and otherwise the instance's flight recorder.
 pub open struct Serving {
     deliveries: task::Receiver[Delivery]
     reports: task::Sender[Input]
@@ -12,6 +12,7 @@ pub open struct Serving {
     keeping: Option[Keeping]
     restore: Option[os::Checkpoint]
     revival: bool
+    updated: bool
     config: Option[Untrusted[mem::Bytes]]
     forking: Option[ForkRun]
     recorder: Option[Recorder]
@@ -25,17 +26,18 @@ struct ForkRun {
     reaching: mem::Shared[core::atomic::AtomicBool]
 } ForkRun
 
-/// What a driver delivers to its instance's domain: a call with its header and the deadline of its dispatch, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns.
+/// What a driver delivers to its instance's domain: a call with its header and the deadline of its dispatch, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns, handing the driver the encoding of its component's state when `hand`.
 enum Delivery {
     Call(id: u64, hash: sys::ProtocolHash, encoded: sys::Encoded, request: bool, header: os::Header, deadline: u64)
     SuspendAfter(ms: u32)
     Hold(order: HolderOrder)
-    Stop
+    Stop(hand: bool)
 } Delivery
 
-/// What the task of an instance's domain tells its driver: among others, that it runs, with the names of its component's operations by number, and how a hibernation it was ordered ended, with the image it took or none when the instance serves on.
+/// What the task of an instance's domain tells its driver: among others, that it runs, with the names of its component's operations by number, how a hibernation it was ordered ended, with the image it took or none when the instance serves on, and the encoding of its component's state, of schema `schema`, as it stops for an update.
 enum Report {
     Running(from: journal::StartedFrom, operations: mem::List[text::String])
+    Handed(state: mem::Bytes, schema: ident::HashValue)
     Hibernation(image: Option[Image])
     Taken(id: u64)
     Postponed(id: u64)
@@ -76,9 +78,9 @@ pub open struct Served[S: sys::Component[Env, P] and Encode, Env: nanos::Environ
 pub open struct Driven[S: sys::Component[Env, P] and Encode, Env: Any and Send, P: sys::Protocol and Send] {
 } Driven
 
-/// The end of the delivery loop: the driver asked to stop, or released its deliveries, or the instance of a bundle's component ended.
+/// The end of the delivery loop: the driver asked to stop, handing it the encoding of the state when `hand`, or released its deliveries, or the instance of a bundle's component ended.
 enum Stopping {
-    Asked
+    Asked(hand: bool)
     Ended
     Cancelled(task::Cancelled) from
 } Stopping
@@ -114,7 +116,7 @@ pub fn Driven.run(
     if serving.forking.is_some() {
         return try await Driven[S, Env, P].forked(take env, exec, alloc, take serving, release)
     }
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: revival, config: _, forking: _, recorder: recorder) = serving
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: revival, updated: updated, config: _, forking: _, recorder: recorder) = serving
     let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
@@ -138,7 +140,7 @@ pub fn Driven.run(
     let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
     let telling = Telling(reports: reports.split(), marks: marks.split(), steps: steps.share(), finished: take finished, clock: clock, incarnation: incarnation, recorder: take recorder, alloc: alloc)
     let resuming = telling.begin(call: SystemCall.Resume)
-    mut stepper.resumed(resumed_for(reason, revival))
+    mut stepper.resumed(resumed_for(reason, revival, updated))
     telling.end_system(resuming)
     discard mut stepper.start_keyed()
     let probing = telling.begin(call: SystemCall.Health)
@@ -149,7 +151,7 @@ pub fn Driven.run(
         }
         sys::HealthReply.Unhealthy(_) => return Ended.Unhealthy
     }
-    try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival), operations: names_in(steps.contents().operations, alloc)))
+    try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival, updated), operations: names_in(steps.contents().operations, alloc)))
     let out = stepper.outbox()
     let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
     var given = Some(Given(deliveries: take deliveries, finishes: take finishes, peers: take peers))
@@ -174,24 +176,25 @@ pub fn Driven.run(
         image = Some(try await hold(mut stepper, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), orders, mut holding, telling, s))
         s.cancel()
     })
-    match looped {
+    let hand = match looped {
         Err(Stopping.Cancelled(cancelled)) => fail cancelled
-        else => {
-        }
+        Err(Stopping.Asked(hand: asked)) => asked
+        else => false
     }
     undefer stepper
     return match mut image.extract() {
         Some(taken) => try await Driven[S, Env, P].hibernate(take stepper, image: take taken, mut holding, orders, replies, telling, release)
-        None => try await Driven[S, Env, P].stop(take stepper, mut holding, keeping, dirty: due_at.is_some(), telling, release)
+        None => try await Driven[S, Env, P].stop(take stepper, mut holding, keeping, dirty: due_at.is_some(), hand, telling, release)
     }
 } Driven.run
 
-/// Ends the component behind `stepper` once told to stop: handles every message that waits, drops what its replays keep, keeps a checkpoint of it when it is `dirty` or handled a message, and ends the stepper, cancelling its keyed tasks with acknowledgement and handing its Env to `release`.
+/// Ends the component behind `stepper` once told to stop: handles every message that waits, drops what its replays keep, keeps a checkpoint of it when it is `dirty` or handled a message, hands the driver the encoding of its state when `hand`, and ends the stepper, cancelling its keyed tasks with acknowledgement and handing its Env to `release`.
 fn Driven.stop(
     take stepper: sys::Stepper[S, Env, P],
     mut holding: Holding[P],
     keeping: Option[Keeping],
     dirty: bool,
+    hand: bool,
     telling: Telling,
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
@@ -205,6 +208,11 @@ fn Driven.stop(
         }
         else => {
         }
+    }
+    if hand {
+        var state = mem::Bytes.empty(telling.alloc)
+        mem::wire::Codec[S].encode(ending.state(), out: mut state)
+        try await telling.tell(report: Report.Handed(state: take state, schema: ident::HashValue(bytes: mem::wire::Codec[S].schema_hash().bytes)))
     }
     try await telling.tell(report: Report.Ending)
     undefer ending
@@ -242,18 +250,24 @@ fn Driven.hibernate(
     return Ended.Hibernated
 } Driven.hibernate
 
-/// The reason the component's `resume` is called with: `Revived` for a revival, else the one its start gave.
-fn resumed_for(reason: sys::ResumeReason, revival: bool) -> sys::ResumeReason {
+/// The reason the component's `resume` is called with: `Revived` for a revival, `Updated` for an update, else the one its start gave.
+fn resumed_for(reason: sys::ResumeReason, revival: bool, updated: bool) -> sys::ResumeReason {
     if revival {
         return sys::ResumeReason.Revived
+    }
+    if updated {
+        return sys::ResumeReason.Updated
     }
     return reason
 } resumed_for
 
-/// What a start began from: a revival, the checkpoint `restored` names, or the component's start.
-fn started_from(restored: Option[u64], revival: bool) -> journal::StartedFrom {
+/// What a start began from: a revival, an update, the checkpoint `restored` names, or the component's start.
+fn started_from(restored: Option[u64], revival: bool, updated: bool) -> journal::StartedFrom {
     if revival {
         return journal::StartedFrom.Revival
+    }
+    if updated {
+        return journal::StartedFrom.Update
     }
     return match restored {
         Some(number) => journal::StartedFrom.Checkpoint(number: number)
@@ -269,7 +283,7 @@ fn Driven.forked(
     take serving: Serving,
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
-    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, revival: _, config: _, forking: forking, recorder: _) = serving
+    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, revival: _, updated: _, config: _, forking: forking, recorder: _) = serving
     let Some(ForkRun(call: call, reporting: reporting, tape: tape, reaching: reaching)) = forking else {
         release(take env)
         return Ended.Stopped
@@ -666,7 +680,7 @@ fn dispatch[P: sys::Protocol and Send](
     var signals = finishes
     loop {
         let Some(delivery) = try await mut receiver.receive() else {
-            fail Stopping.Asked
+            fail Stopping.Asked(hand: false)
         }
         match delivery {
             Delivery.Call(id: id, hash: hash, encoded: encoded, request: request, header: header, deadline: deadline) => {
@@ -678,7 +692,7 @@ fn dispatch[P: sys::Protocol and Send](
             Delivery.Hold(order: order) => {
                 discard orders.give(take order)
             }
-            Delivery.Stop => fail Stopping.Asked
+            Delivery.Stop(hand: hand) => fail Stopping.Asked(hand: hand)
         }
     }
 } dispatch
@@ -746,7 +760,7 @@ fn finish_step(steps: Steps, mut signals: task::Receiver[u64]) fails Stopping us
     }
     loop {
         let Some(through) = try await mut signals.receive() else {
-            fail Stopping.Asked
+            fail Stopping.Asked(hand: false)
         }
         if through >= target {
             return
