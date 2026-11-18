@@ -1,10 +1,13 @@
-//! The sequencer: the one task holding the engine, which mounts the volume, commits genesis or the generation's base instances, then serves the requests handed to it in their order, committing each run of commits through one log flush and telling subscriptions of the commits they watch.
+//! The sequencer: the one task holding the engine, which mounts the volume, commits genesis or the generation's base instances, tells the core every grant, then serves the requests handed to it in their order, committing each run of commits through one log flush, telling the core of the grants each commit to `main` writes before answering it, and telling subscriptions of the commits they watch.
 
 /// The most paths one `changed` message names.
 const MOST_PATHS: usize = 64
 
 /// The commits a subscription catches up on at most.
 const CAUGHT_UP: u32 = 64
+
+/// The grants one listing of `/sys/grants` gives at a mount.
+const GRANTS_LISTED: u32 = 256
 
 /// What the sequencer draws on besides its hand-off: the volume's port, the clocks, the random source, the reporter and its cell.
 struct Surroundings derives Copy {
@@ -55,7 +58,7 @@ fn Surroundings.now(self) -> ident::WallTime {
     return self.wall.now(self.clock)
 } Surroundings.now
 
-/// Mounts the volume and commits genesis or the generation's base instances, tells the component, then serves the requests the hand-off brings until cancelled; after a failed mount, every request fails as the mount did.
+/// Mounts the volume and commits genesis or the generation's base instances, tells the core every grant and then the component, then serves the requests the hand-off brings until cancelled; after a failed mount, every request fails as the mount did.
 fn sequence(
     world: Surroundings,
     take genesis: Genesis,
@@ -71,8 +74,9 @@ fn sequence(
     }
     match mounted {
         Ok(ready) => {
-            discard attempt await out.mounted(failure: None)
             var sequencer = ready
+            try await mut sequencer.hold_grants(world)
+            discard attempt await out.mounted(failure: None)
             var mappings = Mappings.empty(alloc)
             defer take mappings.close()
             var roots = BranchRoots.empty(alloc)
@@ -298,7 +302,7 @@ fn Run.empty(alloc: mem::Alloc) -> Run {
     return Run(requests: mem::List.empty(alloc), commits: mem::List.empty(alloc), paths: mem::List.empty(alloc))
 } Run.empty
 
-/// Commits the run of commits through one log flush, answers each and tells the subscriptions of those committed.
+/// Commits the run of commits through one log flush, answers each once the core holds the grants it writes to `main`, and tells the subscriptions of those committed.
 fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::Outbox[Store]) fails task::Cancelled uses wait {
     let Run(requests: requests, commits: commits, paths: paths) = run
     if commits.len() == 0 {
@@ -315,6 +319,9 @@ fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::O
         var reply = mem::Bytes.empty(alloc)
         match outcome {
             Ok(done) => {
+                if branches[at].as_str() == "main" {
+                    try await mut self.tell_grants(paths[at], whole: false, world)
+                }
                 try await mut self.tell(branch: branches[at].as_str(), commit: done.number, paths: paths[at], alloc)
                 let accepted: Result[store::Committed, Failure] = Ok(take done)
                 reply = encoded(accepted, alloc)
@@ -329,6 +336,80 @@ fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::O
     }
     try await mut self.show(world)
 } Sequencer.flush_run
+
+/// Tells the core of every grant of `/sys/grants` on `main` and waits until it holds them.
+fn Sequencer.hold_grants(mut self, world: Surroundings) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let dir = ident::Path(text: text::String.of("/sys/grants", alloc))
+    var paths = mem::List[ident::Path].empty(alloc)
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await mut self.engine.list(self.volume, branch: "main", path: dir, after, limit: GRANTS_LISTED, now: world.now(), alloc) {
+            Ok(found) => found
+            Err(store::StoreError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return
+        }
+        for entry in listing.entries {
+            let Some(path) = dir.child(entry.name.as_str().as_bytes(), alloc) else {
+                continue
+            }
+            mut paths.push(take path)
+        }
+        let Some(next) = listing.next else {
+            break
+        }
+        after = Some(take next)
+    }
+    try await mut self.tell_grants(paths, whole: true, world)
+} Sequencer.hold_grants
+
+/// Tells the core of the grants `/sys/grants/g<n>` among `paths` as `main` holds them, `None` for those it no longer holds, as every grant when `whole`, and waits until it holds them; nothing when `paths` names none and not `whole`.
+fn Sequencer.tell_grants(mut self, paths: mem::List[ident::Path], whole: bool, world: Surroundings) fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    var grants = mem::Map[u64, Option[os::Grant]].empty(alloc)
+    for path in paths {
+        let Some(number) = grant_number(path, alloc) else {
+            continue
+        }
+        let grant = match first attempt await mut self.engine.get(self.volume, branch: "main", path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), now: world.now(), alloc) {
+            Ok(node) => match node.value {
+                Some(value) => match attempt mem::wire::Codec[os::Grant].decode(value.view(), alloc) {
+                    Ok(decoded) => Some(take decoded)
+                    Err(_) => None
+                }
+                None => None
+            }
+            Err(store::StoreError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => None
+        }
+        discard mut grants.insert(number, value: take grant)
+    }
+    if grants.len() == 0 and not whole {
+        return
+    }
+    try await world.reporter.grants(take grants, whole, alloc)
+} Sequencer.tell_grants
+
+/// The number of the grant `/sys/grants/g<n>` that `path` names.
+fn grant_number(path: ident::Path, alloc: mem::Alloc) -> Option[u64] {
+    let segments = path.segments(alloc)
+    if segments.len() != 3 or segments[0].view() != b"sys" or segments[1].view() != b"grants" {
+        return None
+    }
+    let name = segments[2].view()
+    if name.len() < 2 or name[0] != b'g' {
+        return None
+    }
+    var number: u64 = 0
+    for at in 1..<name.len() {
+        let digit = name[at]
+        if digit < b'0' or digit > b'9' {
+            return None
+        }
+        number = number.saturating_mul(10).saturating_add(u64.widen(digit - b'0'))
+    }
+    return Some(number)
+} grant_number
 
 /// Tells each subscription on `branch` of the commit `commit`, which wrote `paths`, naming those below its prefix.
 fn Sequencer.tell(

@@ -18,6 +18,13 @@ pub closed struct Grant derives Render, Encode {
     pub granted_by: ident::CommitId
 } Grant
 
+/// What the core learns of the grants of `/sys/grants` on `main`: each grant a commit wrote, by number, `None` for one removed, or at a mount, `whole`, every grant; `applied` answers once the core's live grants hold them.
+pub closed struct Granted {
+    pub grants: mem::Map[u64, Option[Grant]]
+    pub whole: bool
+    pub applied: task::Sender[Unit]
+} Granted
+
 pub closed struct Caveats derives Render, Encode {
     pub budget: Option[u64]
     pub expires_utc_ns: Option[i64]
@@ -100,6 +107,121 @@ pub fn Grant.operations(self, alloc: mem::Alloc) -> Option[mem::Set[text::String
     return Some(take copied)
 } Grant.operations
 
+/// Whether the grant lies within `parent`, as a grant must its parent's: its object covered by the parent's, its rights among the parent's, its expiry at or before the parent's, and `ask` when the parent has it.
+pub fn Grant.within(self, parent: Grant) -> bool {
+    for right in self.rights {
+        if not parent.rights.contains(right) {
+            return false
+        }
+    }
+    match parent.caveats.expires_utc_ns {
+        Some(bound) => {
+            match self.caveats.expires_utc_ns {
+                Some(own) => {
+                    if own > bound {
+                        return false
+                    }
+                }
+                None => return false
+            }
+        }
+        None => {
+        }
+    }
+    if parent.caveats.ask and not self.caveats.ask {
+        return false
+    }
+    return object_within(self.object, parent: parent.object)
+} Grant.within
+
+/// Whether `object` is covered by `parent`: anything under `Machine`, a tree prefix under the parent's on its branch, an instance prefix under the parent's, a port prefix under the parent's with a subset of its operations, the same device, clock or random source, and a session no larger than the parent's.
+fn object_within(object: Object, parent: Object) -> bool {
+    return match parent {
+        Object.Machine => true
+        Object.Tree(prefix: bound, branch: branch) => match object {
+            Object.Tree(prefix: prefix, branch: own) => own.as_str() == branch.as_str() and path_under(prefix.text.as_str(), bound: bound.text.as_str())
+            else => false
+        }
+        Object.Instance(prefix: bound) => match object {
+            Object.Instance(prefix: prefix) => is_under(prefix, prefix: bound)
+            else => false
+        }
+        Object.Port(prefix: bound, operations: allowed) => match object {
+            Object.Port(prefix: prefix, operations: operations) => is_under(prefix, prefix: bound) and operations_within(operations, allowed)
+            else => false
+        }
+        Object.Clock => match object {
+            Object.Clock => true
+            else => false
+        }
+        Object.Random => match object {
+            Object.Random => true
+            else => false
+        }
+        Object.Device(path: bound) => match object {
+            Object.Device(path: path) => path.as_str() == bound.as_str()
+            else => false
+        }
+        Object.Session(share: bound, budget: ceiling) => match object {
+            Object.Session(share: share, budget: budget) => share_within(share, parent: bound) and budget_within(budget, parent: ceiling)
+            else => false
+        }
+    }
+} object_within
+
+/// Whether the tree path `path` is `bound` or a path below it.
+fn path_under(path: Str, bound: Str) -> bool {
+    if bound == "/" or path == bound {
+        return true
+    }
+    return path.byte_len() > bound.byte_len() and path.starts_with(bound) and path.as_bytes()[bound.byte_len()] == b'/'
+} path_under
+
+/// Whether the port operations `operations` are among `allowed`, every operation when empty.
+fn operations_within(operations: mem::Set[text::String], allowed: mem::Set[text::String]) -> bool {
+    if allowed.len() == 0 {
+        return true
+    }
+    if operations.len() == 0 {
+        return false
+    }
+    for operation in operations {
+        if not allowed.contains(operation) {
+            return false
+        }
+    }
+    return true
+} operations_within
+
+/// Whether the share `share` is at most `parent`: its class no higher, `Background` below `Normal` below `Latency`, and each other field no larger.
+fn share_within(share: Share, parent: Share) -> bool {
+    return class_rank(share.class) <= class_rank(parent.class) and share.weight <= parent.weight and share.runtime_us <= parent.runtime_us and share.period_us <= parent.period_us and share.energy_mj_per_h <= parent.energy_mj_per_h
+} share_within
+
+fn class_rank(class: CpuClass) -> u8 {
+    return match class {
+        CpuClass.Background => 0
+        CpuClass.Normal => 1
+        CpuClass.Latency => 2
+    }
+} class_rank
+
+/// Whether the session budget `budget` is at most `parent`, a `None` counting as unlimited.
+fn budget_within(budget: SessionBudget, parent: SessionBudget) -> bool {
+    return bound_within(budget.output_units, parent: parent.output_units) and budget.response_units <= parent.response_units and budget.query_records <= parent.query_records and budget.query_bytes <= parent.query_bytes and budget.previews <= parent.previews and bound_within(budget.cpu_ms, parent: parent.cpu_ms) and bound_within(budget.memory_bytes, parent: parent.memory_bytes) and bound_within(budget.egress_bytes, parent: parent.egress_bytes) and bound_within(budget.energy_mj, parent: parent.energy_mj) and bound_within(budget.infer_tokens, parent: parent.infer_tokens) and bound_within(budget.infer_micros, parent: parent.infer_micros)
+} budget_within
+
+/// Whether the bound `bound` is at most `parent`, `None` counting as unlimited.
+fn bound_within(bound: Option[u64], parent: Option[u64]) -> bool {
+    let Some(limit) = parent else {
+        return true
+    }
+    return match bound {
+        Some(own) => own <= limit
+        None => false
+    }
+} bound_within
+
 /// Whether `moniker` is `prefix` or a moniker below it.
 pub fn is_under(moniker: ident::Moniker, prefix: ident::Moniker) -> bool {
     let name = moniker.text.as_bytes()
@@ -120,3 +242,43 @@ test prefixes_cover_their_descendants for is_under {
     expect not is_under(named("apps"), prefix: named("app"))
     expect not is_under(named("app"), prefix: named("app.mail"))
 } prefixes_cover_their_descendants
+
+test grants_lie_within_parents_covering_their_object_rights_expiry_and_ask for Grant.within {
+    let alloc = testing::world().alloc
+    let machine = Grant(holder: owner(), object: Object.Machine, rights: rights_of(write: true, alloc), caveats: Caveats.none(), parent: None, granted_by: ident::CommitId(number: 1))
+    let data = tree_grant("/data", write: false, expires: Some(100), ask: true, alloc)
+    let notes = tree_grant("/data/notes", write: false, expires: Some(50), ask: true, alloc)
+    let sibling = tree_grant("/database", write: false, expires: Some(50), ask: true, alloc)
+    let writing = tree_grant("/data/notes", write: true, expires: Some(50), ask: true, alloc)
+    let unbounded = tree_grant("/data/notes", write: false, expires: None, ask: true, alloc)
+    let unasked = tree_grant("/data/notes", write: false, expires: Some(50), ask: false, alloc)
+    expect data.within(machine) and notes.within(data)
+    expect not sibling.within(data) and not writing.within(data) and not unbounded.within(data) and not unasked.within(data)
+    expect not machine.within(data)
+} grants_lie_within_parents_covering_their_object_rights_expiry_and_ask
+
+/// The principal `owner`.
+fn owner() -> ident::Principal {
+    return ident::Principal(text: text::Fixed[64].of("owner"))
+} owner
+
+/// The right to read, and to write when `write`.
+fn rights_of(write: bool, alloc: mem::Alloc) -> mem::Set[Right] {
+    var rights = mem::Set[Right].empty(alloc)
+    discard mut rights.insert(Right.Read)
+    if write {
+        discard mut rights.insert(Right.Write)
+    }
+    return rights
+} rights_of
+
+/// A grant of the tree under `prefix` on `main` to `owner`, reading and writing when `write`, until `expires`, asking when `ask`.
+fn tree_grant(
+    prefix: Str,
+    write: bool,
+    expires: Option[i64],
+    ask: bool,
+    alloc: mem::Alloc,
+    ) -> Grant {
+    return Grant(holder: owner(), object: Object.Tree(prefix: ident::Path(text: text::String.of(prefix, alloc)), branch: text::String.of("main", alloc)), rights: rights_of(write, alloc), caveats: Caveats(budget: None, expires_utc_ns: expires, ask: ask), parent: Some(0), granted_by: ident::CommitId(number: 2))
+} tree_grant

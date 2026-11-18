@@ -1,0 +1,286 @@
+//! The `selftest` job: checks that every base instance is converged, that `/live/memory` sums to RAM, that the policy record verifies, that every grant lies within its parent and that every specification's bundle is admitted.
+
+/// The most children one scan of a dir gives.
+const SCANNED: u32 = 256
+
+/// What a check examines.
+pub closed enum Checked derives Copy, Eq, Render, Encode {
+    Converged
+    Memory
+    Policy
+    Grants
+    Admitted
+} Checked
+
+/// A check of the selftest: what it examines, whether it passed, and in ASCII what failed it.
+pub closed struct Check derives Render, Encode {
+    pub name: Checked
+    pub passed: bool
+    pub detail: Untrusted[mem::Bytes]
+} Check
+
+/// Makes every check, reading the tree through the View of the job's grant `tree` and verifying the policy through the port of its wire `keys`; without that View every check fails.
+fn main(take world: nanos::World, take input: Unit) -> mem::List[Check] fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    var checks = mem::List[Check].empty(alloc)
+    let Ok(tree) = attempt nanos::Cap[store::service::View].get(world.caps, key: "tree") else {
+        mut checks.push(ungranted(Checked.Converged, alloc))
+        mut checks.push(ungranted(Checked.Memory, alloc))
+        mut checks.push(ungranted(Checked.Policy, alloc))
+        mut checks.push(ungranted(Checked.Grants, alloc))
+        mut checks.push(ungranted(Checked.Admitted, alloc))
+        return checks
+    }
+    mut checks.push(try await converged(tree, alloc))
+    mut checks.push(try await memory(tree, alloc))
+    mut checks.push(try await policy_verifies(tree, caps: world.caps, alloc))
+    mut checks.push(try await grants_within(tree, alloc))
+    mut checks.push(try await bundles_admitted(tree, alloc))
+    return checks
+} main
+
+/// `converged`: every instance acting for `system` that `/sys/instances` specifies is converged in `/live/instances`.
+fn converged(tree: store::service::View, alloc: mem::Alloc) -> Check fails task::Cancelled uses wait {
+    var lagging = mem::Bytes.empty(alloc)
+    for node in try await children(tree, dir: "/sys/instances", alloc) {
+        let Some(value) = node.value else {
+            continue
+        }
+        let Ok(spec) = attempt mem::wire::Codec[os::InstanceSpec].decode(value.view(), alloc) else {
+            continue
+        }
+        if spec.principal.text.as_str() != "system" {
+            continue
+        }
+        let name = last_segment(node.path.text.as_str(), alloc)
+        var path = text::String.of("/live/instances/", alloc)
+        mut path.append(name.as_str())
+        var running = false
+        match try await value_at(tree, path: path.as_str(), alloc) {
+            Some(bytes) => {
+                match attempt mem::wire::Codec[os::LiveInstance].decode(bytes.view(), alloc) {
+                    Ok(live) => {
+                        running = live.status.state == os::ReconcileState.Converged
+                    }
+                    Err(_) => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        if not running {
+            add(mut lagging, name: name.as_str())
+        }
+    }
+    return check(Checked.Converged, failures: take lagging)
+} converged
+
+/// `memory`: the parts of `/live/memory` sum to its `ram`.
+fn memory(tree: store::service::View, alloc: mem::Alloc) -> Check fails task::Cancelled uses wait {
+    var failures = mem::Bytes.empty(alloc)
+    let decoded = match try await value_at(tree, path: "/live/memory", alloc) {
+        Some(bytes) => attempt mem::wire::Codec[os::MemorySummary].decode(bytes.view(), alloc)
+        None => Err(core::DecodeError.Invalid)
+    }
+    match decoded {
+        Ok(summary) => {
+            if parts_of(summary) != summary.ram {
+                mut failures.append(b"its parts do not sum to its ram")
+            }
+        }
+        Err(_) => mut failures.append(b"/live/memory is unreadable")
+    }
+    return check(Checked.Memory, take failures)
+} memory
+
+/// The sum of the parts `summary` partitions RAM into.
+fn parts_of(summary: os::MemorySummary) -> u64 {
+    return summary.image + summary.boot_heap + summary.excluded + summary.frame_metadata + summary.page_tables + summary.core + summary.intakes + summary.hibernation + summary.store_cache + summary.blob_cache + summary.reserved + summary.accounts + summary.free + summary.unattributed
+} parts_of
+
+/// `policy`: `/sys/policy` is the genesis record's policy, or its signature verifies by the owner key through the port wired as `keys`.
+fn policy_verifies(tree: store::service::View, caps: nanos::Caps, alloc: mem::Alloc) -> Check fails task::Cancelled uses wait {
+    let decoded = match try await value_at(tree, path: "/sys/policy", alloc) {
+        Some(bytes) => attempt mem::wire::Codec[policy::SignedPolicy].decode(bytes.view(), alloc)
+        None => Err(core::DecodeError.Invalid)
+    }
+    let Ok(signed) = decoded else {
+        return check(Checked.Policy, failures: said("/sys/policy is unreadable", alloc))
+    }
+    if policy::is_genesis(signed, alloc) {
+        return check(Checked.Policy, failures: mem::Bytes.empty(alloc))
+    }
+    let Ok(handle) = attempt nanos::Cap[os::PortHandle].get(caps, key: "keys") else {
+        return check(Checked.Policy, failures: said("no port wired as keys", alloc))
+    }
+    let Some(keys) = os::Port[keys::Keys].of(handle) else {
+        return check(Checked.Policy, failures: said("keys serves another protocol", alloc))
+    }
+    let failures = match try await policy::signature_verifies(signed, keys, alloc) {
+        Some(true) => mem::Bytes.empty(alloc)
+        Some(false) => said("its signature does not verify", alloc)
+        None => said("it is unsigned", alloc)
+    }
+    return check(Checked.Policy, take failures)
+} policy_verifies
+
+/// `grants`: every grant of `/sys/grants` with a parent lies within it.
+fn grants_within(tree: store::service::View, alloc: mem::Alloc) -> Check fails task::Cancelled uses wait {
+    var numbers = mem::List[u64].empty(alloc)
+    var grants = mem::List[os::Grant].empty(alloc)
+    for node in try await children(tree, dir: "/sys/grants", alloc) {
+        let Some(number) = grant_number(last_segment(node.path.text.as_str(), alloc).as_str()) else {
+            continue
+        }
+        let Some(value) = node.value else {
+            continue
+        }
+        let Ok(grant) = attempt mem::wire::Codec[os::Grant].decode(value.view(), alloc) else {
+            continue
+        }
+        mut numbers.push(number)
+        mut grants.push(take grant)
+    }
+    var stray = mem::Bytes.empty(alloc)
+    for at in 0..<grants.len() {
+        let Some(parent) = grants[at].parent else {
+            continue
+        }
+        let inside = match numbers.position(fn(number: u64) => number == parent) {
+            Some(found) => grants[at].within(parent: grants[found])
+            None => false
+        }
+        if not inside {
+            add(mut stray, name: grant_name(numbers[at], alloc).as_str())
+        }
+    }
+    return check(Checked.Grants, failures: take stray)
+} grants_within
+
+/// `admitted`: the bundle of every specification of `/sys/instances` has an admission record.
+fn bundles_admitted(tree: store::service::View, alloc: mem::Alloc) -> Check fails task::Cancelled uses wait {
+    var missing = mem::Bytes.empty(alloc)
+    for node in try await children(tree, dir: "/sys/instances", alloc) {
+        let Some(value) = node.value else {
+            continue
+        }
+        let Ok(spec) = attempt mem::wire::Codec[os::InstanceSpec].decode(value.view(), alloc) else {
+            continue
+        }
+        var path = text::String.of("/sys/code/", alloc)
+        mut path.append(spec.bundle.full_form().as_str())
+        mut path.append("/admission")
+        if not try await exists(tree, path: path.as_str(), alloc) {
+            add(mut missing, name: last_segment(node.path.text.as_str(), alloc).as_str())
+        }
+    }
+    return check(Checked.Admitted, failures: take missing)
+} bundles_admitted
+
+/// The check `name`, passed when `failures` is empty, else naming them.
+fn check(name: Checked, take failures: mem::Bytes) -> Check {
+    return Check(name: name, passed: failures.len() == 0, detail: Untrusted.of(take failures))
+} check
+
+/// The check `name` failed for want of the job's View.
+fn ungranted(name: Checked, alloc: mem::Alloc) -> Check {
+    return check(name, failures: said("no View granted as tree", alloc))
+} ungranted
+
+/// The bytes of `text`.
+fn said(text: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(text.as_bytes())
+    return bytes
+} said
+
+/// Adds `name` to the list `names`, separated by commas.
+fn add(mut names: mem::Bytes, name: Str) {
+    if names.len() > 0 {
+        mut names.append(b", ")
+    }
+    mut names.append(name.as_bytes())
+} add
+
+/// The children of the dir `dir` with their values, through `tree`, scanned `SCANNED` at a time.
+fn children(tree: store::service::View, dir: Str, alloc: mem::Alloc) -> mem::List[store::Node] fails task::Cancelled uses wait {
+    var all = mem::List[store::Node].empty(alloc)
+    var from = text::String.empty(alloc)
+    loop {
+        let page = match first attempt await tree.scan(ident::Path(text: text::String.of(dir, alloc)), from: text::String.of(from.as_str(), alloc), to: text::String.empty(alloc), limit: SCANNED, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return all
+        }
+        let count = page.len()
+        for node in take page {
+            let name = last_segment(node.path.text.as_str(), alloc)
+            if not from.is_empty() and name.as_str() == from.as_str() {
+                continue
+            }
+            from = name
+            mut all.push(take node)
+        }
+        if u32.saturate(count) < SCANNED {
+            return all
+        }
+    }
+} children
+
+/// The value of the record at `path` through `tree`; `None` when there is none.
+fn value_at(tree: store::service::View, path: Str, alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]] fails task::Cancelled uses wait {
+    return match first attempt await tree.get(ident::Path(text: text::String.of(path, alloc)), at: None, alloc) {
+        Ok(found) => found.value
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} value_at
+
+/// Whether `tree` holds a node at `path`.
+fn exists(tree: store::service::View, path: Str, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
+    return match first attempt await tree.get(ident::Path(text: text::String.of(path, alloc)), at: None, alloc) {
+        Ok(_) => true
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => false
+    }
+} exists
+
+/// The last segment of the tree path `path`.
+fn last_segment(path: Str, alloc: mem::Alloc) -> text::String {
+    var start: usize = 0
+    let bytes = path.as_bytes()
+    for at in 0..<bytes.len() {
+        if bytes[at] == b'/' {
+            start = at + 1
+        }
+    }
+    let Some(segment) = path.slice_bytes(start, end: path.byte_len()) else {
+        return text::String.empty(alloc)
+    }
+    return text::String.of(segment, alloc)
+} last_segment
+
+/// The number of the grant named `name`, `g<n>`.
+fn grant_number(name: Str) -> Option[u64] {
+    if not name.starts_with("g") or name.byte_len() < 2 {
+        return None
+    }
+    var number: u64 = 0
+    let bytes = name.as_bytes()
+    for at in 1..<bytes.len() {
+        let digit = bytes[at]
+        if digit < b'0' or digit > b'9' {
+            return None
+        }
+        number = number.saturating_mul(10).saturating_add(u64.widen(digit - b'0'))
+    }
+    return Some(number)
+} grant_number
+
+/// The name `g<n>` of the grant numbered `number`.
+fn grant_name(number: u64, alloc: mem::Alloc) -> text::String {
+    var name = text::String.of("g", alloc)
+    mut name.write(Dyn[Render].view(number), budget: 20)
+    return name
+} grant_name

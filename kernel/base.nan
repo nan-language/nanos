@@ -62,6 +62,8 @@ const POWER_CONFIG_TYPE: Str = "power::PowerConfig"
 
 const LINK_CONFIG_TYPE: Str = "link::LinkConfig"
 
+const POLICY_CONFIG_TYPE: Str = "policy::PolicyConfig"
+
 /// The memory limit of `store`, whose engine keeps index nodes of 16 KiB in memory.
 const STORE_LIMIT: u64 = 67_108_864
 
@@ -80,12 +82,13 @@ const TRANSFER_ROOM: usize = 256
 /// How long after the core's start `store`, `keys`, `journal` and `policy` may take to run.
 const BASE_DEADLINE_NS: u64 = 30_000_000_000
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the hash of the support routines the image exports, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, the switch of the machine's power, where `link` publishes `/live/sessions` and learns the instances calling it, and the loader of jobs' bundles.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the hash of the support routines the image exports, the bytes the image spans, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, the switch of the machine's power, where `link` publishes `/live/sessions` and learns the instances calling it, and the loader of jobs' bundles.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
     bundle: ident::HashValue
     support: ident::HashValue
+    image_bytes: u64
     boot: devices::BootVolume
     isa: Array[acpi::IsaRoute, 16]
     reporter: store::service::Reporter
@@ -246,8 +249,30 @@ fn Base.schema(self, component: Str, alloc: mem::Alloc) -> Option[sys::ProtocolS
 /// Whether the component's Env draws only on its world: `policy`'s and `clock`'s.
 fn Base.forkable(self, component: Str) -> bool = component == POLICY or component == TIMEKEEPER
 
-/// Whether the component's Env takes a configuration record: `journal`'s, `policy`'s, `clock`'s, `power`'s and `link`'s.
-fn Base.configured(self, component: Str) -> bool = component == JOURNAL or component == POLICY or component == TIMEKEEPER or component == POWER or component == LINKER
+/// Whether the component's Env takes a configuration record.
+fn Base.configured(self, component: Str) -> bool {
+    return config_type(component).is_some()
+} Base.configured
+
+/// The canonical path of the configuration record type the component's Env takes: `journal`'s, `policy`'s, `clock`'s, `power`'s and `link`'s.
+fn config_type(component: Str) -> Option[text::Fixed[32]] {
+    if component == JOURNAL {
+        return Some(text::Fixed[32].of(JOURNAL_CONFIG_TYPE))
+    }
+    if component == POLICY {
+        return Some(text::Fixed[32].of(POLICY_CONFIG_TYPE))
+    }
+    if component == TIMEKEEPER {
+        return Some(text::Fixed[32].of(CLOCK_CONFIG_TYPE))
+    }
+    if component == POWER {
+        return Some(text::Fixed[32].of(POWER_CONFIG_TYPE))
+    }
+    if component == LINKER {
+        return Some(text::Fixed[32].of(LINK_CONFIG_TYPE))
+    }
+    return None
+} config_type
 
 fn Base.serve(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     if component == DEVICES {
@@ -531,7 +556,7 @@ fn Base.serve_store(self, take world: nanos::World, take serving: runner::Servin
         Ok(reached) => os::Port[store::service::Sealing].of(reached)
         Err(_) => None
     }
-    let genesis = genesis_record(self.bundle, handoff: self.handoff, alloc)
+    let genesis = genesis_record(self.bundle, handoff: self.handoff, admitted: self.admission(alloc), alloc)
     let env = store::service::Env.of(volume, take genesis, boot: boot_record(self.handoff, alloc), clock: world.clock, wall: self.wall, random: world.random, reporter: self.reporter, live: self.store_live, devices: manager, keys: keyring, alloc)
     return try await runner::Driven[store::service::Service, store::service::Env, store::service::Store].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: store::service::Env) limits stack 8_192 {
     })
@@ -993,8 +1018,8 @@ fn tree_of(prefix: Str, alloc: mem::Alloc) -> os::Object {
     return os::Object.Tree(prefix: tree_path(prefix, alloc), branch: text::String.of("main", alloc))
 } tree_of
 
-/// The genesis record of generation `generation`: the dirs of `/sys`, `/data` and `/state`, the base instances' specifications and grants of the image's genesis, running `bundle`, and the store's retention defaults.
-fn genesis_record(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::Genesis {
+/// The genesis record of generation `generation`: the dirs of `/sys`, `/data` and `/state`, the base instances' specifications and grants of the image's genesis, running `bundle` of admission record `admitted`, and the store's retention defaults.
+fn genesis_record(bundle: ident::HashValue, handoff: bootfmt::Handoff, take admitted: store::service::TypedValue, alloc: mem::Alloc) -> store::service::Genesis {
     let runner::Known(specs: specs, grants: grants) = image_genesis(bundle, handoff, alloc)
     var granted = mem::List[store::service::TypedValue].empty(alloc)
     for entry in take grants {
@@ -1039,7 +1064,7 @@ fn genesis_record(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: me
     var policed = mem::Bytes.empty(alloc)
     mem::wire::Codec[policy::SignedPolicy].encode(policy::SignedPolicy(policy: policy::Preset.Supervised.policy(version: 1, machine: Array[u8, 16].filled(0), alloc), signature: None), out: mut policed)
     let signed = store::service::TypedValue(type: store::TypeRef.of(SIGNED_POLICY_TYPE, schema: mem::wire::Codec[policy::SignedPolicy].schema_hash(), alloc), bytes: take policed)
-    return store::service::Genesis(format: 1, generation: handoff.generation, nodes: take nodes, instances: take specs, config: take config, principals: take principals, grants: take granted, policy: take signed)
+    return store::service::Genesis(format: 1, generation: handoff.generation, nodes: take nodes, instances: take specs, admission: take admitted, config: take config, principals: take principals, grants: take granted, policy: take signed)
 } genesis_record
 
 /// The owner's principal record: holding the owner key the handoff record names on a claimed machine, no key in `dev` mode on an unclaimed one, `None` otherwise.
@@ -1118,6 +1143,7 @@ fn run_base(
     defer take pool.close()
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
     let task::Channel(sender: reported, receiver: reports) = task::Channel[store::service::Report].bounded(16, alloc: config.alloc)
+    let task::Channel(sender: granted, receiver: granting) = task::Channel[os::Granted].bounded(1, alloc: config.alloc)
     let task::Channel(sender: posted, receiver: postings) = task::Channel[os::Posting].bounded(16, alloc: config.alloc)
     let task::Channel(sender: switched, receiver: switches) = task::Channel[power::Switching].bounded(1, alloc: config.alloc)
     let task::Channel(sender: accounted, receiver: accounting) = task::Channel[os::AccountOrder].bounded(16, alloc: config.alloc)
@@ -1128,13 +1154,13 @@ fn run_base(
     let lives = Roots.of(orders, reported, posted, switched, accounted, take transferred, loads, backlog, monikers: rings.monikers(), alloc: config.alloc)
     defer take lives.close()
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
-    let base = Base(root: lives.root.mint(claim: false), claims: lives.root.mint(claim: true), bundle: bundle, support: support, boot: boot, isa: isa, reporter: lives.reporter.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: lives.feed.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint(), loading: lives.loading.mint())
+    let base = Base(root: lives.root.mint(claim: false), claims: lives.root.mint(claim: true), bundle: bundle, support: support, image_bytes: fixed.image, boot: boot, isa: isa, reporter: lives.reporter.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: lives.feed.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint(), loading: lives.loading.mint())
     var requested = incoming
     let counters = Counters.of(requests.split(), alloc: config.alloc)
-    var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, postings: take postings, switches: take switches, logged: take logged, traced: take traced, accounting: take accounting, transfers: take transfers, loads: take load_orders, loader: take loader))
+    var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, granted: take granted, granting: take granting, postings: take postings, switches: take switches, logged: take logged, traced: take traced, accounting: take accounting, transfers: take transfers, loads: take load_orders, loader: take loader))
     defer abandon_given(take given)
     try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested, mut pool](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, postings: board, switches: switch_orders, logged: log_records, traced: tracing, accounting: account_orders, transfers: transfer_records, loads: bundle_orders, loader: bundles)) = mut given.extract() else {
+        let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, granted: grants_out, granting: grants_in, postings: board, switches: switch_orders, logged: log_records, traced: tracing, accounting: account_orders, transfers: transfer_records, loads: bundle_orders, loader: bundles)) = mut given.extract() else {
             return
         }
         let origin = Origin.of(handoff, clock: config.clock, wall: config.wall)
@@ -1153,8 +1179,8 @@ fn run_base(
         discard s.spawn(fn() fails task::Cancelled uses wait limits stack 16_384 {
             try await print_events(rings, backlog, exec: config.exec, alloc: config.alloc)
         })
-        discard s.spawn(fn[take store_events]() fails task::Cancelled uses wait limits stack 8_192 {
-            try await record_store_events(take store_events, rings, blob_cache: counters.blob_cache.share())
+        discard s.spawn(fn[take store_events, take grants_out]() fails task::Cancelled uses wait limits stack 8_192 {
+            try await record_store_events(take store_events, rings, blob_cache: counters.blob_cache.share(), granted: take grants_out)
         })
         discard s.spawn(fn[take switch_orders]() fails task::Cancelled uses wait limits stack 4_096 {
             try await switch_power(take switch_orders, cpus: cpus.share())
@@ -1179,8 +1205,8 @@ fn run_base(
         discard s.spawn(fn[take signal, take inputs]() fails task::Cancelled uses wait limits stack 8_192 {
             try await keeper::relay_slots(signal, take inputs)
         })
-        discard s.spawn(fn[take genesis, take resources, take account_orders, take gauges, take tracing]() fails task::Cancelled uses wait limits stack 36_864 {
-            discard try await runner::run(take genesis, components: base, journal: rings, machine: take resources, accounting: take account_orders, config, postings: posted, logs: logs.split(), gauges, tracings: take tracing, body: fn(core: runner::Core) fails task::Cancelled uses wait {
+        discard s.spawn(fn[take genesis, take resources, take account_orders, take gauges, take tracing, take grants_in]() fails task::Cancelled uses wait limits stack 36_864 {
+            discard try await runner::run(take genesis, components: base, journal: rings, machine: take resources, accounting: take account_orders, config, postings: posted, logs: logs.split(), gauges, tracings: take tracing, granting: take grants_in, body: fn(core: runner::Core) fails task::Cancelled uses wait {
                 discard attempt await core.control.start(moniker("supervisor"), alloc: config.alloc)
                 try await watch_base(core.control, clock: config.clock, alloc: config.alloc)
                 let parked = hw::Signal[Unit].empty()
@@ -1283,8 +1309,8 @@ fn hold_logs(take logged: task::Receiver[journal::Logged], backlog: journal::Bac
     }
 } hold_logs
 
-/// Writes each event the store reports to the core rings, keeps the bytes it reports its blob cache holds in `blob_cache`, and halts the kernel with the code of a failed mount.
-fn record_store_events(take reports: task::Receiver[store::service::Report], rings: rings::Rings, blob_cache: mem::Shared[core::atomic::AtomicU64]) fails task::Cancelled uses wait {
+/// Writes each event the store reports to the core rings, keeps the bytes it reports its blob cache holds in `blob_cache`, hands the grants it reports to the runner through `granted`, and halts the kernel with the code of a failed mount.
+fn record_store_events(take reports: task::Receiver[store::service::Report], rings: rings::Rings, blob_cache: mem::Shared[core::atomic::AtomicU64], take granted: task::Sender[os::Granted]) fails task::Cancelled uses wait {
     var receiver = reports
     loop {
         let Some(report) = try await mut receiver.receive() else {
@@ -1294,6 +1320,13 @@ fn record_store_events(take reports: task::Receiver[store::service::Report], rin
             store::service::Report.Event(event) => rings.record_store(event)
             store::service::Report.MountFailed(code: code) => halt(code: code.as_str(), subject: "store")
             store::service::Report.BlobCache(bytes: bytes) => blob_cache.contents().store(bytes)
+            store::service::Report.Grants(grants) => {
+                match attempt await granted.send(take grants) {
+                    Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+                    else => {
+                    }
+                }
+            }
         }
     }
 } record_store_events
@@ -1302,7 +1335,7 @@ fn record_store_events(take reports: task::Receiver[store::service::Report], rin
 fn abandon_given(take given: Option[Given]) {
     match given {
         Some(left) => {
-            let Given(known: _, machine: _, keeper: kept, orders: _, store_events: _, postings: _, switches: _, logged: _, traced: _, accounting: _, transfers: _, loads: _, loader: _) = left
+            let Given(known: _, machine: _, keeper: kept, orders: _, store_events: _, granted: _, granting: _, postings: _, switches: _, logged: _, traced: _, accounting: _, transfers: _, loads: _, loader: _) = left
             take kept.release()
         }
         None => {
@@ -1310,13 +1343,15 @@ fn abandon_given(take given: Option[Given]) {
     }
 } abandon_given
 
-/// What the tasks of `run_base` take: the genesis record and the machine the runner takes, the keeper with the device root's orders, the events the store reports, the postings to the board, the orders of the power switch, the log records of instances, the instances `journal` traces, the orders for the accounts of sessions, the transfers drivers charge, and the orders of loading with the loader carrying them out.
+/// What the tasks of `run_base` take: the genesis record and the machine the runner takes, the keeper with the device root's orders, the events the store reports and the grants it hands the runner, the postings to the board, the orders of the power switch, the log records of instances, the instances `journal` traces, the orders for the accounts of sessions, the transfers drivers charge, and the orders of loading with the loader carrying them out.
 linear struct Given {
     known: runner::Known
     machine: Resources
     keeper: keeper::Keeper
     orders: task::Receiver[devices::RootOrder]
     store_events: task::Receiver[store::service::Report]
+    granted: task::Sender[os::Granted]
+    granting: task::Receiver[os::Granted]
     postings: task::Receiver[os::Posting]
     switches: task::Receiver[power::Switching]
     logged: task::Receiver[journal::Logged]
@@ -1418,10 +1453,12 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unloaded
     let loads = loading::MintedLoading.of(loading, alloc)
     defer take loads.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), support: ident::HashValue(bytes: bundle), boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint(), loading: loads.mint())
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), support: ident::HashValue(bytes: bundle), image_bytes: 0, boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint(), loading: loads.mint())
     let task::Channel(sender: logs, receiver: unlogged) = task::Channel[journal::Logged].bounded(1, alloc)
     discard unlogged
-    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, machine: Unkept(alloc: alloc), accounting: take unaccounted, config, postings: posted, logs, gauges: runner::Gauges.empty(alloc), tracings: take untraced, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
+    let task::Channel(sender: ungranted, receiver: granting) = task::Channel[os::Granted].bounded(1, alloc)
+    discard ungranted
+    let started = try await runner::run(image_genesis(ident::HashValue(bytes: bundle), handoff: bootfmt::Handoff.empty(), alloc), components: base, journal: rings, machine: Unkept(alloc: alloc), accounting: take unaccounted, config, postings: posted, logs, gauges: runner::Gauges.empty(alloc), tracings: take untraced, take granting, body: fn(core: runner::Core) -> os::Lifecycle fails os::ControlError uses wait {
         let started = try await core.control.start(moniker("supervisor"), alloc)
         discard try await core.control.stop(moniker("supervisor"), alloc)
         return started

@@ -226,7 +226,7 @@ fn ask(revocations: task::Sender[Revocation], grant: u64, reason: Reason, alloc:
     return revoked
 } ask
 
-/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them, as work of the boot's system cause, `body`'s included: each has a driver carrying out its lifecycle and publishing its record through `postings` and the gauge of its running incarnation through `gauges`, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes. The handler calls of the instances each set `tracings` gives names are traced, each until it expires. Each rise of the pressure level of a pool `machine` tells relieves it, and `accounting` brings the orders opening and closing the accounts of sessions.
+/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them, as work of the boot's system cause, `body`'s included: each has a driver carrying out its lifecycle and publishing its record through `postings` and the gauge of its running incarnation through `gauges`, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes. The handler calls of the instances each set `tracings` gives names are traced, each until it expires. Each rise of the pressure level of a pool `machine` tells relieves it, `accounting` brings the orders opening and closing the accounts of sessions, and `granting` the grants of `/sys/grants` the live grants follow.
 pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Machine and Send, T: Send, E: Send](
     take known: Known,
     components: C,
@@ -238,6 +238,7 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Machine and 
     logs: task::Sender[journal::Logged],
     gauges: Gauges,
     take tracings: task::Receiver[mem::List[journal::TracedInstance]],
+    take granting: task::Receiver[os::Granted],
     body: fn(core: Core) -> T fails E uses wait limits stack 16_384,
     ) -> Option[T] fails E uses wait {
     let alloc = config.alloc
@@ -268,11 +269,11 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Machine and 
     let core = os::MintedControl.of(orders, grant: None, prefix: None, alloc)
     defer take core.close()
     var result: Option[T] = None
-    var waiting = Some(Waiting(drivers: take drivers, ordered: take ordered, revoking: take revoking, tracing: take tracings, accounting: take accounting))
+    var waiting = Some(Waiting(drivers: take drivers, ordered: take ordered, revoking: take revoking, tracing: take tracings, accounting: take accounting, granting: take granting))
     defer abandon(take waiting)
     try await sys::run_headed(config.work().carried(), body: fn[mut result, mut waiting]() fails E uses wait {
         try await task::scope(config.exec, body: fn[mut result, mut waiting](s: task::Scope) fails E uses wait {
-            let Some(Waiting(drivers: started, ordered: orders_in, revoking: revoking_in, tracing: tracing_in, accounting: accounting_in)) = mut waiting.extract() else {
+            let Some(Waiting(drivers: started, ordered: orders_in, revoking: revoking_in, tracing: tracing_in, accounting: accounting_in, granting: granting_in)) = mut waiting.extract() else {
                 return
             }
             let governed = routes.share()
@@ -283,6 +284,11 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Machine and 
             let revoking_routes = routes.share()
             discard s.spawn(fn[take revoking_in, take revoked, take revoking_routes]() fails task::Cancelled uses wait limits stack 16_384 {
                 try await revoke(take revoking_in, routes: revoking_routes, directory: revoked, journal, alloc)
+            })
+            let held = reached.share()
+            let withdrawing = routes.share()
+            discard s.spawn(fn[take granting_in, take held, take withdrawing]() fails task::Cancelled uses wait limits stack 16_384 {
+                try await keep_grants(take granting_in, routes: withdrawing, directory: held, journal, alloc)
             })
             let tracing_routes = routes.share()
             let tracing_set = traced.share()
@@ -331,13 +337,14 @@ linear struct Waiting {
     revoking: task::Receiver[Revocation]
     tracing: task::Receiver[mem::List[journal::TracedInstance]]
     accounting: task::Receiver[os::AccountOrder]
+    granting: task::Receiver[os::Granted]
 } Waiting
 
 /// Releases the drivers that never ran.
 fn abandon(take waiting: Option[Waiting]) {
     match waiting {
         Some(left) => {
-            let Waiting(drivers: drivers, ordered: _, revoking: _, tracing: _, accounting: _) = left
+            let Waiting(drivers: drivers, ordered: _, revoking: _, tracing: _, accounting: _, granting: _) = left
             for each in take drivers {
                 let Started(driver: driver, inputs: _, taken: _, calls: _) = each
                 take driver.abandon()
@@ -348,7 +355,7 @@ fn abandon(take waiting: Option[Waiting]) {
     }
 } abandon
 
-/// Carries out each revocation in turn: its grants leave the live grants, every driver `routes` reaches revokes the root entries it holds of them, and each removal is recorded as the core's, before their numbers are answered.
+/// Carries out each revocation in turn: its grants leave the live grants and are withdrawn, before their numbers are answered.
 fn revoke[J: Journal](
     take revocations: task::Receiver[Revocation],
     routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]],
@@ -362,31 +369,69 @@ fn revoke[J: Journal](
             return
         }
         let revoked = await when mut directory => mut directory.revoke(grant, alloc)
-        let drivers = await when routes => routed(routes, alloc)
-        if revoked.len() > 0 and drivers.len() > 0 {
-            let task::Channel(sender: closed, receiver: acknowledged) = task::Channel[Unit].bounded(drivers.len(), alloc)
-            var asked: usize = 0
-            for driver in drivers {
-                match attempt await driver.inputs.send(Input.Revoke(grants: copy_of(revoked, alloc), done: closed.split())) {
-                    Ok(_) => {
-                        asked += 1
-                    }
-                    Err(task::SendError.Closed) => {
-                    }
-                    Err(task::SendError.Cancelled(cancelled)) => fail cancelled
-                }
-            }
-            var acknowledgements = acknowledged
-            for _ in 0..<asked {
-                discard try await mut acknowledgements.receive()
-            }
-        }
-        for number in revoked {
-            journal.record(0, cause: 0, event: Event.Revoked(grant: number, reason: reason))
+        let Withdrawal(acknowledged: acknowledged, asked: asked) = try await withdraw(revoked, routes, journal, reason, alloc)
+        var acknowledgements = acknowledged
+        for _ in 0..<asked {
+            discard try await mut acknowledgements.receive()
         }
         discard attempt await done.send(take revoked)
     }
 } revoke
+
+/// Holds the grants each report of `/sys/grants` gives as live grants and answers it, then withdraws the grants it removed, leaving the drivers' acknowledgements unread so that the store is never held up by a driver.
+fn keep_grants[J: Journal](
+    take granting: task::Receiver[os::Granted],
+    routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]],
+    directory: task::Cown[Directory],
+    journal: J,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var receiver = granting
+    loop {
+        let Some(os::Granted(grants: grants, whole: whole, applied: applied)) = try await mut receiver.receive() else {
+            return
+        }
+        var given = Some(take grants)
+        let removed = await when mut directory => mut directory.hold(mut given, whole, alloc)
+        discard attempt await applied.send(Unit)
+        discard try await withdraw(removed, routes, journal, reason: Reason.Revoke, alloc)
+    }
+} keep_grants
+
+/// The acknowledgements of the drivers asked to revoke grants, and how many were asked.
+struct Withdrawal {
+    acknowledged: task::Receiver[Unit]
+    asked: usize
+} Withdrawal
+
+/// Withdraws the grants `revoked` took from the live grants: asks every driver `routes` reaches to revoke the root entries it holds of them, and records each removal as the core's, for `reason`.
+fn withdraw[J: Journal](
+    revoked: mem::Set[u64],
+    routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]],
+    journal: J,
+    reason: Reason,
+    alloc: mem::Alloc,
+    ) -> Withdrawal fails task::Cancelled uses wait {
+    let drivers = await when routes => routed(routes, alloc)
+    let task::Channel(sender: closed, receiver: acknowledged) = task::Channel[Unit].bounded(drivers.len().max(1), alloc)
+    var asked: usize = 0
+    if revoked.len() > 0 {
+        for driver in drivers {
+            match attempt await driver.inputs.send(Input.Revoke(grants: copy_of(revoked, alloc), done: closed.split())) {
+                Ok(_) => {
+                    asked += 1
+                }
+                Err(task::SendError.Closed) => {
+                }
+                Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+            }
+        }
+    }
+    for number in revoked {
+        journal.record(0, cause: 0, event: Event.Revoked(grant: number, reason: reason))
+    }
+    return Withdrawal(acknowledged: take acknowledged, asked: asked)
+} withdraw
 
 /// Keeps each set of traced instances in `traced`, for the drivers launched after it, and tells every driver `routes` reaches until when its instance is traced.
 fn trace(take tracings: task::Receiver[mem::List[journal::TracedInstance]], routes: task::Cown[mem::Map[ident::Moniker, task::Sender[Input]]], traced: task::Cown[mem::List[journal::TracedInstance]], config: Config) fails task::Cancelled uses wait {

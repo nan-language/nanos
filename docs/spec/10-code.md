@@ -108,7 +108,7 @@ Admitting a code hash already admitted runs steps 7 to 12 only. Admission is cha
 
 ## Admission record
 
-`/sys/code/<hash>` is a dir holding `admission`, the admission record, `bundle`, the bundle blob, and `image`, the image the machine loads. Only `admission` writes it, and at a generation's initial boot it writes the base bundle's record from the genesis record.
+`/sys/code/<hash>` is a dir holding `admission`, the admission record, `bundle`, the bundle blob, and `image`, the image the machine loads. Only admission writes it; the base bundle's record comes from the genesis record ([genesis](13-tree.md#genesis)).
 
 ```nan
 pub closed struct Admission derives Encode {

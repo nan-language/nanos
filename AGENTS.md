@@ -36,6 +36,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `link/` | The `link` package: requests, blocks in canonical rendering and JSON, sessions under their principals' grants, queries, watches, plans with their previews, applies and undos, uploads, request keys, the primer, the code catalogue and the `link` instance on the serial and port transports; in `transcripts/` the link transcripts `tools/transcripts` runs |
 | `console/` | The `console` package: the `console` instance, sharing the console UART with the link |
 | `loader/` | The `loader` package |
+| `jobs/` | The jobs a generation ships, one package each |
 | `kernel/` | The `kernel` package |
 | `tools/` | The `install`, `sandbox` and `transcripts` scripts, and in `bundler/` the host program making bundle files |
 | `docs/` | Documentation: the specification in `docs/spec/`, ADRs in `docs/decisions/` |
