@@ -1,6 +1,6 @@
 # 0115. Bundle components
 
-Status: accepted
+Status: superseded by 0120
 
 ## Context
 

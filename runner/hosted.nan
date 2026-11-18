@@ -1,6 +1,6 @@
 //! Instances of a bundle's components: the admission record describing each one's component, and the task of its domain, which reads the image of its bundle at each start and drives the instance the kernel holds for it as `Driven.run` drives a component of the kernel image.
 
-/// A bundle's component as the runner runs it: the name of the entry its bundle exports it under, the protocol it serves, its state schema, the names of its operations by number, whether its Env takes a configuration record, and the View of `/sys/code` its starts read its bundle's image through, `None` while `store` has no endpoint.
+/// A bundle's component as the runner runs it: the name of the entry its bundle exports it under, the protocol it serves, its state schema, the names of its operations by number, whether its Env takes a configuration record, the View of `/sys/code` its starts read its bundle's image through, `None` while `store` has no endpoint, and the encoding of the protocol schema its bundle gives for it once an incarnation told it.
 struct Hosted {
     entry: text::String
     protocol: sys::ProtocolHash
@@ -8,13 +8,15 @@ struct Hosted {
     operations: mem::List[text::String]
     configured: bool
     code: Option[store::service::View]
+    served: Option[mem::Bytes]
 } Hosted
 
-/// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, its state schema, the names of its component's operations by number, the executor and allocator of its domain, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
+/// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, its state schema, the names of its component's operations by number, the encoding of the protocol schema its bundle gives for it, the executor and allocator of its domain, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
 pub open linear struct Hosting {
     serving: Serving
     schema: ident::HashValue
     operations: mem::List[text::String]
+    served: Option[mem::Bytes]
     exec: task::Executor
     alloc: mem::Alloc
     replier: sys::Minter[Replier, Pending, u8]
@@ -44,7 +46,7 @@ validator fn hosted_in(record: Untrusted[Slice[u8]], component: Str, alloc: mem:
         for operation in described.operations {
             mut operations.push(text::String.of(operation.name.as_str(), alloc))
         }
-        return Some(Hosted(entry: text::String.of(entry, alloc), protocol: sys::ProtocolHash(bytes: described.protocol.bytes), schema: described.schema, operations: take operations, configured: described.config.is_some(), code: None))
+        return Some(Hosted(entry: text::String.of(entry, alloc), protocol: sys::ProtocolHash(bytes: described.protocol.bytes), schema: described.schema, operations: take operations, configured: described.config.is_some(), code: None, served: None))
     }
     return None
 } hosted_in
@@ -163,6 +165,36 @@ fn Directory.read_code(self, mut driver: Driver, alloc: mem::Alloc) {
     }
 } Directory.read_code
 
+/// Keeps a copy of `encoded`, the encoding of the protocol schema the bundle gives for the instance's component.
+fn Driver.described_hosted(mut self, encoded: Slice[u8]) {
+    let Some(described) = mut self.hosted.extract() else {
+        return
+    }
+    var hosted = take described.into_contents()
+    var kept = mem::Bytes.empty(self.alloc)
+    mut kept.append(encoded)
+    hosted.served = Some(take kept)
+    self.hosted = Some(mem::Heap.of(self.alloc).boxed(take hosted))
+} Driver.described_hosted
+
+/// The protocol schema the bundle of the instance's component gives for it, when it serves the instance's protocol; `None` for a component of the kernel image or before an incarnation told it.
+fn Driver.served_schema(self) -> Option[sys::ProtocolSchema] {
+    let Some(described) = self.hosted else {
+        return None
+    }
+    let hosted = described.contents()
+    let Some(encoded) = hosted.served else {
+        return None
+    }
+    let Ok(schema) = attempt mem::wire::Codec[sys::ProtocolSchema].decode(Untrusted.of(encoded.view()), alloc: self.alloc) else {
+        return None
+    }
+    if schema.hash != hosted.protocol {
+        return None
+    }
+    return Some(take schema)
+} Driver.served_schema
+
 /// What the first task of a start of the instance's domain runs the bundle's component from; `None` for a component of the kernel image.
 fn Driver.bundled(self) -> Option[mem::Box[Bundled]] {
     let Some(described) = self.hosted else {
@@ -193,8 +225,18 @@ pub fn Hosting.of(
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: serving.keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
     let signal = pending.signal.share()
-    return Hosting(serving: take serving, schema: schema, operations: take operations, exec: exec, alloc: alloc, replier: sys::Minter[Replier, Pending, u8].of(take pending, alloc), replies: take replies, signal: take signal, syncing: take syncing)
+    return Hosting(serving: take serving, schema: schema, operations: take operations, served: None, exec: exec, alloc: alloc, replier: sys::Minter[Replier, Pending, u8].of(take pending, alloc), replies: take replies, signal: take signal, syncing: take syncing)
 } Hosting.of
+
+/// Keeps `served`, the protocol schema the bundle gives for the component, for the driver.
+pub fn Hosting.describe(mut self, served: Option[sys::ProtocolSchema]) {
+    let Some(schema) = served else {
+        return
+    }
+    var bytes = mem::Bytes.empty(self.alloc)
+    mem::wire::Codec[sys::ProtocolSchema].encode(schema, out: mut bytes)
+    self.served = Some(take bytes)
+} Hosting.describe
 
 /// The runner capability the component hands its replies and summaries through, denied once revoked.
 pub fn Hosting.runner(self) -> sys::Runner {
@@ -215,13 +257,13 @@ pub fn Hosting.take_checkpoint(mut self) -> Option[mem::Bytes] {
 
 /// Revokes the runner capability of an instance the kernel never held.
 pub fn Hosting.close(take self) {
-    let Hosting(serving: _, schema: _, operations: _, exec: _, alloc: _, replier: replier, replies: _, signal: _, syncing: _) = self
+    let Hosting(serving: _, schema: _, operations: _, served: _, exec: _, alloc: _, replier: replier, replies: _, signal: _, syncing: _) = self
     take replier.close()
 } Hosting.close
 
 /// Runs the instance `instance` of the bundle's component as `Driven.run` runs one of the kernel image: resumes it, ends it at once when its health is not `Healthy`, then serves what its driver delivers, one call at a time, suspending it after the time without a message the driver sets and keeping its checkpoints. Told to stop, it handles every message that waits, keeps a checkpoint when the state is dirty, and ends the instance. Orders for its holder are refused. How the instance ended, or the trap that abandoned its domain.
 pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
-    let Hosting(serving: serving, schema: schema, operations: operations, exec: exec, alloc: alloc, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
+    let Hosting(serving: serving, schema: schema, operations: operations, served: served, exec: exec, alloc: alloc, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
     defer take replier.close()
     let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: _, updated: updated, config: _, forking: _, recorder: recorder) = serving
     var held = instance
@@ -239,6 +281,11 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
         Err(nanos::InstanceError.Ended) => false
     }
     if began {
+        match served {
+            Some(encoded) => try await tell(reports, incarnation, report: Report.Described(schema: take encoded))
+            None => {
+            }
+        }
         try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival: false, updated), operations: names_in(steps.contents().operations, alloc)))
         let inbox = held.inbox()
         let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)

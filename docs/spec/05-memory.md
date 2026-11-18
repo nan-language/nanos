@@ -22,6 +22,7 @@ A **pool** is a NaN memory store over one region that the frame allocator gives 
 | an extra pool | a free range of at least 64 MiB, made when a node pool reaches [pressure](#pressure) level 4 | instances and sessions that start after it |
 
 - The node pool of the node with the most memory leaves RAM ÷ 16 of its range to the frame allocator, which keeps it with every other free range for reserved instances, page tables beyond the core reserve and extra pools.
+- Below that part, it gives RAM ÷ 32 of its range to NaN's boot heap, which holds the runtime's records and the core's task stacks.
 - At each start, revival and update of a top-level instance, and when a principal's first session opens, the core splits its cell from the pool with the most free memory among the pools of the node of the CPU that runs the start, or of any node when that node has none.
 - An idle pool costs nothing.
 
