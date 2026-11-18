@@ -58,13 +58,14 @@ enum Mark {
     Ended
 } Mark
 
-/// How an instance's domain ended other than by abandonment: stopped, hibernated, without an Env, unhealthy at its start, or with a latest checkpoint that does not decode.
+/// How an instance's domain ended other than by abandonment: stopped, hibernated, without an Env, unhealthy at its start, with a latest checkpoint that does not decode, or with a bundle that does not load, the load's code given.
 pub closed enum Ended derives Copy, Eq {
     Stopped
     Hibernated
     EnvIncomplete
     Unhealthy
     CheckpointUndecodable
+    Unloadable(code: text::Fixed[32])
 } Ended
 
 /// The instances of a component of state S serving P whose Env is Env, which they build from their world.
@@ -75,9 +76,10 @@ pub open struct Served[S: sys::Component[Env, P] and Encode, Env: nanos::Environ
 pub open struct Driven[S: sys::Component[Env, P] and Encode, Env: Any and Send, P: sys::Protocol and Send] {
 } Driven
 
-/// The end of the delivery loop: the driver asked to stop, or released its deliveries.
+/// The end of the delivery loop: the driver asked to stop, or released its deliveries, or the instance of a bundle's component ended.
 enum Stopping {
     Asked
+    Ended
     Cancelled(task::Cancelled) from
 } Stopping
 
@@ -457,13 +459,18 @@ fn epoch_after(keeping: Option[Keeping], clock: sys::Clock) -> Option[u64] {
 fn checkpoint[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], keeping: Keeping, telling: Telling) -> bool fails task::Cancelled uses wait {
     var bytes = mem::Bytes.empty(telling.alloc)
     mem::wire::Codec[S].encode(stepper.state(), out: mut bytes)
+    return try await keep_checkpoint(keeping, take bytes, schema: mem::wire::Codec[S].schema_hash(), telling)
+} checkpoint
+
+/// Keeps `bytes`, the encoding of the component's state of schema `schema`, as its next checkpoint, telling the driver when that fails; whether it was kept.
+fn keep_checkpoint(keeping: Keeping, take bytes: mem::Bytes, schema: mem::wire::SchemaHash, telling: Telling) -> bool fails task::Cancelled uses wait {
     let encoded = u64.widen(bytes.len())
-    let Some(code) = try await keeping.keep(take bytes, schema: mem::wire::Codec[S].schema_hash(), incarnation: telling.incarnation) else {
+    let Some(code) = try await keeping.keep(take bytes, schema, incarnation: telling.incarnation) else {
         return true
     }
     try await telling.tell(report: Report.CheckpointFailed(code: code, bytes: encoded))
     return false
-} checkpoint
+} keep_checkpoint
 
 /// What the holder of an instance's domain tells and counts through: the driver's inputs for the incarnation `incarnation`, the marks of its watch, the steps it counts for the dispatcher with the signal of those finished, the monotonic clock, the instance's flight recorder, and the allocator of the domain.
 struct Telling {
@@ -487,7 +494,7 @@ struct Began derives Copy {
 fn Telling.begin(self, call: SystemCall) -> Began {
     let began = Began(time: now(self.clock), taken: Taken.system(call, cause: os::Header.current().cause))
     match self.recorder {
-        Some(recorder) => recorder.begin(time: began.time, taken: began.taken)
+        Some(recorder) => recorder.begin(time: began.time, taken: Some(began.taken))
         None => {
         }
     }
@@ -530,6 +537,19 @@ fn Telling.end_step(self, began: u64, stepped: Option[sys::Handled]) {
     }
 } Telling.end_step
 
+/// Counts a finished step, signalling the dispatcher when it waits for that count.
+fn Telling.count_step(self) fails task::Cancelled uses wait {
+    let counts = self.steps.contents()
+    let done = counts.done.fetch_add(1).value_or(0) + 1
+    if counts.wanted.compare_swap(expected: done, replacement: 0).is_ok() {
+        match attempt await self.finished.send(done) {
+            Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    }
+} Telling.count_step
+
 /// Tells the driver `report`.
 fn Telling.tell(self, take report: Report) fails task::Cancelled uses wait {
     try await tell(self.reports, incarnation: self.incarnation, take report)
@@ -554,6 +574,21 @@ fn Steps.operation_of(self, encoding: Slice[u8], alloc: mem::Alloc) -> u8 {
     }
 } Steps.operation_of
 
+/// What the flight recorder takes of the call posted to the component, which it takes, the step that just handled a message having taken it; nothing known when none is posted.
+fn Steps.claimed(self) -> Taken {
+    let claimed = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Posted] limits notrap {
+        return self.posted.with(t, body: fn(mut held: Option[Posted]) -> Option[Posted] limits notrap, terminates, noalloc {
+            let posted = held
+            held = None
+            return posted
+        })
+    })
+    return match claimed {
+        Some(call) => call.taken
+        None => Taken.unknown()
+    }
+} Steps.claimed
+
 /// A call posted to the component: the header the step handling it gives, and what the flight recorder takes of it.
 struct Posted derives Copy {
     header: sys::Header
@@ -569,16 +604,16 @@ fn Steps.post(self, posted: Option[Posted]) {
     })
 } Steps.post
 
-/// What the flight recorder takes of the call posted to the component, which the next step most likely handles; nothing known when none is posted.
-fn Steps.posted_taken(self) -> Taken {
+/// What the flight recorder takes of the call posted to the component, which the next step most likely handles; `None` when none is posted.
+fn Steps.posted_taken(self) -> Option[Taken] {
     let posted = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[Posted] limits notrap {
         return self.posted.with(t, body: fn(mut held: Option[Posted]) -> Option[Posted] limits notrap, terminates, noalloc {
             return held
         })
     })
     return match posted {
-        Some(call) => call.taken
-        None => Taken.unknown()
+        Some(call) => Some(call.taken)
+        None => None
     }
 } Steps.posted_taken
 
@@ -670,9 +705,22 @@ fn serve_call[P: sys::Protocol and Send](
         return try await sys::Wire[P].serve(out, request: id, hash, peers: peers.view(), raw: Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc)
     })
     steps.contents().post(None)
+    try await settle_call(take outcome, id, request, steps: steps.contents(), mut signals, reports, incarnation)
+} serve_call
+
+/// Tells the driver how the call `id` its component was served ended with `outcome`: a request answered or postponed, or a one-way call taken once the handler call that took it has returned.
+fn settle_call(
+    take outcome: Result[Option[sys::Encoded], sys::CallError[Never]],
+    id: u64,
+    request: bool,
+    steps: Steps,
+    mut signals: task::Receiver[u64],
+    reports: task::Sender[Input],
+    incarnation: u64,
+    ) fails Stopping uses wait {
     if not request {
         if outcome.is_ok() {
-            try await finish_step(steps.contents(), mut signals)
+            try await finish_step(steps, mut signals)
         }
         try await tell(reports, incarnation, report: Report.Taken(id: id))
         return
@@ -687,7 +735,7 @@ fn serve_call[P: sys::Protocol and Send](
         else => os::Answer.ServerStopped
     }
     try await tell(reports, incarnation, report: Report.Answered(id: id, answer: take answer))
-} serve_call
+} settle_call
 
 /// Waits until the step that took the call just posted has finished: every step begun by now. The holder signals the count it waits for when it reaches it, unless the count is already reached and the dispatcher withdraws its wait first.
 fn finish_step(steps: Steps, mut signals: task::Receiver[u64]) fails Stopping uses wait {
@@ -754,14 +802,7 @@ fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept
             None => {
             }
         }
-        let done = counts.done.fetch_add(1).value_or(0) + 1
-        if counts.wanted.compare_swap(expected: done, replacement: 0).is_ok() {
-            match attempt await telling.finished.send(done) {
-                Err(task::SendError.Cancelled(cancelled)) => fail cancelled
-                else => {
-                }
-            }
-        }
+        try await telling.count_step()
         if stepped.is_none() {
             break
         }

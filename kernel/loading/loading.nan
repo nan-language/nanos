@@ -1,4 +1,4 @@
-//! Jobs in the shared space: the loader the core keeps, loading the image of each job's bundle and unloading it once the job ends, and the runs of jobs' `main`.
+//! Bundles in the shared space: the loader the core keeps, loading the image of each job's or instance's bundle and unloading it once the job or instance ends, the runs of jobs' `main`, and the instances of bundles' components.
 
 /// A capability having the core load bundle images and unload them.
 pkg struct Loading {
@@ -126,22 +126,8 @@ pkg fn Loading.run_job(
     exec: task::Executor,
     alloc: mem::Alloc,
     ) -> os::JobOutcome fails task::Cancelled uses wait {
-    let Some(orders) = sys::reach(self, body: fn(state: Loads, record: u8) => state.orders.split()) else {
-        return failed_job("port.revoked", alloc)
-    }
-    let task::Channel(sender: loaded, receiver: loading) = task::Channel[Result[Loaded, text::Fixed[32]]].bounded(1, alloc)
-    match attempt await orders.send(LoadOrder.Load(image: take image, loaded: take loaded)) {
-        Ok(_) => {
-        }
-        Err(task::SendError.Closed) => return failed_job("port.server-stopped", alloc)
-        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
-    }
-    var receiver = loading
-    let Some(replied) = try await mut receiver.receive() else {
-        return failed_job("port.server-stopped", alloc)
-    }
-    let Loaded(number: number, load: load) = match replied {
-        Ok(given) => given
+    let Held(orders: orders, number: number, load: load) = match try await self.loaded(take image, alloc) {
+        Ok(held) => held
         Err(code) => return failed_job(code.as_str(), alloc)
     }
     let ran = attempt await nanos::run(load, take world, take input, domain, exec, alloc)
@@ -156,6 +142,81 @@ pkg fn Loading.run_job(
         Err(nanos::RunError.Cancelled(cancelled)) => fail cancelled
     }
 } Loading.run_job
+
+/// Runs an instance of the component the bundle whose image is `image` exports as its entry `component`, on `world` as `hosting` asks: the core loads the image, `nanos::hold` holds the instance in a domain of its own, and the core unloads the image once the instance ends. A bundle whose image does not load, or which exports no such entry, is `Unloadable` with the load's code or `code.malformed`.
+pkg fn Loading.host(
+    self,
+    take image: mem::Bytes,
+    component: Str,
+    take world: nanos::World,
+    take hosting: runner::Hosting,
+    ) -> Result[runner::Ended, sys::Trap] fails task::Cancelled uses wait {
+    let exec = world.exec
+    let alloc = world.alloc
+    var hosted = hosting
+    defer take hosted.close()
+    let Held(orders: orders, number: number, load: load) = match try await self.loaded(take image, alloc) {
+        Ok(held) => held
+        Err(code) => return Ok(runner::Ended.Unloadable(code: code))
+    }
+    let checkpoint = mut hosted.take_checkpoint()
+    let runner = hosted.runner()
+    undefer hosted
+    var given = Some(take hosted)
+    let held = attempt await nanos::hold(load, component, take world, take checkpoint, runner, exec, alloc, body: fn[mut given](take instance: nanos::Instance) -> Result[runner::Ended, sys::Trap] fails task::Cancelled uses wait limits stack 65_536 {
+        let Some(taken) = mut given.extract() else {
+            take instance.abandon()
+            return Ok(runner::Ended.Stopped)
+        }
+        return try await runner::Hosting.run(take taken, take instance)
+    })
+    discard attempt await orders.send(LoadOrder.Unload(number: number))
+    release(take given)
+    return match held {
+        Ok(Some(ended)) => ended
+        Ok(None) => Ok(runner::Ended.Unloadable(code: text::Fixed[32].of("code.malformed")))
+        Err(cancelled) => fail cancelled
+    }
+} Loading.host
+
+/// Revokes the runner capability of an instance `nanos::hold` never held.
+fn release(take unheld: Option[runner::Hosting]) {
+    match unheld {
+        Some(hosting) => take hosting.close()
+        None => {
+        }
+    }
+} release
+
+/// A bundle the core loaded for a job or an instance: where the orders of loading go, the number the core keeps it under, and a load of it.
+struct Held {
+    orders: task::Sender[LoadOrder]
+    number: u64
+    load: sys::load::Load
+} Held
+
+/// Has the core load the image `image`, giving the bundle it keeps, or the code of the failure.
+fn Loading.loaded(self, take image: mem::Bytes, alloc: mem::Alloc) -> Result[Held, text::Fixed[32]] fails task::Cancelled uses wait {
+    let Some(orders) = sys::reach(self, body: fn(state: Loads, record: u8) => state.orders.split()) else {
+        return Err(text::Fixed[32].of("port.revoked"))
+    }
+    let task::Channel(sender: loaded, receiver: loading) = task::Channel[Result[Loaded, text::Fixed[32]]].bounded(1, alloc)
+    match attempt await orders.send(LoadOrder.Load(image: take image, loaded: take loaded)) {
+        Ok(_) => {
+        }
+        Err(task::SendError.Closed) => return Err(text::Fixed[32].of("port.server-stopped"))
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+    }
+    var receiver = loading
+    let Some(replied) = try await mut receiver.receive() else {
+        return Err(text::Fixed[32].of("port.server-stopped"))
+    }
+    let Loaded(number: number, load: load) = match replied {
+        Ok(given) => given
+        Err(code) => return Err(code)
+    }
+    return Ok(Held(orders: take orders, number: number, load: take load))
+} Loading.loaded
 
 /// A job's failure with the code `code`.
 fn failed_job(code: Str, alloc: mem::Alloc) -> os::JobOutcome {
