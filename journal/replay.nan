@@ -1,0 +1,108 @@
+//! Replay: a recorded input re-run on forks of its instance, and what it found.
+
+/// What a replay asks: the instance, the number of the recorded input, the bundle to run it under in place of the recorded one, and whether its store reads return `main`'s head rather than the store as the recording left it.
+pub closed struct ReplayRequest derives Render, Encode {
+    pub moniker: ident::Moniker
+    pub seq: u64
+    pub bundle: Option[ident::HashValue]
+    pub with_head: bool
+} ReplayRequest
+
+/// How a replayed input ended: its handler returned, or trapped with this report.
+pub closed enum ReplayResult derives Render, Encode {
+    Returned
+    Trapped(report: text::String)
+} ReplayResult
+
+/// What a replay found: the input's number, the bundle that ran it, how it ended, the fields of the state it changed, the messages it sent the instance, the encodings of its replies and its store writes, none of which was released.
+pub closed struct ReplayReport derives Encode {
+    pub seq: u64
+    pub bundle: ident::HashValue
+    pub result: ReplayResult
+    pub changed: mem::List[store::FieldEdit]
+    pub sends: mem::List[os::HeldOutput]
+    pub replies: mem::List[mem::Bytes]
+    pub writes: mem::List[store::Write]
+} ReplayReport
+
+/// Re-runs the recorded input `request` names on forks of its instance through `control`; without `with_head`, their store reads reach a branch `view` creates at the commit that wrote the recording, deleted after. What the input found, or the code of what failed.
+pub fn replay_input(control: os::Control, view: store::service::View, request: ReplayRequest, alloc: mem::Alloc) -> Result[ReplayReport, text::Fixed[32]] fails task::Cancelled uses wait {
+    var branch = text::String.of("main", alloc)
+    var made = false
+    if not request.with_head {
+        match try await recording_commit(view, moniker: request.moniker, alloc) {
+            Some(written) => {
+                let name = replay_branch(request, alloc)
+                match first attempt await view.branch(text::String.of(name.as_str(), alloc), at: Some(written), alloc) {
+                    Ok(_) => {
+                        branch = name
+                        made = true
+                    }
+                    Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+                    Err(_) => {
+                    }
+                }
+            }
+            None => {
+            }
+        }
+    }
+    let rerun = attempt await control.rerun(ident::Moniker(text: request.moniker.text), seq: request.seq, bundle: request.bundle, branch: text::String.of(branch.as_str(), alloc), alloc)
+    if made {
+        discard attempt await view.delete_branch(take branch, alloc)
+    }
+    let os::Rerun(bundle: bundle, before: before, forked: forked) = match first rerun {
+        Ok(reran) => reran
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(refused) => return Err(refused.code())
+    }
+    let os::Forked(state_bytes: _, reply: reply, sent: sent, spawns: _, state: after, recorded: _, reached: _, fault: fault) = forked
+    let result = match fault {
+        Some(os::ForkFault.Trap(kind: kind, report: report)) => ReplayResult.Trapped(report: trap_report(kind.as_str(), report: report.as_str(), alloc))
+        Some(os::ForkFault.Unhealthy(reason: reason)) => ReplayResult.Trapped(report: take reason)
+        Some(os::ForkFault.Unbuilt(code: code)) => return Err(code)
+        None => ReplayResult.Returned
+    }
+    let changed = match after {
+        Some(state) => store::field_edits_of(old: before.state.view(), new: state.state.view(), alloc)
+        None => mem::List.empty(alloc)
+    }
+    var replies = mem::List[mem::Bytes].empty(alloc)
+    match reply {
+        Some(bytes) => mut replies.push(take bytes)
+        None => {
+        }
+    }
+    return Ok(ReplayReport(seq: request.seq, bundle: bundle, result: take result, changed: take changed, sends: take sent, replies: take replies, writes: mem::List.empty(alloc)))
+} replay_input
+
+/// The commit that wrote the recording of the instance `moniker` at `/state/<moniker>/recording`, `None` when `view` reads none.
+fn recording_commit(view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) -> Option[ident::CommitId] fails task::Cancelled uses wait {
+    var path = text::String.of("/state/", alloc)
+    mut path.append(moniker.text.as_str())
+    mut path.append("/recording")
+    return match first attempt await view.get(ident::Path(text: take path), at: None, alloc) {
+        Ok(node) => Some(node.version)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} recording_commit
+
+/// The name of the branch a replay of `request` reads the store through: `replay-<moniker>-<seq>`.
+fn replay_branch(request: ReplayRequest, alloc: mem::Alloc) -> text::String {
+    var name = text::String.of("replay-", alloc)
+    mut name.append(request.moniker.text.as_str())
+    mut name.append("-")
+    mut name.write(Dyn[Render].view(request.seq), budget: 20)
+    return name
+} replay_branch
+
+/// The report of a trap of kind `kind`: its kind, then its report when it has one.
+fn trap_report(kind: Str, report: Str, alloc: mem::Alloc) -> text::String {
+    var text = text::String.of(kind, alloc)
+    if report.byte_len() > 0 {
+        mut text.append(": ")
+        mut text.append(report)
+    }
+    return text
+} trap_report

@@ -53,7 +53,7 @@ fn history(
     return block
 } history
 
-/// `history <moniker>`: an `input` record per input header of the instance's flight recorder, oldest first, read through `control`; a moniker naming no instance the session reads fails with the nearest monikers as fixes.
+/// `history <moniker>`: an `input` record per input header of the instance's flight recorder, oldest first, read through `control`, or with `--replay`, the replay of one of its recorded inputs; a moniker naming no instance the session reads fails with the nearest monikers as fixes.
 fn moniker_history(
     request: Request,
     subject: Str,
@@ -66,6 +66,9 @@ fn moniker_history(
     let monikers = try await names_below(tree, path: "/sys/instances", alloc)
     match first moniker_of(subject) {
         Some(moniker) if monikers.position(fn(each: text::String) => each.as_str() == subject).is_some() => {
+            if request.has("replay") {
+                return try await replay_history(request, take moniker, tree, control, alloc)
+            }
             let inputs = match first attempt await control.inputs(take moniker, alloc) {
                 Ok(held) => held
                 Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
@@ -88,6 +91,63 @@ fn moniker_history(
     }
     return failed_block(id, verb, operand: subject, take failure, alloc)
 } moniker_history
+
+/// `history <moniker> --replay <seq> [--bundle <hash>] [--with-head]`: re-runs the recorded input `seq` of the instance `moniker` on forks through `control`, its store reads reaching `tree` as the recording left it or, with `--with-head`, `main`'s head, and prints `replay <seq>, bundle, result`, a `changed` record per field of the state it changed, and an `output` record per message it sent the instance, none released.
+fn replay_history(request: Request, take moniker: ident::Moniker, tree: store::service::View, control: os::Control, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+    let id = request.id.as_str()
+    let verb = request.verb.as_str()
+    let operand = moniker.text.as_str()
+    let written = match request.flag("replay") {
+        Some(given) => text::String.of(given, alloc)
+        None => text::String.empty(alloc)
+    }
+    let Some(seq) = number_of(written.as_str()) else {
+        return failed_block(id, verb, operand, failure: Failure.of("request.invalid-flag", subject: "--replay", alloc).expecting("the number of a recorded input", found: written.as_str(), alloc), alloc)
+    }
+    var bundle: Option[ident::HashValue] = None
+    match request.flag("bundle") {
+        Some(named) => {
+            let shown = text::String.of(named, alloc)
+            let Ok(hash) = attempt ident::HashValue.parse(Untrusted.of(take named), alloc) else {
+                return failed_block(id, verb, operand, failure: Failure.of("request.invalid-flag", subject: "--bundle", alloc).expecting("a code hash", found: shown.as_str(), alloc), alloc)
+            }
+            bundle = Some(hash)
+        }
+        None => {
+        }
+    }
+    let asked = journal::ReplayRequest(moniker: ident::Moniker(text: moniker.text), seq: seq, bundle: bundle, with_head: request.has("with-head"))
+    let replayed = match try await journal::replay_input(control, view: tree, request: asked, alloc) {
+        Ok(found) => found
+        Err(code) => return failed_block(id, verb, operand, failure: Failure.of(code.as_str(), subject: operand, alloc), alloc)
+    }
+    var block = Block.of(Verdict.Ok, id, verb, operand, alloc)
+    var head = Record.of("replay", alloc)
+    mut head.subject(Dyn[Render].view(replayed.seq))
+    mut head.hash("bundle", value: replayed.bundle)
+    match replayed.result {
+        journal::ReplayResult.Returned => mut head.rendered("result", rendered: "returned", alloc)
+        journal::ReplayResult.Trapped(report: trap_text) => {
+            var rendered = text::String.of("trapped: ", alloc)
+            mut rendered.append(trap_text.as_str())
+            mut head.rendered("result", rendered: rendered.as_str(), alloc)
+        }
+    }
+    mut block.records.push(take head)
+    for field in replayed.changed {
+        var record = Record.of("changed", alloc)
+        mut record.rendered("field", rendered: field.field.as_str(), alloc)
+        mut block.records.push(take record)
+    }
+    for output in replayed.sends {
+        var record = Record.of("output", alloc)
+        mut record.rendered("operation", rendered: output.operation.as_str(), alloc)
+        mut record.field("size", value: Dyn[Render].view(output.encoded.len()))
+        mut record.hash("hash", value: ident::HashValue.of_content(output.encoded.view()))
+        mut block.records.push(take record)
+    }
+    return block
+} replay_history
 
 /// `input <seq>, cause, sender, operation, size, hash`: the sender `kernel` for the core, without the operation when it is unknown.
 fn input_record(input: os::Input, alloc: mem::Alloc) -> Record {

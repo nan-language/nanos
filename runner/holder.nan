@@ -6,7 +6,7 @@ const HOLDER_ORDERS: usize = 8
 /// The request number a replayed call is served under.
 const REPLAYED_REQUEST: u64 = 0xFFFF_FFFF_FFFF_FFFF
 
-/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`; a pause, told to `done`; the end of the pause; a hibernation, only of an idle component when `idle`; a call of its `pressure` with `level`; a probe of its health, which the holder reports; a replay of `call` under `header`, the component's Views of `main` reaching the branch `branch` through `redirect` and its clock and random source serving `recorded` through `tape` meanwhile, which the holder reports; the release of what replays keep but those `kept` names; the release of the first message or keyed task `kept` names; and the drop of what replays keep.
+/// What the task of an instance's domain carries out between its handler calls: a copy of its component's state, sent to `reply`; a pause, told to `done`; the end of the pause; a hibernation, only of an idle component when `idle`; a call of its `pressure` with `level`; a probe of its health, which the holder reports; a replay of `call` under `header`, the component's Views of `main` reaching the branch `branch` through `redirect` and its clock and random source serving `recorded` through `tape` meanwhile, which the holder reports; the release of what replays keep but those `kept` names; the release of the first message or keyed task `kept` names; the drop of what replays keep; and the arming of the flight recorder for `period` from the component's state, a state of the bundle `bundle`, its handlers' reads taken through `tape`.
 enum HolderOrder {
     Snapshot(reply: task::Sender[os::StateCopy])
     Pause(done: task::Sender[Result[os::Outcome, os::ControlError]])
@@ -18,6 +18,7 @@ enum HolderOrder {
     Release(kept: mem::List[os::Kept], done: task::Sender[Result[os::Outcome, os::ControlError]])
     Deliver(kept: os::Kept, done: task::Sender[Result[os::Outcome, os::ControlError]])
     Discard(done: task::Sender[Result[os::Outcome, os::ControlError]])
+    Arm(bundle: ident::HashValue, period: Period, tape: Tape)
 } HolderOrder
 
 /// The orders waiting for an instance's holder, the waker of its stepper, and the signal each order posts for a paused holder.
@@ -181,7 +182,7 @@ fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
             }
             HolderOrder.Replay(call: call, header: header, branch: branch, redirect: redirect, recorded: recorded, tape: tape) => {
                 tape.replay(recorded)
-                let outcome = try await replayed(mut stepper, take call, header, branch: branch.as_str(), redirect, mut holding, telling, s)
+                let outcome = try await replayed(mut stepper, take call, header, branch: branch.as_str(), redirect, served: recorded, mut holding, telling, s)
                 tape.pass()
                 try await telling.tell(report: Report.Replayed(outcome: take outcome))
             }
@@ -200,22 +201,31 @@ fn carry_out[S: Encode, Env: Any, P: sys::Protocol and Send](
                 mut holding.drop_kept(mut stepper)
                 discard attempt await done.send(Ok(os::Outcome.Done))
             }
+            HolderOrder.Arm(bundle: bundle, period: period, tape: tape) => {
+                match telling.recorder {
+                    Some(recorder) => try await recorder.arm(base: state_copy(stepper, alloc), bundle, period, take tape)
+                    None => {
+                    }
+                }
+            }
         }
     }
 } carry_out
 
-/// Replays `call` on the paused component behind `stepper` under `header`, its Views of `main` reaching `branch` through `redirect` until its handler returns: a task of `s` posts it, and the holder calls the handlers of the messages its intake holds, starting the keyed tasks they spawn, until it handles the call, recording each handler call through `telling`. Keeps in `holding` the messages and keyed tasks the call's handler gave, setting the other messages aside, and gives them with the encoding of its reply; `request.invalid-operand` when `branch` is no branch name, `port.stopped` when the call could not be served.
+/// Replays `call` on the paused component behind `stepper` under `header`, its Views of `main` reaching `branch` through `redirect` until its handler returns: a task of `s` posts it, and the holder calls the handlers of the messages its intake holds, starting the keyed tasks they spawn, until it handles the call, recording each handler call through `telling`, and an armed flight recorder each message handled, the call with the reads `served` its handler took. Keeps in `holding` the messages and keyed tasks the call's handler gave, setting the other messages aside, and gives them with the encoding of its reply; `request.invalid-operand` when `branch` is no branch name, `port.stopped` when the call could not be served.
 fn replayed[S, Env: Any, P: sys::Protocol and Send](
     mut stepper: sys::Stepper[S, Env, P],
     take call: os::ForkCall,
     header: os::Header,
     branch: Str,
     redirect: store::service::Redirect,
+    served: os::Recorded,
     mut holding: Holding[P],
     telling: Telling,
     s: task::Scope,
     ) -> Result[os::Replayed, os::ControlError] fails task::Cancelled uses wait {
     let alloc = telling.alloc
+    let recording = telling.armed().is_some()
     if not redirect.set(from: "main", to: Some(branch)) {
         return Err(os::ControlError.Invalid)
     }
@@ -229,8 +239,16 @@ fn replayed[S, Env: Any, P: sys::Protocol and Send](
     loop {
         try await stepper.incoming()
         let stepping = now(telling.clock)
+        let seq = match telling.armed() {
+            Some(recorder) => recorder.next_seq()
+            None => 0
+        }
         telling.begin_step(stepping)
-        let stepped = mut stepper.step()
+        var out = sys::Encoded.empty(alloc)
+        let stepped = match recording {
+            true => sys::Wire[P].step_encoded(mut stepper, mut out)
+            false => mut stepper.step()
+        }
         let Some(handled) = stepped else {
             telling.end_step(stepping, stepped)
             if failed.contents().load() {
@@ -241,6 +259,17 @@ fn replayed[S, Env: Any, P: sys::Protocol and Send](
         let replay = match handled.header {
             Some(carried) => os::Header.from_bits(carried.bytes).cause == header.cause
             None => false
+        }
+        match first telling.armed() {
+            Some(recorder) if out.bytes.len() > 0 => {
+                let reads = match replay {
+                    true => os::Recorded(clock: copied_words(served.clock, alloc), random: copied_words(served.random, alloc))
+                    false => os::Recorded(clock: mem::List.empty(alloc), random: mem::List.empty(alloc))
+                }
+                try await recorder.take_input(os::RecordedInput(seq: seq, hash: sys::Wire[P].hash(), encoded: take out.bytes, recorded: take reads))
+            }
+            else => {
+            }
         }
         if replay {
             taken.operation = u8.saturate(handled.operation)
@@ -272,6 +301,15 @@ fn replayed[S, Env: Any, P: sys::Protocol and Send](
     let spawns = mut holding.keep_tasks(stepper, alloc)
     return Ok(os::Replayed(reply: take reply, sent: take sent, spawns: take spawns))
 } replayed
+
+/// A copy of `words`.
+fn copied_words(words: mem::List[u64], alloc: mem::Alloc) -> mem::List[u64] {
+    var copy = mem::List[u64].empty(alloc)
+    for word in words {
+        mut copy.push(word)
+    }
+    return copy
+} copied_words
 
 /// Serves `call` on the component behind `out` from a task of `s`, under the header `carried`, telling `answering` its reply, or that it could not be served, waking the stepper `waker` then.
 fn serve_replayed[P: sys::Protocol and Send](

@@ -1,4 +1,4 @@
-//! Flight recorders: the headers of the last inputs each instance's handler calls took, kept across its incarnations.
+//! Flight recorders: the headers of the last inputs each instance's handler calls took, kept across its incarnations, and while armed a recording of its inputs from a base state.
 
 /// How many inputs a flight recorder holds the headers of.
 const RECORDED_INPUTS: u64 = 16
@@ -6,10 +6,29 @@ const RECORDED_INPUTS: u64 = 16
 /// The operation number of an input whose handler call ended before telling what it took.
 const UNKNOWN_OPERATION: u8 = 0xFF
 
-/// The flight recorder of an instance, which its driver holds and the holders of its incarnations write.
+/// The flight recorder of an instance, which its driver holds and the holders of its incarnations write: the headers of its last inputs, what it keeps while armed, drawn through the driver's `alloc` so that it outlives the instance's domains, whether it is armed, and the period the next start arms it for.
 pub open struct Recorder {
     ring: mem::Shared[hw::SpinLock[Ring]]
+    capture: task::Cown[Option[Capture]]
+    armed: mem::Shared[core::atomic::AtomicBool]
+    deferred: task::Cown[Option[Period]]
+    alloc: mem::Alloc
 } Recorder
+
+/// What an armed recorder keeps: the recording so far and its bytes, the tape of the instance's clock and random source, and its armed period.
+struct Capture {
+    recording: os::Recording
+    bytes: u64
+    tape: Tape
+    period: Period
+} Capture
+
+/// An armed period: the bytes past which its recording takes a new base at the next quiescence, when it ends in monotonic nanoseconds, never for a probation's, which ends with the probation, and whether the instance's next checkpoint ends it.
+struct Period derives Copy {
+    bound: u64
+    until_ns: Option[u64]
+    to_checkpoint: bool
+} Period
 
 /// The headers of an instance's last inputs, each at its number modulo 16, the number of inputs it took, and the header of the handler call running, which takes the next number once it ends having handled an input, and which reads show only when `shown`, its input known.
 struct Ring {
@@ -41,12 +60,222 @@ enum SystemCall derives Copy, Eq {
 /// A recorder that has recorded nothing.
 fn Recorder.of(alloc: mem::Alloc) -> Recorder {
     let empty = os::InputHeader.from_bits(Array[u8, 48].filled(0))
-    return Recorder(ring: mem::Shared.of(hw::SpinLock.of(Ring(headers: Array[os::InputHeader, 16].filled(empty), taken: 0, running: None, shown: false)), alloc))
+    return Recorder(ring: mem::Shared.of(hw::SpinLock.of(Ring(headers: Array[os::InputHeader, 16].filled(empty), taken: 0, running: None, shown: false)), alloc), capture: task::Cown.of(None, alloc), armed: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), deferred: task::Cown.of(None, alloc), alloc: alloc)
 } Recorder.of
 
 fn Recorder.share(self) -> Recorder {
-    return Recorder(ring: self.ring.share())
+    return Recorder(ring: self.ring.share(), capture: self.capture.share(), armed: self.armed.share(), deferred: self.deferred.share(), alloc: self.alloc)
 } Recorder.share
+
+/// Whether the recorder keeps a recording.
+fn Recorder.is_armed(self) -> bool {
+    return self.armed.contents().load()
+} Recorder.is_armed
+
+/// Arms the recorder for `period` from a copy of the state `base` of the bundle `bundle`, its handlers' reads taken through `tape`; an armed recorder keeps its recording, its period lasting until the later end and holding the larger bound.
+fn Recorder.arm(self, base: os::StateCopy, bundle: ident::HashValue, period: Period, take tape: Tape) fails task::Cancelled uses wait {
+    let bytes = u64.widen(base.state.len())
+    var given = Some(Capture(recording: os::Recording(bundle: bundle, base: self.copy_state(base), inputs: mem::List.empty(self.alloc)), bytes: bytes, tape: take tape, period: period))
+    let capture = self.capture.share()
+    await when mut capture {
+        match mut capture.extract() {
+            Some(kept) => {
+                var held = kept
+                held.period = held.period.joined(period)
+                capture = Some(take held)
+            }
+            None => {
+                capture = mut given.extract()
+            }
+        }
+    }
+    self.armed.contents().store(true)
+} Recorder.arm
+
+/// The period lasting until the later end of this one and `other`, never when either never ends, holding the larger bound, which a checkpoint ends only when it ends both.
+fn Period.joined(self, other: Period) -> Period {
+    let until_ns = match self.until_ns {
+        Some(mine) => match other.until_ns {
+            Some(theirs) => Some(mine.max(theirs))
+            None => None
+        }
+        None => None
+    }
+    return Period(bound: self.bound.max(other.bound), until_ns: until_ns, to_checkpoint: self.to_checkpoint and other.to_checkpoint)
+} Period.joined
+
+/// The tape the armed recorder takes its handlers' reads through.
+fn Recorder.tape(self) -> Option[Tape] fails task::Cancelled uses wait {
+    let capture = self.capture.share()
+    return await when capture => match capture {
+        Some(kept) => Some(kept.tape.share())
+        None => None
+    }
+} Recorder.tape
+
+/// Adds a copy of `input` to the recording of the armed recorder.
+fn Recorder.take_input(self, input: os::RecordedInput) fails task::Cancelled uses wait {
+    var given = Some(os::RecordedInput(seq: input.seq, hash: input.hash, encoded: copied(input.encoded.view(), alloc: self.alloc), recorded: os::Recorded(clock: copied_words(input.recorded.clock, alloc: self.alloc), random: copied_words(input.recorded.random, alloc: self.alloc))))
+    let capture = self.capture.share()
+    await when mut capture {
+        match mut capture.extract() {
+            Some(kept) => {
+                var held = kept
+                match mut given.extract() {
+                    Some(adding) => {
+                        held.bytes = held.bytes.saturating_add(u64.widen(adding.encoded.len()))
+                        mut held.recording.inputs.push(take adding)
+                    }
+                    None => {
+                    }
+                }
+                capture = Some(take held)
+            }
+            None => {
+            }
+        }
+    }
+} Recorder.take_input
+
+/// The bytes the armed recorder's recording holds, 0 when it is not armed.
+fn Recorder.bytes(self) -> u64 fails task::Cancelled uses wait {
+    let capture = self.capture.share()
+    return await when capture => match capture {
+        Some(kept) => kept.bytes
+        None => 0
+    }
+} Recorder.bytes
+
+/// Whether the armed recorder's recording passed its bound, so that it takes a new base at the next quiescence.
+fn Recorder.rebase_due(self) -> bool fails task::Cancelled uses wait {
+    let capture = self.capture.share()
+    return await when capture => match capture {
+        Some(kept) => kept.period.until_ns.is_some() and kept.bytes > kept.period.bound
+        None => false
+    }
+} Recorder.rebase_due
+
+/// Takes a copy of `base` as the recording's base, dropping the inputs before it.
+fn Recorder.rebase(self, base: os::StateCopy) fails task::Cancelled uses wait {
+    var given = Some(self.copy_state(base))
+    let alloc = self.alloc
+    let capture = self.capture.share()
+    await when mut capture {
+        match mut capture.extract() {
+            Some(kept) => {
+                var held = kept
+                match mut given.extract() {
+                    Some(taking) => {
+                        held.bytes = u64.widen(taking.state.len())
+                        held.recording.base = taking
+                        held.recording.inputs = mem::List.empty(alloc)
+                    }
+                    None => {
+                    }
+                }
+                capture = Some(take held)
+            }
+            None => {
+            }
+        }
+    }
+} Recorder.rebase
+
+/// The period of the armed recorder, `None` when it is not armed.
+fn Recorder.period(self) -> Option[Period] fails task::Cancelled uses wait {
+    let capture = self.capture.share()
+    return await when capture => match capture {
+        Some(kept) => Some(kept.period)
+        None => None
+    }
+} Recorder.period
+
+/// Takes `base`, the state the component's checkpoint just kept, as the recording's base, unless that checkpoint ends the armed period; whether it does.
+fn Recorder.checkpointed(self, base: os::StateCopy) -> bool fails task::Cancelled uses wait {
+    match first try await self.period() {
+        Some(period) if period.to_checkpoint => return true
+        else => {
+        }
+    }
+    try await self.rebase(base)
+    return false
+} Recorder.checkpointed
+
+/// A copy of `state` drawn through the recorder's allocator.
+fn Recorder.copy_state(self, state: os::StateCopy) -> os::StateCopy {
+    return os::StateCopy(schema: state.schema, state: copied(state.state.view(), alloc: self.alloc))
+} Recorder.copy_state
+
+/// Disarms the recorder, giving its recording.
+fn Recorder.disarm(self) -> Option[os::Recording] fails task::Cancelled uses wait {
+    self.armed.contents().store(false)
+    var taken: Option[Capture] = None
+    let capture = self.capture.share()
+    await when mut capture {
+        taken = mut capture.extract()
+    }
+    return match taken {
+        Some(kept) => Some(take kept.into_recording())
+        None => None
+    }
+} Recorder.disarm
+
+/// The recording a capture kept.
+fn Capture.into_recording(take self) -> os::Recording {
+    let Capture(recording: recording, bytes: _, tape: _, period: _) = self
+    return recording
+} Capture.into_recording
+
+/// A copy of the armed recorder's recording when it holds the input `seq`.
+fn Recorder.holding(self, seq: u64, alloc: mem::Alloc) -> Option[os::Recording] fails task::Cancelled uses wait {
+    var bytes = mem::Bytes.empty(alloc)
+    let capture = self.capture.share()
+    let holds = await when capture => match capture {
+        Some(kept) => kept.recording.inputs.position(fn(input: os::RecordedInput) => input.seq == seq).is_some()
+        None => false
+    }
+    if not holds {
+        return None
+    }
+    await when capture {
+        match capture {
+            Some(kept) => mem::wire::Codec[os::Recording].encode(kept.recording, out: mut bytes)
+            None => {
+            }
+        }
+    }
+    return match attempt mem::wire::Codec[os::Recording].decode(Untrusted.of(bytes.view()), alloc) {
+        Ok(copy) => Some(take copy)
+        Err(_) => None
+    }
+} Recorder.holding
+
+/// Has the next start arm the recorder for `period`.
+fn Recorder.defer_arming(self, period: Period) fails task::Cancelled uses wait {
+    let deferred = self.deferred.share()
+    await when mut deferred {
+        deferred = Some(period)
+    }
+} Recorder.defer_arming
+
+/// The period deferred to this start, which it takes.
+fn Recorder.take_deferred(self) -> Option[Period] fails task::Cancelled uses wait {
+    var taken: Option[Period] = None
+    let deferred = self.deferred.share()
+    await when mut deferred {
+        taken = mut deferred.extract()
+    }
+    return taken
+} Recorder.take_deferred
+
+/// The number the next input the recorder takes gets.
+fn Recorder.next_seq(self) -> u64 {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap {
+        return self.ring.contents().with(t, body: fn(mut ring: Ring) -> u64 limits notrap, terminates, noalloc {
+            return ring.taken
+        })
+    })
+} Recorder.next_seq
 
 /// Notes that a handler call began at the monotonic time `time` on what `taken` tells of its input, unknown when `None`: a call that may find no input, which reads do not show while it runs.
 fn Recorder.begin(self, time: u64, taken: Option[Taken]) {
@@ -73,14 +302,21 @@ fn Recorder.end(self, run_ns: u64, taken: Option[Taken]) {
     })
 } Recorder.end
 
-/// Records the input of the handler call running as trapped, its domain abandoned.
-fn Recorder.trapped(self) {
+/// Records the input of the handler call running as trapped, its domain abandoned, as `outstanding` tells it when the call began without knowing its input.
+fn Recorder.trapped(self, outstanding: Option[Taken]) {
     hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
         self.ring.contents().with(t, body: fn(mut ring: Ring) limits notrap, terminates, noalloc {
             let Some(running) = mut ring.running.extract() else {
                 return
             }
             var trapped = running
+            match first outstanding {
+                Some(taken) if running.operation == UNKNOWN_OPERATION => {
+                    trapped = header_of(seq: running.seq, time: running.time, taken, run_ns: 0, outcome: os::InputOutcome.Running)
+                }
+                else => {
+                }
+            }
             trapped.outcome = os::InputOutcome.Trapped.to_bits()
             mut ring.keep(trapped)
         })
@@ -164,6 +400,25 @@ fn Taken.encoded(header: os::Header, encoding: Slice[u8], request: bool, operati
 fn Taken.system(call: SystemCall, cause: u64) -> Taken {
     return Taken(cause: cause, sender: 0, hash: 0, size: 0, operation: call.number(), flags: os::InputFlags(request: false, encoded: false, redelivered: false, system: true, reserved: 0))
 } Taken.system
+
+/// What the flight recorder takes of the call outstanding in the instance's domain, `None` without one or when its encoding was not kept.
+fn Driver.outstanding_taken(self) -> Option[Taken] {
+    let Some(domain) = self.domain else {
+        return None
+    }
+    let Some(outstanding) = domain.outstanding else {
+        return None
+    }
+    let Some(message) = outstanding.message else {
+        return None
+    }
+    let name = operation_of(message.view(), alloc: self.alloc)
+    let number = match self.operations.position(fn(each: text::String) => each.as_str() == name.as_str()) {
+        Some(found) => u8.saturate(found)
+        None => UNKNOWN_OPERATION
+    }
+    return Some(Taken.encoded(outstanding.header, encoding: message.view(), request: outstanding.reply.is_some(), operation: number))
+} Driver.outstanding_taken
 
 /// What is known of an input before its handler call takes it: nothing.
 fn Taken.unknown() -> Taken = Taken(cause: 0, sender: 0, hash: 0, size: 0, operation: UNKNOWN_OPERATION, flags: os::InputFlags.from_bits(0))

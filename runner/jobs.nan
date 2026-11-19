@@ -15,7 +15,7 @@ const CODE_GRANT: u64 = 0xFFFF_FFFF_FFFF_FFFC
 /// The bytes of an image each read of it takes.
 const IMAGE_CHUNK: u32 = 1_048_576
 
-/// A job as its driver holds it: what its order gave of its specification, when its latest run started, whether its next run is prepared, a View of the branch its latest run writes to, the View of `/sys/code` its runs read its bundle's image through, `None` while `store` has no endpoint, why the runner cancelled its latest run, and whether it has ended for good.
+/// A job as its driver holds it: what its order gave of its specification, when its latest run started, whether its next run is prepared, a View of the branch its latest run writes to, the View of `/sys/code` its runs read its bundle's image through, `None` while `store` has no endpoint, why the runner cancelled its latest run, whether it has ended for good, its entry as its preparation read it, and the seed of the serial executor of its latest run.
 struct Job {
     order: os::JobOrder
     started: ident::WallTime
@@ -24,7 +24,21 @@ struct Job {
     code: Option[store::service::View]
     cancelled: Option[text::Fixed[16]]
     over: bool
+    entry: JobEntry
+    seed: Option[u64]
 } Job
+
+/// What a job's admitted bundle tells of how it runs: whether its `main` is a host-compatible entry, and whether the bundle has provenance `agent`.
+struct JobEntry derives Copy {
+    host: bool
+    agent: bool
+} JobEntry
+
+/// The next run of a job, once prepared: the View of `job/<moniker>` it writes through, and its entry.
+struct Prepared {
+    writing: store::service::View
+    entry: JobEntry
+} Prepared
 
 /// What a job order takes into the directory.
 struct JobCreation {
@@ -64,7 +78,7 @@ fn Directory.create_job(mut self, mut creation: Option[JobCreation], slot: u32, 
     if self.endpoints.get(moniker).is_some() or self.jobs.contains(moniker) {
         return Err(os::ControlError.Exists)
     }
-    let job = Job(order: take order.into_contents(), started: ident::WallTime(utc_ns: 0, uncertainty_ns: 0), prepared: false, writing: None, code: None, cancelled: None, over: false)
+    let job = Job(order: take order.into_contents(), started: ident::WallTime(utc_ns: 0, uncertainty_ns: 0), prepared: false, writing: None, code: None, cancelled: None, over: false, entry: JobEntry(host: false, agent: false), seed: None)
     discard mut self.jobs.insert(ident::Moniker(text: moniker.text))
     discard mut self.slots.insert(slot, value: ident::Moniker(text: moniker.text))
     let task::Channel(sender: _, receiver: calls) = task::Channel[os::Call].bounded(1, alloc)
@@ -105,21 +119,24 @@ fn Driver.job_unprepared(self) -> bool {
     }
 } Driver.job_unprepared
 
-/// Prepares the next run of the job of `driver` on a task of `s`, which tells the driver through `sender`: it writes the job's specification to `/state/<moniker>/job` and creates `job/<moniker>` at the head of the job's branch.
+/// Prepares the next run of the job of `driver` on a task of `s`, which tells the driver through `sender`: it reads the job's entry from its bundle's admission record, writes the job's specification to `/state/<moniker>/job` and creates `job/<moniker>` at the head of the job's branch.
 fn Shared.prepare_job(self, mut driver: Driver, sender: task::Sender[Input], s: task::Scope) fails task::Cancelled uses wait {
     let alloc = self.config.alloc
     var record = mem::Bytes.empty(alloc)
     var spec_names = true
     var target = text::String.empty(alloc)
+    var codes: Option[store::service::View] = None
     match driver.job {
         Some(job) => {
             let given = job.contents().order
             mut record.append(given.record.view())
             spec_names = given.named
             mut target.append(given.branch.as_str())
+            codes = job.contents().code
         }
         None => return
     }
+    let bundle = driver.spec.bundle
     let moniker = ident::Moniker(text: driver.moniker.text)
     let principal = ident::Principal(text: driver.spec.principal.text)
     let directory = self.directory.share()
@@ -129,14 +146,61 @@ fn Shared.prepare_job(self, mut driver: Driver, sender: task::Sender[Input], s: 
     discard s.spawn(fn[take record, take moniker, take inputs]() fails task::Cancelled uses wait limits stack 32_768 {
         let prepared = match states {
             Some(state) => match roots {
-                Some(root) => try await prepared_run(state, root, moniker, take record, renamed: not spec_names, alloc)
+                Some(root) => match codes {
+                    Some(code) => try await prepared_entry(code, bundle, state, root, moniker, take record, renamed: not spec_names, alloc)
+                    None => Err(text::Fixed[32].of("port.server-stopped"))
+                }
                 None => Err(text::Fixed[32].of("port.server-stopped"))
             }
             None => Err(text::Fixed[32].of("port.server-stopped"))
         }
-        discard attempt await inputs.send(Input.JobPrepared(outcome: prepared))
+        discard attempt await inputs.send(Input.JobPrepared(outcome: take prepared))
     })
 } Shared.prepare_job
+
+/// The next run of the job `moniker` of the bundle of code hash `bundle`, prepared as `prepared_run` prepares it, with the entry the bundle's admission record, read through `code`, a View of `/sys/code`, gives; the code of what failed otherwise.
+fn prepared_entry(
+    code: store::service::View,
+    bundle: ident::HashValue,
+    state: store::service::View,
+    root: store::service::View,
+    moniker: ident::Moniker,
+    take record: mem::Bytes,
+    renamed: bool,
+    alloc: mem::Alloc,
+    ) -> Result[Prepared, text::Fixed[32]] fails task::Cancelled uses wait {
+    let entry = match try await admitted_entry(code, bundle, alloc) {
+        Ok(read) => read
+        Err(failed) => return Err(failed)
+    }
+    return match try await prepared_run(state, root, moniker, take record, renamed, alloc) {
+        Ok(writing) => Ok(Prepared(writing: writing, entry: entry))
+        Err(failed) => Err(failed)
+    }
+} prepared_entry
+
+/// The entry of the admitted bundle of code hash `bundle`, as its admission record, read through `code`, a View of `/sys/code`, gives it; `store.corrupt` for a record that does not decode.
+fn admitted_entry(code: store::service::View, bundle: ident::HashValue, alloc: mem::Alloc) -> Result[JobEntry, text::Fixed[32]] fails task::Cancelled uses wait {
+    var text = text::String.of("/", alloc)
+    mut text.append(bundle.full_form().as_str())
+    mut text.append("/admission")
+    let node = match first attempt await code.get(ident::Path(text: take text), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(failed.code())
+    }
+    let Some(value) = node.value else {
+        return Err(text::Fixed[32].of("store.corrupt"))
+    }
+    let Ok(admission) = attempt mem::wire::Codec[code::Admission].decode(value.view(), alloc) else {
+        return Err(text::Fixed[32].of("store.corrupt"))
+    }
+    let host = match admission.program {
+        Some(program) => program.host
+        None => false
+    }
+    return Ok(JobEntry(host: host, agent: admission.provenance == os::Provenance.Agent))
+} admitted_entry
 
 /// The rights of a job's View of the root of its branch: reading, writing, branching and merging, and owning the nodes its owning operations write.
 fn branching() -> store::service::Rights = store::service::Rights(read: true, write: true, admin: true, secret_read: false, own: true, reserved: 0)
@@ -177,7 +241,7 @@ fn prepared_run(
 fn Shared.job_prepared[J: Journal](
     self,
     mut driver: Driver,
-    outcome: Result[store::service::View, text::Fixed[32]],
+    take outcome: Result[Prepared, text::Fixed[32]],
     sender: task::Sender[Input],
     journal: J,
     s: task::Scope,
@@ -186,7 +250,7 @@ fn Shared.job_prepared[J: Journal](
         return
     }
     let failure = match outcome {
-        Ok(writing) => match mut driver.job_ready(writing) {
+        Ok(prepared) => match mut driver.job_ready(take prepared) {
             true => {
                 self.elapse(s, ns: 0, inputs: sender.split(), incarnation: driver.incarnation)
                 return
@@ -198,8 +262,9 @@ fn Shared.job_prepared[J: Journal](
     try await self.job_ended(mut driver, outcome: os::JobOutcome.Failed(text: text::String.of(failure.as_str(), alloc: self.config.alloc)), cpu_ns: 0, sender, journal, s)
 } Shared.job_prepared
 
-/// Has the next run of the job of the driver write through `writing`, its Views of the job's branch reaching `job/<moniker>`; false, the run not prepared, when the branch name is too long for a redirect.
-fn Driver.job_ready(mut self, writing: store::service::View) -> bool {
+/// Has the next run of the job of the driver write through the View `prepared` gives, its Views of the job's branch reaching `job/<moniker>`, and run its entry as `prepared` tells; false, the run not prepared, when the branch name is too long for a redirect.
+fn Driver.job_ready(mut self, take prepared: Prepared) -> bool {
+    let Prepared(writing: writing, entry: entry) = prepared
     let Some(job) = mut self.job.extract() else {
         return false
     }
@@ -209,12 +274,13 @@ fn Driver.job_ready(mut self, writing: store::service::View) -> bool {
         ready.prepared = true
         ready.writing = Some(writing)
         ready.cancelled = None
+        ready.entry = entry
     }
     self.job = Some(mem::Heap.of(self.alloc).boxed(take ready))
     return redirected
 } Driver.job_ready
 
-/// The run of the job of the driver its preparation made ready, `None` for an instance of a component: the View reading the image of its bundle, the encoding of its input and its deadline, the run starting at `started`.
+/// The run of the job of the driver its preparation made ready, `None` for an instance of a component: the View reading the image of its bundle, the encoding of its typed entry's input or of its host-compatible entry's arguments and environment, and its deadline, the run starting at `started`.
 fn Driver.take_run(mut self, started: ident::WallTime) -> Option[mem::Box[JobRun]] {
     let Some(job) = mut self.job.extract() else {
         return None
@@ -223,7 +289,10 @@ fn Driver.take_run(mut self, started: ident::WallTime) -> Option[mem::Box[JobRun
     var launching: Option[mem::Box[JobRun]] = None
     if running.prepared {
         var input = mem::Bytes.empty(self.alloc)
-        mut input.append(running.order.input.view())
+        match running.entry.host {
+            true => mut input.append(running.order.host_input.view())
+            false => mut input.append(running.order.input.view())
+        }
         launching = Some(mem::Heap.of(self.alloc).boxed(JobRun(code: running.code, bundle: self.spec.bundle, input: take input, deadline_s: running.order.deadline_s)))
         running.started = started
         running.prepared = false
@@ -266,6 +335,118 @@ fn Driver.overdue(mut self, incarnation: u64) {
         mut self.cancel_job("deadline")
     }
 } Driver.overdue
+
+/// The exit status of a host-compatible entry that ended with `outcome`, the `u8` its result encodes; `None` when it did not return one.
+fn exit_status(outcome: os::JobOutcome, alloc: mem::Alloc) -> Option[u8] {
+    let os::JobOutcome.Returned(bytes: bytes) = outcome else {
+        return None
+    }
+    return match attempt mem::wire::Codec[u8].decode(Untrusted.of(bytes.view()), alloc) {
+        Ok(status) => Some(status)
+        Err(_) => None
+    }
+} exit_status
+
+/// How the tasks of an incarnation run: on a serial executor seeded with `seed`, when it has one, and on a clock at 1 ms resolution when `coarse`.
+struct Pacing derives Copy {
+    seed: Option[u64]
+    coarse: bool
+} Pacing
+
+/// How the incarnation the driver starts runs: a job of provenance `agent` on a serial executor seeded now, the job keeping the seed, unless a grant confers `exec.parallel`, and on a clock at 1 ms resolution unless a grant confers `clock.fine`; any other incarnation on its account's executor and the runner's clock.
+fn Shared.pacing(self, mut driver: Driver) -> Pacing fails task::Cancelled uses wait {
+    let agent = match driver.job {
+        Some(job) => job.contents().entry.agent
+        None => false
+    }
+    if not agent {
+        return Pacing(seed: None, coarse: false)
+    }
+    let directory = self.directory.share()
+    let parallel = await when directory => directory.confers(driver.spec, right: os::Right.Parallel)
+    let fine = await when directory => directory.confers(driver.spec, right: os::Right.Fine)
+    if parallel {
+        return Pacing(seed: None, coarse: not fine)
+    }
+    let seed = seed_of(self.config.random, alloc: self.config.alloc)
+    mut driver.seed_job(seed)
+    return Pacing(seed: Some(seed), coarse: not fine)
+} Shared.pacing
+
+/// The serial executor, seeded as `pacing` asks, of the incarnation running on `account`; `None` when it runs on `account`'s executor.
+fn Pacing.serial(self, account: task::Account) -> Option[task::Account] {
+    return match self.seed {
+        Some(seed) => Some(account.executor().serial(seed))
+        None => None
+    }
+} Pacing.serial
+
+/// `clock` at the resolution `pacing` asks: 1 ms when coarse, its own otherwise or once it is revoked.
+fn Pacing.clock(self, clock: sys::Clock) -> sys::Clock {
+    if not self.coarse {
+        return clock
+    }
+    return match attempt clock.coarse(NS_PER_MS) {
+        Ok(coarse) => coarse
+        Err(_) => clock
+    }
+} Pacing.clock
+
+/// The executor of an incarnation running on `account`, or on `serial` when it has one.
+fn executor_of(account: task::Account, serial: Option[task::Account]) -> task::Executor {
+    return match serial {
+        Some(serialised) => serialised.executor()
+        None => account.executor()
+    }
+} executor_of
+
+/// A seed drawn from `random`, 0 once it is revoked.
+fn seed_of(random: sys::Random, alloc: mem::Alloc) -> u64 {
+    var bytes = mem::Bytes.zeroed(8, alloc)
+    discard attempt random.fill(mut bytes.view_mut())
+    return bytes.view().u64_le(0)
+} seed_of
+
+/// Has the job of the driver keep `seed`, the seed of its run's serial executor.
+fn Driver.seed_job(mut self, seed: u64) {
+    let Some(job) = mut self.job.extract() else {
+        return
+    }
+    var seeded = take job.into_contents()
+    seeded.seed = Some(seed)
+    self.job = Some(mem::Heap.of(self.alloc).boxed(take seeded))
+} Driver.seed_job
+
+/// Closes the serial executor `serial`, when there is one.
+fn close_serial(take serial: Option[task::Account]) {
+    match serial {
+        Some(account) => take account.close()
+        None => {
+        }
+    }
+} close_serial
+
+/// Whether a grant of `spec` confers `right` on the executor or the clock of its instance: `parallel` through an `Exec` grant, `fine` through a `Clock` grant, either through a `Machine` grant.
+fn Directory.confers(self, spec: os::InstanceSpec, right: os::Right) -> bool {
+    for granted in spec.grants {
+        let Some(grant) = self.grants.get(granted.value()) else {
+            continue
+        }
+        if not grant.rights.contains(right) {
+            continue
+        }
+        let reaches = match grant.object {
+            os::Object.Machine => true
+            os::Object.Exec => right == os::Right.Parallel
+            os::Object.Clock => right == os::Right.Fine
+            else => false
+        }
+        if reaches {
+            return true
+        }
+    }
+    return false
+} Directory.confers
 
 /// The branch the job `moniker` writes to.
 fn job_branch(moniker: ident::Moniker, alloc: mem::Alloc) -> text::String {
@@ -370,12 +551,15 @@ fn Shared.launch_job(
             let Some(JobLaunch(code: code, bundle: bundle, input: encoded, world: granted)) = mut given.extract() else {
                 return os::JobOutcome.Interrupted
             }
-            let Some(view) = code else {
-                return os::JobOutcome.Failed(text: text::String.of("port.server-stopped", alloc))
-            }
-            let image = match try await read_image(view, bundle, alloc) {
-                Ok(read) => read
-                Err(failure) => return os::JobOutcome.Failed(text: text::String.of(failure.as_str(), alloc))
+            var image: Option[mem::Bytes] = None
+            if not components.base_job(bundle) {
+                let Some(view) = code else {
+                    return os::JobOutcome.Failed(text: text::String.of("port.server-stopped", alloc))
+                }
+                image = Some(match try await read_image(view, bundle, alloc) {
+                    Ok(read) => read
+                    Err(failure) => return os::JobOutcome.Failed(text: text::String.of(failure.as_str(), alloc))
+                })
             }
             return try await components.run_job(take image, code: bundle, input: take encoded, world: take granted, domain: abandoner.contents(), exec, alloc)
         })
@@ -441,6 +625,8 @@ fn Shared.job_ended[J: Journal](
     var started = ident::WallTime(utc_ns: 0, uncertainty_ns: 0)
     var cancelled: Option[text::Fixed[16]] = None
     var writing: Option[store::service::View] = None
+    var host = false
+    var seed: Option[u64] = None
     match driver.job {
         Some(job) => {
             let held = job.contents()
@@ -448,6 +634,8 @@ fn Shared.job_ended[J: Journal](
             started = held.started
             cancelled = held.cancelled
             writing = held.writing
+            host = held.entry.host
+            seed = held.seed
         }
         None => return
     }
@@ -459,8 +647,12 @@ fn Shared.job_ended[J: Journal](
             None => "cancel"
         }, alloc))
     }
+    let status = match host {
+        true => exit_status(ended, alloc)
+        false => None
+    }
     let returned = match ended {
-        os::JobOutcome.Returned(bytes: _) => true
+        os::JobOutcome.Returned(bytes: _) => status.value_or(0) == 0
         else => false
     }
     let rerun = match driver.spec.restart.policy {
@@ -494,7 +686,7 @@ fn Shared.job_ended[J: Journal](
             }
         }
         let kind = outcome_name(ended)
-        let result = os::JobResult(outcome: take ended, status: None, commit: commit, commit_failure: take failure, seed: None, started: started, ended: ended_at, cpu_ns: cpu_ns)
+        let result = os::JobResult(outcome: take ended, status: status, commit: commit, commit_failure: take failure, seed: seed, started: started, ended: ended_at, cpu_ns: cpu_ns)
         match states {
             Some(state) => {
                 var bytes = mem::Bytes.empty(alloc)

@@ -20,6 +20,12 @@ const PAYLOAD_BYTES: usize = 4_096
 
 const NS_PER_S: u64 = 1_000_000_000
 
+/// The keys of the keyed tasks serving requests start here.
+const SERVING: u64 = 0x1_0000_0000
+
+/// The longest a flight recorder is armed by `record`, in seconds.
+const MOST_RECORDING_S: u32 = 3_600
+
 /// What `journal` serves: the events instances emit, and what its own timer and tasks report.
 pub protocol Journal {
     /// Takes the event of kind `kind`, severity `severity` and payload `payload` that the instance `source` names emits.
@@ -30,7 +36,16 @@ pub protocol Journal {
     fn drained(events: u64, lost: u64) limits traceless
     /// The task appending the held events of batch `batch` ended.
     fn appended(batch: u64) limits traceless
+    /// Arms the flight recorder of the instance `moniker` for `duration_s` seconds, at most an hour, its recording holding at most `JournalConfig.recording_bytes`.
+    pub fn record(moniker: ident::Moniker, duration_s: u32) fails RecordFailure limits traceless
+    /// The keyed task serving request `request` gives its reply.
+    fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Journal
+
+/// Why `record` failed: the instance may hold a resource, so it is never forked.
+pub closed enum RecordFailure derives Eq, Render, Encode {
+    NotForkable
+} RecordFailure
 
 /// The Env of `journal`: the feed of what the core drains from its rings, its View of `/journal`, its configuration, the boot's system cause, the principals of the causes the core opened, the monotonic clock, the wall clock of the core's start and its cell.
 pub open struct Env derives Send {
@@ -237,6 +252,31 @@ fn Recorder.append(mut self, mut env: Env, mut cx: sys::Cx[Journal]) {
 fn Recorder.appended(mut self, take batch: u64, mut env: Env, mut cx: sys::Cx[Journal]) {
     mut cx.cancel(key: APPENDING + batch)
 } Recorder.appended
+
+pub fn Recorder.record(mut self, take moniker: ident::Moniker, take duration_s: u32, mut env: Env, mut cx: sys::Cx[Journal]) fails RecordFailure {
+    let Some(request) = mut cx.postpone() else {
+        fail RecordFailure.NotForkable
+    }
+    let feed = env.feed
+    let bound = env.config.recording_bytes
+    let alloc = env.alloc
+    mut cx.spawn(key: SERVING + request, run: fn[take moniker](out: sys::Outbox[Journal]) fails task::Cancelled uses wait limits stack 16_384 {
+        let armed = try await feed.record(take moniker, duration_s: duration_s.min(MOST_RECORDING_S), bound, alloc)
+        let outcome: Result[Unit, RecordFailure] = match armed {
+            true => Ok(Unit)
+            false => Err(RecordFailure.NotForkable)
+        }
+        var bytes = mem::Bytes.empty(alloc)
+        mem::wire::Codec[Result[Unit, RecordFailure]].encode(outcome, out: mut bytes)
+        discard attempt await out.answered(request, reply: sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc)))
+    })
+    fail RecordFailure.NotForkable
+} Recorder.record
+
+fn Recorder.answered(mut self, take request: u64, take reply: sys::Encoded, mut env: Env, mut cx: sys::Cx[Journal]) {
+    discard attempt mut cx.reply(request, reply)
+    mut cx.cancel(key: SERVING + request)
+} Recorder.answered
 
 /// Declares the streams of `/journal` with what `retention` keeps of the store's capacity, leaving their declarations as they are when the store tells no capacity.
 fn declare(tree: store::service::View, retention: Retention, alloc: mem::Alloc) fails task::Cancelled uses wait {

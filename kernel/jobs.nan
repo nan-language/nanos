@@ -1,0 +1,141 @@
+//! The base jobs: the generation's jobs, which the kernel image runs and genesis admits.
+
+const SELFTEST_JOB: Str = "selftest"
+
+const SCRUB_JOB: Str = "scrub"
+
+const REPLAY_JOB: Str = "replay"
+
+/// The stack a base job's `main` runs on.
+const JOB_STACK: usize = 262_144
+
+/// The bytes of a base job's failure its rendering keeps.
+const FAILURE_BUDGET: usize = 1_024
+
+/// The code hashes of the base jobs.
+struct BaseJobs derives Copy {
+    selftest: ident::HashValue
+    scrub: ident::HashValue
+    replay: ident::HashValue
+} BaseJobs
+
+/// The code hashes of the base jobs of the base bundle of code hash `bundle`.
+fn BaseJobs.of(bundle: ident::HashValue, alloc: mem::Alloc) -> BaseJobs {
+    return BaseJobs(selftest: job_code(SELFTEST_JOB, bundle, alloc), scrub: job_code(SCRUB_JOB, bundle, alloc), replay: job_code(REPLAY_JOB, bundle, alloc))
+} BaseJobs.of
+
+/// The code hash of the base job `name`: that of the closure rooted at `name` whose one code root is the base bundle's code hash `bundle`.
+fn job_code(name: Str, bundle: ident::HashValue, alloc: mem::Alloc) -> ident::HashValue {
+    var roots = mem::List[ident::HashValue].empty(alloc)
+    mut roots.push(bundle)
+    return code::CodeId(root: text::String.of(name, alloc), code_roots: take roots).hash(alloc)
+} job_code
+
+/// The admission records of the base jobs, by code hash.
+fn Base.job_admissions(self, alloc: mem::Alloc) -> mem::Map[ident::HashValue, store::service::TypedValue] {
+    var records = mem::Map[ident::HashValue, store::service::TypedValue].empty(alloc)
+    discard mut records.insert(self.jobs.selftest, value: self.record(root: SELFTEST_JOB, components: mem::List.empty(alloc), program: Some(program_of(input: mem::wire::Codec[Unit].schema_hash(), output: mem::wire::Codec[mem::List[selftest::Check]].schema_hash())), alloc))
+    discard mut records.insert(self.jobs.scrub, value: self.record(root: SCRUB_JOB, components: mem::List.empty(alloc), program: Some(program_of(input: mem::wire::Codec[Unit].schema_hash(), output: mem::wire::Codec[store::ScrubReport].schema_hash())), alloc))
+    discard mut records.insert(self.jobs.replay, value: self.record(root: REPLAY_JOB, components: mem::List.empty(alloc), program: Some(program_of(input: mem::wire::Codec[journal::ReplayRequest].schema_hash(), output: mem::wire::Codec[journal::ReplayReport].schema_hash())), alloc))
+    return records
+} Base.job_admissions
+
+/// The program of a base job, of input schema `input` and output schema `output`, which leaves no trace.
+fn program_of(input: mem::wire::SchemaHash, output: mem::wire::SchemaHash) -> code::Program {
+    return code::Program(input: Some(ident::HashValue(bytes: input.bytes)), output: Some(ident::HashValue(bytes: output.bytes)), class: sys::Reversibility.Traceless, host: false)
+} program_of
+
+fn Base.base_job(self, code: ident::HashValue) -> bool = self.base_job_of(code).is_some()
+
+/// A base job.
+enum BaseJob derives Copy, Eq {
+    Selftest
+    Scrub
+    Replay
+} BaseJob
+
+/// The base job of code hash `code`, `None` for another bundle's job.
+fn Base.base_job_of(self, code: ident::HashValue) -> Option[BaseJob] {
+    if code == self.jobs.selftest {
+        return Some(BaseJob.Selftest)
+    }
+    if code == self.jobs.scrub {
+        return Some(BaseJob.Scrub)
+    }
+    if code == self.jobs.replay {
+        return Some(BaseJob.Replay)
+    }
+    return None
+} Base.base_job_of
+
+/// Runs the base job of code hash `code` on `world` with `input`, the encoding of its input, in a domain run of `domain` through `exec` and `alloc`, as a loaded bundle's `main` runs: `Cancelled` with an empty reason when `domain` abandoned it.
+fn Base.run_base_job(
+    self,
+    code: ident::HashValue,
+    take input: mem::Bytes,
+    take world: nanos::World,
+    domain: sys::Abandoner,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    ) -> os::JobOutcome fails task::Cancelled uses wait {
+    let Some(job) = self.base_job_of(code) else {
+        return os::JobOutcome.Failed(text: text::String.of("code.malformed", alloc))
+    }
+    let ran = attempt await domain.run_sized(fn[take world, take input]() -> os::JobOutcome fails task::Cancelled uses wait limits stack 196_608 {
+        return try await job.run(take world, take input, alloc)
+    }, stack: JOB_STACK, exec, alloc)
+    return match first ran {
+        Ok(Ok(outcome)) => outcome
+        Ok(Err(trap)) if trap.kind() == sys::TrapKind.Abandoned => os::JobOutcome.Cancelled(reason: text::String.empty(alloc))
+        Ok(Err(trap)) => os::JobOutcome.Trapped(text: text::String.of(journal::trap_code(trap.kind()).as_str(), alloc))
+        Err(cancelled) => fail cancelled
+    }
+} Base.run_base_job
+
+/// Runs the job's `main` on `world` with the input `input` encodes: its result encoded, its failure rendered, `instance.input-mismatch` for an input that does not decode.
+fn BaseJob.run(self, take world: nanos::World, take input: mem::Bytes, alloc: mem::Alloc) -> os::JobOutcome fails task::Cancelled uses wait {
+    match self {
+        BaseJob.Selftest => {
+            let Ok(given) = attempt mem::wire::Codec[Unit].decode(Untrusted.of(input.view()), alloc) else {
+                return mismatch(alloc)
+            }
+            let ended: Result[mem::List[selftest::Check], task::Cancelled] = attempt await selftest::main(take world, input: given)
+            return outcome_of(ended, alloc)
+        }
+        BaseJob.Scrub => {
+            let Ok(given) = attempt mem::wire::Codec[Unit].decode(Untrusted.of(input.view()), alloc) else {
+                return mismatch(alloc)
+            }
+            let ended: Result[store::ScrubReport, scrub::Unscrubbed] = attempt await scrub::main(take world, input: given)
+            return outcome_of(ended, alloc)
+        }
+        BaseJob.Replay => {
+            let Ok(given) = attempt mem::wire::Codec[journal::ReplayRequest].decode(Untrusted.of(input.view()), alloc) else {
+                return mismatch(alloc)
+            }
+            let ended: Result[journal::ReplayReport, replay::Unreplayed] = attempt await replay::main(take world, input: take given)
+            return outcome_of(ended, alloc)
+        }
+    }
+} BaseJob.run
+
+/// How a `main` ending with `result` ended: its result encoded, or its failure rendered.
+fn outcome_of[O: Encode, F: Render](result: Result[O, F], alloc: mem::Alloc) -> os::JobOutcome {
+    return match result {
+        Ok(output) => {
+            var bytes = mem::Bytes.empty(alloc)
+            mem::wire::Codec[O].encode(output, out: mut bytes)
+            return os::JobOutcome.Returned(bytes: take bytes)
+        }
+        Err(failure) => {
+            var text = text::String.empty(alloc)
+            mut text.write(Dyn[Render].view(failure), budget: FAILURE_BUDGET)
+            return os::JobOutcome.Failed(text: take text)
+        }
+    }
+} outcome_of
+
+/// The failure of a job whose input does not decode.
+fn mismatch(alloc: mem::Alloc) -> os::JobOutcome {
+    return os::JobOutcome.Failed(text: text::String.of("instance.input-mismatch", alloc))
+} mismatch

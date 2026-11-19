@@ -24,6 +24,7 @@ struct ForkRun {
     reporting: task::Sender[os::Forked]
     tape: Tape
     reaching: mem::Shared[core::atomic::AtomicBool]
+    served: Option[os::Recorded]
 } ForkRun
 
 /// What a driver delivers to its instance's domain: a call with its header and the deadline of its dispatch, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns, handing the driver the encoding of its component's state when `hand`.
@@ -34,7 +35,7 @@ enum Delivery {
     Stop(hand: bool)
 } Delivery
 
-/// What the task of an instance's domain tells its driver: among others, that it runs, with the names of its component's operations by number, how a hibernation it was ordered ended, with the image it took or none when the instance serves on, the encoding of the protocol schema the bundle of its component gives for it, the encoding of its component's state, of schema `schema`, as it stops for an update, and whether a health probe found it healthy.
+/// What the task of an instance's domain tells its driver: among others, that it runs, with the names of its component's operations by number, how a hibernation it was ordered ended, with the image it took or none when the instance serves on, the encoding of the protocol schema the bundle of its component gives for it, the encoding of its component's state, of schema `schema`, as it stops for an update, whether a health probe found it healthy, and that a checkpoint ended the armed period of its flight recorder.
 enum Report {
     Running(from: journal::StartedFrom, operations: mem::List[text::String])
     Described(schema: mem::Bytes)
@@ -50,6 +51,7 @@ enum Report {
     Published(summary: mem::Bytes)
     Replayed(outcome: Result[os::Replayed, os::ControlError])
     Health(healthy: bool)
+    RecordingEnded
 } Report
 
 /// What the watch of an incarnation takes: when its handlers run, which it bounds, their start, then how long they took; how long a handler call of a message charged to the account `account` took; a reading of its gauge; and the end of its domain.
@@ -286,7 +288,7 @@ fn Driven.forked(
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
     let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, revival: _, updated: _, config: _, forking: forking, recorder: _) = serving
-    let Some(ForkRun(call: call, reporting: reporting, tape: tape, reaching: reaching)) = forking else {
+    let Some(ForkRun(call: call, reporting: reporting, tape: tape, reaching: reaching, served: served)) = forking else {
         release(take env)
         return Ended.Stopped
     }
@@ -305,7 +307,10 @@ fn Driven.forked(
             discard held_outputs(mut stepper, alloc)
             discard held_spawns(mut stepper, alloc)
             reaching.contents().store(false)
-            tape.record()
+            match served {
+                Some(reads) => tape.replay(reads)
+                None => tape.record()
+            }
             reply = try await Driven[S, Env, P].handled_once(mut stepper, call: take given, exec, alloc)
             recorded = tape.recorded(alloc)
             reached = reaching.contents().load()
@@ -341,7 +346,7 @@ linear struct Begun[S, Env: Any, P: Any] {
     restored: Option[u64]
 } Begun
 
-/// The stepper of a component on `env`: resumed from `restore` when given, else started; `None` once `env` is released when `restore` does not decode as the state.
+/// The stepper of a component on `env`: resumed from `restore` when given, decoded from its schema through a migration of the state type when it is an older one, else started; `None` once `env` is released when `restore` does not decode as the state.
 fn Driven.begin(
     take env: Env,
     take restore: Option[os::Checkpoint],
@@ -352,11 +357,7 @@ fn Driven.begin(
     let Some(saved) = restore else {
         return Some(Begun(stepper: try sys::Stepper[S, Env, P].start(take env, exec, alloc), reason: sys::ResumeReason.Started, restored: None))
     }
-    if saved.schema.bytes != mem::wire::Codec[S].schema_hash().bytes {
-        release(take env)
-        return None
-    }
-    let Ok(state) = attempt mem::wire::Codec[S].decode(Untrusted.of(saved.state.view()), alloc) else {
+    let Ok(state) = attempt mem::wire::Codec[S].decode_from(mem::wire::SchemaHash(bytes: saved.schema.bytes), raw: Untrusted.of(saved.state.view()), alloc) else {
         release(take env)
         return None
     }
@@ -471,11 +472,23 @@ fn epoch_after(keeping: Option[Keeping], clock: sys::Clock) -> Option[u64] {
     return Some(now(clock) + kept.epoch_ms * NS_PER_MS)
 } epoch_after
 
-/// Keeps the quiescent state of the component as its next checkpoint, telling the driver when that fails; whether it was kept.
+/// Keeps the quiescent state of the component as its next checkpoint, telling the driver when that fails; whether it was kept. A checkpoint kept becomes the base of the armed flight recorder's recording, or ends its period, which the driver is told.
 fn checkpoint[S: Encode, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], keeping: Keeping, telling: Telling) -> bool fails task::Cancelled uses wait {
     var bytes = mem::Bytes.empty(telling.alloc)
     mem::wire::Codec[S].encode(stepper.state(), out: mut bytes)
-    return try await keep_checkpoint(keeping, take bytes, schema: mem::wire::Codec[S].schema_hash(), telling)
+    if not try await keep_checkpoint(keeping, take bytes, schema: mem::wire::Codec[S].schema_hash(), telling) {
+        return false
+    }
+    match telling.armed() {
+        Some(recorder) => {
+            if try await recorder.checkpointed(base: state_copy(stepper, alloc: telling.alloc)) {
+                try await telling.tell(report: Report.RecordingEnded)
+            }
+        }
+        None => {
+        }
+    }
+    return true
 } checkpoint
 
 /// Keeps `bytes`, the encoding of the component's state of schema `schema`, as its next checkpoint, telling the driver when that fails; whether it was kept.
@@ -505,6 +518,14 @@ struct Began derives Copy {
     time: u64
     taken: Taken
 } Began
+
+/// The instance's flight recorder while it is armed.
+fn Telling.armed(self) -> Option[Recorder] {
+    return match first self.recorder {
+        Some(recorder) if recorder.is_armed() => Some(recorder.share())
+        else => None
+    }
+} Telling.armed
 
 /// Notes in the flight recorder that the holder calls the system interface `call`.
 fn Telling.begin(self, call: SystemCall) -> Began {
@@ -800,8 +821,8 @@ fn idle[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], quiet: core::
     try await telling.tell(report: Report.Woken)
 } idle
 
-/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn but those `kept` names, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and the time of each handler call of a message charged to another account than the running work's, and returns whether it called any.
-fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept: mem::List[u64], telling: Telling) -> bool fails task::Cancelled uses wait {
+/// Calls the handlers of every message waiting in the component's intake, starting the keyed tasks they spawn but those `kept` names, and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and the time of each handler call of a message charged to another account than the running work's, and returns whether it called any. An armed flight recorder records each message handled, then takes the quiescent state as its base once its recording passed its bound.
+fn call_handlers[S: Encode, Env: Any, P: sys::Protocol](mut stepper: sys::Stepper[S, Env, P], kept: mem::List[u64], telling: Telling) -> bool fails task::Cancelled uses wait {
     try await mark(telling.marks, marked: Mark.Began)
     let started = now(telling.clock)
     let own = os::Header.current().account
@@ -811,7 +832,10 @@ fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept
         discard counts.begun.fetch_add(1)
         let stepping = now(telling.clock)
         telling.begin_step(stepping)
-        let stepped = try await paced_step(mut stepper, deadline: counts.deadline.load(), clock: telling.clock)
+        let stepped = match telling.armed() {
+            Some(recorder) => try await recorded_step(mut stepper, recorder, deadline: counts.deadline.load(), telling)
+            None => try await paced_step(mut stepper, deadline: counts.deadline.load(), clock: telling.clock)
+        }
         telling.end_step(stepping, stepped)
         match charged_elsewhere(stepped, own) {
             Some(account) => try await mark(telling.marks, marked: Mark.Charged(account: account, ns: now(telling.clock).saturating_sub(stepping)))
@@ -826,8 +850,38 @@ fn call_handlers[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], kept
         start_unkept(mut stepper, kept, alloc: telling.alloc)
     }
     try await mark(telling.marks, marked: Mark.Took(ns: now(telling.clock).saturating_sub(started)))
+    match telling.armed() {
+        Some(recorder) => {
+            if try await recorder.rebase_due() {
+                try await recorder.rebase(base: state_copy(stepper, alloc: telling.alloc))
+            }
+        }
+        None => {
+        }
+    }
     return handled
 } call_handlers
+
+/// Steps `stepper` as `paced_step` does, `recorder` recording the message the step handles with the clock and random reads of its handler call under the number its flight recorder gives it.
+fn recorded_step[S, Env: Any, P: sys::Protocol](mut stepper: sys::Stepper[S, Env, P], recorder: Recorder, deadline: u64, telling: Telling) -> Option[sys::Handled] fails task::Cancelled uses wait {
+    let Some(tape) = try await recorder.tape() else {
+        return try await paced_step(mut stepper, deadline, clock: telling.clock)
+    }
+    let seq = recorder.next_seq()
+    var out = sys::Encoded.empty(telling.alloc)
+    tape.record()
+    let stepped = match deadline == os::NO_DEADLINE {
+        true => sys::Wire[P].step_encoded(mut stepper, mut out)
+        false => try await task::paced(telling.clock, at_ns: deadline, body: fn[mut stepper, mut out]() -> Option[sys::Handled] {
+            return sys::Wire[P].step_encoded(mut stepper, mut out)
+        })
+    }
+    let recorded = tape.recorded(telling.alloc)
+    if stepped.is_some() and out.bytes.len() > 0 {
+        try await recorder.take_input(os::RecordedInput(seq: seq, hash: sys::Wire[P].hash(), encoded: take out.bytes, recorded: take recorded))
+    }
+    return stepped
+} recorded_step
 
 /// Steps `stepper` under the deadline `deadline` on `clock`, which cancels nothing, or under none for `os::NO_DEADLINE`.
 fn paced_step[S, Env: Any, P: Any](mut stepper: sys::Stepper[S, Env, P], deadline: u64, clock: sys::Clock) -> Option[sys::Handled] fails task::Cancelled uses wait {

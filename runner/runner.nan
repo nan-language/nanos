@@ -21,10 +21,12 @@ pub interface Components {
         take world: nanos::World,
         take hosting: Hosting,
         ) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait
-    /// Runs the `main` of the bundle of code hash `code` whose image is `image` on `world` with `input`, the encoding of its input, in a domain run of `domain` through `exec` and `alloc`, and gives how it ended: `Cancelled` with an empty reason when `domain` abandoned it.
+    /// Whether the job of the bundle of code hash `code` is a base job, which the kernel image runs.
+    fn base_job(self, code: ident::HashValue) -> bool
+    /// Runs the `main` of the bundle of code hash `code` on `world` with `input`, the encoding of its input, in a domain run of `domain` through `exec` and `alloc`, from its image `image`, or from the kernel image for a base job, which has none, and gives how it ended: `Cancelled` with an empty reason when `domain` abandoned it.
     fn run_job(
         self,
-        take image: mem::Bytes,
+        take image: Option[mem::Bytes],
         code: ident::HashValue,
         take input: mem::Bytes,
         take world: nanos::World,
@@ -233,7 +235,7 @@ fn ask(revocations: task::Sender[Revocation], grant: u64, reason: Reason, alloc:
     return revoked
 } ask
 
-/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them, as work of the boot's system cause, `body`'s included: each has a driver carrying out its lifecycle and publishing its record through `postings` and the gauge of its running incarnation through `gauges`, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes. The handler calls of the instances each set `tracings` gives names are traced, each until it expires. Each rise of the pressure level of a pool `machine` tells relieves it, `accounting` brings the orders opening and closing the accounts of sessions, and `granting` the grants of `/sys/grants` the live grants follow.
+/// Runs the instances `known` describes, and those `Control` orders create, until `body` returns, then ends them, as work of the boot's system cause, `body`'s included: each has a driver carrying out its lifecycle and publishing its record through `postings` and the gauge of its running incarnation through `gauges`, an intake taking the calls of its ports and an endpoint in the directory worlds draw on, and `body` holds the core's `Control` over every instance. Grants past their expiry leave before any capability is minted, and the others once it passes. The handler calls of the instances each set `tracings` gives names are traced, each until it expires, and `arming` brings the orders arming flight recorders. Each rise of the pressure level of a pool `machine` tells relieves it, `accounting` brings the orders opening and closing the accounts of sessions, and `granting` the grants of `/sys/grants` the live grants follow.
 pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Machine and Send, T: Send, E: Send](
     take known: Known,
     components: C,
@@ -245,6 +247,7 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Machine and 
     logs: task::Sender[journal::Logged],
     gauges: Gauges,
     take tracings: task::Receiver[mem::List[journal::TracedInstance]],
+    take arming: task::Receiver[journal::Arming],
     take granting: task::Receiver[os::Granted],
     body: fn(core: Core) -> T fails E uses wait limits stack 16_384,
     ) -> Option[T] fails E uses wait {
@@ -276,15 +279,15 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Machine and 
     let core = os::MintedControl.of(orders, grant: None, prefix: None, alloc)
     defer take core.close()
     var result: Option[T] = None
-    var waiting = Some(Waiting(drivers: take drivers, ordered: take ordered, revoking: take revoking, tracing: take tracings, accounting: take accounting, granting: take granting))
+    var waiting = Some(Waiting(drivers: take drivers, ordered: take ordered, revoking: take revoking, tracing: take tracings, arming: take arming, accounting: take accounting, granting: take granting))
     defer abandon(take waiting)
     try await sys::run_headed(config.work().carried(), body: fn[mut result, mut waiting]() fails E uses wait {
         try await task::scope(config.exec, body: fn[mut result, mut waiting](s: task::Scope) fails E uses wait {
-            let Some(Waiting(drivers: started, ordered: orders_in, revoking: revoking_in, tracing: tracing_in, accounting: accounting_in, granting: granting_in)) = mut waiting.extract() else {
+            let Some(Waiting(drivers: started, ordered: orders_in, revoking: revoking_in, tracing: tracing_in, arming: arming_in, accounting: accounting_in, granting: granting_in)) = mut waiting.extract() else {
                 return
             }
             let governed = routes.share()
-            discard s.spawn(fn[take started, take orders_in, take governed]() fails task::Cancelled uses wait limits stack 102_400 {
+            discard s.spawn(fn[take started, take orders_in, take governed]() fails task::Cancelled uses wait limits stack 122_880 {
                 try await shared.govern(take started, orders: take orders_in, routes: governed, journal)
             })
             let revoked = reached.share()
@@ -301,6 +304,13 @@ pub fn run[C: Components and Copy and Send, J: Journal and Send, R: Machine and 
             let tracing_set = traced.share()
             discard s.spawn(fn[take tracing_in, take tracing_routes, take tracing_set]() fails task::Cancelled uses wait limits stack 16_384 {
                 try await trace(take tracing_in, routes: tracing_routes, traced: tracing_set, config)
+            })
+            let arming_routes = routes.share()
+            discard s.spawn(fn[take arming_in, take arming_routes]() fails task::Cancelled uses wait limits stack 16_384 {
+                try await keep_arming(take arming_in, routes: arming_routes)
+            })
+            discard s.spawn(fn() fails task::Cancelled uses wait limits stack 32_768 {
+                try await shared.sweep_jobs()
             })
             let relieved = routes.share()
             discard s.spawn(fn[take relieved]() fails task::Cancelled uses wait limits stack 16_384 {
@@ -337,12 +347,13 @@ linear struct Started {
     calls: task::Receiver[os::Call]
 } Started
 
-/// What the runner's scope takes once: the drivers, the orders to carry out, the revocations, and the instances to trace.
+/// What the runner's scope takes once: the drivers, the orders to carry out, the revocations, the instances to trace, the flight recorders to arm, the orders of sessions' accounts and the grants to follow.
 linear struct Waiting {
     drivers: mem::List[Started]
     ordered: task::Receiver[os::Order]
     revoking: task::Receiver[Revocation]
     tracing: task::Receiver[mem::List[journal::TracedInstance]]
+    arming: task::Receiver[journal::Arming]
     accounting: task::Receiver[os::AccountOrder]
     granting: task::Receiver[os::Granted]
 } Waiting
@@ -351,7 +362,7 @@ linear struct Waiting {
 fn abandon(take waiting: Option[Waiting]) {
     match waiting {
         Some(left) => {
-            let Waiting(drivers: drivers, ordered: _, revoking: _, tracing: _, accounting: _, granting: _) = left
+            let Waiting(drivers: drivers, ordered: _, revoking: _, tracing: _, arming: _, accounting: _, granting: _) = left
             for each in take drivers {
                 let Started(driver: driver, inputs: _, taken: _, calls: _) = each
                 take driver.abandon()

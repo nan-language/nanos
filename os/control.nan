@@ -76,7 +76,31 @@ pub closed enum Action {
     Probated(bundle: ident::HashValue, probation: Probation)
     /// Reverts the update of the instance to the bundle `bundle` while its probation runs, another update of the commit naming it having been reverted.
     Revert(bundle: ident::HashValue)
+    /// Re-runs the recorded input `seq` of the instance on forks of it, from the base of the recording holding it, under the recorded bundle or `bundle`, their store reads reaching the branch `branch`: what the input found and gave.
+    Rerun(seq: u64, bundle: Option[ident::HashValue], branch: text::String)
 } Action
+
+/// A recording of an instance's inputs: the bundle handling them, the state they started from, and each input in order.
+pub closed struct Recording derives Encode {
+    pub bundle: ident::HashValue
+    pub base: StateCopy
+    pub inputs: mem::List[RecordedInput]
+} Recording
+
+/// An input a recording holds: its number, the protocol hash and the encoding of its call, and the clock reads and random words its handler took.
+pub closed struct RecordedInput derives Encode {
+    pub seq: u64
+    pub hash: sys::ProtocolHash
+    pub encoded: mem::Bytes
+    pub recorded: Recorded
+} RecordedInput
+
+/// What re-running a recorded input gave: the bundle that ran, the state it handled the input from, and what its fork saw.
+pub closed struct Rerun derives Encode {
+    pub bundle: ident::HashValue
+    pub before: StateCopy
+    pub forked: Forked
+} Rerun
 
 /// The bounds of a probation: it ends once `min_s` seconds have passed and the instance has handled `min_messages` messages, or after `max_s` seconds; `Health` is asked every `health_s` seconds; a regression is a p99 handler latency above `latency_factor` times the previous bundle's plus `latency_margin_us`; and the recording it keeps holds at most `max_record_bytes`.
 pub closed struct Probation derives Copy, Eq, Render, Encode {
@@ -111,11 +135,12 @@ pub closed struct Replayed derives Encode {
     pub spawns: mem::List[sys::Reversibility]
 } Replayed
 
-/// What a forked run runs on a fork of an instance, with the configuration record and the store of the branch `branch`, its state taken from `from`: the call `call` once, one level deep, or without a call its start, or its resumption when `from` gives a state.
+/// What a forked run runs on a fork of an instance, with the configuration record and the store of the branch `branch`, its state taken from `from`: the call `call` once, one level deep, or without a call its start, or its resumption when `from` gives a state; its clock and random source serve `served`, or are recorded when `None`.
 pub closed struct Forking derives Encode {
     pub branch: text::String
     pub from: ForkFrom
     pub call: Option[ForkCall]
+    pub served: Option[Recorded]
 } Forking
 
 /// The state a fork starts from: none, its start running; its checkpoint `number`, or its latest when `None`, for an instance keeping checkpoints, none otherwise; the instance's state at quiescence, or its latest checkpoint while it does not run; or a state copied from an earlier fork.
@@ -186,6 +211,7 @@ pub closed enum Outcome {
     Inputs(mem::List[Input])
     Created(ident::Moniker)
     Probated(reverted: bool)
+    Reran(mem::Box[Rerun])
     Done
 } Outcome
 
@@ -215,6 +241,12 @@ pub closed enum ControlError derives Render {
     Stopped
     /// A call the instance did not answer, failing as its port did.
     Unanswered(PortError[Never])
+    /// No recording holds the input.
+    NotRecorded
+    /// The instance may hold a resource, so it is never forked.
+    NotForkable
+    /// A re-run handler made a call its recording does not hold.
+    Diverged
     Cancelled(task::Cancelled) from
 } ControlError
 
@@ -233,6 +265,9 @@ pub fn ControlError.code(self) -> text::Fixed[32] {
         ControlError.NotRunning => "instance.not-running"
         ControlError.Stopped => "port.stopped"
         ControlError.Unanswered(failure) => return failure.code()
+        ControlError.NotRecorded => "journal.not-recorded"
+        ControlError.NotForkable => "journal.not-forkable"
+        ControlError.Diverged => "journal.diverged"
         ControlError.Cancelled(_) => "task.cancelled"
     }
     return text::Fixed[32].of(code)
@@ -342,6 +377,14 @@ pub fn Control.probated(
     }
     return reverted
 } Control.probated
+
+/// Re-runs the recorded input `seq` of the instance `moniker` on forks of it, as `Action.Rerun` does.
+pub fn Control.rerun(self, take moniker: ident::Moniker, seq: u64, bundle: Option[ident::HashValue], take branch: text::String, alloc: mem::Alloc) -> Rerun fails ControlError uses wait {
+    let Outcome.Reran(reran) = try await self.order(Action.Rerun(seq: seq, bundle: bundle, branch: take branch), take moniker, alloc) else {
+        fail ControlError.Invalid
+    }
+    return take reran.into_contents()
+} Control.rerun
 
 /// Reverts the update of the instance `moniker` to the bundle `bundle` while its probation runs.
 pub fn Control.revert(self, take moniker: ident::Moniker, bundle: ident::HashValue, alloc: mem::Alloc) fails ControlError uses wait {
@@ -524,7 +567,7 @@ struct Ordering {
 
 fn ControlRights.permits(self, action: Action) -> bool {
     return match action {
-        Action.Read or Action.Changed(seen: _) or Action.Suspended(seen: _) or Action.Describe or Action.Fork(forking: _) or Action.Inputs => self.read
+        Action.Read or Action.Changed(seen: _) or Action.Suspended(seen: _) or Action.Describe or Action.Fork(forking: _) or Action.Rerun(seq: _, bundle: _, branch: _) or Action.Inputs => self.read
         Action.Start or Action.Stop or Action.Restart or Action.SuspendAfter(ms: _) or Action.Converge(desired: _) or Action.Restore(number: _) or Action.Pause or Action.Resume or Action.Replay(call: _, redelivery: _, branch: _, recorded: _) or Action.Release(kept: _) or Action.Deliver(kept: _) or Action.Discard or Action.Hibernate or Action.Wake => self.lifecycle
         else => self.spawn
     }

@@ -1,0 +1,79 @@
+//! Interrupted jobs: at each boot, the jobs a stop of the machine ended before they had a result.
+
+/// The grant number the View sweeping `/state` for interrupted jobs goes under, which no grant has.
+const SWEEP_GRANT: u64 = 0xFFFF_FFFF_FFFF_FFFB
+
+/// The children of `/state` one listing gives at once.
+const SWEPT: u32 = 256
+
+/// Gives the result `Interrupted` to each job under `/state` with a specification and no result that no driver of this boot runs, through a View of `/state` for `system`, once `store` serves it.
+fn Shared.sweep_jobs(self) fails task::Cancelled uses wait {
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let minted = await when directory => directory.system_view(prefix: "/state", grant: SWEEP_GRANT, alloc)
+    var granted = match minted {
+        Some(view) => view
+        None => return
+    }
+    defer take granted.close()
+    let state = granted.view.mint(store::service::Rights(read: true, write: true, admin: false, secret_read: false, own: false, reserved: 0))
+    let ended = self.config.wall.now(self.config.clock)
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await state.list(ident::Path(text: text::String.of("/", alloc)), take after, limit: SWEPT, alloc) {
+            Ok(listed) => listed
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return
+        }
+        for entry in listing.entries {
+            let Some(moniker) = moniker_named(entry.name.as_str()) else {
+                continue
+            }
+            let running = await when directory => directory.jobs.contains(moniker)
+            if not running {
+                try await mark_interrupted(state, moniker, ended, alloc)
+            }
+        }
+        let Some(next) = listing.next else {
+            return
+        }
+        after = Some(take next)
+    }
+} Shared.sweep_jobs
+
+/// Gives the job `moniker` of `state`, a View of `/state`, the result `Interrupted`, ending at `ended` and starting when its specification was written, when it has a specification and no result.
+fn mark_interrupted(state: store::service::View, moniker: ident::Moniker, ended: ident::WallTime, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let specified = match first attempt await state.history(state_dir(moniker, name: "job", alloc), before: None, limit: 1, alloc) {
+        Ok(commits) => match commits.get(0) {
+            Some(written) => Some(written.time)
+            None => None
+        }
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+    let Some(started) = specified else {
+        return
+    }
+    match first attempt await state.get(state_dir(moniker, name: "result", alloc), at: None, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) if failed.code().as_str() == "store.not-found" => {
+        }
+        else => return
+    }
+    let result = os::JobResult(outcome: os::JobOutcome.Interrupted, status: None, commit: None, commit_failure: None, seed: None, started: started, ended: ended, cpu_ns: 0)
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::JobResult].encode(result, out: mut bytes)
+    discard try await put_record(state, path: state_dir(moniker, name: "result", alloc), type: store::TypeRef.of(JOB_RESULT_TYPE, schema: mem::wire::Codec[os::JobResult].schema_hash(), alloc), take bytes, alloc)
+} mark_interrupted
+
+/// The moniker `name` spells, `None` for a name that is no moniker.
+fn moniker_named(name: Str) -> Option[ident::Moniker] {
+    if name.byte_len() == 0 or name.byte_len() > 59 {
+        return None
+    }
+    let text = text::Fixed[59].of(name)
+    if not ident::is_moniker(text) {
+        return None
+    }
+    return Some(ident::Moniker(text: text))
+} moniker_named

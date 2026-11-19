@@ -112,7 +112,6 @@ A continuation record holds 32 further payload bytes; an event takes at most 3. 
 | `audit` | `AuditEntry` without `seq` and `prev` | its `seq`, once durable | — | `none` |
 | `anchor` | — | the latest `AuditAnchor`, after anchoring every entry | — | `none` |
 | `record` | `moniker: Moniker`, `duration_s: u32` (at most 3,600) | — | `journal.not-forkable` | `none` |
-| `replay` | `moniker: Moniker`, `seq: u64`, `bundle: Option[HashValue]`, `with_head: bool` | `ReplayReport` | `journal.not-recorded`, `journal.not-forkable`, `journal.diverged` | `none` |
 | `export` | `stream: text`, `from: u64`, `to: Option[u64]` | a blob of the entries in that range | `journal.not-retained` | `none` |
 
 Only base instances hold `audit`; operation masks keep it off every other port ([ports](07-communication.md#ports)). Every instance's `sys::Log` sends its records to `journal` ([Env construction](09-authority.md#env-construction)); a record the instance's credit cannot carry is counted in `journal.lost`.
@@ -239,7 +238,7 @@ An **armed** recorder also keeps a **recording**: the state's encoding at arming
 
 ## Replay
 
-`replay` ([`history --replay`](18-link.md#reading-verbs)) re-runs a recorded input on a fork, as the `replay` job ([jobs](20-base.md#jobs)), whose input is a `ReplayRequest { moniker: Moniker, seq: u64, bundle: Option[HashValue], with_head: bool }` holding the operation's arguments:
+A **replay** re-runs a recorded input on a fork, under the authority of who asks for it: a session through [`history --replay`](18-link.md#reading-verbs), or a plan through the `replay` job ([jobs](20-base.md#jobs)), whose input is a `ReplayRequest { moniker: Moniker, seq: u64, bundle: Option[HashValue], with_head: bool }` holding the verb's arguments:
 
 1. It finds the recording, in memory or in `/state/<moniker>/recording`, that holds input `seq`; none fails with `journal.not-recorded`, and an instance holding a resource with `journal.not-forkable`.
 2. The runner [forks](06-execution.md#forks) the instance from the recording's base, under the recorded bundle or `bundle`; a base the bundle cannot decode fails as [starting](06-execution.md#starting) states.

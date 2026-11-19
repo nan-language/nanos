@@ -231,7 +231,7 @@ Model inference. Its configuration `InferConfig { models: mem::List[Model] }` at
 
 ## Jobs
 
-A generation ships five jobs, admitted bundles of provenance `vendor` that the plan step `run` or the named operation starts ([jobs](06-execution.md#jobs)):
+A generation ships five jobs, admitted bundles of provenance `vendor` that the plan step `run` or the named operation starts ([jobs](06-execution.md#jobs)). Its kernel image runs `selftest`, `scrub` and `replay`, each the bundle whose code hash is that of the `CodeId` rooted at its name with the base bundle's code hash as its one code root ([genesis](13-tree.md#genesis)):
 
 | Job | Does | Input → result | Started by |
 | --- | --- | --- | --- |
@@ -239,7 +239,7 @@ A generation ships five jobs, admitted bundles of provenance `vendor` that the p
 | `scrub` | verifies the store's checksums and blob identities ([scrub](12-store-format.md#scrub)) and the whole retained [audit chain](17-observability.md#audit-chain) | → `ScrubReport` | `store`'s `scrub`, `run` |
 | `selftest` | checks that every base instance is `converged`, `/live/memory` sums to RAM, the policy record verifies, every grant lies within its parent and every specification's bundle is admitted | → a list of `Check { name, passed, detail }` | `run` |
 | `bench` | measures the requirements of [Performance](21-performance.md#measurement) | `BenchRequest` → `BenchReport` | `run` |
-| `replay` | re-runs a recorded transition on a fork ([replay](17-observability.md#replay)) | `ReplayRequest` → `ReplayReport` | `journal`'s `replay` |
+| `replay` | re-runs a recorded transition on a fork ([replay](17-observability.md#replay)) | `ReplayRequest` → `ReplayReport` | `run` |
 
 ## Classical equivalents
 
