@@ -1,4 +1,4 @@
-//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, and uploads the image it takes as a draft blob; and it removes admitted bundles no instance uses.
+//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, and uploads the image it takes as a draft blob; it judges the state schemas of updates; and it removes admitted bundles no instance uses.
 
 /// The keys of the keyed tasks serving requests start here.
 const SERVING: u64 = 0x1_0000_0000
@@ -15,11 +15,13 @@ pub protocol Admitting {
     pub fn admit(bundle: store::service::View, base: ident::CommitId) -> code::Admission fails Refusal limits recorded
     /// Removes `/sys/code/<bundle>`: the admission record, bundle and image of the code hash `bundle`, unless a specification or a running instance names it.
     pub fn remove(bundle: ident::HashValue) fails Refusal limits recorded
+    /// Whether an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving` is additive, its new state schema accepting the running one, rather than identical; `code.schema-incompatible` when it is neither, or when the base bundle's state schema does not accept the new one of a `checkpointed` instance of a base component.
+    pub fn additive(running: ident::HashValue, moving: ident::HashValue, state: text::String, checkpointed: bool) -> bool fails Refusal limits recorded
     /// The keyed task serving request `request` gives its reply.
     fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Admitting
 
-/// The Env of `admission`: its View of `/sys/code`, its reading Views of `/sys/instances` and `/live/instances`, its ports to `keys` and `policy`, the machine it judges for and the nanos target of its architecture, and its cell.
+/// The Env of `admission`: its View of `/sys/code`, its reading Views of `/sys/instances` and `/live/instances`, its ports to `keys` and `policy`, the machine it judges for and the nanos target of its architecture, the base bundle, and its cell.
 pub open struct Env derives Send {
     code: store::service::View
     specs: store::service::View
@@ -28,8 +30,15 @@ pub open struct Env derives Send {
     oversight: os::Port[policy::Oversight]
     machine: Machine
     target: text::Fixed[16]
+    base: mem::Shared[Base]
     alloc: mem::Alloc
 } Env
+
+/// The base bundle as the kernel image holds it: its code hash and the schema trees of its components' states.
+pub closed struct Base {
+    pub code: ident::HashValue
+    pub states: mem::List[code::Tree]
+} Base
 
 /// The state of `admission`: none, each admission running as a keyed task.
 pub closed struct Admitter derives Render, Encode {
@@ -45,9 +54,10 @@ pub fn Env.of(
     oversight: os::Port[policy::Oversight],
     machine: Machine,
     target: Str,
+    take base: Base,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(code: code, specs: specs, running: running, keys: keys, oversight: oversight, machine: machine, target: text::Fixed[16].of(target), alloc: alloc)
+    return Env(code: code, specs: specs, running: running, keys: keys, oversight: oversight, machine: machine, target: text::Fixed[16].of(target), base: mem::Shared.of(take base, alloc), alloc: alloc)
 } Env.of
 
 pub fn Admitter.start(mut env: Env) -> Admitter = Admitter()
@@ -84,6 +94,27 @@ pub fn Admitter.remove(mut self, take bundle: ident::HashValue, mut env: Env, mu
     fail Refusal.Unavailable
 } Admitter.remove
 
+pub fn Admitter.additive(
+    mut self,
+    take running: ident::HashValue,
+    take moving: ident::HashValue,
+    take state: text::String,
+    take checkpointed: bool,
+    mut env: Env,
+    mut cx: sys::Cx[Admitting],
+    ) -> bool fails Refusal {
+    let Some(request) = mut cx.postpone() else {
+        fail Refusal.Unavailable
+    }
+    let schemas = Schemas(code: env.code, base: env.base.share(), alloc: env.alloc)
+    let alloc = env.alloc
+    mut cx.spawn(key: SERVING + request, run: fn[take schemas, take state](out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 65_536 {
+        let outcome = try await schemas.additive(running, moving, state: state.as_str(), checkpointed)
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail Refusal.Unavailable
+} Admitter.additive
+
 fn Admitter.answered(
     mut self,
     take request: u64,
@@ -108,7 +139,7 @@ struct Judge derives Copy {
 /// The admission record of the bundle blob `bundle` reads, for the plan of base commit `base`, the image it takes uploaded as a draft blob.
 fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId) -> Result[code::Admission, Refusal] fails task::Cancelled uses wait {
     let alloc = self.alloc
-    let blob = match first try await read_blob(bundle, alloc) {
+    let blob = match first try await read_blob(bundle, path: ident::Path(text: text::String.of("/", alloc)), alloc) {
         Ok(read) => read
         Err(refusal) => return Err(take refusal)
     }
@@ -209,6 +240,120 @@ fn Judge.upload(self, image: Slice[u8], expected: ident::HashValue) -> Option[Re
     }
 } Judge.upload
 
+/// What a judgement of state schemas reaches: the Env's View of `/sys/code` and the base bundle.
+struct Schemas {
+    code: store::service::View
+    base: mem::Shared[Base]
+    alloc: mem::Alloc
+} Schemas
+
+/// Step 8 of an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving`: whether it is additive rather than identical, or `code.schema-incompatible`.
+fn Schemas.additive(self, running: ident::HashValue, moving: ident::HashValue, state: Str, checkpointed: bool) -> Result[bool, Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let refused = Refusal.SchemaIncompatible(state: text::String.of(state, alloc))
+    let was = match first try await self.state_schema(bundle: running, state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Err(take refused)
+        Err(refusal) => return Err(take refusal)
+    }
+    let now = match first try await self.state_schema(bundle: moving, state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Err(take refused)
+        Err(refusal) => return Err(take refusal)
+    }
+    if was == now {
+        return Ok(false)
+    }
+    let older = match first try await self.tree(bundle: running, state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Err(take refused)
+        Err(refusal) => return Err(take refusal)
+    }
+    let newer = match first try await self.tree(bundle: moving, state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Err(take refused)
+        Err(refusal) => return Err(take refusal)
+    }
+    var base: Option[mem::wire::Schema] = None
+    if checkpointed {
+        base = self.base_tree(state)
+    }
+    return match first accepted_schemas(state, running: older, moving: newer, base, alloc) {
+        Ok(_) => Ok(true)
+        Err(refusal) => Err(take refusal)
+    }
+} Schemas.additive
+
+/// The state schema of the component of state type `state` that the admission record of the bundle of code hash `bundle` describes, `None` when no record describes it.
+fn Schemas.state_schema(self, bundle: ident::HashValue, state: Str) -> Result[Option[ident::HashValue], Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let node = match first attempt await self.code.get(code_path(bundle, name: "admission", alloc), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return Ok(None)
+    }
+    let Some(raw) = node.value else {
+        return Ok(None)
+    }
+    let Ok(admission) = attempt mem::wire::Codec[code::Admission].decode(raw.view(), alloc) else {
+        return Err(Refusal.Malformed)
+    }
+    for described in admission.components {
+        if described.state.as_str() == state {
+            return Ok(Some(described.schema))
+        }
+    }
+    return Ok(None)
+} Schemas.state_schema
+
+/// The schema tree of the state type `state` in the bundle of code hash `bundle`: the kernel image's for the base bundle, else the one the code root of its package records in the bundle blob; `None` when it has none.
+fn Schemas.tree(self, bundle: ident::HashValue, state: Str) -> Result[Option[mem::wire::Schema], Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    if bundle == self.base.contents().code {
+        return Ok(self.base_tree(state))
+    }
+    let Some(cut) = state.find("::") else {
+        return Ok(None)
+    }
+    let Some(home) = state.as_bytes().prefix(cut) else {
+        return Ok(None)
+    }
+    let blob = match first try await read_blob(self.code, path: code_path(bundle, name: "bundle", alloc), alloc) {
+        Ok(read) => read
+        Err(refusal) => return Err(take refusal)
+    }
+    let Ok(decoded) = attempt mem::wire::Codec[code::Bundle].decode(blob.bytes.view(), alloc) else {
+        return Err(Refusal.Malformed)
+    }
+    for each in decoded.artefacts {
+        let Some(read) = code::Artefact.read(Untrusted.of(each.view()), alloc) else {
+            return Err(Refusal.Malformed)
+        }
+        if read.name.as_bytes() == home {
+            return Ok(read.tree(state, alloc))
+        }
+    }
+    return Ok(None)
+} Schemas.tree
+
+/// The base bundle's schema tree of the state type `state`, `None` when no base component has it.
+fn Schemas.base_tree(self, state: Str) -> Option[mem::wire::Schema] {
+    let held = self.base.contents()
+    let Some(at) = held.states.position(fn(each: code::Tree) => each.path.as_str() == state) else {
+        return None
+    }
+    return held.states[at].decoded(self.alloc)
+} Schemas.base_tree
+
+/// The path of the child `name` of `/sys/code/<bundle>` in the View of `/sys/code`.
+fn code_path(bundle: ident::HashValue, name: Str, alloc: mem::Alloc) -> ident::Path {
+    var path = text::String.of("/", alloc)
+    mut path.append(bundle.full_form().as_str())
+    mut path.push('/')
+    mut path.append(name)
+    return ident::Path(text: take path)
+} code_path
+
 /// What a removal's keyed task reaches: the Env's Views of `/sys/code`, `/sys/instances` and `/live/instances`.
 struct Users derives Copy {
     code: store::service::View
@@ -294,10 +439,9 @@ struct Blob {
     bytes: Untrusted[mem::Bytes]
 } Blob
 
-/// The blob `view` reads alone.
-fn read_blob(view: store::service::View, alloc: mem::Alloc) -> Result[Blob, Refusal] fails task::Cancelled uses wait {
-    let root = ident::Path(text: text::String.of("/", alloc))
-    let node = match first attempt await view.get(take root, at: None, alloc) {
+/// The blob at `path` in `view`.
+fn read_blob(view: store::service::View, path: ident::Path, alloc: mem::Alloc) -> Result[Blob, Refusal] fails task::Cancelled uses wait {
+    let node = match first attempt await view.get(ident::Path(text: text::String.of(path.text.as_str(), alloc)), at: None, alloc) {
         Ok(found) => found
         Err(failure) => return Err(try refusal_of(take failure))
     }
@@ -306,7 +450,7 @@ fn read_blob(view: store::service::View, alloc: mem::Alloc) -> Result[Blob, Refu
     }
     var bytes = Untrusted.of(mem::Bytes.empty(alloc))
     while u64.widen(bytes.byte_len()) < node.size {
-        let read = match first attempt await view.read(ident::Path(text: text::String.of("/", alloc)), at: Some(node.version), offset: u64.widen(bytes.byte_len()), length: CHUNK_BYTES, alloc) {
+        let read = match first attempt await view.read(ident::Path(text: text::String.of(path.text.as_str(), alloc)), at: Some(node.version), offset: u64.widen(bytes.byte_len()), length: CHUNK_BYTES, alloc) {
             Ok(given) => given
             Err(failure) => return Err(try refusal_of(take failure))
         }

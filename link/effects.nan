@@ -19,7 +19,7 @@ struct Assessed {
     store_bytes: u64
 } Assessed
 
-/// Computes the effect set of the steps `stepped` applied to the preview branch `branch` from `base`, the head of the plan's branch `planned` reaches, with what the forked runs of their messages saw in `forked_runs`, running a fork of each instance they start or restart through `control`, has `oversight` decide the plan, and keeps the plan; the changes of a plan for a branch other than the running branch activate no instance, and those of a plan for the running branch reserve what `reservations_of` checks, reading the running system through the link's View `tree`.
+/// Computes the effect set of the steps `stepped` applied to the preview branch `branch` from `base`, the head of the plan's branch `planned` reaches, with what the forked runs of their messages saw in `forked_runs`, running a fork of each instance they start or restart through `control`, judging the state schemas of each update with `admitting`, has `oversight` decide the plan, and keeps the plan; the changes of a plan for a branch other than the running branch activate no instance, and those of a plan for the running branch reserve what `reservations_of` checks, reading the running system through the link's View `tree`.
 pub fn effects_of(
     asked: Planning,
     tree: store::service::View,
@@ -31,21 +31,19 @@ pub fn effects_of(
     take forked_runs: Runs,
     control: os::Control,
     oversight: os::Port[policy::Oversight],
+    admitting: os::Port[admission::Admitting],
     alloc: mem::Alloc,
     ) -> Preview fails task::Cancelled uses wait {
     let changes = match try await delta_of(forked, branch, stepped, alloc) {
         Ok(found) => found
         Err(failure) => return Preview.Failed(take failure)
     }
-    let observed = match try await observe(changes, planned, forked, base, alloc) {
+    let observed = match try await observe(changes, planned, forked, base, activating: asked.options.branch.as_str() == RUNNING_BRANCH, admitting, alloc) {
         Ok(found) => found
         Err(failure) => return Preview.Failed(take failure)
     }
     let Observed(lines: lines, activations: changed) = observed
     var activations = changed
-    if asked.options.branch.as_str() != RUNNING_BRANCH {
-        activations = mem::List.empty(alloc)
-    }
     for each in stepped {
         match each.command {
             Some(InstanceStep(step: step, moniker: moniker, code: _, command: Command.Restore(number: _), operation: _, message: _, class: _, foreseen: _)) => mut activations.push(Activation(moniker: ident::Moniker(text: moniker.text), step: step, kind: ActivationKind.Restart, migration: None, pause_ms: RESTART_PAUSE_MS, cpu: None))
@@ -126,12 +124,14 @@ fn previews_too_large(held_bytes: u64, plans: PlanConfig, alloc: mem::Alloc) -> 
     return Some(Failure.of("plan.preview-too-large", subject: "-", alloc).expecting(expected.as_str(), found: found.as_str(), alloc))
 } previews_too_large
 
-/// The lines printing each change of `changes`, from `base` through `planned` to the head of `forked`, and the activations they make.
+/// The lines printing each change of `changes`, from `base` through `planned` to the head of `forked`, and, when `activating`, the activations they make, an update of the migration class `admitting` judges.
 fn observe(
     changes: mem::List[NodeChange],
     planned: store::service::View,
     forked: store::service::View,
     base: ident::CommitId,
+    activating: bool,
+    admitting: os::Port[admission::Admitting],
     alloc: mem::Alloc,
     ) -> Result[Observed, Failure] fails task::Cancelled uses wait {
     var lines = mem::List[mem::List[text::String]].empty(alloc)
@@ -147,14 +147,49 @@ fn observe(
             Err(failure) => return Err(take failure)
         }
         mut lines.push(change_lines(before, after, alloc))
-        match activation_of(path, before, after, step: change.step, alloc) {
-            Some(activation) => mut activations.push(take activation)
-            None => {
+        if not activating {
+            continue
+        }
+        let Some(activation) = activation_of(path, before, after, step: change.step, alloc) else {
+            continue
+        }
+        var activated = activation
+        if activated.kind == ActivationKind.Update {
+            match try await migration_of(activated.moniker.text.as_str(), before, after, admitting, alloc) {
+                Ok(class) => {
+                    activated.migration = Some(class)
+                }
+                Err(failure) => return Err(take failure)
             }
         }
+        mut activations.push(take activated)
     }
     return Ok(Observed(lines: take lines, activations: take activations))
 } observe
+
+/// The migration class of the update of the instance `moniker` that its specification `before` becoming `after` makes, as `admitting` judges it.
+fn migration_of(moniker: Str, before: Option[store::Node], after: Option[store::Node], admitting: os::Port[admission::Admitting], alloc: mem::Alloc) -> Result[Migration, Failure] fails task::Cancelled uses wait {
+    let Some(old) = spec_in(before, alloc) else {
+        return Err(Failure.of("schema.invalid", subject: "/sys/instances", alloc))
+    }
+    let Some(new) = spec_in(after, alloc) else {
+        return Err(Failure.of("schema.invalid", subject: "/sys/instances", alloc))
+    }
+    return try await judged_migration(moniker, running: old.bundle, renewed: new, admitting, alloc)
+} migration_of
+
+/// The migration class of moving the instance `moniker`, of specification `renewed`, from the bundle of code hash `running` to the one `renewed` names: `additive` when `admitting` judges that the new bundle's state schema accepts the running one's; the code of its refusal, such as `code.schema-incompatible`, as a failure naming the instance.
+pkg fn judged_migration(moniker: Str, running: ident::HashValue, renewed: os::InstanceSpec, admitting: os::Port[admission::Admitting], alloc: mem::Alloc) -> Result[Migration, Failure] fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[admission::Admitting].additive(mut call, running, moving: renewed.bundle, state: text::String.of(renewed.component.as_str(), alloc), checkpointed: renewed.durability.class == os::DurabilityClass.Checkpointed)
+    return match first attempt await admitting.call(take call, reply, alloc) {
+        Ok(true) => Ok(Migration.Additive)
+        Ok(false) => Ok(Migration.Identical)
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(os::PortError.Failed(refused_by)) => Err(Failure.of(refused_by.code().as_str(), subject: moniker, alloc))
+        Err(_) => Err(Failure.of("port.server-stopped", subject: "admission", alloc))
+    }
+} judged_migration
 
 /// What the steps `stepped` of `asked` give, `activations` being the activations they make, those of the steps `declared` observed by no fork: a step's basis is `Declared` when one of its activations is, and for a call or a redelivery no fork ran, whose class its operation declares; a span ends after a point of no return and before a call or a redelivery to an instance an earlier step of the span activates.
 fn assess(
@@ -444,7 +479,7 @@ fn node_items(node: Option[store::Node], alloc: mem::Alloc) -> mem::List[text::S
     return items
 } node_items
 
-/// The activation a change of `path` from `before` to `after` by the step `step` makes: a restart for a configuration record, a start or a stop for a specification whose instance it makes run or stop, a restart for one whose running instance's principal, component, placement or reserved budget it changes, and otherwise an update of identical migration class for one whose running instance's bundle it changes.
+/// The activation a change of `path` from `before` to `after` by the step `step` makes: a restart for a configuration record, a start or a stop for a specification whose instance it makes run or stop, a restart for one whose running instance's principal, component, placement or reserved budget it changes, and otherwise an update, of identical migration class until its state schemas are judged, for one whose running instance's bundle it changes.
 fn activation_of(
     path: Str,
     before: Option[store::Node],

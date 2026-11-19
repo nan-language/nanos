@@ -123,10 +123,11 @@ pub closed enum Typed {
     Other
 } Typed
 
-/// A schema tree a code root records: the canonical path of its type and its schema hash.
+/// A schema tree a code root records: the canonical path of its type, its schema hash and the `mem::wire` encoding of the tree.
 pub closed struct Tree {
     pub path: text::String
     pub schema: ident::HashValue
+    pub encoding: mem::Bytes
 } Tree
 
 /// A seal: its principal, the canonical path of the item it seals, the packages holding the items of its closure entries, in byte order, and its signature when it holds one.
@@ -185,6 +186,29 @@ pub validator fn Artefact.read(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> 
         Err(_) => None
     }
 } Artefact.read
+
+/// The schema tree its code root records for the type of canonical path `path`, `None` when it records none that decodes.
+pub fn Artefact.tree(self, path: Str, alloc: mem::Alloc) -> Option[mem::wire::Schema] {
+    let Some(at) = self.trees.position(fn(each: Tree) => each.path.as_str() == path) else {
+        return None
+    }
+    return self.trees[at].decoded(alloc)
+} Artefact.tree
+
+/// The record of the schema tree `schema` of the type of canonical path `path`.
+pub fn Tree.of(path: Str, schema: mem::wire::Schema, alloc: mem::Alloc) -> Tree {
+    var encoding = mem::Bytes.empty(alloc)
+    mem::wire::Codec[mem::wire::Schema].encode(schema, out: mut encoding)
+    return Tree(path: text::String.of(path, alloc), schema: ident::HashValue.of_content(encoding.view()), encoding: take encoding)
+} Tree.of
+
+/// The schema tree its encoding holds, `None` when it does not decode.
+pub fn Tree.decoded(self, alloc: mem::Alloc) -> Option[mem::wire::Schema] {
+    return match attempt mem::wire::Codec[mem::wire::Schema].decode(Untrusted.of(self.encoding.view()), alloc) {
+        Ok(schema) => Some(take schema)
+        Err(_) => None
+    }
+} Tree.decoded
 
 /// Whether every signature the artefact holds verifies by the key beside it.
 pub fn Artefact.verifies(self) -> bool {
@@ -857,7 +881,15 @@ fn trees_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> mem::List[Tree] 
         if tree.end > span.end {
             fail core::DecodeError.Invalid
         }
-        mut trees.push(Tree(path: try text_in(bytes, span: Span(start: at, end: path.end), alloc), schema: try hash_of_content(bytes, span: tree)))
+        let Some(parts) = bytes.split_at(tree.start) else {
+            fail core::DecodeError.Invalid
+        }
+        let Some(content) = parts.tail.prefix(tree.end - tree.start) else {
+            fail core::DecodeError.Invalid
+        }
+        var encoding = mem::Bytes.empty(alloc)
+        mut encoding.append(content)
+        mut trees.push(Tree(path: try text_in(bytes, span: Span(start: at, end: path.end), alloc), schema: ident::HashValue.of_content(content), encoding: take encoding))
         at = tree.end
     }
     if at != span.end {
@@ -1228,9 +1260,10 @@ fn meter_root(alloc: mem::Alloc) -> mem::Bytes {
     }
     push_field(mut root, key: LEDGER_PART, content: ledger.view())
     push_field(mut root, key: 9, content: uvar_of(0, alloc).view())
+    let total = Tree.of("meter::Total", schema: mem::wire::Codec[u64].schema(alloc), alloc)
     var trees = uvar_of(1, alloc)
-    push_bytes(mut trees, bytes: b"meter::Total")
-    push_bytes(mut trees, bytes: b"tree of Total")
+    push_bytes(mut trees, bytes: total.path.as_bytes())
+    push_bytes(mut trees, bytes: total.encoding.view())
     push_field(mut root, key: SCHEMAS_PART, content: trees.view())
     return root
 } meter_root
@@ -1352,7 +1385,14 @@ test published_artefacts_give_their_package_escapes_seals_and_signatures for Art
     expect read.seals.len() == 1 and read.seals[0].principal.as_str() == "human.alice" and read.seals[0].item.as_str() == "meter::total" and read.seals[0].signature.is_some()
     expect read.seals[0].packages.len() == 2 and read.seals[0].packages[0].as_str() == "core" and read.seals[0].packages[1].as_str() == "units"
     expect read.authors.len() == 1 and read.authors[0].as_str() == "human.bob" and read.publisher.is_some()
-    expect read.entries.len() == 1 and read.entries[0].as_str() == "main" and read.trees.len() == 1 and read.trees[0].schema == ident::HashValue.of_content(b"tree of Total")
+    expect read.entries.len() == 1 and read.entries[0].as_str() == "main" and read.trees.len() == 1 and read.trees[0].schema == ident::HashValue(bytes: mem::wire::Codec[u64].schema_hash().bytes)
+    let Some(total) = read.tree("meter::Total", alloc) else {
+        expect false
+        return
+    }
+    let accepted = total.accepts(mem::wire::Codec[u64].schema(alloc), alloc)
+    let other = read.tree("meter::Other", alloc)
+    expect accepted and other.is_none()
     expect read.authority.len() == 6 and read.authority[0].as_str() == "alloc" and read.authority[1].as_str() == "capability \"sys::Fs\"" and read.authority[2].as_str() == "escape grant \"meter\"" and read.authority[5].as_str() == "escape validator \"meter::parse\""
     expect read.verifies()
     let Some(main) = read.main else {
