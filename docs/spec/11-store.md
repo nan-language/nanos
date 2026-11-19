@@ -189,7 +189,7 @@ For an instance, each `write_all`, `remove` and release of a writing `File` is o
 
 ## The Store protocol
 
-`store` serves the `Store` protocol (requires [N4](22-nan.md#n4)). Each operation arrives through a [`View`](09-authority.md#capability-kinds), whose subtree, branch, rights and as-of apply to every path. Reads need `read` rights; `commit`, `append`, drafts, `revert` and `erase` need `write`; `branch`, `delete_branch`, `merge`, `pin`, `unpin`, `scrub` and `gc` need `admin`, and `keyring_seed` a View covering `/state/keys`, which only `keys` holds; a missing right fails with `store.denied`, and a revoked View fails as [revocation](09-authority.md#revocation) states.
+`store` serves the `Store` protocol (requires [N4](22-nan.md#n4)). Each operation arrives through a [`View`](09-authority.md#capability-kinds), whose subtree, branch, rights and as-of apply to every path. Reads need `read` rights; `commit`, `append`, drafts, `revert` and `erase` need `write`; `branch`, `delete_branch`, `keep_branch`, `merge`, `pin`, `unpin`, `scrub` and `gc` need `admin`, and `keyring_seed` a View covering `/state/keys`, which only `keys` holds; a missing right fails with `store.denied`, and a revoked View fails as [revocation](09-authority.md#revocation) states.
 
 | Operation | Arguments | Result | Failures | Reversibility |
 | --- | --- | --- | --- | --- |
@@ -211,6 +211,7 @@ For an instance, each `write_all`, `remove` and release of a writing `File` is o
 | `diff` | from, to: each a commit or a branch, path | `mem::List[Edit]` | `store.thinned`, `store.not-found` | `none` |
 | `branch` | name, at: `Option[CommitId]` | its `Branch` record and a View of it | `store.branch-exists`, `store.branch-reserved`, `store.thinned` | `recorded` |
 | `delete_branch` | name | — | `store.not-found`, `store.branch-reserved` | `irreversible{erase}` |
+| `keep_branch` | name, until: `WallTime` | — | `store.not-found`, `store.branch-reserved` | `restorable` |
 | `merge` | source: a View of the source branch, take | `Committed` | `conflict.merge`, `store.denied` | `recorded` |
 | `revert` | commit, dry_run: `bool` | `Committed`, or the writes when `dry_run` | `conflict.revert`, `store.thinned` | `recorded` |
 | `pin` | commit, note | — | `store.thinned` | `restorable` |

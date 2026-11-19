@@ -88,6 +88,13 @@ fn Directory.create_job(mut self, mut creation: Option[JobCreation], slot: u32, 
     return Ok(Started(driver: take driver, inputs: take inputs, taken: take taken, calls: take calls))
 } Directory.create_job
 
+/// Has the numbering of jobs continue past `job-<n>`.
+fn Directory.number_jobs_past(mut self, n: u64) {
+    if n > self.jobs_numbered {
+        self.jobs_numbered = n
+    }
+} Directory.number_jobs_past
+
 /// The moniker `job-<n>` of the next job of the boot, n the first number past the last one given that no instance or job has.
 fn Directory.next_job(mut self, alloc: mem::Alloc) -> ident::Moniker {
     loop {
@@ -632,6 +639,7 @@ fn Shared.job_ended[J: Journal](
     var writing: Option[store::service::View] = None
     var host = false
     var seed: Option[u64] = None
+    var keep_h: u32 = 0
     match driver.job {
         Some(job) => {
             let held = job.contents()
@@ -641,6 +649,7 @@ fn Shared.job_ended[J: Journal](
             writing = held.writing
             host = held.entry.host
             seed = held.seed
+            keep_h = held.order.keep_h
         }
         None => return
     }
@@ -678,18 +687,7 @@ fn Shared.job_ended[J: Journal](
     let ended_at = self.config.wall.now(self.config.clock)
     let inputs = sender.split()
     discard s.spawn(fn[take ended, take moniker, take inputs]() fails task::Cancelled uses wait limits stack 32_768 {
-        var commit: Option[ident::CommitId] = None
-        var failure: Option[text::String] = None
-        if returned {
-            match try await merged(roots, writing, moniker, alloc) {
-                Ok(done) => {
-                    commit = Some(done)
-                }
-                Err(code) => {
-                    failure = Some(text::String.of(code.as_str(), alloc))
-                }
-            }
-        }
+        let Concluded(commit: commit, failure: failure) = try await concluded(roots, writing, moniker, returned, until: hours_after(ended_at, hours: keep_h), alloc)
         let kind = outcome_name(ended)
         let result = os::JobResult(outcome: take ended, status: status, commit: commit, commit_failure: take failure, seed: seed, started: started, ended: ended_at, cpu_ns: cpu_ns)
         match states {
@@ -738,6 +736,34 @@ fn unexplained(outcome: os::JobOutcome) -> bool {
     }
 } unexplained
 
+/// What the end of a run does to `job/<moniker>`, which `writing` is a View of: when `returned`, has the store merge it into the branch `root` is a View of the root of; when nothing merged it, has the store keep it until `until`.
+fn concluded(
+    root: Option[store::service::View],
+    writing: Option[store::service::View],
+    moniker: ident::Moniker,
+    returned: bool,
+    until: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Concluded fails task::Cancelled uses wait {
+    var failure: Option[text::String] = None
+    if returned {
+        match try await merged(root, writing, moniker, alloc) {
+            Ok(done) => return Concluded(commit: Some(done), failure: None)
+            Err(code) => {
+                failure = Some(text::String.of(code.as_str(), alloc))
+            }
+        }
+    }
+    try await keep_job_branch(root, moniker, until, alloc)
+    return Concluded(commit: None, failure: take failure)
+} concluded
+
+/// The end of a run on its branch: the commit merging it, and the code of a merge that failed.
+struct Concluded {
+    commit: Option[ident::CommitId]
+    failure: Option[text::String]
+} Concluded
+
 /// Has the store merge `job/<moniker>`, which `writing` is a View of, as one commit into the branch `root` is a View of the root of, then delete it, giving the commit or the code of the failure; the branch is kept when the merge fails.
 fn merged(root: Option[store::service::View], writing: Option[store::service::View], moniker: ident::Moniker, alloc: mem::Alloc) -> Result[ident::CommitId, text::Fixed[32]] fails task::Cancelled uses wait {
     let Some(target) = root else {
@@ -758,6 +784,23 @@ fn merged(root: Option[store::service::View], writing: Option[store::service::Vi
     }
     return Ok(commit)
 } merged
+
+/// Has the store keep `job/<moniker>`, which `root` is a View of the root of, until `until`, unless it has no such branch.
+fn keep_job_branch(root: Option[store::service::View], moniker: ident::Moniker, until: ident::WallTime, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(target) = root else {
+        return
+    }
+    match first attempt await target.keep_branch(job_branch(moniker, alloc), until, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} keep_job_branch
+
+/// The time `hours` hours after `at`.
+fn hours_after(at: ident::WallTime, hours: u32) -> ident::WallTime {
+    return ident::WallTime(utc_ns: at.utc_ns.saturating_add(i64.widen(hours) * 3_600_000_000_000), uncertainty_ns: at.uncertainty_ns)
+} hours_after
 
 /// The name of the kind of a job's outcome, as `instance.job-ended` gives it.
 fn outcome_name(outcome: os::JobOutcome) -> text::Fixed[16] {

@@ -1,12 +1,15 @@
-//! Interrupted jobs: at each boot, the jobs a stop of the machine ended before they had a result.
+//! Interrupted jobs: at each boot, the jobs a stop of the machine ended before they had a result, and the numbering of jobs past those `/state` keeps.
 
 /// The grant number the View sweeping `/state` for interrupted jobs goes under, which no grant has.
 const SWEEP_GRANT: u64 = 0xFFFF_FFFF_FFFF_FFFB
 
+/// The grant number the View keeping the branches of interrupted jobs goes under, which no grant has.
+const SWEEP_ROOT_GRANT: u64 = 0xFFFF_FFFF_FFFF_FFFA
+
 /// The children of `/state` one listing gives at once.
 const SWEPT: u32 = 256
 
-/// Gives the result `Interrupted` to each job under `/state` with a specification and no result that no driver of this boot runs, through a View of `/state` for `system`, once `store` serves it.
+/// Gives the result `Interrupted` to each job under `/state` with a specification and no result that no driver of this boot runs, through Views of `/state` and of the root for `system`, once `store` serves them, and has the numbering of jobs continue past the `job-<n>` monikers `/state` keeps.
 fn Shared.sweep_jobs(self) fails task::Cancelled uses wait {
     let alloc = self.config.alloc
     let directory = self.directory.share()
@@ -16,8 +19,16 @@ fn Shared.sweep_jobs(self) fails task::Cancelled uses wait {
         None => return
     }
     defer take granted.close()
+    let rooted = await when directory => directory.system_view(prefix: "/", grant: SWEEP_ROOT_GRANT, alloc)
+    var root_granted = match rooted {
+        Some(view) => view
+        None => return
+    }
+    defer take root_granted.close()
     let state = granted.view.mint(store::service::Rights(read: true, write: true, admin: false, secret_read: false, own: true, reserved: 0))
+    let root = root_granted.view.mint(store::service::Rights(read: false, write: false, admin: true, secret_read: false, own: false, reserved: 0))
     let ended = self.config.wall.now(self.config.clock)
+    var highest: u64 = 0
     var after: Option[text::String] = None
     loop {
         let listing = match first attempt await state.list(ident::Path(text: text::String.of("/", alloc)), take after, limit: SWEPT, alloc) {
@@ -29,20 +40,41 @@ fn Shared.sweep_jobs(self) fails task::Cancelled uses wait {
             let Some(moniker) = moniker_named(entry.name.as_str()) else {
                 continue
             }
+            highest = highest.max(job_number(entry.name.as_str()).value_or(0))
             let running = await when directory => directory.jobs.contains(moniker)
             if not running {
-                try await mark_interrupted(state, moniker, ended, alloc)
+                try await mark_interrupted(state, root, moniker, ended, alloc)
             }
         }
         let Some(next) = listing.next else {
-            return
+            break
         }
         after = Some(take next)
     }
+    await when mut directory {
+        mut directory.number_jobs_past(highest)
+    }
 } Shared.sweep_jobs
 
-/// Gives the job `moniker` of `state`, a View of `/state`, the result `Interrupted`, ending at `ended` and starting when its specification was written, when it has a specification and no result.
-fn mark_interrupted(state: store::service::View, moniker: ident::Moniker, ended: ident::WallTime, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// The number n of the moniker `job-<n>` that `name` spells, `None` for another name.
+fn job_number(name: Str) -> Option[u64] {
+    if not name.starts_with("job-") or name.byte_len() < 5 or name.byte_len() > 23 {
+        return None
+    }
+    let bytes = name.as_bytes()
+    var n: u64 = 0
+    for at in 4..<bytes.len() {
+        let digit = bytes[at]
+        if digit < b'0' or digit > b'9' {
+            return None
+        }
+        n = n.saturating_mul(10).saturating_add(u64.widen(digit - b'0'))
+    }
+    return Some(n)
+} job_number
+
+/// Gives the job `moniker` of `state`, a View of `/state`, the result `Interrupted`, ending at `ended` and starting when its specification was written, when it has a specification and no result; its subtree of `/state` and its branch, which `root` keeps, then expire after its `keep_h` hours.
+fn mark_interrupted(state: store::service::View, root: store::service::View, moniker: ident::Moniker, ended: ident::WallTime, alloc: mem::Alloc) fails task::Cancelled uses wait {
     let specified = match first attempt await state.history(state_dir(moniker, name: "job", alloc), before: None, limit: 1, alloc) {
         Ok(commits) => match commits.get(0) {
             Some(written) => Some(written.time)
@@ -64,7 +96,26 @@ fn mark_interrupted(state: store::service::View, moniker: ident::Moniker, ended:
     var bytes = mem::Bytes.empty(alloc)
     mem::wire::Codec[os::JobResult].encode(result, out: mut bytes)
     discard try await put_record(state, path: state_dir(moniker, name: "result", alloc), type: store::TypeRef.of(JOB_RESULT_TYPE, schema: mem::wire::Codec[os::JobResult].schema_hash(), alloc), take bytes, alloc)
+    let until = hours_after(ended, hours: try await kept_hours(state, moniker, alloc))
+    try await set_expiry(state, path: state_root(moniker, alloc), at: Some(until), alloc)
+    try await keep_job_branch(Some(root), moniker, until, alloc)
 } mark_interrupted
+
+/// The hours the job `moniker` of `state`, a View of `/state`, keeps its subtree and branch after its end, as its specification gives them.
+fn kept_hours(state: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) -> u32 fails task::Cancelled uses wait {
+    let node = match first attempt await state.get(state_dir(moniker, name: "job", alloc), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return os::KEPT_HOURS
+    }
+    let Some(raw) = node.value else {
+        return os::KEPT_HOURS
+    }
+    return match attempt mem::wire::Codec[os::JobSpec].decode(raw.view(), alloc) {
+        Ok(spec) => spec.kept_hours()
+        Err(_) => os::KEPT_HOURS
+    }
+} kept_hours
 
 /// The moniker `name` spells, `None` for a name that is no moniker.
 fn moniker_named(name: Str) -> Option[ident::Moniker] {
