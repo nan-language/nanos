@@ -1,0 +1,553 @@
+//! File views: the `sys::Fs` of a job's world, a View of the dir its grant `fs` names, whose files are blob nodes, served by a task of each run.
+
+/// The key of the grant whose View a job's file view reaches.
+const FILES_GRANT: Str = "fs"
+
+/// The bytes one read of a file's blob takes at most.
+const FILE_PIECE: usize = 1_048_576
+
+/// The children one listing of a dir gives at once.
+const LISTED_FILES: u32 = 256
+
+/// The service behind the `sys::Fs` of a job's world, which reaches the task serving it.
+pub open struct Files {
+} Files
+
+impl Files: sys::Kind[Filing, u8]
+
+impl Files: sys::FsService
+
+/// What a world's file view reaches: the task serving it, and the allocator its replies are drawn through.
+struct Filing {
+    orders: task::Sender[FileOrder]
+    alloc: mem::Alloc
+} Filing
+
+/// What the task serving a file view carries out, each order telling its answer to the sender it holds: opening a file to read or creating one to write, giving its number; reading or writing a whole file; removing a node; reading from or writing to an open file; its length; releasing it; making a dir; renaming a node; the kind of a node; the entries of a dir.
+enum FileOrder {
+    Open(path: text::String, answer: task::Sender[Result[u64, sys::fs::FsError]])
+    Create(path: text::String, answer: task::Sender[Result[u64, sys::fs::FsError]])
+    ReadAll(path: text::String, answer: task::Sender[Result[mem::Bytes, sys::fs::FsError]])
+    WriteAll(path: text::String, bytes: mem::Bytes, answer: task::Sender[Result[Unit, sys::fs::FsError]])
+    Remove(path: text::String, answer: task::Sender[Result[Unit, sys::fs::FsError]])
+    Read(file: u64, length: usize, answer: task::Sender[Result[mem::Bytes, sys::fs::FsError]])
+    Write(file: u64, bytes: mem::Bytes, answer: task::Sender[Result[usize, sys::fs::FsError]])
+    Length(file: u64, answer: task::Sender[Result[u64, sys::fs::FsError]])
+    Release(file: u64)
+    MakeDir(path: text::String, answer: task::Sender[Result[Unit, sys::fs::FsError]])
+    Rename(from: text::String, to: text::String, answer: task::Sender[Result[Unit, sys::fs::FsError]])
+    KindOf(path: text::String, answer: task::Sender[Result[sys::fs::Kind, sys::fs::FsError]])
+    List(path: text::String, answer: task::Sender[Result[mem::List[sys::fs::Entry], sys::fs::FsError]])
+} FileOrder
+
+/// A file a file view holds open: a blob read as of the commit `at` that the open saw, from `offset`, of `size` bytes; or a draft written so far, to put at `path` once released.
+enum OpenFile {
+    Reading(path: ident::Path, at: ident::CommitId, offset: u64, size: u64)
+    Writing(path: ident::Path, draft: u64, written: u64)
+} OpenFile
+
+/// The file view `self` reaches, failing as revoked once its root entry is revoked.
+fn Files.filing(self) -> Filing fails sys::fs::FsError {
+    let Some(filing) = sys::reach(self, body: fn(filing: Filing, record: u8) => Filing(orders: filing.orders.split(), alloc: filing.alloc)) else {
+        fail sys::fs::FsError.Denied
+    }
+    return filing
+} Files.filing
+
+/// Gives the task serving the file view `order`, failing as denied once it is gone.
+fn Filing.give(self, take order: FileOrder) fails sys::fs::FsError uses wait {
+    match attempt await self.orders.send(take order) {
+        Ok(_) => {
+        }
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        Err(task::SendError.Closed) => fail sys::fs::FsError.Denied
+    }
+} Filing.give
+
+pub fn Files.open(self, path: Str) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[u64, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.Open(path: text::String.of(path, alloc: filing.alloc), answer: take answer))
+    return try await file_answer(take answers)
+} Files.open
+
+pub fn Files.create(self, path: Str) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[u64, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.Create(path: text::String.of(path, alloc: filing.alloc), answer: take answer))
+    return try await file_answer(take answers)
+} Files.create
+
+pub fn Files.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[mem::Bytes, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.ReadAll(path: text::String.of(path, alloc: filing.alloc), answer: take answer))
+    let read = try await file_answer(take answers)
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(read.view())
+    return bytes
+} Files.read_all
+
+pub fn Files.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    var bytes = mem::Bytes.empty(filing.alloc)
+    mut bytes.append(data)
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[Unit, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.WriteAll(path: text::String.of(path, alloc: filing.alloc), bytes: take bytes, answer: take answer))
+    try await file_answer(take answers)
+} Files.write_all
+
+pub fn Files.remove(self, path: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[Unit, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.Remove(path: text::String.of(path, alloc: filing.alloc), answer: take answer))
+    try await file_answer(take answers)
+} Files.remove
+
+pub fn Files.read(self, file: u64, mut buf: SliceMut[u8]) -> usize fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[mem::Bytes, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.Read(file: file, length: buf.len(), answer: take answer))
+    let read = try await file_answer(take answers)
+    for at in 0..<read.len() {
+        buf[at] = read[at]
+    }
+    return read.len()
+} Files.read
+
+pub fn Files.write(self, file: u64, data: Slice[u8]) -> usize fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    var bytes = mem::Bytes.empty(filing.alloc)
+    mut bytes.append(data)
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[usize, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.Write(file: file, bytes: take bytes, answer: take answer))
+    return try await file_answer(take answers)
+} Files.write
+
+pub fn Files.byte_len(self, file: u64) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[u64, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.Length(file: file, answer: take answer))
+    return try await file_answer(take answers)
+} Files.byte_len
+
+pub fn Files.release(self, file: u64) limits stack 4_096 {
+    let Some(orders) = sys::reach(self, body: fn(filing: Filing, record: u8) => filing.orders.split()) else {
+        return
+    }
+    discard orders.offer(FileOrder.Release(file: file))
+} Files.release
+
+pub fn Files.create_dir(self, path: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[Unit, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.MakeDir(path: text::String.of(path, alloc: filing.alloc), answer: take answer))
+    try await file_answer(take answers)
+} Files.create_dir
+
+pub fn Files.rename(self, from: Str, to: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[Unit, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.Rename(from: text::String.of(from, alloc: filing.alloc), to: text::String.of(to, alloc: filing.alloc), answer: take answer))
+    try await file_answer(take answers)
+} Files.rename
+
+pub fn Files.kind(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[sys::fs::Kind, sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.KindOf(path: text::String.of(path, alloc: filing.alloc), answer: take answer))
+    return try await file_answer(take answers)
+} Files.kind
+
+pub fn Files.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError uses wait limits stack 4_096 {
+    let filing = try self.filing()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[mem::List[sys::fs::Entry], sys::fs::FsError]].bounded(1, alloc: filing.alloc)
+    try await filing.give(FileOrder.List(path: text::String.of(path, alloc: filing.alloc), answer: take answer))
+    let given = try await file_answer(take answers)
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    for entry in given {
+        mut entries.push(sys::fs::Entry(name: text::String.of(entry.name.as_str(), alloc), kind: entry.kind))
+    }
+    return entries
+} Files.list
+
+/// The answer `answers` receives, failing as denied when none comes.
+fn file_answer[T: Send](take answers: task::Receiver[Result[T, sys::fs::FsError]]) -> T fails sys::fs::FsError uses wait {
+    var receiver = answers
+    let Some(answer) = try await mut receiver.receive() else {
+        fail sys::fs::FsError.Denied
+    }
+    return match answer {
+        Ok(value) => value
+        Err(failed) => fail failed
+    }
+} file_answer
+
+/// Serves the file view of `view`, a View of the dir a job's grant `fs` names, until every sender of `orders` is gone, keeping by number the files it opens; the drafts of files left open are discarded.
+fn serve_files(view: store::service::View, take orders: task::Receiver[FileOrder], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var receiver = orders
+    var files = OpenFiles(open: mem::Map.empty(alloc), next: 1)
+    loop {
+        let Some(order) = try await mut receiver.receive() else {
+            return
+        }
+        try await mut files.carry_out(view, take order, alloc)
+    }
+} serve_files
+
+/// The files a file view holds open, by number, and the number the next one gets.
+struct OpenFiles {
+    open: mem::Map[u64, OpenFile]
+    next: u64
+} OpenFiles
+
+/// Carries out `order` on the file view of `view`, telling its answer.
+fn OpenFiles.carry_out(mut self, view: store::service::View, take order: FileOrder, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    match order {
+        FileOrder.Open(path: path, answer: answer) => {
+            let reading = try await file_opened(view, relative: path.as_str(), alloc)
+            discard attempt await answer.send(mut self.numbered(take reading))
+        }
+        FileOrder.Create(path: path, answer: answer) => {
+            let writing = try await file_created(view, relative: path.as_str(), alloc)
+            discard attempt await answer.send(mut self.numbered(take writing))
+        }
+        FileOrder.ReadAll(path: path, answer: answer) => {
+            discard attempt await answer.send(try await file_read_whole(view, relative: path.as_str(), alloc))
+        }
+        FileOrder.WriteAll(path: path, bytes: bytes, answer: answer) => {
+            discard attempt await answer.send(try await file_written_whole(view, relative: path.as_str(), take bytes, alloc))
+        }
+        FileOrder.Remove(path: path, answer: answer) => {
+            discard attempt await answer.send(try await file_removed(view, relative: path.as_str(), alloc))
+        }
+        FileOrder.Read(file: file, length: length, answer: answer) => {
+            discard attempt await answer.send(try await mut self.read(view, file, length, alloc))
+        }
+        FileOrder.Write(file: file, bytes: bytes, answer: answer) => {
+            discard attempt await answer.send(try await mut self.write(view, file, take bytes, alloc))
+        }
+        FileOrder.Length(file: file, answer: answer) => {
+            discard attempt await answer.send(self.length(file))
+        }
+        FileOrder.Release(file: file) => try await mut self.release(view, file, alloc)
+        FileOrder.MakeDir(path: path, answer: answer) => {
+            discard attempt await answer.send(try await file_dir_made(view, relative: path.as_str(), alloc))
+        }
+        FileOrder.Rename(from: from, to: to, answer: answer) => {
+            discard attempt await answer.send(try await file_moved(view, from: from.as_str(), to: to.as_str(), alloc))
+        }
+        FileOrder.KindOf(path: path, answer: answer) => {
+            discard attempt await answer.send(try await file_node_kind(view, relative: path.as_str(), alloc))
+        }
+        FileOrder.List(path: path, answer: answer) => {
+            discard attempt await answer.send(try await file_listing(view, relative: path.as_str(), alloc))
+        }
+    }
+} OpenFiles.carry_out
+
+/// Keeps the file `outcome` opened under the next number, which it gives, or gives its failure.
+fn OpenFiles.numbered(mut self, take outcome: Result[OpenFile, sys::fs::FsError]) -> Result[u64, sys::fs::FsError] {
+    let file = match outcome {
+        Ok(found) => found
+        Err(failed) => return Err(take failed)
+    }
+    let number = self.next
+    self.next += 1
+    discard mut self.open.insert(number, value: take file)
+    return Ok(number)
+} OpenFiles.numbered
+
+/// The path of the node `relative` names in a file view's dir, `None` when its segments break the path rules.
+fn file_path(relative: Str, alloc: mem::Alloc) -> Option[ident::Path] {
+    var text = text::String.of("/", alloc)
+    if relative.starts_with("/") {
+        return None
+    }
+    mut text.append(relative)
+    if not ident::is_path(text::String.of(text.as_str(), alloc)) {
+        return None
+    }
+    return Some(ident::Path(text: take text))
+} file_path
+
+/// The file-view failure of a store call that failed with `failed`.
+fn fs_failure(failed: store::service::ViewError) -> sys::fs::FsError {
+    return match failed {
+        store::service::ViewError.Revoked => sys::fs::FsError.Revoked(sys::Revoked.Stale)
+        else => match failed.code().as_str() {
+            "store.not-found" => sys::fs::FsError.NotFound
+            "store.full" => sys::fs::FsError.NoSpace
+            else => sys::fs::FsError.Denied
+        }
+    }
+} fs_failure
+
+/// A file reading the blob at `relative` as `view` sees it now.
+fn file_opened(view: store::service::View, relative: Str, alloc: mem::Alloc) -> Result[OpenFile, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(path) = file_path(relative, alloc) else {
+        return Err(sys::fs::FsError.InvalidPath)
+    }
+    let node = match first attempt await view.get(ident::Path(text: text::String.of(path.text.as_str(), alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(fs_failure(failed))
+    }
+    if node.kind != store::NodeKind.Blob {
+        return Err(sys::fs::FsError.Denied)
+    }
+    return Ok(OpenFile.Reading(path: take path, at: node.version, offset: 0, size: node.size))
+} file_opened
+
+/// A file writing a new draft, which its release puts at `relative`.
+fn file_created(view: store::service::View, relative: Str, alloc: mem::Alloc) -> Result[OpenFile, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(path) = file_path(relative, alloc) else {
+        return Err(sys::fs::FsError.InvalidPath)
+    }
+    return match first attempt await view.draft(alloc) {
+        Ok(draft) => Ok(OpenFile.Writing(path: take path, draft: draft, written: 0))
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(fs_failure(failed))
+    }
+} file_created
+
+/// Reads at most `length` bytes of the open file `file` from its position, which advances by what it read.
+fn OpenFiles.read(mut self, view: store::service::View, file: u64, length: usize, alloc: mem::Alloc) -> Result[mem::Bytes, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(OpenFile.Reading(path: path, at: at, offset: offset, size: size)) = self.open.get(file) else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    let read = match first attempt await view.read(ident::Path(text: text::String.of(path.text.as_str(), alloc)), at: Some(at), offset, length: u32.saturate(length.min(FILE_PIECE)), alloc) {
+        Ok(piece) => input_bytes(piece.view(), alloc)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(fs_failure(failed))
+    }
+    let moved = OpenFile.Reading(path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), at: at, offset: offset + u64.widen(read.len()), size: size)
+    discard mut self.open.insert(file, value: take moved)
+    return Ok(take read)
+} OpenFiles.read
+
+/// Appends `bytes` to the draft of the open file `file`, giving how many it wrote.
+fn OpenFiles.write(mut self, view: store::service::View, file: u64, take bytes: mem::Bytes, alloc: mem::Alloc) -> Result[usize, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(OpenFile.Writing(path: path, draft: draft, written: written)) = self.open.get(file) else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    let count = bytes.len()
+    match first attempt await view.draft_append(draft, take bytes, alloc) {
+        Ok(_) => {
+        }
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(fs_failure(failed))
+    }
+    let grown = OpenFile.Writing(path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), draft: draft, written: written + u64.widen(count))
+    discard mut self.open.insert(file, value: take grown)
+    return Ok(count)
+} OpenFiles.write
+
+/// The bytes of the open file `file`: its blob's when it reads, what it wrote when it writes.
+fn OpenFiles.length(self, file: u64) -> Result[u64, sys::fs::FsError] {
+    return match self.open.get(file) {
+        Some(OpenFile.Reading(path: _, at: _, offset: _, size: size)) => Ok(size)
+        Some(OpenFile.Writing(path: _, draft: _, written: written)) => Ok(written)
+        None => Err(sys::fs::FsError.Denied)
+    }
+} OpenFiles.length
+
+/// Lets go of the open file `file`: the draft of a writing one becomes the blob at its path, in one blind commit.
+fn OpenFiles.release(mut self, view: store::service::View, file: u64, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(released) = mut self.open.remove(file) else {
+        return
+    }
+    let OpenFile.Writing(path: path, draft: draft, written: _) = released else {
+        return
+    }
+    discard try await file_draft_put(view, take path, draft, alloc)
+} OpenFiles.release
+
+/// Closes the draft `draft` and puts its blob at `path` of `view` in one blind commit.
+fn file_draft_put(view: store::service::View, take path: ident::Path, draft: u64, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let closed = match first attempt await view.draft_close(draft, expected: None, alloc) {
+        Ok(blob) => blob
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(fs_failure(failed))
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: take path, value: store::Value.Blob(closed.id)))
+    return try await file_committed(view, take writes, alloc)
+} file_draft_put
+
+/// Commits `writes` through `view` as one blind transaction.
+fn file_committed(view: store::service::View, take writes: mem::List[store::Write], alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
+    return match first attempt await view.commit(take transaction, typed: true, alloc) {
+        Ok(_) => Ok(Unit)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(fs_failure(failed))
+    }
+} file_committed
+
+/// The bytes of the blob at `relative`, read in pieces.
+fn file_read_whole(view: store::service::View, relative: Str, alloc: mem::Alloc) -> Result[mem::Bytes, sys::fs::FsError] fails task::Cancelled uses wait {
+    let reading = match try await file_opened(view, relative, alloc) {
+        Ok(file) => file
+        Err(failed) => return Err(take failed)
+    }
+    let OpenFile.Reading(path: path, at: at, offset: _, size: size) = reading else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    while u64.widen(bytes.len()) < size {
+        let piece = match first attempt await view.read(ident::Path(text: text::String.of(path.text.as_str(), alloc)), at: Some(at), offset: u64.widen(bytes.len()), length: u32.saturate(FILE_PIECE), alloc) {
+            Ok(read) => input_bytes(read.view(), alloc)
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => return Err(fs_failure(failed))
+        }
+        if piece.len() == 0 {
+            break
+        }
+        mut bytes.append(piece.view())
+    }
+    return Ok(take bytes)
+} file_read_whole
+
+/// Writes `bytes` as the blob at `relative`, in one blind commit.
+fn file_written_whole(view: store::service::View, relative: Str, take bytes: mem::Bytes, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let created = match try await file_created(view, relative, alloc) {
+        Ok(file) => file
+        Err(failed) => return Err(take failed)
+    }
+    let OpenFile.Writing(path: path, draft: draft, written: _) = created else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    match first attempt await view.draft_append(draft, take bytes, alloc) {
+        Ok(_) => {
+        }
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(fs_failure(failed))
+    }
+    return try await file_draft_put(view, take path, draft, alloc)
+} file_written_whole
+
+/// Deletes the node at `relative`, in one blind commit.
+fn file_removed(view: store::service::View, relative: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(path) = file_path(relative, alloc) else {
+        return Err(sys::fs::FsError.InvalidPath)
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Delete(path: take path))
+    return try await file_committed(view, take writes, alloc)
+} file_removed
+
+/// Makes the dir `relative`, in one blind commit.
+fn file_dir_made(view: store::service::View, relative: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(path) = file_path(relative, alloc) else {
+        return Err(sys::fs::FsError.InvalidPath)
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Make(path: take path, declaration: store::Declaration.Dir(store::DirDecl(element: None, ephemeral: false, secret: false, numbered: false, keep: None))))
+    return try await file_committed(view, take writes, alloc)
+} file_dir_made
+
+/// Moves the blob at `from` to `to`, in one blind commit.
+fn file_moved(view: store::service::View, from: Str, to: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(source) = file_path(from, alloc) else {
+        return Err(sys::fs::FsError.InvalidPath)
+    }
+    let Some(target) = file_path(to, alloc) else {
+        return Err(sys::fs::FsError.InvalidPath)
+    }
+    let node = match first attempt await view.get(ident::Path(text: text::String.of(source.text.as_str(), alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => return Err(fs_failure(failed))
+    }
+    let Some(blob) = node.hash else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    if node.kind != store::NodeKind.Blob {
+        return Err(sys::fs::FsError.Denied)
+    }
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: take target, value: store::Value.Blob(blob)))
+    mut writes.push(store::Write.Delete(path: take source))
+    return try await file_committed(view, take writes, alloc)
+} file_moved
+
+/// What the node at `relative` is: a file for a blob, a dir, or another kind.
+fn file_node_kind(view: store::service::View, relative: Str, alloc: mem::Alloc) -> Result[sys::fs::Kind, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(path) = file_path(relative, alloc) else {
+        return Err(sys::fs::FsError.InvalidPath)
+    }
+    return match first attempt await view.get(take path, at: None, alloc) {
+        Ok(node) => Ok(file_kind(node.kind))
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) => Err(fs_failure(failed))
+    }
+} file_node_kind
+
+/// The kind a node of kind `kind` has in a file view.
+fn file_kind(kind: store::NodeKind) -> sys::fs::Kind {
+    return match kind {
+        store::NodeKind.Blob => sys::fs::Kind.File
+        store::NodeKind.Dir => sys::fs::Kind.Directory
+        else => sys::fs::Kind.Other
+    }
+} file_kind
+
+/// The entries of the dir at `relative`, every listing of it in turn.
+fn file_listing(view: store::service::View, relative: Str, alloc: mem::Alloc) -> Result[mem::List[sys::fs::Entry], sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(path) = file_path(relative, alloc) else {
+        return Err(sys::fs::FsError.InvalidPath)
+    }
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await view.list(ident::Path(text: text::String.of(path.text.as_str(), alloc)), take after, limit: LISTED_FILES, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(failed) => return Err(fs_failure(failed))
+        }
+        for entry in listing.entries {
+            mut entries.push(sys::fs::Entry(name: text::String.of(entry.name.as_str(), alloc), kind: file_kind(entry.kind)))
+        }
+        let Some(next) = listing.next else {
+            return Ok(take entries)
+        }
+        after = Some(take next)
+    }
+} file_listing
+
+/// The root entry of the file view of the job of the driver, over the View its world holds under its grant `fs`, served by a task of `s`; `None` for an instance of a component or a job without that grant.
+fn Shared.job_files(self, driver: Driver, world: nanos::World, s: task::Scope) -> Option[sys::Minter[Files, Filing, u8]] {
+    if driver.job.is_none() {
+        return None
+    }
+    let Ok(view) = attempt nanos::Cap[store::service::View].get(world.caps, key: FILES_GRANT) else {
+        return None
+    }
+    let alloc = self.config.alloc
+    let task::Channel(sender: orders, receiver: ordered) = task::Channel[FileOrder].bounded(1, alloc)
+    discard s.spawn(fn[take ordered]() fails task::Cancelled uses wait limits stack 32_768 {
+        try await serve_files(view, orders: take ordered, alloc)
+    })
+    return Some(sys::Minter[Files, Filing, u8].of(Filing(orders: take orders, alloc: alloc), alloc))
+} Shared.job_files
+
+/// The file view `filing` serves, `None` without it or once revoked.
+fn fs_of(filing: Option[sys::Minter[Files, Filing, u8]]) -> Option[sys::Fs] {
+    return match filing {
+        Some(minter) => match attempt sys::Fs.served(minter.mint(0)) {
+            Ok(fs) => Some(fs)
+            Err(_) => None
+        }
+        None => None
+    }
+} fs_of
+
+/// Revokes the file view `filing` serves, when there is one.
+fn close_files(take filing: Option[sys::Minter[Files, Filing, u8]]) {
+    match filing {
+        Some(minter) => take minter.close()
+        None => {
+        }
+    }
+} close_files

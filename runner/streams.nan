@@ -1,0 +1,191 @@
+//! The standard streams of jobs: their input, the blob their specification names, placed at `/state/<moniker>/stdin`, and what they write, one entry per write of the streams `/state/<moniker>/stdout` and `/state/<moniker>/stderr`.
+
+/// The bytes each output stream of a job keeps.
+const STREAM_BYTES: u64 = 16_777_216
+
+/// The bytes one read of a job's input takes at most.
+const READ_BYTES: usize = 65_536
+
+/// The type of the entries of a job's output streams.
+const STREAM_TYPE: Str = "mem::Bytes"
+
+/// The service behind the standard streams of a job's world, which reach the task serving them.
+pub open struct Streams {
+} Streams
+
+impl Streams: sys::Kind[Pipe, u8]
+
+impl Streams: sys::StdioService
+
+/// What the standard streams of a job's world reach: the task serving them, and the allocator their replies are drawn through.
+struct Pipe {
+    requests: task::Sender[Piping]
+    alloc: mem::Alloc
+} Pipe
+
+/// What the task serving a job's streams carries out: a read of at most `length` bytes of its input, which gives `reply` the bytes it read, none at its end; or the write of `bytes` to its output stream or, when `error`, its error stream, which tells `done` whether it was kept.
+enum Piping {
+    Read(length: usize, reply: task::Sender[mem::Bytes])
+    Write(error: bool, bytes: mem::Bytes, done: task::Sender[bool])
+} Piping
+
+pub fn Streams.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError uses wait limits stack 4_096 {
+    let Some(pipe) = sys::reach(self, body: fn(pipe: Pipe, record: u8) => Pipe(requests: pipe.requests.split(), alloc: pipe.alloc)) else {
+        fail sys::StdioError.Closed
+    }
+    let task::Channel(sender: reply, receiver: replies) = task::Channel[mem::Bytes].bounded(1, alloc: pipe.alloc)
+    match attempt await pipe.requests.send(Piping.Read(length: buf.len(), reply: take reply)) {
+        Ok(_) => {
+        }
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        Err(task::SendError.Closed) => fail sys::StdioError.Closed
+    }
+    var receiver = replies
+    let Some(read) = try await mut receiver.receive() else {
+        fail sys::StdioError.Closed
+    }
+    for at in 0..<read.len() {
+        buf[at] = read[at]
+    }
+    return read.len()
+} Streams.read_in
+
+pub fn Streams.write_out(self, data: Slice[u8]) fails sys::StdioError uses wait limits stack 4_096 {
+    try await self.write(error: false, data)
+} Streams.write_out
+
+pub fn Streams.write_err(self, data: Slice[u8]) fails sys::StdioError uses wait limits stack 4_096 {
+    try await self.write(error: true, data)
+} Streams.write_err
+
+/// Writes `data` to the output stream, or the error stream when `error`, once the task serving the streams has kept it.
+fn Streams.write(self, error: bool, data: Slice[u8]) fails sys::StdioError uses wait limits stack 4_096 {
+    let Some(pipe) = sys::reach(self, body: fn(pipe: Pipe, record: u8) => Pipe(requests: pipe.requests.split(), alloc: pipe.alloc)) else {
+        fail sys::StdioError.Closed
+    }
+    var bytes = mem::Bytes.empty(pipe.alloc)
+    mut bytes.append(data)
+    let task::Channel(sender: done, receiver: answers) = task::Channel[bool].bounded(1, alloc: pipe.alloc)
+    match attempt await pipe.requests.send(Piping.Write(error: error, bytes: take bytes, done: take done)) {
+        Ok(_) => {
+        }
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        Err(task::SendError.Closed) => fail sys::StdioError.Closed
+    }
+    var receiver = answers
+    if try await mut receiver.receive() != Some(true) {
+        fail sys::StdioError.Closed
+    }
+} Streams.write
+
+/// Serves the streams of the job `moniker` through `state`, its View of `/state`, until every sender of `requests` is gone: its reads take its input's blob in order, and each write appends one entry to its output or error stream.
+fn pipe_streams(state: store::service::View, take moniker: ident::Moniker, take requests: task::Receiver[Piping], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    var receiver = requests
+    var offset: u64 = 0
+    loop {
+        let Some(piping) = try await mut receiver.receive() else {
+            return
+        }
+        match piping {
+            Piping.Read(length: length, reply: reply) => {
+                let read = try await input_piece(state, moniker: ident::Moniker(text: moniker.text), offset, length: length.min(READ_BYTES), alloc)
+                offset += u64.widen(read.len())
+                discard attempt await reply.send(take read)
+            }
+            Piping.Write(error: error, bytes: bytes, done: done) => {
+                let name = match error {
+                    true => "stderr"
+                    false => "stdout"
+                }
+                var entry = mem::Bytes.empty(alloc)
+                mem::wire::Codec[mem::Bytes].encode(bytes, out: mut entry)
+                var entries = mem::List[mem::Bytes].empty(alloc)
+                mut entries.push(take entry)
+                var writes = mem::List[store::Write].empty(alloc)
+                mut writes.push(store::Write.Append(path: state_dir(moniker, name: name, alloc), entries: take entries))
+                let kept = (try await commit_writes(state, take writes, alloc)).is_none()
+                discard attempt await done.send(kept)
+            }
+        }
+    }
+} pipe_streams
+
+/// At most `length` bytes of the input of the job `moniker` from `offset`, read through `state`; none past its end or without one.
+fn input_piece(state: store::service::View, moniker: ident::Moniker, offset: u64, length: usize, alloc: mem::Alloc) -> mem::Bytes fails task::Cancelled uses wait {
+    return match first attempt await state.read(state_dir(moniker, name: "stdin", alloc), at: None, offset, length: u32.saturate(length), alloc) {
+        Ok(read) => input_bytes(read.view(), alloc)
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => mem::Bytes.empty(alloc)
+    }
+} input_piece
+
+/// The bytes of a job's input, which the job reads as untrusted.
+validator fn input_bytes(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect())
+    return bytes
+} input_bytes
+
+/// The writes declaring the output streams the subtree of the job `moniker` of `state`, a View of `/state`, lacks, and placing its input `stdin` at `/state/<moniker>/stdin`.
+fn stream_writes(state: store::service::View, moniker: ident::Moniker, stdin: Option[ident::HashValue], alloc: mem::Alloc) -> mem::List[store::Write] fails task::Cancelled uses wait {
+    var writes = mem::List[store::Write].empty(alloc)
+    try await declare_stream(state, moniker, name: "stdout", mut writes, alloc)
+    try await declare_stream(state, moniker, name: "stderr", mut writes, alloc)
+    match stdin {
+        Some(blob) => mut writes.push(store::Write.Put(path: state_dir(moniker, name: "stdin", alloc), value: store::Value.Blob(blob)))
+        None => {
+        }
+    }
+    return writes
+} stream_writes
+
+/// Adds to `writes` the declaration of the output stream `name` of the job `moniker` when `state` has none.
+fn declare_stream(state: store::service::View, moniker: ident::Moniker, name: Str, mut writes: mem::List[store::Write], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    match first attempt await state.get(state_dir(moniker, name, alloc), at: None, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(failed) if failed.code().as_str() == "store.not-found" => {
+            mut writes.push(store::Write.Make(path: state_dir(moniker, name, alloc), declaration: store::Declaration.Stream(store::StreamDecl(type: store::TypeRef.of(STREAM_TYPE, schema: mem::wire::Codec[mem::Bytes].schema_hash(), alloc), max_age_s: None, max_bytes: Some(STREAM_BYTES)))))
+        }
+        else => {
+        }
+    }
+} declare_stream
+
+/// The root entry of the standard streams of the run of the job the driver starts, served by a task of `s` through the job's View of `/state`; `None` for an instance of a component, or while `store` has no endpoint.
+fn Shared.job_pipe(self, mut driver: Driver, s: task::Scope) -> Option[sys::Minter[Streams, Pipe, u8]] fails task::Cancelled uses wait {
+    if driver.job.is_none() {
+        return None
+    }
+    let alloc = self.config.alloc
+    let directory = self.directory.share()
+    let view = await when directory => directory.state_view(mut driver.minted, moniker: ident::Moniker(text: driver.moniker.text), principal: ident::Principal(text: driver.spec.principal.text), alloc)
+    let Some(state) = view else {
+        return None
+    }
+    let task::Channel(sender: requests, receiver: requested) = task::Channel[Piping].bounded(1, alloc)
+    let moniker = ident::Moniker(text: driver.moniker.text)
+    discard s.spawn(fn[take requested, take moniker]() fails task::Cancelled uses wait limits stack 16_384 {
+        try await pipe_streams(state, take moniker, requests: take requested, alloc)
+    })
+    return Some(sys::Minter[Streams, Pipe, u8].of(Pipe(requests: take requests, alloc: alloc), alloc))
+} Shared.job_pipe
+
+/// The standard streams `piping` serves, `None` without it or once revoked.
+fn stdio_of(piping: Option[sys::Minter[Streams, Pipe, u8]]) -> Option[sys::Stdio] {
+    return match piping {
+        Some(minter) => match attempt sys::Stdio.served(minter.mint(0)) {
+            Ok(stdio) => Some(stdio)
+            Err(_) => None
+        }
+        None => None
+    }
+} stdio_of
+
+/// Revokes the standard streams `piping` serves, when there are some.
+fn close_pipe(take piping: Option[sys::Minter[Streams, Pipe, u8]]) {
+    match piping {
+        Some(minter) => take minter.close()
+        None => {
+        }
+    }
+} close_pipe

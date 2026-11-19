@@ -855,36 +855,7 @@ fn Shared.start[J: Journal](
     driver.cause = journal.open(driver.slot, moniker: ident::Moniker(text: driver.moniker.text), incarnation: driver.incarnation, parent: driver.changed_by)
     let config = try await self.configuration(mut driver)
     let bundled = driver.bundled()
-    let pacing = try await self.pacing(mut driver)
-    let budget = match try await self.resources(mut driver) {
-        Ok(cell) => cell
-        Err(code) => {
-            mut driver.showing.faulted(text::String.of(code.as_str(), alloc: self.config.alloc))
-            try await self.give_up(mut driver, journal, cause: driver.cause)
-            return
-        }
-    }
-    let account = self.config.exec.split_on(self.config.share(driver.spec.share), alloc: budget.alloc())
-    var sources = Some(Sources(clock: self.config.clock, random: self.config.random))
-    if driver.forkable(self.components) {
-        sources = mut driver.minted.taped_sources(clock: self.config.clock, random: self.config.random, alloc: self.config.alloc)
-    }
-    let Some(drawn) = sources else {
-        take account.close()
-        take budget.close()
-        try await self.give_up(mut driver, journal, cause: driver.cause)
-        return
-    }
-    let serial = pacing.serial(account)
-    let exec = executor_of(account, serial)
-    let request = Request(moniker: ident::Moniker(text: driver.moniker.text), cell: budget.alloc(), exec: exec, clock: pacing.clock(drawn.clock), random: drawn.random, withheld: self.withheld, orders: self.orders.split(), logs: self.logs.split(), forking: None, alloc: self.config.alloc)
-    let directory = self.directory.share()
-    let built = await when directory => directory.world(driver.spec, minted: mut driver.minted, request)
-    let Some(world) = built else {
-        close_serial(take serial)
-        take account.close()
-        take budget.close()
-        try await self.give_up(mut driver, journal, cause: driver.cause)
+    let Some(Incarnation(budget: budget, account: account, serial: serial, piping: piping, filing: filing, world: world, exec: exec)) = try await self.incarnation(mut driver, journal, s) else {
         return
     }
     let task::Channel(sender: deliveries, receiver: delivered) = task::Channel[Delivery].bounded(2, alloc: self.config.alloc)
@@ -894,7 +865,7 @@ fn Shared.start[J: Journal](
     let executor = account.id()
     self.bind(executor, account: driver.slot, reservation: driver.reservation, group: 0)
     let alloc = budget.alloc()
-    let held = Held(budget: take budget, reserved: driver.spec.budget.reserved, account: take account, serial: take serial, shares: self.config.shares(driver.spec.share), intake: driver.intake.share(), bundle: driver.spec.bundle, traps: driver.traps)
+    let held = Held(budget: take budget, reserved: driver.spec.budget.reserved, account: take account, serial: take serial, piping: take piping, filing: take filing, shares: self.config.shares(driver.spec.share), intake: driver.intake.share(), bundle: driver.spec.bundle, traps: driver.traps)
     let header = os::Header.of_work(cause: driver.cause, slot: driver.slot)
     match mut driver.take_run(started: self.config.wall.now(self.config.clock)) {
         Some(ready) => {
@@ -915,6 +886,79 @@ fn Shared.start[J: Journal](
     driver.domain = Some(Domain(deliveries: take deliveries, abandoner: take abandoner, outstanding: None, executor: executor))
     try await self.gauges.watch(driver.moniker.text.as_str(), watch: take gauged, alloc: self.config.alloc)
 } Shared.start
+
+/// What an incarnation runs on: its cell, its account and the serial executor it runs on when it has one, the root entries of a job's standard streams and file view, its world, and the executor its tasks run on.
+linear struct Incarnation {
+    budget: mem::Budget
+    account: task::Account
+    serial: Option[task::Account]
+    piping: Option[sys::Minter[Streams, Pipe, u8]]
+    filing: Option[sys::Minter[Files, Filing, u8]]
+    world: nanos::World
+    exec: task::Executor
+} Incarnation
+
+/// The cell, account, executor, streams and world of the incarnation the driver starts; `None` once it gave up the instance for lack of one.
+fn Shared.incarnation[J: Journal](self, mut driver: Driver, journal: J, s: task::Scope) -> Option[Incarnation] fails task::Cancelled uses wait {
+    let pacing = try await self.pacing(mut driver)
+    let budget = match try await self.resources(mut driver) {
+        Ok(cell) => cell
+        Err(code) => {
+            mut driver.showing.faulted(text::String.of(code.as_str(), alloc: self.config.alloc))
+            try await self.give_up(mut driver, journal, cause: driver.cause)
+            return None
+        }
+    }
+    let account = self.config.exec.split_on(self.config.share(driver.spec.share), alloc: budget.alloc())
+    var sources = Some(Sources(clock: self.config.clock, random: self.config.random))
+    if driver.forkable(self.components) {
+        sources = mut driver.minted.taped_sources(clock: self.config.clock, random: self.config.random, alloc: self.config.alloc)
+    }
+    let Some(drawn) = sources else {
+        take account.close()
+        take budget.close()
+        try await self.give_up(mut driver, journal, cause: driver.cause)
+        return None
+    }
+    let piping = match attempt await self.job_pipe(mut driver, s) {
+        Ok(served) => served
+        Err(cancelled) => {
+            take account.close()
+            take budget.close()
+            fail cancelled
+        }
+    }
+    let serial = pacing.serial(account)
+    let exec = executor_of(account, serial)
+    let request = Request(moniker: ident::Moniker(text: driver.moniker.text), cell: budget.alloc(), exec: exec, clock: pacing.clock(drawn.clock), random: drawn.random, withheld: self.withheld, orders: self.orders.split(), logs: self.logs.split(), forking: None, alloc: self.config.alloc)
+    let directory = self.directory.share()
+    let built = await when directory => directory.world(driver.spec, minted: mut driver.minted, request)
+    let Some(granted) = built else {
+        close_pipe(take piping)
+        close_serial(take serial)
+        take account.close()
+        take budget.close()
+        try await self.give_up(mut driver, journal, cause: driver.cause)
+        return None
+    }
+    var world = granted
+    match stdio_of(piping) {
+        Some(streams) => {
+            world.stdio = streams
+        }
+        None => {
+        }
+    }
+    let filing = self.job_files(driver, world, s)
+    match fs_of(filing) {
+        Some(files) => {
+            world.fs = files
+        }
+        None => {
+        }
+    }
+    return Some(Incarnation(budget: take budget, account: take account, serial: take serial, piping: take piping, filing: take filing, world: take world, exec: exec))
+} Shared.incarnation
 
 /// What a new incarnation takes: the CPU reservation of a `latency` share, admitted unless one is, `budget.over-reservation` when no CPU holds it, then its cell, the reservation ending when the cell is refused.
 fn Shared.resources(self, mut driver: Driver) -> Result[mem::Budget, text::Fixed[32]] fails task::Cancelled uses wait {
@@ -1064,12 +1108,14 @@ fn Shared.cell(self, mut driver: Driver) -> Result[mem::Budget, text::Fixed[32]]
     return Ok(store.alloc().split(usize.widen(limit)))
 } Shared.cell
 
-/// What an incarnation's watch holds: its cell, whether a reserved region supplies it, its account, the serial executor it runs on when it has one, the shares it starts in, and the length of its instance's queue.
+/// What an incarnation's watch holds: its cell, whether a reserved region supplies it, its account, the serial executor it runs on when it has one, the root entries of a job's standard streams and file view, the shares it starts in, and the length of its instance's queue.
 linear struct Held {
     budget: mem::Budget
     reserved: bool
     account: task::Account
     serial: Option[task::Account]
+    piping: Option[sys::Minter[Streams, Pipe, u8]]
+    filing: Option[sys::Minter[Files, Filing, u8]]
     shares: Shares
     intake: mem::Shared[core::atomic::AtomicU32]
     bundle: ident::HashValue
@@ -1177,7 +1223,9 @@ fn Shared.watch(
     let charging = Charging(gauges: self.gauges.share(), account: number)
     discard s.spawn(fn[take marks, take held, take abandoner, take inputs, take busy_mw, take charging]() fails task::Cancelled uses wait limits stack 16_384 {
         let watched = attempt await watch_marks(take marks, held, abandoner, inputs, clock, busy_mw, incarnation, handlers, charging)
-        let Held(budget: budget, reserved: _, account: account, serial: serial, shares: _, intake: _, bundle: _, traps: _) = held
+        let Held(budget: budget, reserved: _, account: account, serial: serial, piping: piping, filing: filing, shares: _, intake: _, bundle: _, traps: _) = held
+        close_files(take filing)
+        close_pipe(take piping)
         close_serial(take serial)
         take account.close()
         take budget.close()
