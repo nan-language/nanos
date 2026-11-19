@@ -1,6 +1,6 @@
 # 0117. Live updates
 
-Status: accepted
+Status: superseded by 0124
 
 ## Context
 

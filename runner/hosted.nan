@@ -11,6 +11,9 @@ struct Hosted {
     served: Option[mem::Bytes]
 } Hosted
 
+/// The longest an instance started by an update waits for a message before its holder looks for a health probe to run, in nanoseconds; such an instance is never suspended.
+const PROBED_WAIT_NS: u64 = 1_000_000_000
+
 /// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, its state schema, the names of its component's operations by number, the encoding of the protocol schema its bundle gives for it, the executor and allocator of its domain, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
 pub open linear struct Hosting {
     serving: Serving
@@ -289,6 +292,7 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
         try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival: false, updated), operations: names_in(steps.contents().operations, alloc)))
         let inbox = held.inbox()
         let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
+        let probe = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
         var given = Some(HostedGiven(deliveries: take deliveries, finishes: take finishes))
         var due_at = epoch_after(keeping, clock)
         let looped = attempt await task::scope(exec, body: fn[mut held, mut given, mut due_at](s: task::Scope) fails Stopping uses wait {
@@ -298,8 +302,9 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
             let sending = reports.split()
             let counted = steps.share()
             let setting = quiet.share()
-            discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take setting]() fails Stopping uses wait limits stack 40_960 {
-                try await dispatch_hosted(inbox, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, quiet: setting, alloc)
+            let probing = probe.share()
+            discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take setting, take probing]() fails Stopping uses wait limits stack 40_960 {
+                try await dispatch_hosted(inbox, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, quiet: setting, probe: probing, alloc)
             })
             let answering = reports.split()
             let queued = replies.share()
@@ -307,7 +312,7 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
             discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
                 try await hand_over(queued, signal: ringing, reports: answering, incarnation)
             })
-            match attempt await hold_hosted(mut held, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), schema, telling) {
+            match attempt await hold_hosted(mut held, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), probe: probe.contents(), updated, schema, telling) {
                 Ok(_) => {
                 }
                 Err(nanos::InstanceError.Ended) => fail Stopping.Ended
@@ -365,7 +370,7 @@ fn begin_hosted(mut instance: nanos::Instance, restored: bool, updated: bool, te
     }
 } begin_hosted
 
-/// Serves each call delivered to the instance through `inbox`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which it is suspended and refusing each order for its holder.
+/// Serves each call delivered to the instance through `inbox`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which it is suspended, setting `probe` for each health probe ordered and refusing each other order for its holder.
 fn dispatch_hosted(
     inbox: nanos::Inbox,
     take deliveries: task::Receiver[Delivery],
@@ -374,6 +379,7 @@ fn dispatch_hosted(
     reports: task::Sender[Input],
     incarnation: u64,
     quiet: mem::Shared[core::atomic::AtomicU64],
+    probe: mem::Shared[core::atomic::AtomicBool],
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
     var receiver = deliveries
@@ -400,7 +406,12 @@ fn dispatch_hosted(
                 counts.deadline.store(os::NO_DEADLINE)
             }
             Delivery.SuspendAfter(ms: ms) => quiet.contents().store(u64.widen(ms))
-            Delivery.Hold(order: order) => try await take order.refuse()
+            Delivery.Hold(order: order) => {
+                match order {
+                    HolderOrder.Health => probe.contents().store(true)
+                    else => try await take order.refuse()
+                }
+            }
             Delivery.Stop(hand: hand) => fail Stopping.Asked(hand: hand)
         }
     }
@@ -413,6 +424,8 @@ fn hold_hosted(
     mut due_at: Option[u64],
     syncing: core::atomic::AtomicBool,
     quiet: core::atomic::AtomicU64,
+    probe: core::atomic::AtomicBool,
+    updated: bool,
     schema: ident::HashValue,
     telling: Telling,
     ) fails nanos::InstanceError uses wait {
@@ -421,20 +434,52 @@ fn hold_hosted(
         if syncing.swap(false) {
             due_at = Some(now(clock))
         }
+        if probe.swap(false) {
+            let probing = telling.begin(call: SystemCall.Health)
+            let health = try await mut instance.health()
+            telling.end_system(probing)
+            let healthy = match health {
+                sys::HealthReply.Healthy => true
+                sys::HealthReply.Unhealthy(_) => false
+            }
+            match attempt await telling.tell(report: Report.Health(healthy: healthy)) {
+                Err(cancelled) => fail nanos::InstanceError.Cancelled(take cancelled)
+                Ok(_) => {
+                }
+            }
+        }
         match first keeping {
             Some(kept) if due_at.is_some() => {
-                let arrived = try await task::within_ns(clock, ns: due_at.value_or(0).saturating_sub(now(clock)), body: fn() fails nanos::InstanceError uses wait {
+                let until_due = due_at.value_or(0).saturating_sub(now(clock))
+                let bound = match updated {
+                    true => until_due.min(PROBED_WAIT_NS)
+                    false => until_due
+                }
+                let arrived = try await task::within_ns(clock, ns: bound, body: fn() fails nanos::InstanceError uses wait {
                     try await instance.incoming()
                 })
                 if arrived.is_none() and not try await instance.ready() {
-                    due_at = match try await keep_hosted(instance, keeping: kept, schema, telling) {
-                        true => None
-                        false => epoch_after(keeping, clock)
+                    if bound == until_due {
+                        due_at = match try await keep_hosted(instance, keeping: kept, schema, telling) {
+                            true => None
+                            false => epoch_after(keeping, clock)
+                        }
                     }
                     continue
                 }
             }
-            else => try await idle_hosted(mut instance, quiet, telling)
+            else => {
+                if updated {
+                    let arrived = try await task::within_ns(clock, ns: PROBED_WAIT_NS, body: fn() fails nanos::InstanceError uses wait {
+                        try await instance.incoming()
+                    })
+                    if arrived.is_none() {
+                        continue
+                    }
+                } else {
+                    try await idle_hosted(mut instance, quiet, telling)
+                }
+            }
         }
         if try await step_hosted(mut instance, telling) and due_at.is_none() {
             due_at = epoch_after(keeping, clock)

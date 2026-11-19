@@ -243,6 +243,8 @@ A **revert** runs these steps:
 4. It calls `resume` with reason `Updated` and reopens the intake.
 5. The spec's `bundle` returns to the old code hash: during the update's health window, by its revert by blame ([health windows](14-changes.md#health-windows)); after it, by a revert commit of `supervisor`. The runner emits `update.reverted`.
 
+The reason `update.reverted` gives is the trap's kind, `unhealthy`, `regression`, `grouped` for the revert of another update of its commit, or the abort's code.
+
 ## Rollback after probation
 
 `undo` of an update commit ([undo](14-changes.md#undo)) previews an `update` back to the old code hash. That update is lossless when the schema hash is unchanged, when the new schema is additive over the old one and the old state type is `flexible`, so the old decoder keeps the new fields, or when the `migrate` declares an inverse (requires [N5](22-nan.md#n5)). Otherwise the preview offers `restore-checkpoint <moniker> <n>` with the checkpoint taken before the update while the store keeps it ([checkpoints](06-execution.md#checkpoints)), else a restart, and lists the commits the instance has written since the update, whose effects the restored state no longer reflects.

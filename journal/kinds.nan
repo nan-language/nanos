@@ -83,6 +83,22 @@ pub const HIBERNATED: u16 = 25
 /// `instance.job-ended`, its argument the commit merging the job's branch, 0 for none, and its continuation holding the name of the outcome's kind.
 pub const JOB_ENDED: u16 = 26
 
+/// The kinds whose payload fills their argument and two continuations, as `Wide` lays it out.
+pub const CODE_LOADED: u16 = 27
+
+pub const CODE_UNLOADED: u16 = 28
+
+pub const UPDATE_STARTED: u16 = 29
+
+pub const UPDATE_PASSED: u16 = 30
+
+pub const UPDATE_REVERTED: u16 = 31
+
+/// The payload bytes of a record of a kind of two continuations: its argument's 8 bytes, least significant first, then the bytes of each continuation.
+pub closed struct Wide derives Copy {
+    pub bytes: Array[u8, 72]
+} Wide
+
 /// A record of a core ring as the core drained it: the record, its continuations, the instance its slot names, `supervisor` for the core's, and for a span the instance that sent the call, `None` for the core.
 pub closed struct CoreRecord {
     pub record: RingRecord
@@ -115,6 +131,73 @@ pub closed struct JobEnded derives Render, Encode {
     pub outcome: text::String
     pub commit: Option[ident::CommitId]
 } JobEnded
+
+/// The payload of `code.loaded`: the bundle's code hash, the space it was loaded into and its code bytes.
+pub closed struct CodeLoaded derives Render, Encode {
+    pub code: ident::HashValue
+    pub space: text::String
+    pub code_bytes: u64
+} CodeLoaded
+
+/// The payload of `code.unloaded`: the bundle's code hash and the space it left.
+pub closed struct CodeUnloaded derives Render, Encode {
+    pub code: ident::HashValue
+    pub space: text::String
+} CodeUnloaded
+
+/// How an update moves an instance's state: unchanged, additive over a `flexible` type, or through the new bundle's `migrate`.
+pub closed enum MigrationClass derives Copy, Eq, Render, Encode {
+    Identical
+    Additive
+    Migrated
+} MigrationClass
+
+/// The payload of `update.started`: the instance, its old and new code hash, and the update's migration class.
+pub closed struct UpdateStarted derives Render, Encode {
+    pub moniker: ident::Moniker
+    pub old: ident::HashValue
+    pub new: ident::HashValue
+    pub class: MigrationClass
+} UpdateStarted
+
+/// What ended a probation without a revert: its bounds, its recording's bound, a stop or a restart.
+pub closed enum ProbationEnd derives Copy, Eq, Render, Encode {
+    Bounds
+    Recording
+    Stop
+    Restart
+} ProbationEnd
+
+/// The payload of `update.passed`: the instance, its code hash, the messages it handled during probation, and what ended it.
+pub closed struct UpdatePassed derives Render, Encode {
+    pub moniker: ident::Moniker
+    pub code: ident::HashValue
+    pub messages: u64
+    pub ended: ProbationEnd
+} UpdatePassed
+
+/// Why an update was reverted: a trap of the new code, a failed health check, a latency regression, the revert of another update of its commit, or the code aborting it.
+pub closed enum RevertReason derives Copy, Eq {
+    Trapped(kind: sys::TrapKind)
+    Unhealthy
+    Regression
+    Grouped
+    DecodeFailed
+    ActivationTimeout
+    EnvIncomplete
+    NoImage
+    Malformed
+} RevertReason
+
+/// The payload of `update.reverted`: the instance, its old and new code hash, the reason's code, and the recorded inputs the revert replayed and dead-lettered.
+pub closed struct UpdateReverted derives Render, Encode {
+    pub moniker: ident::Moniker
+    pub old: ident::HashValue
+    pub new: ident::HashValue
+    pub reason: text::String
+    pub replayed: u64
+    pub dead_lettered: u64
+} UpdateReverted
 
 /// The payload of `instance.stopped`.
 pub closed struct InstanceStopped derives Render, Encode {
@@ -242,6 +325,11 @@ pub fn kind_name(kind: u16) -> text::Fixed[32] {
         BOOT_CANDIDATE_FAILED => "boot.candidate-failed"
         HIBERNATED => "instance.hibernated"
         JOB_ENDED => "instance.job-ended"
+        CODE_LOADED => "code.loaded"
+        CODE_UNLOADED => "code.unloaded"
+        UPDATE_STARTED => "update.started"
+        UPDATE_PASSED => "update.passed"
+        UPDATE_REVERTED => "update.reverted"
         else => "unknown"
     })
 } kind_name
@@ -272,6 +360,190 @@ pub fn Severity.name(self) -> text::Fixed[8] {
 
 /// Whether the record has a continuation after it.
 pub fn RingRecord.continued(self) -> bool = (self.flags & CONTINUED) != 0
+
+/// The continuations a continued record of kind `kind` has: two for the kinds `Wide` lays out, one otherwise.
+pub fn continuations(kind: u16) -> usize {
+    if kind >= CODE_LOADED and kind <= UPDATE_REVERTED {
+        return 2
+    }
+    return 1
+} continuations
+
+/// The argument the payload's first 8 bytes give.
+pub fn Wide.argument(self) -> u64 {
+    var argument: u64 = 0
+    var at: usize = 8
+    while at > 0 {
+        at -= 1
+        argument = (argument << 8) | u64.widen(self.bytes[at])
+    }
+    return argument
+} Wide.argument
+
+/// The continuation holding the payload's bytes from `8 + 32 * index`.
+pub fn Wide.continuation(self, index: usize) -> RingRecord {
+    var part = Array[u8, 32].filled(0)
+    for at in 0..<32usize {
+        part[at] = self.bytes[8 + 32 * index + at]
+    }
+    return RingRecord.from_bits(part)
+} Wide.continuation
+
+/// The payload of `code.loaded` or `code.unloaded` of the bundle `code` in the shared space, of `code_bytes` code bytes: those bytes, the hash, then the space's name.
+pub fn Wide.of_code(code: ident::HashValue, code_bytes: u64) -> Wide {
+    var wide = Wide(bytes: Array[u8, 72].filled(0))
+    mut wide.put_number(at: 0, value: code_bytes)
+    mut wide.put_hash(at: 8, hash: code)
+    var at: usize = 41
+    for byte in SHARED_SPACE.as_bytes() {
+        wide.bytes[at] = byte
+        at += 1
+    }
+    return wide
+} Wide.of_code
+
+/// The payload of `update.started` from `old` to `new` of migration class `class`: the class in its first byte, then both hashes.
+pub fn Wide.of_start(old: ident::HashValue, new: ident::HashValue, class: MigrationClass) -> Wide {
+    var wide = Wide(bytes: Array[u8, 72].filled(0))
+    wide.bytes[0] = match class {
+        MigrationClass.Identical => 0
+        MigrationClass.Additive => 1
+        MigrationClass.Migrated => 2
+    }
+    mut wide.put_hash(at: 1, hash: old)
+    mut wide.put_hash(at: 34, hash: new)
+    return wide
+} Wide.of_start
+
+/// The payload of `update.passed` of the bundle `code` after `messages` messages, ended by `ended`: the messages, the hash, then the end.
+pub fn Wide.of_pass(code: ident::HashValue, messages: u64, ended: ProbationEnd) -> Wide {
+    var wide = Wide(bytes: Array[u8, 72].filled(0))
+    mut wide.put_number(at: 0, value: messages)
+    mut wide.put_hash(at: 8, hash: code)
+    wide.bytes[41] = match ended {
+        ProbationEnd.Bounds => 0
+        ProbationEnd.Recording => 1
+        ProbationEnd.Stop => 2
+        ProbationEnd.Restart => 3
+    }
+    return wide
+} Wide.of_pass
+
+/// The payload of `update.reverted` from `new` back to `old` for `reason`, having replayed `replayed` recorded inputs and dead-lettered `dead_lettered`: the reason and its trap kind, both counts in two bytes each, then both hashes.
+pub fn Wide.of_revert(
+    old: ident::HashValue,
+    new: ident::HashValue,
+    reason: RevertReason,
+    replayed: u64,
+    dead_lettered: u64,
+    ) -> Wide {
+    var wide = Wide(bytes: Array[u8, 72].filled(0))
+    wide.bytes[0] = reason.number()
+    wide.bytes[1] = match reason {
+        RevertReason.Trapped(kind: kind) => u8.truncate(trap_number(Some(kind)))
+        else => 0
+    }
+    let replays = u16.saturate(replayed)
+    let deaths = u16.saturate(dead_lettered)
+    wide.bytes[2] = u8.truncate(replays)
+    wide.bytes[3] = u8.truncate(replays >> 8)
+    wide.bytes[4] = u8.truncate(deaths)
+    wide.bytes[5] = u8.truncate(deaths >> 8)
+    mut wide.put_hash(at: 6, hash: old)
+    mut wide.put_hash(at: 39, hash: new)
+    return wide
+} Wide.of_revert
+
+/// The payload bytes of the record and its continuations.
+pkg fn CoreRecord.wide(self) -> Wide {
+    var wide = Wide(bytes: Array[u8, 72].filled(0))
+    mut wide.put_number(at: 0, value: self.record.argument)
+    for index in 0..<2usize {
+        let Some(next) = self.more.get(index) else {
+            break
+        }
+        let bits = next.to_bits()
+        for at in 0..<32usize {
+            wide.bytes[8 + 32 * index + at] = bits[at]
+        }
+    }
+    return wide
+} CoreRecord.wide
+
+fn Wide.put_number(mut self, at: usize, value: u64) {
+    for index in 0..<8usize {
+        self.bytes[at + index] = u8.truncate(value >> u32.truncate(8 * index))
+    }
+} Wide.put_number
+
+fn Wide.put_hash(mut self, at: usize, hash: ident::HashValue) {
+    for index in 0..<33usize {
+        self.bytes[at + index] = hash.bytes[index]
+    }
+} Wide.put_hash
+
+fn Wide.hash(self, at: usize) -> ident::HashValue {
+    var bytes = Array[u8, 33].filled(0)
+    for index in 0..<33usize {
+        bytes[index] = self.bytes[at + index]
+    }
+    return ident::HashValue(bytes: bytes)
+} Wide.hash
+
+fn Wide.count(self, at: usize) -> u64 {
+    return u64.widen(self.bytes[at]) | (u64.widen(self.bytes[at + 1]) << 8)
+} Wide.count
+
+/// The name of the space the payload's bytes from 41 hold.
+fn Wide.space(self, alloc: mem::Alloc) -> text::String {
+    var space = text::String.empty(alloc)
+    for at in 41..<72usize {
+        let byte = self.bytes[at]
+        if byte == 0 {
+            break
+        }
+        mut space.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+    }
+    return space
+} Wide.space
+
+/// The name of the only space bundles load into until isolated spaces are built.
+const SHARED_SPACE: Str = "shared"
+
+/// The reason's number in `update.reverted`'s payload.
+fn RevertReason.number(self) -> u8 {
+    return match self {
+        RevertReason.Trapped(kind: _) => 1
+        RevertReason.Unhealthy => 2
+        RevertReason.Regression => 3
+        RevertReason.DecodeFailed => 4
+        RevertReason.ActivationTimeout => 5
+        RevertReason.EnvIncomplete => 6
+        RevertReason.NoImage => 7
+        RevertReason.Malformed => 8
+        RevertReason.Grouped => 9
+    }
+} RevertReason.number
+
+/// The code of the reason numbered `number`, of trap kind `trap` for a trap.
+fn reason_code(number: u8, trap: u8) -> text::Fixed[32] {
+    if number == 1 {
+        return match trap_kind(u16.widen(trap)) {
+            Some(kind) => trap_code(kind)
+            None => text::Fixed[32].of("trap.abandoned")
+        }
+    }
+    return text::Fixed[32].of(match number {
+        2 => "unhealthy"
+        3 => "regression"
+        9 => "grouped"
+        4 => "update.decode-failed"
+        5 => "plan.activation-timeout"
+        6 => "instance.env-incomplete"
+        7 => "code.no-image"
+        else => "code.malformed"
+    })
+} reason_code
 
 /// The event the record gives, acting for `system`.
 pub fn CoreRecord.event(self, system: ident::Cause, alloc: mem::Alloc) -> Event {
@@ -328,6 +600,20 @@ fn CoreRecord.payload(self, alloc: mem::Alloc) -> Payload {
         STORE_WRITES_REFUSED => payload_of(WritesRefused(free: argument), alloc)
         BOOT_STARTED => payload_of(started_of(generation: argument, more), alloc)
         BOOT_CANDIDATE_FAILED => payload_of(CandidateFailed(generation: argument, code: text_of(more, alloc)), alloc)
+        CODE_LOADED => payload_of(CodeLoaded(code: self.wide().hash(at: 8), space: self.wide().space(alloc), code_bytes: argument), alloc)
+        CODE_UNLOADED => payload_of(CodeUnloaded(code: self.wide().hash(at: 8), space: self.wide().space(alloc)), alloc)
+        UPDATE_STARTED => payload_of(UpdateStarted(moniker: ident::Moniker(text: self.source.text), old: self.wide().hash(at: 1), new: self.wide().hash(at: 34), class: match self.wide().bytes[0] {
+            1 => MigrationClass.Additive
+            2 => MigrationClass.Migrated
+            else => MigrationClass.Identical
+        }), alloc)
+        UPDATE_PASSED => payload_of(UpdatePassed(moniker: ident::Moniker(text: self.source.text), code: self.wide().hash(at: 8), messages: argument, ended: match self.wide().bytes[41] {
+            1 => ProbationEnd.Recording
+            2 => ProbationEnd.Stop
+            3 => ProbationEnd.Restart
+            else => ProbationEnd.Bounds
+        }), alloc)
+        UPDATE_REVERTED => payload_of(UpdateReverted(moniker: ident::Moniker(text: self.source.text), old: self.wide().hash(at: 6), new: self.wide().hash(at: 39), reason: text::String.of(reason_code(number: self.wide().bytes[0], trap: self.wide().bytes[1]).as_str(), alloc), replayed: self.wide().count(at: 2), dead_lettered: self.wide().count(at: 4)), alloc)
         else => payload_of(StoreDeviceFailed(), alloc)
     }
 } CoreRecord.payload
@@ -440,6 +726,37 @@ test core_records_give_their_kinds_events for CoreRecord.event {
     }
     expect device.path.as_str() == "pci" and device.argument == 3
 } core_records_give_their_kinds_events
+
+test wide_records_carry_two_code_hashes_through_their_continuations for Wide.of_revert {
+    let alloc = testing::world().alloc
+    var old = Array[u8, 33].filled(0x11)
+    old[0] = 0x01
+    var new = Array[u8, 33].filled(0x22)
+    new[0] = 0x01
+    let wide = Wide.of_revert(old: ident::HashValue(bytes: old), new: ident::HashValue(bytes: new), reason: RevertReason.Trapped(kind: sys::TrapKind.Expect), replayed: 7, dead_lettered: 1)
+    var more = mem::List[RingRecord].empty(alloc)
+    mut more.push(wide.continuation(0))
+    mut more.push(wide.continuation(1))
+    let reverted = CoreRecord(record: RingRecord(time: 5, cause: 0, source: 4, kind: UPDATE_REVERTED, severity: 4, flags: CONTINUED, argument: wide.argument()), more: take more, source: ident::Moniker(text: text::Fixed[59].of("counter")), sender: None)
+    let event = reverted.event(ident::Cause.of(boot: 2, number: 1), alloc)
+    let Ok(payload) = attempt mem::wire::Codec[UpdateReverted].decode(Untrusted.of(event.payload.bytes.view()), alloc) else {
+        expect false
+        return
+    }
+    expect event.kind.as_str() == "update.reverted" and continuations(UPDATE_REVERTED) == 2
+    expect payload.moniker.text.as_str() == "counter" and payload.old == ident::HashValue(bytes: old) and payload.new == ident::HashValue(bytes: new)
+    expect payload.reason.as_str() == "trap.expect" and payload.replayed == 7 and payload.dead_lettered == 1
+    let start = Wide.of_start(old: ident::HashValue(bytes: old), new: ident::HashValue(bytes: new), class: MigrationClass.Additive)
+    var opening = mem::List[RingRecord].empty(alloc)
+    mut opening.push(start.continuation(0))
+    mut opening.push(start.continuation(1))
+    let opened = CoreRecord(record: RingRecord(time: 5, cause: 0, source: 4, kind: UPDATE_STARTED, severity: 2, flags: CONTINUED, argument: start.argument()), more: take opening, source: ident::Moniker(text: text::Fixed[59].of("counter")), sender: None).event(ident::Cause.of(boot: 2, number: 1), alloc)
+    let Ok(begun) = attempt mem::wire::Codec[UpdateStarted].decode(Untrusted.of(opened.payload.bytes.view()), alloc) else {
+        expect false
+        return
+    }
+    expect begun.old == ident::HashValue(bytes: old) and begun.new == ident::HashValue(bytes: new) and begun.class == MigrationClass.Additive
+} wide_records_carry_two_code_hashes_through_their_continuations
 
 test traps_give_fault_records_and_boots_their_system_cause for CoreRecord.fault {
     let alloc = testing::world().alloc

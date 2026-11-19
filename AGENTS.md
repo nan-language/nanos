@@ -21,7 +21,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `code/` | The `code` package: the records of bundle files, their code hash and their admission, reading their artefacts, and making a bundle from what a bundle build writes |
 | `admission/` | The `admission` package: the `admission` instance, judging bundles by the steps of admission |
 | `os/` | The `os` package: the records instances and the core share, message headers, and the capability kinds `Port`, `Control`, `Live`, `Callers`, `Accounts` and `Meter` |
-| `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints, dead letters, flight recorders, forks, pauses, replays and hibernations, and the accounts of sessions |
+| `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints, dead letters, flight recorders, forks, pauses, replays, hibernations, updates and their probations, and the accounts of sessions |
 | `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |
 | `devices/` | The `devices` package: the device protocols and `fat`'s, the `drivers` registry, the AML evaluator, partition tables, volume views and the device manager |
 | `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries |

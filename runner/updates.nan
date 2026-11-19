@@ -1,15 +1,26 @@
-//! Live updates: an instance moving to the bundle its specification names restarts under it from its old code's encoding of its state, resuming with reason `Updated`, and goes back to its old bundle from the same encoding when the new code fails before its probation ends.
+//! Live updates: an instance moving to the bundle its specification names restarts under it from its old code's encoding of its state, resuming with reason `Updated`, and goes back to its old bundle from the same encoding when the new code fails, is unhealthy or regresses before its probation ends.
 
-/// How long an update's probation lasts, in seconds.
-const PROBATION_S: u64 = 60
+/// How often a probation is looked at, in nanoseconds.
+const PROBATION_TICK_NS: u64 = 1_000_000_000
 
-/// A live update of an instance: the code hash and the description of the component it ran before, the old code's encoding of its state once handed, and whether the update was reverted, the old bundle running again from that encoding.
+/// A live update of an instance: the code hash and the description of the component it ran before, the old code's encoding of its state once handed, whether the update was reverted, the old bundle running again from that encoding, the probation it runs under, the p99 handler latency of the old bundle in µs when it handled enough messages to give one, when the new code began running and when its health was last asked, in monotonic nanoseconds, 0 until it runs, and whether its probation is still looked at.
 struct Updating {
     old: ident::HashValue
     hosted: Option[mem::Box[Hosted]]
     handed: Option[PreUpdate]
     reverted: bool
+    probation: os::Probation
+    baseline_us: Option[u64]
+    started_ns: u64
+    probed_ns: u64
+    ticking: mem::Shared[core::atomic::AtomicBool]
 } Updating
+
+/// How the latest probation of an instance ended: the bundle it put on probation, and whether it was reverted.
+struct Probated derives Copy, Eq {
+    bundle: ident::HashValue
+    reverted: bool
+} Probated
 
 /// The old code's encoding of an instance's state as an update stopped it, and the schema of that state.
 struct PreUpdate {
@@ -55,17 +66,27 @@ fn Shared.redescribed[J: Journal](
     take described: Result[Option[mem::Box[Hosted]], os::ControlError],
     journal: J,
     ) fails task::Cancelled uses wait {
+    let bundle = renewed.contents().bundle
     let Ok(hosted) = described else {
+        try await self.refuse_update(mut driver, bundle, journal)
         return
     }
     let Some(serving) = protocols_of(self.components, spec: driver.spec, hosted: driver.hosted) else {
+        try await self.refuse_update(mut driver, bundle, journal)
         return
     }
     let Some(serves) = protocols_of(self.components, spec: renewed.contents(), hosted) else {
+        try await self.refuse_update(mut driver, bundle, journal)
         return
     }
     if serves.own != serving.own {
+        try await self.refuse_update(mut driver, bundle, journal)
         return
+    }
+    let probation = driver.waiting_probation(bundle).value_or(os::Probation.defaults())
+    let baseline_us = match try await self.gauges.read(driver.moniker.text.as_str(), alloc: self.config.alloc) {
+        Some(gauge) => p99_us(gauge.latency, least: probation.min_messages)
+        None => None
     }
     let old = driver.spec.bundle
     var before: Option[mem::Box[Hosted]] = None
@@ -85,9 +106,206 @@ fn Shared.redescribed[J: Journal](
     if driver.lifecycle != Some(os::Lifecycle.Running) {
         return
     }
-    driver.updating = Some(mem::Heap.of(self.config.alloc).boxed(Updating(old: old, hosted: take before, handed: None, reverted: false)))
+    driver.updating = Some(mem::Heap.of(self.config.alloc).boxed(Updating(old: old, hosted: take before, handed: None, reverted: false, probation: probation, baseline_us: baseline_us, started_ns: 0, probed_ns: 0, ticking: mem::Shared.of(core::atomic::AtomicBool.of(true), alloc: self.config.alloc))))
     try await self.stop(mut driver, then: Then.Update, journal)
 } Shared.redescribed
+
+/// Leaves the instance on its bundle when the bundle `bundle` cannot replace it: the update is reverted before it began.
+fn Shared.refuse_update[J: Journal](self, mut driver: Driver, bundle: ident::HashValue, journal: J) fails task::Cancelled uses wait {
+    journal.record(driver.slot, cause: driver.cause, event: Event.UpdateReverted(old: driver.spec.bundle, new: bundle, reason: journal::RevertReason.Malformed, replayed: 0, dead_lettered: 0))
+    driver.probated = Some(Probated(bundle: bundle, reverted: true))
+    try await mut driver.settle()
+} Shared.refuse_update
+
+/// The probation the supervisor's order waiting for the update to `bundle` gives, `None` when no order waits for it.
+fn Driver.waiting_probation(self, bundle: ident::HashValue) -> Option[os::Probation] {
+    for waiter in self.waiters {
+        match waiter.awaits {
+            Awaited.Probation(bundle: waited, probation: probation) => {
+                if waited == bundle {
+                    return Some(probation)
+                }
+            }
+            else => {
+            }
+        }
+    }
+    return None
+} Driver.waiting_probation
+
+/// Has the update to `bundle` in progress run under `probation` from now on.
+fn Driver.set_probation(mut self, bundle: ident::HashValue, probation: os::Probation) {
+    if self.spec.bundle != bundle {
+        return
+    }
+    let Some(boxed) = mut self.updating.extract() else {
+        return
+    }
+    var updating = take boxed.into_contents()
+    updating.probation = probation
+    self.updating = Some(mem::Heap.of(self.alloc).boxed(take updating))
+} Driver.set_probation
+
+/// Starts the probation of the update under way, its new code running from `now_ns`, and records `update.started`.
+fn Driver.update_started[J: Journal](mut self, journal: J, now_ns: u64) {
+    let Some(boxed) = mut self.updating.extract() else {
+        return
+    }
+    var updating = take boxed.into_contents()
+    if not updating.reverted {
+        updating.started_ns = now_ns
+        updating.probed_ns = now_ns
+        journal.record(self.slot, cause: self.cause, event: Event.UpdateStarted(old: updating.old, new: self.spec.bundle, class: journal::MigrationClass.Identical))
+    }
+    self.updating = Some(mem::Heap.of(self.alloc).boxed(take updating))
+} Driver.update_started
+
+/// Whether a probation runs: the new code of an update not reverted began running.
+fn Driver.in_probation(self) -> bool {
+    return match self.updating {
+        Some(boxed) => boxed.contents().started_ns != 0 and not boxed.contents().reverted
+        None => false
+    }
+} Driver.in_probation
+
+/// The monotonic time in nanoseconds at which the probation running ends at the latest, `None` when none runs.
+fn Driver.probation_ends_ns(self) -> Option[u64] {
+    let Some(boxed) = self.updating else {
+        return None
+    }
+    let updating = boxed.contents()
+    if updating.started_ns == 0 or updating.reverted {
+        return None
+    }
+    return Some(updating.started_ns + u64.widen(updating.probation.max_s) * NS_PER_S)
+} Driver.probation_ends_ns
+
+/// Looks at the probation of the incarnation `incarnation` at `now_ns`: asks its health when due, and ends it once its bounds are met, reverting the update on a latency regression.
+fn Shared.probation_tick[J: Journal](self, mut driver: Driver, incarnation: u64, journal: J) fails task::Cancelled uses wait {
+    if incarnation != driver.incarnation or driver.lifecycle != Some(os::Lifecycle.Running) or not driver.in_probation() {
+        return
+    }
+    let Some(boxed) = mut driver.updating.extract() else {
+        return
+    }
+    var updating = take boxed.into_contents()
+    let now_ns = now(self.config.clock)
+    let probation = updating.probation
+    if now_ns.saturating_sub(updating.probed_ns) >= u64.widen(probation.health_s) * NS_PER_S {
+        updating.probed_ns = now_ns
+        match driver.domain {
+            Some(domain) => {
+                discard attempt await domain.deliveries.send(Delivery.Hold(order: HolderOrder.Health))
+            }
+            None => {
+            }
+        }
+    }
+    let started_ns = updating.started_ns
+    let baseline_us = updating.baseline_us
+    driver.updating = Some(mem::Heap.of(self.config.alloc).boxed(take updating))
+    let Some(gauge) = try await self.gauges.read(driver.moniker.text.as_str(), alloc: self.config.alloc) else {
+        return
+    }
+    let elapsed_s = now_ns.saturating_sub(started_ns) / NS_PER_S
+    let bounded = elapsed_s >= u64.widen(probation.max_s) or (elapsed_s >= u64.widen(probation.min_s) and gauge.messages >= probation.min_messages)
+    if not bounded {
+        return
+    }
+    if regressed(baseline_us, latency: gauge.latency, probation) {
+        try await self.revert_update(mut driver, reason: journal::RevertReason.Regression, journal)
+        return
+    }
+    mut driver.pass_probation(messages: gauge.messages, ended: journal::ProbationEnd.Bounds, journal)
+    try await mut driver.settle()
+} Shared.probation_tick
+
+/// Reverts the update in probation for `reason`: the old bundle restarts from the old code's encoding of the state, and `update.reverted` is recorded.
+fn Shared.revert_update[J: Journal](self, mut driver: Driver, reason: journal::RevertReason, journal: J) fails task::Cancelled uses wait {
+    let new = driver.spec.bundle
+    let Some(boxed) = driver.updating else {
+        return
+    }
+    let old = boxed.contents().old
+    if not mut driver.revert(self.config.alloc) {
+        return
+    }
+    journal.record(driver.slot, cause: driver.cause, event: Event.UpdateReverted(old: old, new: new, reason: reason, replayed: 0, dead_lettered: 0))
+    driver.probated = Some(Probated(bundle: new, reverted: true))
+    try await self.stop(mut driver, then: Then.Restart, journal)
+    try await mut driver.settle()
+} Shared.revert_update
+
+/// Ends the probation running without a revert, `ended` ending it after `messages` messages: `update.passed` is recorded and the old code's encoding of the state dropped.
+fn Driver.pass_probation[J: Journal](mut self, messages: u64, ended: journal::ProbationEnd, journal: J) {
+    if not self.in_probation() {
+        return
+    }
+    let Some(boxed) = mut self.updating.extract() else {
+        return
+    }
+    boxed.contents().ticking.contents().store(false)
+    journal.record(self.slot, cause: self.cause, event: Event.UpdatePassed(code: self.spec.bundle, messages: messages, ended: ended))
+    self.probated = Some(Probated(bundle: self.spec.bundle, reverted: false))
+} Driver.pass_probation
+
+/// Ends the probation running as a stop or restart of the instance, `ended`, ends it.
+fn Shared.end_probation[J: Journal](self, mut driver: Driver, ended: journal::ProbationEnd, journal: J) fails task::Cancelled uses wait {
+    if not driver.in_probation() {
+        return
+    }
+    let messages = match try await self.gauges.read(driver.moniker.text.as_str(), alloc: self.config.alloc) {
+        Some(gauge) => gauge.messages
+        None => 0
+    }
+    mut driver.pass_probation(messages: messages, ended, journal)
+} Shared.end_probation
+
+/// The reason a failed start or a trap of an update's new code gives its revert.
+fn revert_reason(outcome: Result[Ended, sys::Trap]) -> journal::RevertReason {
+    return match outcome {
+        Err(trap) => journal::RevertReason.Trapped(kind: trap.kind())
+        Ok(Ended.EnvIncomplete) => journal::RevertReason.EnvIncomplete
+        Ok(Ended.CheckpointUndecodable) => journal::RevertReason.DecodeFailed
+        Ok(Ended.Unhealthy) => journal::RevertReason.Unhealthy
+        Ok(Ended.Unloadable(code: code)) => match code.as_str() == "code.no-image" {
+            true => journal::RevertReason.NoImage
+            false => journal::RevertReason.Malformed
+        }
+        else => journal::RevertReason.Malformed
+    }
+} revert_reason
+
+/// The p99 handler latency in µs the latency buckets of a gauge give, the upper bound of the bucket holding the call at the 99th percentile; `None` when they count fewer calls than `least`, or none.
+fn p99_us(latency: Array[u64, 32], least: u64) -> Option[u64] {
+    var total: u64 = 0
+    for count in latency {
+        total = total.saturating_add(count)
+    }
+    if total == 0 or total < least {
+        return None
+    }
+    let wanted = total - total / 100
+    var seen: u64 = 0
+    for bucket in 0..<32usize {
+        seen = seen.saturating_add(latency[bucket])
+        if seen >= wanted {
+            return Some(1u64 << u32.truncate(bucket))
+        }
+    }
+    return Some(1u64 << 31)
+} p99_us
+
+/// Whether the p99 handler latency `latency` gives exceeds `probation`'s factor times the old bundle's `baseline_us` plus its margin; never without a baseline.
+fn regressed(baseline_us: Option[u64], latency: Array[u64, 32], probation: os::Probation) -> bool {
+    let Some(before) = baseline_us else {
+        return false
+    }
+    let Some(during) = p99_us(latency, least: 1) else {
+        return false
+    }
+    return during > before.saturating_mul(u64.widen(probation.latency_factor)).saturating_add(u64.widen(probation.latency_margin_us))
+} regressed
 
 /// Whether a start of the instance restores the old code's encoding of its state for an update.
 fn Driver.handing(self) -> bool {
@@ -153,23 +371,35 @@ fn Driver.revert(mut self, alloc: mem::Alloc) -> bool {
     self.spec.bundle = updating.old
     self.hosted = mut updating.hosted.extract()
     updating.reverted = true
+    updating.ticking.contents().store(false)
     self.updating = Some(mem::Heap.of(alloc).boxed(take updating))
     return true
 } Driver.revert
 
-/// Has the driver end the probation of the update its incarnation `incarnation` started once it passes, on a task of `s`.
-fn Shared.probation(self, s: task::Scope, inputs: task::Sender[Input], incarnation: u64) {
+/// Has the driver look at the probation of the update its incarnation `incarnation` started every second, on a task of `s`, until `ticking` clears.
+fn Shared.probation(
+    self,
+    s: task::Scope,
+    inputs: task::Sender[Input],
+    incarnation: u64,
+    take ticking: mem::Shared[core::atomic::AtomicBool],
+    ) {
     let clock = self.config.clock
     let telling = inputs.split()
-    discard s.spawn(fn[take telling]() fails task::Cancelled uses wait limits stack 8_192 {
-        try await clock.sleep_ns(PROBATION_S * 1_000_000_000)
-        discard attempt await telling.send(Input.Probated(incarnation: incarnation))
+    discard s.spawn(fn[take telling, take ticking]() fails task::Cancelled uses wait limits stack 8_192 {
+        while ticking.contents().load() {
+            try await clock.sleep_ns(PROBATION_TICK_NS)
+            if (attempt await telling.send(Input.ProbationTick(incarnation: incarnation))).is_err() {
+                return
+            }
+        }
     })
 } Shared.probation
 
-/// Ends the probation of the update the incarnation `incarnation` started, unless another incarnation runs: the old code's encoding of the state is dropped.
-fn Driver.probated(mut self, incarnation: u64) {
-    if incarnation == self.incarnation {
-        self.updating = None
+/// The flag the ticks of the update under way look at, `None` when no update is under way.
+fn Driver.ticking(self) -> Option[mem::Shared[core::atomic::AtomicBool]] {
+    return match self.updating {
+        Some(boxed) => Some(boxed.contents().ticking.share())
+        None => None
     }
-} Driver.probated
+} Driver.ticking

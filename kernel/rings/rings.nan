@@ -82,9 +82,17 @@ pkg fn Rings.source_of(self, slot: u32) -> ident::Moniker fails task::Cancelled 
     return ident::Moniker(text: named)
 } Rings.source_of
 
-/// Writes the record of an event of the cause `cause`, and its continuation when it has one, in the running CPU's ring, counting the event lost when the ring has no room for it, and posts the signal when the journal must look at the ring.
+/// Writes the record of an event of the cause `cause`, and its continuations when it has some, in the running CPU's ring, counting the event lost when the ring has no room for it, and posts the signal when the journal must look at the ring.
 pkg fn Rings.record(self, slot: u32, cause: u64, event: runner::Event) {
-    self.write(journal::RingRecord(time: elapsed(self.clock), cause: cause, source: slot, kind: kind_of(event), severity: severity_of(event), flags: 0, argument: argument_of(event)), continuation: continuation_of(event))
+    let record = journal::RingRecord(time: elapsed(self.clock), cause: cause, source: slot, kind: kind_of(event), severity: severity_of(event), flags: 0, argument: argument_of(event))
+    match wide_of(event) {
+        Some(wide) => {
+            var widened = record
+            widened.argument = wide.argument()
+            self.write_two(widened, leading: wide.continuation(0), trailing: wide.continuation(1))
+        }
+        None => self.write(record, continuation: continuation_of(event))
+    }
 } Rings.record
 
 /// The principals of the causes the core opened.
@@ -196,6 +204,16 @@ pkg fn Rings.record_boot(self, handoff: bootfmt::Handoff) {
 } Rings.record_boot
 
 fn Rings.write(self, record: journal::RingRecord, continuation: Option[journal::RingRecord]) {
+    self.put_records(record, continuation, second: None)
+} Rings.write
+
+/// Writes `record` with its two continuations.
+fn Rings.write_two(self, record: journal::RingRecord, leading: journal::RingRecord, trailing: journal::RingRecord) {
+    self.put_records(record, continuation: Some(leading), second: Some(trailing))
+} Rings.write_two
+
+/// Writes `record`, its continuation and a second one in the running CPU's ring.
+fn Rings.put_records(self, record: journal::RingRecord, continuation: Option[journal::RingRecord], second: Option[journal::RingRecord]) {
     var written = record
     if continuation.is_some() {
         written.flags = written.flags | journal::CONTINUED
@@ -208,13 +226,13 @@ fn Rings.write(self, record: journal::RingRecord, continuation: Option[journal::
             return
         }
         let wake = ring.with(t, body: fn(mut held: Ring) -> bool limits notrap, terminates, noalloc {
-            return mut held.write(written, continuation)
+            return mut held.write(written, continuation, second)
         })
         if wake {
             self.signal.contents().post(t, value: Unit)
         }
     })
-} Rings.write
+} Rings.put_records
 
 /// Waits until a ring is due, a quarter full, holding a critical record or holding a record 1 s old, and gives its CPU's number; while every ring is empty it waits for a write alone. The tasks of `exec` race the signal against the clock.
 pkg fn Rings.due(self, exec: task::Executor) -> u32 fails task::Cancelled uses wait {
@@ -296,12 +314,15 @@ fn Rings.due_at(self, cpu: usize) -> Option[u64] {
     })
 } Rings.due_at
 
-/// Writes `record` and its continuation, counting the event lost when the ring has no room for both; whether the journal must look at the ring: the event entered it empty, filled a quarter of it, or is critical.
-fn Ring.write(mut self, record: journal::RingRecord, continuation: Option[journal::RingRecord]) -> bool limits notrap, terminates, noalloc {
+/// Writes `record` and its continuations, counting the event lost when the ring has no room for all; whether the journal must look at the ring: the event entered it empty, filled a quarter of it, or is critical.
+fn Ring.write(mut self, record: journal::RingRecord, continuation: Option[journal::RingRecord], second: Option[journal::RingRecord]) -> bool limits notrap, terminates, noalloc {
     let size = self.records.len()
-    let needed: usize = match continuation {
-        Some(_) => 2
-        None => 1
+    var needed: usize = 1
+    if continuation.is_some() {
+        needed += 1
+    }
+    if second.is_some() {
+        needed += 1
     }
     if needed > size or self.held > size - needed {
         self.lost = self.lost.saturating_add(1)
@@ -310,6 +331,11 @@ fn Ring.write(mut self, record: journal::RingRecord, continuation: Option[journa
     let before = self.held
     mut self.put(record)
     match continuation {
+        Some(more) => mut self.put(more)
+        None => {
+        }
+    }
+    match second {
         Some(more) => mut self.put(more)
         None => {
         }
@@ -546,6 +572,11 @@ fn kind_of(event: runner::Event) -> u16 {
         runner::Event.CheckpointFailed(code: _, bytes: _) => journal::CHECKPOINT_FAILED
         runner::Event.Hibernated(bytes: _) => journal::HIBERNATED
         runner::Event.JobEnded(outcome: _, commit: _) => journal::JOB_ENDED
+        runner::Event.Loaded(code: _, bytes: _) => journal::CODE_LOADED
+        runner::Event.Unloaded(code: _) => journal::CODE_UNLOADED
+        runner::Event.UpdateStarted(old: _, new: _, class: _) => journal::UPDATE_STARTED
+        runner::Event.UpdatePassed(code: _, messages: _, ended: _) => journal::UPDATE_PASSED
+        runner::Event.UpdateReverted(old: _, new: _, reason: _, replayed: _, dead_lettered: _) => journal::UPDATE_REVERTED
     }
 } kind_of
 
@@ -553,10 +584,10 @@ fn kind_of(event: runner::Event) -> u16 {
 fn severity_of(event: runner::Event) -> u8 {
     return match event {
         runner::Event.Hibernated(bytes: _) => 0
-        runner::Event.Started(incarnation: _, from: _) or runner::Event.Stopped(abandoned: _) or runner::Event.JobEnded(outcome: _, commit: _) => 1
-        runner::Event.Revoked(grant: _, reason: _) => 2
+        runner::Event.Started(incarnation: _, from: _) or runner::Event.Stopped(abandoned: _) or runner::Event.JobEnded(outcome: _, commit: _) or runner::Event.Loaded(code: _, bytes: _) or runner::Event.Unloaded(code: _) => 1
+        runner::Event.Revoked(grant: _, reason: _) or runner::Event.UpdateStarted(old: _, new: _, class: _) or runner::Event.UpdatePassed(code: _, messages: _, ended: _) => 2
         runner::Event.SlowHandler(ns: _) or runner::Event.CheckpointFailed(code: _, bytes: _) => 3
-        runner::Event.Trapped(incarnation: _, kind: _, limit: _) or runner::Event.Failed(restarts: _) => 4
+        runner::Event.Trapped(incarnation: _, kind: _, limit: _) or runner::Event.Failed(restarts: _) or runner::Event.UpdateReverted(old: _, new: _, reason: _, replayed: _, dead_lettered: _) => 4
         runner::Event.Integrity(incarnation: _) => 5
     }
 } severity_of
@@ -576,8 +607,21 @@ fn argument_of(event: runner::Event) -> u64 {
         runner::Event.Hibernated(bytes: bytes) => bytes
         runner::Event.JobEnded(outcome: _, commit: Some(commit)) => commit.number
         runner::Event.JobEnded(outcome: _, commit: None) => 0
+        else => 0
     }
 } argument_of
+
+/// The payload of an event that fills its argument and two continuations, `None` for another.
+fn wide_of(event: runner::Event) -> Option[journal::Wide] {
+    return match event {
+        runner::Event.Loaded(code: code, bytes: bytes) => Some(journal::Wide.of_code(code, code_bytes: bytes))
+        runner::Event.Unloaded(code: code) => Some(journal::Wide.of_code(code, code_bytes: 0))
+        runner::Event.UpdateStarted(old: old, new: new, class: class) => Some(journal::Wide.of_start(old, new, class))
+        runner::Event.UpdatePassed(code: code, messages: messages, ended: ended) => Some(journal::Wide.of_pass(code, messages, ended))
+        runner::Event.UpdateReverted(old: old, new: new, reason: reason, replayed: replayed, dead_lettered: dead_lettered) => Some(journal::Wide.of_revert(old, new, reason, replayed, dead_lettered))
+        else => None
+    }
+} wide_of
 
 test rings_wake_the_journal_and_count_what_they_drop for Ring.write {
     let alloc = testing::world().alloc
@@ -588,7 +632,7 @@ test rings_wake_the_journal_and_count_what_they_drop for Ring.write {
     var ring = Ring(records: take records, next: 0, oldest: 0, held: 0, lost: 0, due: false)
     var woke = Array[bool, 10].filled(false)
     for at in 0..<10usize {
-        woke[at] = mut ring.write(journal::RingRecord(time: 1, cause: 0, source: 3, kind: 0, severity: 1, flags: 0, argument: u64.widen(at)), continuation: None)
+        woke[at] = mut ring.write(journal::RingRecord(time: 1, cause: 0, source: 3, kind: 0, severity: 1, flags: 0, argument: u64.widen(at)), continuation: None, second: None)
     }
     expect woke[0] and woke[1] and not woke[2] and not woke[7] and not woke[9]
     expect ring.held == 8 and ring.lost == 2 and ring.next == 0 and ring.due
@@ -600,7 +644,7 @@ test rings_wake_the_journal_and_count_what_they_drop for Ring.write {
         mut taken.push(record.argument)
     }
     for at in 10..<13u64 {
-        discard mut ring.write(journal::RingRecord(time: 1, cause: 0, source: 3, kind: 0, severity: 1, flags: 0, argument: at), continuation: None)
+        discard mut ring.write(journal::RingRecord(time: 1, cause: 0, source: 3, kind: 0, severity: 1, flags: 0, argument: at), continuation: None, second: None)
     }
     loop {
         let Some(record) = mut ring.pop() else {

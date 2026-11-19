@@ -18,6 +18,9 @@ const PAGE: u32 = 256
 /// The credit of the port the store tells the supervisor's subscriptions through.
 const WATCH_CREDIT: u16 = 64
 
+/// The bit setting the keys of the keyed tasks following probations apart from those acting on instances.
+const PROBATING: u64 = 0x4000_0000_0000_0000
+
 pub protocol Supervisor {
     /// Stops the instance `moniker`, setting `stopped` in its specification when the store holds it.
     pub fn stop(moniker: ident::Moniker) limits restorable
@@ -32,10 +35,27 @@ pub protocol Supervisor {
     pub fn appended(subscription: u64, path: ident::Path, seq: u64) limits traceless
     /// The store could not tell of `commits` commits.
     pub fn lost(subscription: u64, commits: u64) limits traceless
-    fn reconciled(listed: mem::List[ident::Moniker]) limits traceless
+    fn reconciled(listed: mem::List[ident::Moniker], updates: mem::List[Update]) limits traceless
     /// The request `request` ended with `reply`.
     fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Supervisor
+
+/// The configuration record of `supervisor`, `/sys/config/supervisor`: whether every instance but the base ones is frozen, and the bounds of the probation of an update.
+pub closed struct SupervisorConfig derives Render, Encode {
+    pub frozen: bool
+    pub probation: os::Probation
+} SupervisorConfig
+
+/// The configuration chapter 20 gives `supervisor` by default.
+pub fn SupervisorConfig.defaults() -> SupervisorConfig = SupervisorConfig(frozen: false, probation: os::Probation.defaults())
+
+/// An update a reconciling pass started: the instance, the bundle it ran, the bundle its specification names, and the commit that wrote that specification.
+pub closed struct Update derives Render, Encode {
+    pub moniker: ident::Moniker
+    pub old: ident::HashValue
+    pub new: ident::HashValue
+    pub commit: u64
+} Update
 
 /// Why an operation on an instance failed: it keeps no checkpoints, or it does not run.
 pub closed enum SupervisorFailure derives Eq, Render, Encode {
@@ -195,9 +215,35 @@ pub fn Supervision.lost(
     mut self.reconcile(mut env, mut cx)
 } Supervision.lost
 
-/// Keeps the monikers a pass found, and starts the pass due after it.
-fn Supervision.reconciled(mut self, take listed: mem::List[ident::Moniker], mut env: Env, mut cx: sys::Cx[Supervisor]) {
+/// Keeps the monikers a pass found, follows the probation of each update it started on a keyed task with the other updates of its commit, and starts the pass due after it.
+fn Supervision.reconciled(
+    mut self,
+    take listed: mem::List[ident::Moniker],
+    take updates: mem::List[Update],
+    mut env: Env,
+    mut cx: sys::Cx[Supervisor],
+    ) {
     self.listed = listed
+    match env.tree {
+        Some(view) => {
+            for at in 0..<updates.len() {
+                var siblings = mem::List[Update].empty(env.alloc)
+                for other in 0..<updates.len() {
+                    if other != at and updates[other].commit == updates[at].commit {
+                        mut siblings.push(Update(moniker: ident::Moniker(text: updates[other].moniker.text), old: updates[other].old, new: updates[other].new, commit: updates[other].commit))
+                    }
+                }
+                let update = Update(moniker: ident::Moniker(text: updates[at].moniker.text), old: updates[at].old, new: updates[at].new, commit: updates[at].commit)
+                let control = env.control
+                let alloc = env.alloc
+                mut cx.spawn(key: keyed(update.moniker) ^ PROBATING, run: fn[take update, take siblings](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 32_768 {
+                    try await follow_probation(control, view, take update, take siblings, alloc)
+                })
+            }
+        }
+        None => {
+        }
+    }
     self.reconciling = false
     if self.due {
         self.due = false
@@ -222,8 +268,8 @@ fn Supervision.reconcile(mut self, mut env: Env, mut cx: sys::Cx[Supervisor]) {
     let control = env.control
     let alloc = env.alloc
     mut cx.spawn(key: RECONCILING, run: fn[take before](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 32_768 {
-        let listed = try await reconcile(control, view, take before, alloc)
-        discard attempt await out.reconciled(listed: take listed)
+        let Reconciled(listed: listed, updates: updates) = try await reconcile(control, view, take before, alloc)
+        discard attempt await out.reconciled(listed: take listed, take updates)
     })
 } Supervision.reconcile
 
@@ -302,15 +348,22 @@ fn configured(path: ident::Path, alloc: mem::Alloc) -> Option[ident::Moniker] {
     return Some(ident::Moniker(text: name))
 } configured
 
-/// Brings the instances to the specifications of `/instances`: each stopped as its specification asks or started, created first when the runner has none, and each instance of `before` whose specification is gone deleted; gives the monikers it found.
-fn reconcile(control: os::Control, view: store::service::View, take before: mem::List[ident::Moniker], alloc: mem::Alloc) -> mem::List[ident::Moniker] fails task::Cancelled uses wait {
+/// What a reconciling pass found: the monikers of the specifications, and the updates it started.
+struct Reconciled {
+    listed: mem::List[ident::Moniker]
+    updates: mem::List[Update]
+} Reconciled
+
+/// Brings the instances to the specifications of `/instances`: each stopped as its specification asks or started, created first when the runner has none, and each instance of `before` whose specification is gone deleted; gives the monikers it found and the updates it started.
+fn reconcile(control: os::Control, view: store::service::View, take before: mem::List[ident::Moniker], alloc: mem::Alloc) -> Reconciled fails task::Cancelled uses wait {
     var listed = mem::List[ident::Moniker].empty(alloc)
+    var updates = mem::List[Update].empty(alloc)
     var after: Option[text::String] = None
     loop {
         let listing = match first attempt await view.list(desired("/instances", alloc), take after, limit: PAGE, alloc) {
             Ok(found) => found
             Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-            Err(_) => return before
+            Err(_) => return Reconciled(listed: take before, updates: take updates)
         }
         for entry in listing.entries {
             var name = text::Fixed[59].empty()
@@ -318,7 +371,11 @@ fn reconcile(control: os::Control, view: store::service::View, take before: mem:
             if not ident::is_moniker(name) {
                 continue
             }
-            try await converge(control, view, moniker: ident::Moniker(text: name), alloc)
+            match try await converge(control, view, moniker: ident::Moniker(text: name), alloc) {
+                Some(update) => mut updates.push(take update)
+                None => {
+                }
+            }
             mut listed.push(ident::Moniker(text: name))
         }
         let Some(next) = listing.next else {
@@ -335,7 +392,7 @@ fn reconcile(control: os::Control, view: store::service::View, take before: mem:
             }
         }
     }
-    return listed
+    return Reconciled(listed: take listed, updates: take updates)
 } reconcile
 
 /// The specification of the instance `moniker` the View's `/instances` holds, with the commit that last wrote it; `None` when it holds none that decodes.
@@ -363,16 +420,27 @@ struct Specified {
     version: u64
 } Specified
 
-/// Brings the instance `moniker` to its specification: has the runner take it, creating the instance when it has none, then stops it when the specification asks, else starts it; then tells the runner the commit of that specification.
-fn converge(control: os::Control, view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Brings the instance `moniker` to its specification: has the runner take it, creating the instance when it has none, then stops it when the specification asks, else starts it; then tells the runner the commit of that specification. Gives the update it started when the specification names another bundle than the instance runs.
+fn converge(control: os::Control, view: store::service::View, moniker: ident::Moniker, alloc: mem::Alloc) -> Option[Update] fails task::Cancelled uses wait {
     let Some(Specified(spec: spec, version: version)) = try await spec_of(view, moniker, alloc) else {
-        return
+        return None
     }
     let stopped = spec.stopped
+    var update: Option[Update] = None
+    match first attempt await control.describe(ident::Moniker(text: moniker.text), alloc) {
+        Ok(described) => {
+            if described.bundle != spec.bundle and not stopped {
+                update = Some(Update(moniker: ident::Moniker(text: moniker.text), old: described.bundle, new: spec.bundle, commit: version))
+            }
+        }
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => {
+        }
+    }
     match attempt await control.specify(ident::Moniker(text: moniker.text), take spec, alloc) {
         Err(os::ControlError.Missing) => {
             let Some(Specified(spec: created, version: _)) = try await spec_of(view, moniker, alloc) else {
-                return
+                return None
             }
             try settled(attempt await control.create(ident::Moniker(text: moniker.text), spec: take created, grants: mem::Map.empty(alloc), alloc))
         }
@@ -386,7 +454,73 @@ fn converge(control: os::Control, view: store::service::View, moniker: ident::Mo
         try settled(attempt await control.start(ident::Moniker(text: moniker.text), alloc))
     }
     try settled(attempt await control.converge(ident::Moniker(text: moniker.text), desired: version, alloc))
+    return update
 } converge
+
+/// Waits for the end of the probation of `update` under the bounds `/config/supervisor` gives, and when the runner reverted it, has the runner revert `siblings`, the other updates of its commit, and the specification name the old bundle again unless it changed since the update.
+fn follow_probation(
+    control: os::Control,
+    view: store::service::View,
+    take update: Update,
+    take siblings: mem::List[Update],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    let probation = try await configured_probation(view, alloc)
+    let reverted = match first attempt await control.probated(ident::Moniker(text: update.moniker.text), bundle: update.new, probation, alloc) {
+        Ok(given) => given
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return
+    }
+    if not reverted {
+        return
+    }
+    for sibling in siblings {
+        match attempt await control.revert(ident::Moniker(text: sibling.moniker.text), bundle: sibling.new, alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    }
+    let Some(Specified(spec: held, version: version)) = try await spec_of(view, moniker: ident::Moniker(text: update.moniker.text), alloc) else {
+        return
+    }
+    if held.bundle != update.new {
+        return
+    }
+    let Some(path) = desired("/instances", alloc).child(update.moniker.text.as_bytes(), alloc) else {
+        return
+    }
+    var spec = held
+    spec.bundle = update.old
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[os::InstanceSpec].encode(spec, out: mut bytes)
+    var expects = mem::List[store::Expect].empty(alloc)
+    mut expects.push(store::Expect(path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), version: store::Version.Commit(ident::CommitId(number: version))))
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: take path, value: store::Value.Record(type: store::service::spec_type(alloc), bytes: take bytes, secret: false)))
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: take expects, writes: take writes, key: None, plan: None, intent: Some(text::String.of("revert update", alloc)))
+    match attempt await view.commit(take transaction, typed: true, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} follow_probation
+
+/// The probation bounds of `/config/supervisor`, chapter 10's when it holds none that decodes.
+fn configured_probation(view: store::service::View, alloc: mem::Alloc) -> os::Probation fails task::Cancelled uses wait {
+    let node = match first attempt await view.get(desired("/config/supervisor", alloc), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return os::Probation.defaults()
+    }
+    let Some(value) = node.value else {
+        return os::Probation.defaults()
+    }
+    return match attempt mem::wire::Codec[SupervisorConfig].decode(value.view(), alloc) {
+        Ok(config) => config.probation
+        Err(_) => os::Probation.defaults()
+    }
+} configured_probation
 
 /// An order's outcome, which the next pass acts on again when it failed; a cancellation stays one.
 fn settled[T](take outcome: Result[T, os::ControlError]) fails task::Cancelled {
