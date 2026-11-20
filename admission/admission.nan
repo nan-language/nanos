@@ -17,6 +17,8 @@ pub protocol Admitting {
     pub fn remove(bundle: ident::HashValue) fails Refusal limits recorded
     /// The migration class of an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving`; `code.schema-incompatible` when the new state schema is not the running one and neither accepts nor migrates from it, or when the base bundle's state schema does not accept the new one of a `checkpointed` instance of a base component.
     pub fn migration(running: ident::HashValue, moving: ident::HashValue, state: text::String, checkpointed: bool) -> code::Migration fails Refusal limits recorded
+    /// Whether moving an instance of state type `state` from the bundle of code hash `running` back to that of code hash `moving` keeps its state: the state has one schema in both, the state of `moving` migrates from the running schema, or its tree accepts the running one and it is a flexible struct, which keeps the fields it does not know.
+    pub fn keeps(running: ident::HashValue, moving: ident::HashValue, state: text::String) -> bool fails Refusal limits recorded
     /// The keyed task serving request `request` gives its reply.
     fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Admitting
@@ -114,6 +116,26 @@ pub fn Admitter.migration(
     })
     fail Refusal.Unavailable
 } Admitter.migration
+
+pub fn Admitter.keeps(
+    mut self,
+    take running: ident::HashValue,
+    take moving: ident::HashValue,
+    take state: text::String,
+    mut env: Env,
+    mut cx: sys::Cx[Admitting],
+    ) -> bool fails Refusal {
+    let Some(request) = mut cx.postpone() else {
+        fail Refusal.Unavailable
+    }
+    let schemas = Schemas(code: env.code, base: env.base.share(), alloc: env.alloc)
+    let alloc = env.alloc
+    mut cx.spawn(key: SERVING + request, run: fn[take schemas, take state](out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 65_536 {
+        let outcome = try await schemas.keeps(running, moving, state: state.as_str())
+        discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
+    })
+    fail Refusal.Unavailable
+} Admitter.keeps
 
 fn Admitter.answered(
     mut self,
@@ -248,7 +270,13 @@ struct Schemas {
 } Schemas
 
 /// Step 8 of an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving`: its migration class, or `code.schema-incompatible`.
-fn Schemas.migration(self, running: ident::HashValue, moving: ident::HashValue, state: Str, checkpointed: bool) -> Result[code::Migration, Refusal] fails task::Cancelled uses wait {
+fn Schemas.migration(
+    self,
+    running: ident::HashValue,
+    moving: ident::HashValue,
+    state: Str,
+    checkpointed: bool,
+    ) -> Result[code::Migration, Refusal] fails task::Cancelled uses wait {
     let alloc = self.alloc
     let refused = Refusal.SchemaIncompatible(state: text::String.of(state, alloc))
     let was = match first try await self.component(bundle: running, state) {
@@ -282,6 +310,40 @@ fn Schemas.migration(self, running: ident::HashValue, moving: ident::HashValue, 
     return judged_schemas(state, running: older, moving: newer, migrates, base, alloc)
 } Schemas.migration
 
+/// Whether moving an instance of state type `state` from the bundle of code hash `running` back to that of code hash `moving` keeps its state: one schema, a migration of the state of `moving` from the running schema, or a tree of `moving` accepting the running one on a flexible struct.
+fn Schemas.keeps(self, running: ident::HashValue, moving: ident::HashValue, state: Str) -> Result[bool, Refusal] fails task::Cancelled uses wait {
+    let was = match first try await self.component(bundle: running, state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Ok(false)
+        Err(refusal) => return Err(take refusal)
+    }
+    let now = match first try await self.component(bundle: moving, state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Ok(false)
+        Err(refusal) => return Err(take refusal)
+    }
+    if was.schema == now.schema or now.migrations.position(fn(shape: code::Shape) => shape.schema == was.schema).is_some() {
+        return Ok(true)
+    }
+    if moving == self.base.contents().code {
+        return Ok(false)
+    }
+    let older = match first try await self.tree(bundle: running, state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Ok(false)
+        Err(refusal) => return Err(take refusal)
+    }
+    let artefact = match first try await self.artefact(bundle: moving, state) {
+        Ok(Some(found)) => found
+        Ok(None) => return Ok(false)
+        Err(refusal) => return Err(take refusal)
+    }
+    let Some(newer) = artefact.tree(state, alloc: self.alloc) else {
+        return Ok(false)
+    }
+    return Ok(artefact.flexible(state) and newer.accepts(older, alloc: self.alloc))
+} Schemas.keeps
+
 /// The component of state type `state` that the admission record of the bundle of code hash `bundle` describes, `None` when no record describes it.
 fn Schemas.component(self, bundle: ident::HashValue, state: Str) -> Result[Option[code::Component], Refusal] fails task::Cancelled uses wait {
     let alloc = self.alloc
@@ -306,10 +368,19 @@ fn Schemas.component(self, bundle: ident::HashValue, state: Str) -> Result[Optio
 
 /// The schema tree of the state type `state` in the bundle of code hash `bundle`: the kernel image's for the base bundle, else the one the code root of its package records in the bundle blob; `None` when it has none.
 fn Schemas.tree(self, bundle: ident::HashValue, state: Str) -> Result[Option[mem::wire::Schema], Refusal] fails task::Cancelled uses wait {
-    let alloc = self.alloc
     if bundle == self.base.contents().code {
         return Ok(self.base_tree(state))
     }
+    return match first try await self.artefact(bundle, state) {
+        Ok(Some(found)) => Ok(found.tree(state, alloc: self.alloc))
+        Ok(None) => Ok(None)
+        Err(refusal) => Err(take refusal)
+    }
+} Schemas.tree
+
+/// The artefact of the package declaring the state type `state` in the bundle blob of the bundle of code hash `bundle`, `None` when it holds none.
+fn Schemas.artefact(self, bundle: ident::HashValue, state: Str) -> Result[Option[code::Artefact], Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
     let Some(cut) = state.find("::") else {
         return Ok(None)
     }
@@ -328,11 +399,11 @@ fn Schemas.tree(self, bundle: ident::HashValue, state: Str) -> Result[Option[mem
             return Err(Refusal.Malformed)
         }
         if read.name.as_bytes() == home {
-            return Ok(read.tree(state, alloc))
+            return Ok(Some(take read))
         }
     }
     return Ok(None)
-} Schemas.tree
+} Schemas.artefact
 
 /// The base bundle's schema tree of the state type `state`, `None` when no base component has it.
 fn Schemas.base_tree(self, state: Str) -> Option[mem::wire::Schema] {

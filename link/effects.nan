@@ -3,11 +3,19 @@
 /// The intake pause a restart is expected to take, in milliseconds.
 const RESTART_PAUSE_MS: u32 = 2
 
-/// What the changes of a preview show: the lines printing each change and the activations they make.
+/// What the changes of a preview show: the lines printing each change, the activations they make, the authority their updates widen, and the bundles they move the specifications of instances a `restore-checkpoint` step restores to.
 struct Observed {
     lines: mem::List[mem::List[text::String]]
     activations: mem::List[Activation]
+    widenings: mem::List[Widening]
+    moves: mem::List[BundleMove]
 } Observed
+
+/// The bundle a plan moves the specification of an instance it restores to.
+struct BundleMove {
+    moniker: ident::Moniker
+    bundle: ident::HashValue
+} BundleMove
 
 /// What the steps of a preview give: their effects, the authority they widen, the deliveries their commands make, the subjects the policy decides, the nodes they read and the bytes they write.
 struct Assessed {
@@ -38,15 +46,16 @@ pub fn effects_of(
         Ok(found) => found
         Err(failure) => return Preview.Failed(take failure)
     }
-    let observed = match try await observe(changes, planned, forked, base, activating: asked.options.branch.as_str() == RUNNING_BRANCH, admitting, alloc) {
+    let observed = match try await observe(changes, planned, forked, base, activating: asked.options.branch.as_str() == RUNNING_BRANCH, restored: restored_monikers(stepped, alloc), admitting, alloc) {
         Ok(found) => found
         Err(failure) => return Preview.Failed(take failure)
     }
-    let Observed(lines: lines, activations: changed) = observed
+    let Observed(lines: lines, activations: changed, widenings: updated, moves: moves) = observed
+    restores_moved(mut stepped, moves)
     var activations = changed
     for each in stepped {
         match each.command {
-            Some(InstanceStep(step: step, moniker: moniker, code: _, command: Command.Restore(number: _), operation: _, message: _, class: _, foreseen: _)) => mut activations.push(Activation(moniker: ident::Moniker(text: moniker.text), step: step, kind: ActivationKind.Restart, migration: None, pause_ms: RESTART_PAUSE_MS, cpu: None))
+            Some(InstanceStep(step: step, moniker: moniker, code: _, command: Command.Restore(number: _, bundle: _), operation: _, message: _, class: _, foreseen: _)) => mut activations.push(Activation(moniker: ident::Moniker(text: moniker.text), step: step, kind: ActivationKind.Restart, migration: None, pause_ms: RESTART_PAUSE_MS, cpu: None))
             else => {
             }
         }
@@ -73,7 +82,7 @@ pub fn effects_of(
         None => {
         }
     }
-    let Assessed(effects: effects, widenings: widenings, deliveries: deliveries, subjects: subjects, reads: reads, store_bytes: store_bytes) = assess(asked, stepped, activations, declared, granted, alloc)
+    let Assessed(effects: effects, widenings: widenings, deliveries: deliveries, subjects: subjects, reads: reads, store_bytes: store_bytes) = assess(asked, stepped, activations, declared, granted, updated, alloc)
     match try await horizon_failure(asked, stepped, effects, deliveries, activations, tree: planned, alloc) {
         Some(failure) => return Preview.Failed(take failure)
         None => {
@@ -124,18 +133,21 @@ fn previews_too_large(held_bytes: u64, plans: PlanConfig, alloc: mem::Alloc) -> 
     return Some(Failure.of("plan.preview-too-large", subject: "-", alloc).expecting(expected.as_str(), found: found.as_str(), alloc))
 } previews_too_large
 
-/// The lines printing each change of `changes`, from `base` through `planned` to the head of `forked`, and, when `activating`, the activations they make, an update of the migration class `admitting` judges.
+/// The lines printing each change of `changes`, from `base` through `planned` to the head of `forked`, and, when `activating`, the activations they make, an update of the migration class `admitting` judges, with the authority each update widens; the update of an instance among `restored`, which the plan restores from a checkpoint instead, is no activation and gives the bundle it moves to.
 fn observe(
     changes: mem::List[NodeChange],
     planned: store::service::View,
     forked: store::service::View,
     base: ident::CommitId,
     activating: bool,
+    restored: mem::List[ident::Moniker],
     admitting: os::Port[admission::Admitting],
     alloc: mem::Alloc,
     ) -> Result[Observed, Failure] fails task::Cancelled uses wait {
     var lines = mem::List[mem::List[text::String]].empty(alloc)
     var activations = mem::List[Activation].empty(alloc)
+    var widenings = mem::List[Widening].empty(alloc)
+    var moves = mem::List[BundleMove].empty(alloc)
     for change in changes {
         let path = change.path.text.as_str()
         let before = match try await node_as_of(planned, path, at: Some(base), alloc) {
@@ -155,20 +167,114 @@ fn observe(
         }
         var activated = activation
         if activated.kind == ActivationKind.Update {
-            match try await migration_of(activated.moniker.text.as_str(), before, after, admitting, alloc) {
-                Ok(class) => {
-                    activated.migration = Some(class)
+            let restoring = restored.position(fn(each: ident::Moniker) => each == activated.moniker).is_some()
+            if restoring {
+                match spec_in(after, alloc) {
+                    Some(moving) => mut moves.push(BundleMove(moniker: ident::Moniker(text: activated.moniker.text), bundle: moving.bundle))
+                    None => {
+                    }
+                }
+            } else {
+                match try await migration_of(activated.moniker.text.as_str(), before, after, admitting, alloc) {
+                    Ok(class) => {
+                        activated.migration = Some(class)
+                    }
+                    Err(failure) => return Err(take failure)
+                }
+            }
+            match try await update_widenings(before, after, step: change.step, view: forked, alloc) {
+                Ok(widened) => {
+                    for widening in take widened {
+                        mut widenings.push(take widening)
+                    }
                 }
                 Err(failure) => return Err(take failure)
+            }
+            if restoring {
+                continue
             }
         }
         mut activations.push(take activated)
     }
-    return Ok(Observed(lines: take lines, activations: take activations))
+    return Ok(Observed(lines: take lines, activations: take activations, widenings: take widenings, moves: take moves))
 } observe
 
+/// The instances the `restore-checkpoint` steps of `stepped` restore.
+fn restored_monikers(stepped: mem::List[Stepped], alloc: mem::Alloc) -> mem::List[ident::Moniker] {
+    var restored = mem::List[ident::Moniker].empty(alloc)
+    for each in stepped {
+        match each.command {
+            Some(InstanceStep(step: _, moniker: moniker, code: _, command: Command.Restore(number: _, bundle: _), operation: _, message: _, class: _, foreseen: _)) => mut restored.push(ident::Moniker(text: moniker.text))
+            else => {
+            }
+        }
+    }
+    return restored
+} restored_monikers
+
+/// Has each restore of `stepped` whose instance `moves` names restore under the bundle its specification moves to.
+fn restores_moved(mut stepped: mem::List[Stepped], moves: mem::List[BundleMove]) {
+    for each in mut stepped {
+        let Some(commanded) = mut each.command.extract() else {
+            continue
+        }
+        var restoring = commanded
+        match restoring.command {
+            Command.Restore(number: number, bundle: _) => {
+                match moves.position(fn(moved: BundleMove) => moved.moniker == restoring.moniker) {
+                    Some(at) => {
+                        restoring.command = Command.Restore(number: number, bundle: Some(moves[at].bundle))
+                    }
+                    None => {
+                    }
+                }
+            }
+            else => {
+            }
+        }
+        each.command = Some(take restoring)
+    }
+} restores_moved
+
+/// The authority the update of an instance from its specification `before` to `after`, by the step `step`, widens: each entry of the closure summary of the bundle `after` names, as its admission record read through `view` gives it, that the summary of the bundle `before` names lacks, held by the principal the instance acts for.
+fn update_widenings(
+    before: Option[store::Node],
+    after: Option[store::Node],
+    step: u32,
+    view: store::service::View,
+    alloc: mem::Alloc,
+    ) -> Result[mem::List[Widening], Failure] fails task::Cancelled uses wait {
+    var widenings = mem::List[Widening].empty(alloc)
+    let Some(old) = spec_in(before, alloc) else {
+        return Ok(take widenings)
+    }
+    let Some(new) = spec_in(after, alloc) else {
+        return Ok(take widenings)
+    }
+    let running = match try await admission_at(view, bundle: old.bundle, alloc) {
+        Ok(record) => record
+        Err(failure) => return Err(take failure)
+    }
+    let moving = match try await admission_at(view, bundle: new.bundle, alloc) {
+        Ok(record) => record
+        Err(failure) => return Err(take failure)
+    }
+    for entry in moving.authority {
+        if running.authority.position(fn(held: text::String) => held.as_str() == entry.as_str()).is_none() {
+            mut widenings.push(Widening(holder: ident::Principal(text: new.principal.text), step: step, authority: text::String.of(entry.as_str(), alloc), cpu: None))
+        }
+    }
+    return Ok(take widenings)
+} update_widenings
+
 /// The migration class of the update of the instance `moniker` that its specification `before` becoming `after` makes, as `admitting` judges it.
-fn migration_of(moniker: Str, before: Option[store::Node], after: Option[store::Node], admitting: os::Port[admission::Admitting], alloc: mem::Alloc) -> Result[code::Migration, Failure] fails task::Cancelled uses wait {
+fn migration_of(
+    moniker: Str,
+    before: Option[store::Node],
+    after: Option[store::Node],
+    admitting: os::Port[admission::Admitting],
+    alloc: mem::Alloc,
+    ) -> Result[code::Migration, Failure] fails task::Cancelled uses wait {
     let Some(old) = spec_in(before, alloc) else {
         return Err(Failure.of("schema.invalid", subject: "/sys/instances", alloc))
     }
@@ -179,7 +285,13 @@ fn migration_of(moniker: Str, before: Option[store::Node], after: Option[store::
 } migration_of
 
 /// The migration class `admitting` judges of moving the instance `moniker`, of specification `renewed`, from the bundle of code hash `running` to the one `renewed` names; the code of its refusal, such as `code.schema-incompatible`, as a failure naming the instance.
-pkg fn judged_migration(moniker: Str, running: ident::HashValue, renewed: os::InstanceSpec, admitting: os::Port[admission::Admitting], alloc: mem::Alloc) -> Result[code::Migration, Failure] fails task::Cancelled uses wait {
+pkg fn judged_migration(
+    moniker: Str,
+    running: ident::HashValue,
+    renewed: os::InstanceSpec,
+    admitting: os::Port[admission::Admitting],
+    alloc: mem::Alloc,
+    ) -> Result[code::Migration, Failure] fails task::Cancelled uses wait {
     var call = sys::Encoded.empty(alloc)
     let reply = sys::Wire[admission::Admitting].migration(mut call, running, moving: renewed.bundle, state: text::String.of(renewed.component.as_str(), alloc), checkpointed: renewed.durability.class == os::DurabilityClass.Checkpointed)
     return match first attempt await admitting.call(take call, reply, alloc) {
@@ -190,13 +302,14 @@ pkg fn judged_migration(moniker: Str, running: ident::HashValue, renewed: os::In
     }
 } judged_migration
 
-/// What the steps `stepped` of `asked` give, `activations` being the activations they make, those of the steps `declared` observed by no fork: a step's basis is `Declared` when one of its activations is, and for a call or a redelivery no fork ran, whose class its operation declares; a span ends after a point of no return and before a call or a redelivery to an instance an earlier step of the span activates.
+/// What the steps `stepped` of `asked` give, `activations` being the activations they make, those of the steps `declared` observed by no fork, and `updated` the authority their updates widen: a step's basis is `Declared` when one of its activations is, and for a call or a redelivery no fork ran, whose class its operation declares; a span ends after a point of no return and before a call or a redelivery to an instance an earlier step of the span activates.
 fn assess(
     asked: Planning,
     stepped: mem::List[Stepped],
     activations: mem::List[Activation],
     declared: mem::List[u32],
     granted: mem::List[os::GrantReservation],
+    updated: mem::List[Widening],
     alloc: mem::Alloc,
     ) -> Assessed {
     var assessed = Assessed(effects: mem::List.empty(alloc), widenings: mem::List.empty(alloc), deliveries: mem::List.empty(alloc), subjects: mem::List.empty(alloc), reads: mem::List.empty(alloc), store_bytes: 0)
@@ -239,7 +352,12 @@ fn assess(
             }
         }
         closing = class.is_irreversible()
-        let widened = widenings_of(each, granted, alloc)
+        var widened = widenings_of(each, granted, alloc)
+        for widening in updated {
+            if widening.step == each.step {
+                mut widened.push(Widening(holder: ident::Principal(text: widening.holder.text), step: widening.step, authority: text::String.of(widening.authority.as_str(), alloc), cpu: widening.cpu))
+            }
+        }
         mut assessed.subjects.push(subject_of(asked, written, stepped: each, class, widens: widened.len() > 0, alloc))
         for widening in take widened {
             mut assessed.widenings.push(take widening)

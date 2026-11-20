@@ -1,0 +1,171 @@
+//! Rollbacks after probation: the inverse of a commit that moved an instance to another bundle restores the latest checkpoint the bundle it ran before took, when moving back to that bundle would not keep its state.
+
+/// The commits one page of history gives while looking for those an instance wrote.
+const HISTORY_PAGE: u32 = 64
+
+/// Adds to the steps of `asked`, the inverse plan of an undo, a `restore-checkpoint` step for each instance one of its reverts moves back to the bundle it ran before an update when, as `admitting` judges it, that bundle would not keep the instance's state; the step restores the latest checkpoint that bundle took. Gives a `dropped` record per commit such an instance has written since the update, whose effects the restored state no longer reflects. Fails with `update.in-probation` while the update's probation runs and with `instance.no-checkpoint` when the instance keeps no checkpoint of the bundle.
+pub fn rolled_back(mut asked: Planning, tree: store::service::View, admitting: os::Port[admission::Admitting], alloc: mem::Alloc) -> Result[mem::List[Record], Failure] fails task::Cancelled uses wait {
+    var records = mem::List[Record].empty(alloc)
+    if asked.options.branch.as_str() != RUNNING_BRANCH {
+        return Ok(take records)
+    }
+    var restores = mem::List[Written].empty(alloc)
+    for written in asked.steps {
+        let Step.Revert(commit: commit) = written.step else {
+            continue
+        }
+        let writes = match first attempt await tree.revert(commit, dry_run: true, alloc) {
+            Ok(store::Reverted.Writes(found)) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            else => continue
+        }
+        for write in writes {
+            let store::Write.Put(path: path, value: store::Value.Record(type: _, bytes: bytes, secret: _)) = write else {
+                continue
+            }
+            let Some(moniker) = specified_moniker(path.text.as_str()) else {
+                continue
+            }
+            let Ok(before) = attempt mem::wire::Codec[os::InstanceSpec].decode(Untrusted.of(bytes.view()), alloc) else {
+                continue
+            }
+            let Some(running) = try await Records[os::InstanceSpec].at(tree, path: path.text.as_str(), alloc) else {
+                continue
+            }
+            if before.bundle == running.bundle {
+                continue
+            }
+            match try await rollback_of(moniker, update: commit, back: before, running, tree, admitting, alloc) {
+                Ok(Some(Rollback(step: step, dropped: lost))) => {
+                    mut restores.push(take step)
+                    for record in take lost {
+                        mut records.push(take record)
+                    }
+                }
+                Ok(None) => {
+                }
+                Err(failure) => return Err(take failure)
+            }
+        }
+    }
+    for step in take restores {
+        mut asked.steps.push(take step)
+    }
+    return Ok(take records)
+} rolled_back
+
+/// The rollback of an update: its `restore-checkpoint` step, and a `dropped` record per commit the instance wrote since the update.
+struct Rollback {
+    step: Written
+    dropped: mem::List[Record]
+} Rollback
+
+/// The rollback of the instance `moniker`, which the commit `update` moved from the bundle of its specification `back` to the one of `running`: none when, as `admitting` judges it, moving back keeps its state; else the restore of the latest checkpoint the bundle of `back` took, with the commits the instance wrote since `update`.
+fn rollback_of(
+    moniker: ident::Moniker,
+    update: ident::CommitId,
+    back: os::InstanceSpec,
+    running: os::InstanceSpec,
+    tree: store::service::View,
+    admitting: os::Port[admission::Admitting],
+    alloc: mem::Alloc,
+    ) -> Result[Option[Rollback], Failure] fails task::Cancelled uses wait {
+    let name = moniker.text.as_str()
+    var live = text::String.of("/live/instances/", alloc)
+    mut live.append(name)
+    match try await Records[os::LiveInstance].at(tree, path: live.as_str(), alloc) {
+        Some(shown) => {
+            if shown.probation.is_some() {
+                return Err(Failure.of("update.in-probation", subject: name, alloc))
+            }
+        }
+        None => {
+        }
+    }
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[admission::Admitting].keeps(mut call, running: running.bundle, moving: back.bundle, state: text::String.of(running.component.as_str(), alloc))
+    let keeps = match first attempt await admitting.call(take call, reply, alloc) {
+        Ok(given) => given
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(os::PortError.Failed(refused_by)) => return Err(Failure.of(refused_by.code().as_str(), subject: name, alloc))
+        Err(_) => return Err(Failure.of("port.server-stopped", subject: "admission", alloc))
+    }
+    if keeps {
+        return Ok(None)
+    }
+    let Some(number) = try await latest_checkpoint(moniker, bundle: back.bundle, tree, alloc) else {
+        let hash = back.bundle.full_form()
+        var expected = text::String.of("a checkpoint the bundle ", alloc)
+        mut expected.append(hash.as_str())
+        mut expected.append(" took")
+        return Err(Failure.of("instance.no-checkpoint", subject: name, alloc).expecting(expected.as_str(), found: "none", alloc))
+    }
+    var text = text::String.of("restore-checkpoint ", alloc)
+    mut text.append(name)
+    mut text.push(' ')
+    mut text.write(Dyn[Render].view(number), budget: 24)
+    let step = match step_of(text.as_str(), alloc) {
+        Ok(written) => written
+        Err(failure) => return Err(take failure)
+    }
+    return Ok(Some(Rollback(step: take step, dropped: try await dropped_since(moniker, update, tree, alloc))))
+} rollback_of
+
+/// The moniker of the specification at `path`, a child of `/sys/instances`.
+fn specified_moniker(path: Str) -> Option[ident::Moniker] {
+    if not path.starts_with("/sys/instances/") {
+        return None
+    }
+    let Some(name) = path.slice_bytes(15, end: path.byte_len()) else {
+        return None
+    }
+    return moniker_of(name)
+} specified_moniker
+
+/// The number of the latest checkpoint the instance `moniker` keeps that the bundle of code hash `bundle` took.
+fn latest_checkpoint(moniker: ident::Moniker, bundle: ident::HashValue, tree: store::service::View, alloc: mem::Alloc) -> Option[u64] fails task::Cancelled uses wait {
+    var dir = text::String.of("/state/", alloc)
+    mut dir.append(moniker.text.as_str())
+    mut dir.append("/checkpoint")
+    var latest: Option[u64] = None
+    for name in try await names_below(tree, path: dir.as_str(), alloc) {
+        var path = text::String.of(dir.as_str(), alloc)
+        mut path.push('/')
+        mut path.append(name.as_str())
+        let Some(taken) = try await Records[os::Checkpoint].at(tree, path: path.as_str(), alloc) else {
+            continue
+        }
+        if taken.bundle == bundle and taken.number > latest.value_or(0) {
+            latest = Some(taken.number)
+        }
+    }
+    return latest
+} latest_checkpoint
+
+/// A `dropped` record per recorded commit the instance `moniker` wrote after the commit `update`, newest first.
+fn dropped_since(moniker: ident::Moniker, update: ident::CommitId, tree: store::service::View, alloc: mem::Alloc) -> mem::List[Record] fails task::Cancelled uses wait {
+    var records = mem::List[Record].empty(alloc)
+    var before: Option[ident::CommitId] = None
+    loop {
+        let commits = match first attempt await tree.history(ident::Path(text: text::String.of("/", alloc)), before, limit: HISTORY_PAGE, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return records
+        }
+        if commits.len() == 0 {
+            return records
+        }
+        for meta in commits {
+            if meta.number <= update {
+                return records
+            }
+            if meta.instance == Some(moniker) {
+                var record = Record.of("dropped", alloc)
+                mut record.subject(Dyn[Render].view(meta.number))
+                mut record.field("instance", value: Dyn[Render].view(moniker))
+                mut records.push(take record)
+            }
+            before = Some(meta.number)
+        }
+    }
+} dropped_since

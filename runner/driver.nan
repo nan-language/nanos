@@ -26,7 +26,7 @@ enum Input {
     /// The dead letter `seq` read for its redelivery under the cause `cause`, and where the order's outcome goes.
     Letter(seq: u64, cause: u64, letter: Result[os::DeadLetter, os::ControlError], done: task::Sender[Result[os::Outcome, os::ControlError]])
     /// The checkpoint read for a restore under the cause `cause`, and where the order's outcome goes.
-    Restoring(cause: u64, checkpoint: Result[os::Checkpoint, os::ControlError], done: task::Sender[Result[os::Outcome, os::ControlError]])
+    Restoring(cause: u64, checkpoint: Result[os::Checkpoint, os::ControlError], moving: Option[Moving], done: task::Sender[Result[os::Outcome, os::ControlError]])
     /// The first message the instance waits for falls due, as the task the driver armed `armed`th tells.
     Due(armed: u64)
     Pressed(Pressing)
@@ -320,7 +320,7 @@ fn Shared.take_input[J: Journal](
             driver.traced_until = until
         }
         Input.Letter(seq: seq, cause: ordering, letter: letter, done: done) => try await self.redeliver(mut driver, seq, cause: ordering, take letter, take done, now_ns, sender, journal, s)
-        Input.Restoring(cause: ordering, checkpoint: read, done: done) => try await self.restore(mut driver, cause: ordering, take read, take done, sender, journal, s)
+        Input.Restoring(cause: ordering, checkpoint: read, moving: moving, done: done) => try await self.restore(mut driver, cause: ordering, take read, take moving, take done, sender, journal, s)
         Input.Due(armed: armed) => {
             if armed == driver.due_armed {
                 try await self.fall_due(mut driver, now_ns, sender, journal, s)
@@ -475,12 +475,13 @@ fn Shared.described(self, driver: Driver) -> Result[os::Outcome, os::ControlErro
     return Ok(os::Outcome.Described(os::Described(schema: take schema, bundle: driver.spec.bundle)))
 } Shared.described
 
-/// Restarts the instance from a copy of the checkpoint `read` gives, read for a restore of the cause `cause`, once it has stopped, telling `done` once it runs or fails, or why it cannot.
+/// Restarts the instance from a copy of the checkpoint `read` gives, read for a restore of the cause `cause`, once it has stopped, under the bundle `moving` describes when given, telling `done` once it runs or fails, or why it cannot.
 fn Shared.restore[J: Journal](
     self,
     mut driver: Driver,
     cause: u64,
     take read: Result[os::Checkpoint, os::ControlError],
+    take moving: Option[Moving],
     take done: task::Sender[Result[os::Outcome, os::ControlError]],
     sender: task::Sender[Input],
     journal: J,
@@ -491,6 +492,26 @@ fn Shared.restore[J: Journal](
         Err(failure) => {
             discard attempt await done.send(Err(take failure))
             return
+        }
+    }
+    match moving {
+        Some(Moving(bundle: bundle, described: described)) => {
+            match described {
+                Ok(hosted) => {
+                    driver.hosted = hosted
+                }
+                Err(failure) => {
+                    discard attempt await done.send(Err(take failure))
+                    return
+                }
+            }
+            if driver.hosted.is_some() {
+                let directory = self.directory.share()
+                await when directory => directory.read_code(mut driver, alloc: self.config.alloc)
+            }
+            driver.spec.bundle = bundle
+        }
+        None => {
         }
     }
     driver.changed_by = cause
@@ -573,7 +594,7 @@ fn Shared.read_state(
     ) fails task::Cancelled uses wait {
     let checkpointed = driver.spec.durability.class == os::DurabilityClass.Checkpointed
     match first reading {
-        Reading.Checkpoint(number: _) if not checkpointed => {
+        Reading.Checkpoint(number: _, bundle: _) if not checkpointed => {
             discard attempt await done.send(Err(os::ControlError.Volatile))
             return
         }
@@ -588,20 +609,44 @@ fn Shared.read_state(
         discard attempt await done.send(Err(os::ControlError.Missing))
         return
     }
+    var moving: Option[ident::HashValue] = None
+    match reading {
+        Reading.Checkpoint(number: _, bundle: Some(bundle)) => {
+            if bundle != driver.spec.bundle {
+                moving = Some(bundle)
+            }
+        }
+        else => {
+        }
+    }
+    let base = self.config.base
+    let component = text::String.of(driver.spec.component.as_str(), alloc)
+    var codes: Option[store::service::View] = None
+    if moving.is_some() {
+        codes = await when directory => directory.own_view(mut driver.minted, grant: CODE_GRANT, prefix: "/sys/code", branch: "main", rights: store::service::Rights.reading(), moniker: ident::Moniker(text: driver.moniker.text), principal: ident::Principal(text: text::Fixed[64].of("system")), alloc)
+    }
     let inputs = sender.split()
-    discard s.spawn(fn[take reading, take moniker, take done, take inputs]() fails task::Cancelled uses wait limits stack 32_768 {
+    discard s.spawn(fn[take reading, take moniker, take done, take inputs, take component]() fails task::Cancelled uses wait limits stack 65_536 {
+        var moved: Option[Moving] = None
+        match moving {
+            Some(bundle) => {
+                moved = Some(Moving(bundle: bundle, described: try await described_in(codes, bundle, base, component: component.as_str(), alloc)))
+            }
+            None => {
+            }
+        }
         let input = match reading {
             Reading.Letter(seq: seq) => Input.Letter(seq: seq, cause: cause, letter: try await read_dead(view, moniker, seq, alloc), done: take done)
-            Reading.Checkpoint(number: number) => Input.Restoring(cause: cause, checkpoint: try await read_checkpoint(view, moniker, number, alloc), done: take done)
+            Reading.Checkpoint(number: number, bundle: _) => Input.Restoring(cause: cause, checkpoint: try await read_checkpoint(view, moniker, number, alloc), moving: take moved, done: take done)
         }
         discard attempt await inputs.send(take input)
     })
 } Shared.read_state
 
-/// What an order reads of an instance's `/state`: its dead letter `seq`, or its checkpoint `number`.
+/// What an order reads of an instance's `/state`: its dead letter `seq`, or its checkpoint `number`, which a restore under the bundle `bundle`, when given, reads with that bundle's description of the instance's component.
 enum Reading {
     Letter(seq: u64)
-    Checkpoint(number: u64)
+    Checkpoint(number: u64, bundle: Option[ident::HashValue])
 } Reading
 
 /// Carries out a `Control` order.
@@ -659,7 +704,7 @@ fn Shared.order[J: Journal](
             discard attempt await done.send(Ok(os::Outcome.Inputs(try await self.inputs(driver))))
         }
         os::Action.Redeliver(seq: seq) => try await self.read_state(mut driver, reading: Reading.Letter(seq: seq), cause, take done, sender, s)
-        os::Action.Restore(number: number) => try await self.read_state(mut driver, reading: Reading.Checkpoint(number: number), cause, take done, sender, s)
+        os::Action.Restore(number: number, bundle: bundle) => try await self.read_state(mut driver, reading: Reading.Checkpoint(number: number, bundle: bundle), cause, take done, sender, s)
         os::Action.Fork(forking: forking) => try await self.fork(mut driver, take forking, take done, s)
         os::Action.Rerun(seq: seq, bundle: bundle, branch: branch) => try await self.rerun(mut driver, seq, bundle, take branch, take done, s)
         os::Action.Call(hash: hash, encoded: encoded, request: request) => try await self.call(driver, hash, take encoded, request, take done, cause, s)
@@ -668,7 +713,7 @@ fn Shared.order[J: Journal](
     try await mut driver.settle()
 } Shared.order
 
-/// Carries out the `Control` order `action` made under the cause `cause` that deletes, specifies, starts, stops, restarts, replays on, hibernates, wakes or pauses the instance, telling `done` its outcome.
+/// Carries out the `Control` order `action` made under the cause `cause` that deletes, specifies, starts, stops, restarts, cancels, replays on, hibernates, wakes or pauses the instance, telling `done` its outcome.
 fn Shared.order_lifecycle[J: Journal](
     self,
     mut driver: Driver,
@@ -708,6 +753,19 @@ fn Shared.order_lifecycle[J: Journal](
             try await self.end_probation(mut driver, ended: journal::ProbationEnd.Stop, journal)
             try await self.stop(mut driver, then: Then.Stop, journal)
         }
+        os::Action.Cancel(principal: principal) => {
+            if not driver.runs_job() {
+                discard attempt await done.send(Err(os::ControlError.Invalid))
+                return
+            }
+            if principal != driver.spec.principal and principal.text.as_str() != "owner" and principal.text.as_str() != "system" {
+                discard attempt await done.send(Err(os::ControlError.Denied))
+                return
+            }
+            mut driver.cancel_job("cancel")
+            mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Stopped))
+            try await self.stop(mut driver, then: Then.Stop, journal)
+        }
         os::Action.Restart => {
             mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Running))
             try await self.end_probation(mut driver, ended: journal::ProbationEnd.Restart, journal)
@@ -726,7 +784,7 @@ fn Shared.order_lifecycle[J: Journal](
 /// Whether the order `action` changes the instance's lifecycle.
 fn changes_lifecycle(action: os::Action) -> bool {
     return match action {
-        os::Action.Start or os::Action.Stop or os::Action.Restart or os::Action.Delete(unplugged: _) or os::Action.Hibernate or os::Action.Wake => true
+        os::Action.Start or os::Action.Stop or os::Action.Restart or os::Action.Cancel(principal: _) or os::Action.Delete(unplugged: _) or os::Action.Hibernate or os::Action.Wake => true
         else => false
     }
 } changes_lifecycle
@@ -1480,7 +1538,7 @@ fn Shared.restart_reverted[J: Journal](
         else => {
         }
     }
-    mut driver.stopped(journal, abandoned: abandoned)
+    mut driver.stopped(journal, abandoned)
     try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
     try await mut driver.settle()
 } Shared.restart_reverted

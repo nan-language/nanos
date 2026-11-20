@@ -29,7 +29,7 @@ pub fn answer(
         "history" => try await history(request, subject: operand.as_str(), tree, control, reader, alloc)
         "diff" => try await diff(request, tree, alloc)
         "why" => try await why(request, subject: operand.as_str(), tree, alloc)
-        "cancel" => try await cancel_named(request, target: operand.as_str(), tree, alloc)
+        "cancel" => try await cancel_named(request, target: operand.as_str(), tree, control, reader, alloc)
         else => failed_block(id: request.id.as_str(), verb, operand: operand.as_str(), failure: Failure.of("request.unknown-verb", subject: verb, alloc), alloc)
     }
 } answer
@@ -156,20 +156,44 @@ fn writers_of(path: Str, alloc: mem::Alloc) -> mem::List[ident::Moniker] {
     return writers
 } writers_of
 
-/// `cancel <plan|moniker|principal>`: a target naming nothing fails with the nearest names as fixes, and one no cancellable work stands for with `request.not-cancellable`.
-fn cancel_named(request: Request, target: Str, tree: store::service::View, alloc: mem::Alloc) -> Block fails task::Cancelled uses wait {
+/// `cancel <target>` once no pending request or watch of the session is its target: the running job an instance's moniker names is cancelled for the session's principal `reader` through `control`; a principal, a plan, an instance running no job and a job that has ended fail with `request.not-cancellable`, a request id naming nothing as one, and another target naming nothing with the nearest names as fixes.
+fn cancel_named(
+    request: Request,
+    target: Str,
+    tree: store::service::View,
+    control: os::Control,
+    reader: ident::Principal,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
     let id = request.id.as_str()
     let verb = request.verb.as_str()
     let kind = cancel_target(target)
-    let dir = match kind {
-        Target.Principal => "/sys/principals"
-        Target.Plan => "/sys/plans"
-        else => "/sys/instances"
+    var names = mem::List[text::String].empty(alloc)
+    match kind {
+        Target.Principal => {
+            names = try await names_below(tree, path: "/sys/principals", alloc)
+        }
+        Target.Plan => {
+            names = try await names_below(tree, path: "/sys/plans", alloc)
+        }
+        else => {
+            names = try await names_below(tree, path: "/live/instances", alloc)
+            let specifications = try await names_below(tree, path: "/sys/instances", alloc)
+            for specified in take specifications {
+                if names.position(fn(each: text::String) => each.as_str() == specified.as_str()).is_none() {
+                    mut names.push(take specified)
+                }
+            }
+        }
     }
-    let names = try await names_below(tree, path: dir, alloc)
     if names.position(fn(each: text::String) => each.as_str() == target).is_some() {
-        let failure = Failure.of("request.not-cancellable", subject: target, alloc).expecting("a pending request or watch, a plan awaiting approval or scheduled, a job with acknowledgement, or a child's delegation", found: target_word(kind).as_str(), alloc)
-        return failed_block(id, verb, operand: target, take failure, alloc)
+        if kind == Target.Moniker or kind == Target.Request {
+            return try await cancelled_job(request, target, control, reader, alloc)
+        }
+        return failed_block(id, verb, operand: target, failure: not_cancellable(target, kind, alloc), alloc)
+    }
+    if kind == Target.Request {
+        return failed_block(id, verb, operand: target, failure: Failure.of("request.unknown-name", subject: target, alloc).expecting("a pending request or watch of the session", found: target, alloc), alloc)
     }
     var failure = Failure.of("request.unknown-name", subject: target, alloc)
     for candidate in nearest(target, among: names, alloc) {
@@ -179,6 +203,38 @@ fn cancel_named(request: Request, target: Str, tree: store::service::View, alloc
     }
     return failed_block(id, verb, operand: target, take failure, alloc)
 } cancel_named
+
+/// Cancels the job of the instance `target` for `reader` through `control`, printing `cancelled <target>` once its run has ended; an instance that runs no job, or whose job has ended, is not cancellable.
+fn cancelled_job(
+    request: Request,
+    target: Str,
+    control: os::Control,
+    reader: ident::Principal,
+    alloc: mem::Alloc,
+    ) -> Block fails task::Cancelled uses wait {
+    let id = request.id.as_str()
+    let verb = request.verb.as_str()
+    let Some(moniker) = moniker_of(target) else {
+        return failed_block(id, verb, operand: target, failure: not_cancellable(target, kind: Target.Moniker, alloc), alloc)
+    }
+    return match first attempt await control.cancel(take moniker, principal: ident::Principal(text: reader.text), alloc) {
+        Ok(_) => {
+            var block = Block.of(Verdict.Ok, id, verb, operand: target, alloc)
+            var record = Record.of("cancelled", alloc)
+            mut record.words(target)
+            mut block.records.push(take record)
+            return block
+        }
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(os::ControlError.Invalid) => failed_block(id, verb, operand: target, failure: not_cancellable(target, kind: Target.Moniker, alloc), alloc)
+        Err(failed) => failed_block(id, verb, operand: target, failure: Failure.of(failed.code().as_str(), subject: target, alloc), alloc)
+    }
+} cancelled_job
+
+/// The `request.not-cancellable` failure of `target`, of the class `kind`.
+fn not_cancellable(target: Str, kind: Target, alloc: mem::Alloc) -> Failure {
+    return Failure.of("request.not-cancellable", subject: target, alloc).expecting("a pending request or watch, a plan awaiting approval or scheduled, a job with acknowledgement, or a child's delegation", found: target_word(kind).as_str(), alloc)
+} not_cancellable
 
 /// The `instance <moniker>` record of the instance `name` names: its specification and, when it has one, its observed record.
 fn instance_record(name: Str, tree: store::service::View, alloc: mem::Alloc) -> Option[Record] fails task::Cancelled uses wait {
