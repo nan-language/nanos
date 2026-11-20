@@ -505,3 +505,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a nanos bundle's contributions to a kernel's loaded registries, loaded, replaced and unloaded with the bundle, their function fields entered through gates that own the nanos code's extended state.
 - **Chapters:** [04](04-kernel.md), [10](10-code.md), [15](15-devices.md).
 - **Issue:** [nan-language/nan#269](https://github.com/nan-language/nan/issues/269).
+
+## N48
+
+**Contributions read before loading.**
+
+- **Language 1:** `Prepared.load` publishes a bundle's contributions to a kernel's loaded registries and refuses a duplicate key (NaN 24 §Loading), while nothing reads them without publishing: a bundle's format gives each contribution's registry and key field, but not how a `Str` key or the rest of an entry lies in its image.
+- **NaN OS requires:** the entries a bundle would add to each loaded registry, typed by the registry's entry type, read before it loads.
+- **Chapters:** [10](10-code.md), [15](15-devices.md).
+- **Issue:** [nan-language/nan#270](https://github.com/nan-language/nan/issues/270).

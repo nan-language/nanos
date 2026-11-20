@@ -76,7 +76,7 @@ A `DeviceMatch` is one of, from most to least specific: `PciSubsystem { vendor, 
 2. Otherwise the most specific matching entry of the kernel image or of a bundle of provenance `vendor` or `reviewed` ([provenance](09-authority.md#provenance)) wins; ties go to the higher `priority`, then to an entry of the kernel image, then to the lower `name`. An entry of a bundle of provenance `agent` drives a device only through a binding `Entry(name)`.
 3. With no such entry the device stays unbound.
 
-Loading or unloading a bundle that contributes `drivers` entries reruns these steps for every unbound device and every binding naming a contributed entry; a device bound under step 2 keeps its driver. The [preview](14-changes.md#preview) of an `install` step lists each binding it causes as an activation.
+Loading or unloading a bundle that contributes `drivers` entries reruns these steps for every unbound device and every binding naming a contributed entry; a device bound under step 2 keeps its driver. The [preview](14-changes.md#preview) of an `install` step lists each binding it causes as an activation (requires [N48](22-nan.md#n48)).
 
 ### Driver instances
 
