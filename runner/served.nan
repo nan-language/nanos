@@ -1,6 +1,6 @@
 //! The task of an instance's domain: it builds the Env, starts or restores the component, serves the calls its driver delivers, one at a time, keeps its checkpoints, and hands its driver the replies the component gives postponed requests.
 
-/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept, the checkpoint it restores, which its hibernation image gives a revival and the old code's encoding of its state an update, whether it starts as an update, the instance's configuration record, for a fork what it runs and where it tells what it saw, and otherwise the instance's flight recorder.
+/// What an instance's driver gives the task of its domain: the calls it delivers, where the domain reports what it takes and answers and when its handlers run, the abandoner of the domain, the time without a message after which the component is suspended, never when 0, for a checkpointed instance how its checkpoints are kept, the checkpoint it restores, which its hibernation image gives a revival and the old code's encoding of its state an update, whether it starts as an update, the inputs it replays first as the old code of a revert, the instance's configuration record, for a fork what it runs and where it tells what it saw, and otherwise the instance's flight recorder.
 pub open struct Serving {
     deliveries: task::Receiver[Delivery]
     reports: task::Sender[Input]
@@ -13,6 +13,7 @@ pub open struct Serving {
     restore: Option[os::Checkpoint]
     revival: bool
     updated: bool
+    replay: Option[mem::List[os::RecordedInput]]
     config: Option[Untrusted[mem::Bytes]]
     forking: Option[ForkRun]
     recorder: Option[Recorder]
@@ -35,7 +36,7 @@ enum Delivery {
     Stop(hand: bool)
 } Delivery
 
-/// What the task of an instance's domain tells its driver: among others, that it runs, with the names of its component's operations by number, how a hibernation it was ordered ended, with the image it took or none when the instance serves on, the encoding of the protocol schema the bundle of its component gives for it, the encoding of its component's state, of schema `schema`, as it stops for an update, whether a health probe found it healthy, and that a checkpoint ended the armed period of its flight recorder.
+/// What the task of an instance's domain tells its driver: among others, that it runs, with the names of its component's operations by number, how a hibernation it was ordered ended, with the image it took or none when the instance serves on, the encoding of the protocol schema the bundle of its component gives for it, the encoding of its component's state, of schema `schema`, as it stops for an update, whether a health probe found it healthy, that a checkpoint ended the armed period of its flight recorder, the number of the input it replays as the old code of a revert, and how many it replayed.
 enum Report {
     Running(from: journal::StartedFrom, operations: mem::List[text::String])
     Described(schema: mem::Bytes)
@@ -52,6 +53,8 @@ enum Report {
     Replayed(outcome: Result[os::Replayed, os::ControlError])
     Health(healthy: bool)
     RecordingEnded
+    Replaying(seq: u64)
+    ReplayDone(replayed: u64)
 } Report
 
 /// What the watch of an incarnation takes: when its handlers run, which it bounds, their start, then how long they took; how long a handler call of a message charged to the account `account` took; a reading of its gauge; and the end of its domain.
@@ -120,7 +123,7 @@ pub fn Driven.run(
     if serving.forking.is_some() {
         return try await Driven[S, Env, P].forked(take env, exec, alloc, take serving, release)
     }
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: revival, updated: updated, config: _, forking: _, recorder: recorder) = serving
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: revival, updated: updated, replay: replay, config: _, forking: _, recorder: recorder) = serving
     let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
@@ -143,6 +146,11 @@ pub fn Driven.run(
     let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0), deadline: core::atomic::AtomicU64.of(os::NO_DEADLINE), posted: hw::SpinLock.of(None), operations: operation_names(sys::Wire[P].operations(alloc), alloc)), alloc)
     let task::Channel(sender: finished, receiver: finishes) = task::Channel[u64].bounded(1, alloc)
     let telling = Telling(reports: reports.split(), marks: marks.split(), steps: steps.share(), finished: take finished, clock: clock, incarnation: incarnation, recorder: take recorder, alloc: alloc)
+    match replay {
+        Some(inputs) => try await replay_served(mut stepper, take inputs, telling, exec, alloc)
+        None => {
+        }
+    }
     let resuming = telling.begin(call: SystemCall.Resume)
     mut stepper.resumed(resumed_for(reason, revival, updated))
     telling.end_system(resuming)
@@ -287,7 +295,7 @@ fn Driven.forked(
     take serving: Serving,
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
-    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, revival: _, updated: _, config: _, forking: forking, recorder: _) = serving
+    let Serving(deliveries: _, reports: _, marks: _, incarnation: _, clock: _, abandoner: _, suspend_ms: _, keeping: _, restore: restore, revival: _, updated: _, replay: _, config: _, forking: forking, recorder: _) = serving
     let Some(ForkRun(call: call, reporting: reporting, tape: tape, reaching: reaching, served: served)) = forking else {
         release(take env)
         return Ended.Stopped
@@ -861,6 +869,48 @@ fn call_handlers[S: Encode, Env: Any, P: sys::Protocol](mut stepper: sys::Steppe
     }
     return handled
 } call_handlers
+
+/// Has the component behind `stepper` handle each input of `inputs` in order before it resumes, as the old code of a revert: posts each from a task of a scope and steps the component until it handled it, dropping the messages its handler sent the component and the keyed tasks it spawned; tells the driver before each which it replays, then how many it replayed.
+fn replay_served[S, Env: Any, P: sys::Protocol and Send](
+    mut stepper: sys::Stepper[S, Env, P],
+    take inputs: mem::List[os::RecordedInput],
+    telling: Telling,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    let out = stepper.outbox()
+    var count: u64 = 0
+    try await task::scope(exec, body: fn[mut stepper, take inputs, mut count](s: task::Scope) fails task::Cancelled uses wait {
+        for input in inputs {
+            try await telling.tell(report: Report.Replaying(seq: input.seq))
+            let raw = copied(input.encoded.view(), alloc)
+            let hash = input.hash
+            discard s.spawn(fn[take raw]() fails task::Cancelled uses wait limits stack 40_960 {
+                let peers = mem::List[sys::ProtocolSchema].empty(alloc)
+                let handles = mem::List[sys::Handle].empty(alloc)
+                discard attempt await sys::Wire[P].serve(out, request: REPLAYED_REQUEST, hash: hash, peers: peers.view(), raw: Untrusted.of(raw.view()), handles: handles.view(), alloc)
+            })
+            loop {
+                try await stepper.incoming()
+                let stepped = mut stepper.step()
+                if stepped.is_some() {
+                    break
+                }
+            }
+            loop {
+                let Some(_) = mut stepper.take_sent() else {
+                    break
+                }
+            }
+            for held in stepper.held(alloc) {
+                discard mut stepper.drop_held(held.key)
+            }
+            count += 1
+        }
+        s.cancel()
+    })
+    try await telling.tell(report: Report.ReplayDone(replayed: count))
+} replay_served
 
 /// Steps `stepper` as `paced_step` does, `recorder` recording the message the step handles with the clock and random reads of its handler call under the number its flight recorder gives it.
 fn recorded_step[S, Env: Any, P: sys::Protocol](mut stepper: sys::Stepper[S, Env, P], recorder: Recorder, deadline: u64, telling: Telling) -> Option[sys::Handled] fails task::Cancelled uses wait {

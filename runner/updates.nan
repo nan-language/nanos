@@ -3,18 +3,27 @@
 /// How often a probation is looked at, in nanoseconds.
 const PROBATION_TICK_NS: u64 = 1_000_000_000
 
-/// A live update of an instance: the code hash and the description of the component it ran before, the old code's encoding of its state once handed, whether the update was reverted, the old bundle running again from that encoding, the probation it runs under, the p99 handler latency of the old bundle in µs when it handled enough messages to give one, when the new code began running and when its health was last asked, in monotonic nanoseconds, 0 until it runs, and whether its probation is still looked at.
+/// A live update of an instance: the code hash and the description of the component it ran before, the old code's encoding of its state once handed, the inputs its new code handled during its probation, the revert under way, the old bundle running again from that encoding and replaying those inputs, the probation it runs under, the p99 handler latency of the old bundle in µs when it handled enough messages to give one, when the new code began running and when its health was last asked, in monotonic nanoseconds, 0 until it runs, and whether its probation is still looked at.
 struct Updating {
     old: ident::HashValue
     hosted: Option[mem::Box[Hosted]]
     handed: Option[PreUpdate]
-    reverted: bool
+    inputs: mem::List[os::RecordedInput]
+    reverting: Option[Reverting]
     probation: os::Probation
     baseline_us: Option[u64]
     started_ns: u64
     probed_ns: u64
     ticking: mem::Shared[core::atomic::AtomicBool]
 } Updating
+
+/// A revert under way: the bundle it reverts from, its reason, the number of the input the old code replays, and the number of inputs that trapped there, each a dead letter.
+struct Reverting derives Copy {
+    new: ident::HashValue
+    reason: journal::RevertReason
+    replaying: Option[u64]
+    dead_lettered: u64
+} Reverting
 
 /// How the latest probation of an instance ended: the bundle it put on probation, and whether it was reverted.
 struct Probated derives Copy, Eq {
@@ -106,7 +115,7 @@ fn Shared.redescribed[J: Journal](
     if driver.lifecycle != Some(os::Lifecycle.Running) {
         return
     }
-    driver.updating = Some(mem::Heap.of(self.config.alloc).boxed(Updating(old: old, hosted: take before, handed: None, reverted: false, probation: probation, baseline_us: baseline_us, started_ns: 0, probed_ns: 0, ticking: mem::Shared.of(core::atomic::AtomicBool.of(true), alloc: self.config.alloc))))
+    driver.updating = Some(mem::Heap.of(self.config.alloc).boxed(Updating(old: old, hosted: take before, handed: None, inputs: mem::List.empty(self.config.alloc), reverting: None, probation: probation, baseline_us: baseline_us, started_ns: 0, probed_ns: 0, ticking: mem::Shared.of(core::atomic::AtomicBool.of(true), alloc: self.config.alloc))))
     try await self.stop(mut driver, then: Then.Update, journal)
 } Shared.redescribed
 
@@ -156,7 +165,7 @@ fn Driver.update_started[J: Journal](mut self, journal: J, now_ns: u64) {
         return
     }
     var updating = take boxed.into_contents()
-    if not updating.reverted {
+    if updating.reverting.is_none() {
         updating.started_ns = now_ns
         updating.probed_ns = now_ns
         var migrations = mem::List[ident::HashValue].empty(self.alloc)
@@ -202,7 +211,7 @@ fn Updating.handed_schema(self) -> Option[ident::HashValue] {
 /// Whether a probation runs: the new code of an update not reverted began running.
 fn Driver.in_probation(self) -> bool {
     return match self.updating {
-        Some(boxed) => boxed.contents().started_ns != 0 and not boxed.contents().reverted
+        Some(boxed) => boxed.contents().started_ns != 0 and boxed.contents().reverting.is_none()
         None => false
     }
 } Driver.in_probation
@@ -221,7 +230,7 @@ fn Driver.probation_ends_ns(self) -> Option[u64] {
         return None
     }
     let updating = boxed.contents()
-    if updating.started_ns == 0 or updating.reverted {
+    if updating.started_ns == 0 or updating.reverting.is_some() {
         return None
     }
     return Some(updating.started_ns + u64.widen(updating.probation.max_s) * NS_PER_S)
@@ -272,17 +281,12 @@ fn Shared.probation_tick[J: Journal](self, mut driver: Driver, incarnation: u64,
     try await mut driver.settle()
 } Shared.probation_tick
 
-/// Reverts the update in probation for `reason`: the old bundle restarts from the old code's encoding of the state, and `update.reverted` is recorded.
+/// Reverts the update in probation for `reason`: the old bundle restarts from the old code's encoding of the state, replaying the inputs the new code handled.
 fn Shared.revert_update[J: Journal](self, mut driver: Driver, reason: journal::RevertReason, journal: J) fails task::Cancelled uses wait {
     let new = driver.spec.bundle
-    let Some(boxed) = driver.updating else {
+    if not mut driver.revert(reason, alloc: self.config.alloc) {
         return
     }
-    let old = boxed.contents().old
-    if not mut driver.revert(self.config.alloc) {
-        return
-    }
-    journal.record(driver.slot, cause: driver.cause, event: Event.UpdateReverted(old: old, new: new, reason: reason, replayed: 0, dead_lettered: 0))
     driver.probated = Some(Probated(bundle: new, reverted: true))
     try await self.stop(mut driver, then: Then.Restart, journal)
     try await mut driver.settle()
@@ -367,12 +371,12 @@ fn Driver.handing(self) -> bool {
     }
 } Driver.handing
 
-/// What a start under an update keeps checkpoints through, `keeping`, and restores at `time`: a copy of the old code's encoding of the state, which the update keeps for a revert; the update ends with the start that follows its revert.
+/// What a start under an update keeps checkpoints through, `keeping`, and restores at `time`: a copy of the old code's encoding of the state, which the update keeps for a revert, and after a revert the inputs the old code replays first.
 fn Driver.handed_restored(mut self, keeping: Option[Keeping], time: ident::WallTime) -> Option[Restored] {
     var state = mem::Bytes.empty(self.alloc)
     var schema: Option[ident::HashValue] = None
     var old = self.spec.bundle
-    var reverted = false
+    var replay: Option[mem::List[os::RecordedInput]] = None
     match self.updating {
         Some(boxed) => {
             let updating = boxed.contents()
@@ -385,19 +389,102 @@ fn Driver.handed_restored(mut self, keeping: Option[Keeping], time: ident::WallT
                 }
             }
             old = updating.old
-            reverted = updating.reverted
+            if updating.reverting.is_some() {
+                replay = Some(copied_inputs(updating.inputs.view(), alloc: self.alloc))
+            }
         }
         None => {
         }
     }
-    if reverted {
-        self.updating = None
-    }
     let Some(encoded) = schema else {
-        return Some(Restored(keeping: keeping, restore: None, updated: false))
+        return Some(Restored(keeping: keeping, restore: None, updated: false, replay: None))
     }
-    return Some(Restored(keeping: keeping, restore: Some(os::Checkpoint(number: 0, incarnation: self.incarnation, bundle: old, schema: encoded, time: time, state: take state)), updated: true))
+    return Some(Restored(keeping: keeping, restore: Some(os::Checkpoint(number: 0, incarnation: self.incarnation, bundle: old, schema: encoded, time: time, state: take state)), updated: true, replay: take replay))
 } Driver.handed_restored
+
+/// Keeps `inputs`, those the new code of the update under way handled during its probation, for a revert to replay.
+fn Driver.keep_inputs(mut self, take inputs: mem::List[os::RecordedInput]) {
+    let Some(boxed) = mut self.updating.extract() else {
+        return
+    }
+    var updating = take boxed.into_contents()
+    updating.inputs = inputs
+    self.updating = Some(mem::Heap.of(self.alloc).boxed(take updating))
+} Driver.keep_inputs
+
+/// Notes that the old code of the revert under way replays the input numbered `seq`.
+fn Driver.replays(mut self, seq: u64) {
+    let Some(boxed) = mut self.updating.extract() else {
+        return
+    }
+    var updating = take boxed.into_contents()
+    match updating.reverting {
+        Some(reverting) => {
+            var noted = reverting
+            noted.replaying = Some(seq)
+            updating.reverting = Some(noted)
+        }
+        None => {
+        }
+    }
+    self.updating = Some(mem::Heap.of(self.alloc).boxed(take updating))
+} Driver.replays
+
+/// The input the old code of the revert under way was replaying as its domain ended, taken out of those it replays and counted as dead-lettered; `None` when it replayed none.
+fn Driver.take_replaying(mut self) -> Option[os::RecordedInput] {
+    let Some(boxed) = mut self.updating.extract() else {
+        return None
+    }
+    var updating = take boxed.into_contents()
+    var taken: Option[os::RecordedInput] = None
+    match updating.reverting {
+        Some(reverting) => {
+            match reverting.replaying {
+                Some(seq) => {
+                    match updating.inputs.position(fn(input: os::RecordedInput) => input.seq == seq) {
+                        Some(at) => {
+                            taken = Some(mut updating.inputs.remove(at))
+                        }
+                        None => {
+                        }
+                    }
+                    var noted = reverting
+                    noted.replaying = None
+                    noted.dead_lettered += 1
+                    updating.reverting = Some(noted)
+                }
+                None => {
+                }
+            }
+        }
+        None => {
+        }
+    }
+    self.updating = Some(mem::Heap.of(self.alloc).boxed(take updating))
+    return taken
+} Driver.take_replaying
+
+/// Ends the revert under way once its old code replayed `count` inputs: records `update.reverted` and drops the update.
+fn Driver.reverted[J: Journal](mut self, count: u64, journal: J) {
+    let Some(boxed) = mut self.updating.extract() else {
+        return
+    }
+    let updating = take boxed.into_contents()
+    let Some(reverting) = updating.reverting else {
+        self.updating = Some(mem::Heap.of(self.alloc).boxed(take updating))
+        return
+    }
+    journal.record(self.slot, cause: self.cause, event: Event.UpdateReverted(old: updating.old, new: reverting.new, reason: reverting.reason, replayed: count, dead_lettered: reverting.dead_lettered))
+} Driver.reverted
+
+/// A copy of `inputs`.
+fn copied_inputs(inputs: Slice[os::RecordedInput], alloc: mem::Alloc) -> mem::List[os::RecordedInput] {
+    var copies = mem::List[os::RecordedInput].empty(alloc)
+    for input in inputs {
+        mut copies.push(os::RecordedInput(seq: input.seq, hash: input.hash, encoded: copied(input.encoded.view(), alloc), recorded: os::Recorded(clock: copied_words(input.recorded.clock, alloc), random: copied_words(input.recorded.random, alloc))))
+    }
+    return copies
+} copied_inputs
 
 /// Keeps `state`, the old code's encoding of the instance's state of schema `schema`, for the update under way.
 fn Driver.handed(mut self, take state: mem::Bytes, schema: ident::HashValue) {
@@ -411,18 +498,19 @@ fn Driver.handed(mut self, take state: mem::Bytes, schema: ident::HashValue) {
     self.updating = Some(mem::Heap.of(self.alloc).boxed(take updating))
 } Driver.handed
 
-/// Reverts the update under way once its new code failed: the specification's bundle and the component's description go back to the old bundle's, which restarts from the old code's encoding of the state; whether there was one to revert.
-fn Driver.revert(mut self, alloc: mem::Alloc) -> bool {
+/// Reverts the update under way for `reason` once its new code failed: the specification's bundle and the component's description go back to the old bundle's, which restarts from the old code's encoding of the state; whether there was one to revert.
+fn Driver.revert(mut self, reason: journal::RevertReason, alloc: mem::Alloc) -> bool {
     let Some(boxed) = mut self.updating.extract() else {
         return false
     }
     var updating = take boxed.into_contents()
-    if updating.reverted or updating.handed.is_none() {
+    if updating.reverting.is_some() or updating.handed.is_none() {
+        self.updating = Some(mem::Heap.of(alloc).boxed(take updating))
         return false
     }
+    updating.reverting = Some(Reverting(new: self.spec.bundle, reason: reason, replaying: None, dead_lettered: 0))
     self.spec.bundle = updating.old
     self.hosted = mut updating.hosted.extract()
-    updating.reverted = true
     updating.ticking.contents().store(false)
     self.updating = Some(mem::Heap.of(alloc).boxed(take updating))
     return true

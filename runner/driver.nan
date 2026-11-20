@@ -846,7 +846,7 @@ fn Shared.start[J: Journal](
     driver.started_ns = now(self.config.clock)
     let revival = driver.hibernated
     driver.hibernated = false
-    let Some(Restored(keeping: keeping, restore: restore, updated: updated)) = try await self.restored(mut driver, revival, journal) else {
+    let Some(Restored(keeping: keeping, restore: restore, updated: updated, replay: replay)) = try await self.restored(mut driver, revival, journal) else {
         return
     }
     if not revival {
@@ -873,7 +873,7 @@ fn Shared.start[J: Journal](
             driver.lifecycle = Some(os::Lifecycle.Running)
             journal.record(driver.slot, cause: driver.cause, event: Event.Started(incarnation: driver.incarnation, from: journal::StartedFrom.Start))
         }
-        None => self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), bundle: take bundled, take world, serving: Serving(deliveries: take delivered, reports: sender.split(), marks: take marks, incarnation: driver.incarnation, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: driver.suspend_ms.value_or(0), keeping: keeping, restore: take restore, revival: revival, updated: updated, config: take config, forking: None, recorder: Some(driver.recorder.share())), exec, alloc, abandoner: abandoner.share(), ended: sender.split(), incarnation: driver.incarnation, header)
+        None => self.launch(s, component: text::String.of(driver.spec.component.as_str(), alloc: self.config.alloc), bundle: take bundled, take world, serving: Serving(deliveries: take delivered, reports: sender.split(), marks: take marks, incarnation: driver.incarnation, clock: self.config.clock, abandoner: abandoner.share(), suspend_ms: driver.suspend_ms.value_or(0), keeping: keeping, restore: take restore, revival: revival, updated: updated, replay: take replay, config: take config, forking: None, recorder: Some(driver.recorder.share())), exec, alloc, abandoner: abandoner.share(), ended: sender.split(), incarnation: driver.incarnation, header)
     }
     self.watch(s, marks: take marked, take held, abandoner: abandoner.share(), inputs: sender.split(), incarnation: driver.incarnation, handlers: driver.spec.handlers, number: driver.slot)
     if updated {
@@ -911,7 +911,7 @@ fn Shared.incarnation[J: Journal](self, mut driver: Driver, journal: J, s: task:
     }
     let account = self.config.exec.split_on(self.config.share(driver.spec.share), alloc: budget.alloc())
     var sources = Some(Sources(clock: self.config.clock, random: self.config.random))
-    if driver.forkable(self.components) {
+    if driver.recordable(self.components) {
         sources = mut driver.minted.taped_sources(clock: self.config.clock, random: self.config.random, alloc: self.config.alloc)
     }
     let Some(drawn) = sources else {
@@ -1178,7 +1178,7 @@ fn Shared.launch(
                 let Some(boxed) = bundled else {
                     return Ok(try await components.serve(path.as_str(), world: take built, serving: take served))
                 }
-                let Bundled(code: code, bundle: hash, entry: entry, operations: operations) = take boxed.into_contents()
+                let Bundled(code: code, bundle: hash, entry: entry, protocol: protocol, operations: operations) = take boxed.into_contents()
                 let Some(view) = code else {
                     return Ok(Ended.Unloadable(code: text::Fixed[32].of("port.server-stopped")))
                 }
@@ -1186,7 +1186,7 @@ fn Shared.launch(
                     Ok(read) => read
                     Err(failure) => return Ok(Ended.Unloadable(code: failure))
                 }
-                return try await components.host(take image, code: hash, component: entry.as_str(), world: take built, hosting: Hosting.of(take served, take operations, exec, alloc))
+                return try await components.host(take image, code: hash, component: entry.as_str(), world: take built, hosting: Hosting.of(take served, protocol, take operations, exec, alloc))
             })
         }, stack: INSTANCE_STACK, exec, alloc)
         let outcome: Result[Ended, sys::Trap] = match ran {
@@ -1404,24 +1404,27 @@ fn Shared.ended[J: Journal](
     let outstanding = driver.outstanding_taken()
     try await mut driver.end_domain()
     try await self.recording_ended(mut driver, trapped: outcome.is_err(), s)
+    if outcome.is_err() {
+        match mut driver.take_replaying() {
+            Some(input) => {
+                let Err(trap) = outcome else {
+                    return
+                }
+                try await self.replay_trapped(mut driver, trap, take input, sender, journal, s)
+                return
+            }
+            None => {
+            }
+        }
+    }
     let ran = match first outcome {
         Ok(Ended.Stopped) or Ok(Ended.Hibernated) => true
         else => false
     }
     let updated_to = driver.spec.bundle
-    let updated_from = match driver.updating {
-        Some(boxed) => boxed.contents().old
-        None => updated_to
-    }
-    if not ran and mut driver.revert(self.config.alloc) {
-        journal.record(driver.slot, cause: driver.cause, event: Event.UpdateReverted(old: updated_from, new: updated_to, reason: revert_reason(outcome), replayed: 0, dead_lettered: 0))
+    if not ran and mut driver.revert(revert_reason(outcome), alloc: self.config.alloc) {
         driver.probated = Some(Probated(bundle: updated_to, reverted: true))
-        if outcome.is_err() {
-            driver.recorder.trapped(outstanding)
-        }
-        mut driver.stopped(journal, abandoned: outcome.is_err())
-        try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
-        try await mut driver.settle()
+        try await self.restart_reverted(mut driver, take outcome, take dead, outstanding, sender, journal, s)
         return
     }
     match outcome {
@@ -1447,23 +1450,83 @@ fn Shared.ended[J: Journal](
                 None => {
                 }
             }
-            if driver.abandonment == Abandonment.Lingered {
-                mut driver.stopped(journal, abandoned: true)
-                if driver.then != Then.Stop {
-                    try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
-                }
-            } else {
-                match dead {
-                    Some(handled) => try await self.record_dead(mut driver, trap, take handled, s)
-                    None => {
-                    }
-                }
-                try await self.abandoned(mut driver, kind: trap.kind(), trapped, sender, journal, s)
-            }
+            try await self.after_trap(mut driver, trap, take dead, trapped, sender, journal, s)
         }
     }
     try await mut driver.settle()
 } Shared.ended
+
+/// Restarts the old code of the update that `outcome`, the end of its new code's domain, reverted, the message `dead` a trap's handler took becoming a dead letter.
+fn Shared.restart_reverted[J: Journal](
+    self,
+    mut driver: Driver,
+    take outcome: Result[Ended, sys::Trap],
+    take dead: Option[Handled],
+    outstanding: Option[Taken],
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    let abandoned = outcome.is_err()
+    match outcome {
+        Err(trap) => {
+            driver.recorder.trapped(outstanding)
+            match dead {
+                Some(handled) => try await self.record_dead(mut driver, trap, take handled, s)
+                None => {
+                }
+            }
+        }
+        else => {
+        }
+    }
+    mut driver.stopped(journal, abandoned: abandoned)
+    try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
+    try await mut driver.settle()
+} Shared.restart_reverted
+
+/// Restarts the instance after `trap` abandoned its domain when it lingered, and otherwise keeps the message `dead` its handler took as a dead letter and abandons it.
+fn Shared.after_trap[J: Journal](
+    self,
+    mut driver: Driver,
+    trap: sys::Trap,
+    take dead: Option[Handled],
+    trapped: u64,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    if driver.abandonment == Abandonment.Lingered {
+        mut driver.stopped(journal, abandoned: true)
+        if driver.then != Then.Stop {
+            try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
+        }
+        return
+    }
+    match dead {
+        Some(handled) => try await self.record_dead(mut driver, trap, take handled, s)
+        None => {
+        }
+    }
+    try await self.abandoned(mut driver, kind: trap.kind(), trapped, sender, journal, s)
+} Shared.after_trap
+
+/// Has the revert under way replay again without `input`, whose replay on the old code ended in `trap`: the input becomes a dead letter and the old code restarts from the old encoding of the state.
+fn Shared.replay_trapped[J: Journal](
+    self,
+    mut driver: Driver,
+    trap: sys::Trap,
+    take input: os::RecordedInput,
+    sender: task::Sender[Input],
+    journal: J,
+    s: task::Scope,
+    ) fails task::Cancelled uses wait {
+    let os::RecordedInput(seq: _, hash: _, encoded: encoded, recorded: _) = input
+    try await self.record_dead(mut driver, trap, handled: Handled(header: os::Header.of_work(cause: driver.cause, slot: driver.slot), message: Some(take encoded), redelivery: None), s)
+    mut driver.stopped(journal, abandoned: true)
+    try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
+    try await mut driver.settle()
+} Shared.replay_trapped
 
 /// The call whose handler call is running: its header, and a copy of its encoding when the driver kept one; `None` when no handler call runs.
 fn Driver.handled_message(self) -> Option[Handled] {
@@ -1660,6 +1723,8 @@ fn Driver.report[J: Journal](mut self, take report: Report, journal: J, now_ns: 
         }
         Report.Health(healthy: _) or Report.RecordingEnded => {
         }
+        Report.Replaying(seq: seq) => mut self.replays(seq)
+        Report.ReplayDone(replayed: count) => mut self.reverted(count, journal)
         Report.CheckpointFailed(code: code, bytes: bytes) => journal.record(self.slot, cause: 0, event: Event.CheckpointFailed(code: code, bytes: bytes))
         Report.Published(summary: summary) => mut self.showing.summarize(take summary)
         Report.Handed(state: state, schema: schema) => mut self.handed(take state, schema)

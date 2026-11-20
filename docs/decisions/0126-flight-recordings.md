@@ -1,6 +1,6 @@
 # 0126. Flight recordings
 
-Status: accepted
+Status: superseded by 0134
 
 ## Context
 

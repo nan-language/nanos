@@ -6,14 +6,23 @@ const RECORDED_INPUTS: u64 = 16
 /// The operation number of an input whose handler call ended before telling what it took.
 const UNKNOWN_OPERATION: u8 = 0xFF
 
-/// The flight recorder of an instance, which its driver holds and the holders of its incarnations write: the headers of its last inputs, what it keeps while armed, drawn through the driver's `alloc` so that it outlives the instance's domains, whether it is armed, and the period the next start arms it for.
+/// The flight recorder of an instance, which its driver holds and the holders of its incarnations write: the headers of its last inputs, what it keeps while armed, drawn through the driver's `alloc` so that it outlives the instance's domains, whether it is armed, the period the next start arms it for, and the arming the holder of a bundle's component carries out at its next step, with whether one waits.
 pub open struct Recorder {
     ring: mem::Shared[hw::SpinLock[Ring]]
     capture: task::Cown[Option[Capture]]
     armed: mem::Shared[core::atomic::AtomicBool]
     deferred: task::Cown[Option[Period]]
+    ordered: task::Cown[Option[Ordered]]
+    waiting: mem::Shared[core::atomic::AtomicBool]
     alloc: mem::Alloc
 } Recorder
+
+/// An arming the holder of a bundle's component carries out at its next step, from the state it takes then: the bundle the instance runs, the armed period and the tape of its handlers' reads.
+struct Ordered {
+    bundle: ident::HashValue
+    period: Period
+    tape: Tape
+} Ordered
 
 /// What an armed recorder keeps: the recording so far and its bytes, the tape of the instance's clock and random source, and its armed period.
 struct Capture {
@@ -60,12 +69,35 @@ enum SystemCall derives Copy, Eq {
 /// A recorder that has recorded nothing.
 fn Recorder.of(alloc: mem::Alloc) -> Recorder {
     let empty = os::InputHeader.from_bits(Array[u8, 48].filled(0))
-    return Recorder(ring: mem::Shared.of(hw::SpinLock.of(Ring(headers: Array[os::InputHeader, 16].filled(empty), taken: 0, running: None, shown: false)), alloc), capture: task::Cown.of(None, alloc), armed: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), deferred: task::Cown.of(None, alloc), alloc: alloc)
+    return Recorder(ring: mem::Shared.of(hw::SpinLock.of(Ring(headers: Array[os::InputHeader, 16].filled(empty), taken: 0, running: None, shown: false)), alloc), capture: task::Cown.of(None, alloc), armed: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), deferred: task::Cown.of(None, alloc), ordered: task::Cown.of(None, alloc), waiting: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), alloc: alloc)
 } Recorder.of
 
 fn Recorder.share(self) -> Recorder {
-    return Recorder(ring: self.ring.share(), capture: self.capture.share(), armed: self.armed.share(), deferred: self.deferred.share(), alloc: self.alloc)
+    return Recorder(ring: self.ring.share(), capture: self.capture.share(), armed: self.armed.share(), deferred: self.deferred.share(), ordered: self.ordered.share(), waiting: self.waiting.share(), alloc: self.alloc)
 } Recorder.share
+
+/// Has the holder of a bundle's component arm the recorder at its next step, as `arm` does, from the state it takes then.
+fn Recorder.order_arming(self, bundle: ident::HashValue, period: Period, take tape: Tape) fails task::Cancelled uses wait {
+    var given = Some(Ordered(bundle: bundle, period: period, tape: take tape))
+    let ordered = self.ordered.share()
+    await when mut ordered {
+        ordered = mut given.extract()
+    }
+    self.waiting.contents().store(true)
+} Recorder.order_arming
+
+/// The arming ordered for the holder's next step, which it takes; `None` when none waits.
+fn Recorder.take_order(self) -> Option[Ordered] fails task::Cancelled uses wait {
+    if not self.waiting.contents().swap(false) {
+        return None
+    }
+    var taken: Option[Ordered] = None
+    let ordered = self.ordered.share()
+    await when mut ordered {
+        taken = mut ordered.extract()
+    }
+    return taken
+} Recorder.take_order
 
 /// Whether the recorder keeps a recording.
 fn Recorder.is_armed(self) -> bool {
@@ -194,6 +226,7 @@ fn Recorder.period(self) -> Option[Period] fails task::Cancelled uses wait {
 fn Recorder.checkpointed(self, base: os::StateCopy) -> bool fails task::Cancelled uses wait {
     match first try await self.period() {
         Some(period) if period.to_checkpoint => return true
+        Some(period) if period.until_ns.is_none() => return false
         else => {
         }
     }

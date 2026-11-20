@@ -15,9 +15,10 @@ struct Hosted {
 /// The longest an instance started by an update waits for a message before its holder looks for a health probe to run, in nanoseconds; such an instance is never suspended.
 const PROBED_WAIT_NS: u64 = 1_000_000_000
 
-/// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, the names of its component's operations by number, the encoding of the protocol schema its bundle gives for it, the executor and allocator of its domain, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
+/// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, the protocol its component serves and the names of its operations by number, the encoding of the protocol schema its bundle gives for it, the executor and allocator of its domain, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
 pub open linear struct Hosting {
     serving: Serving
+    protocol: sys::ProtocolHash
     operations: mem::List[text::String]
     served: Option[mem::Bytes]
     exec: task::Executor
@@ -146,6 +147,11 @@ fn Driver.forkable[C: Components](self, components: C) -> bool {
     return self.hosted.is_none() and components.forkable(self.spec.component.as_str())
 } Driver.forkable
 
+/// Whether the instance's flight recorder can be armed: its component is a bundle's or forkable.
+fn Driver.recordable[C: Components](self, components: C) -> bool {
+    return self.hosted.is_some() or self.forkable(components)
+} Driver.recordable
+
 /// Whether the Env of the instance's component takes a configuration record.
 fn Driver.configured[C: Components](self, components: C) -> bool {
     return match self.hosted {
@@ -213,20 +219,22 @@ fn Driver.bundled(self) -> Option[mem::Box[Bundled]] {
         return None
     }
     let hosted = described.contents()
-    return Some(mem::Heap.of(self.alloc).boxed(Bundled(code: hosted.code, bundle: self.spec.bundle, entry: text::String.of(hosted.entry.as_str(), alloc: self.alloc), operations: names_in(hosted.operations, alloc: self.alloc))))
+    return Some(mem::Heap.of(self.alloc).boxed(Bundled(code: hosted.code, bundle: self.spec.bundle, entry: text::String.of(hosted.entry.as_str(), alloc: self.alloc), protocol: hosted.protocol, operations: names_in(hosted.operations, alloc: self.alloc))))
 } Driver.bundled
 
-/// What the first task of the domain of an instance of a bundle's component runs it from: a View of `/sys/code` reading the image of the bundle of code hash `bundle`, `None` while `store` has no endpoint, the name of the entry it exports the component under and the names of its operations by number.
+/// What the first task of the domain of an instance of a bundle's component runs it from: a View of `/sys/code` reading the image of the bundle of code hash `bundle`, `None` while `store` has no endpoint, the name of the entry it exports the component under, the protocol it serves and the names of its operations by number.
 struct Bundled {
     code: Option[store::service::View]
     bundle: ident::HashValue
     entry: text::String
+    protocol: sys::ProtocolHash
     operations: mem::List[text::String]
 } Bundled
 
-/// What an instance of a bundle's component takes from its driver, `serving`, with the names of its component's operations by number, and the executor and allocator of its domain.
+/// What an instance of a bundle's component takes from its driver, `serving`, with the protocol its component serves, the names of its operations by number, and the executor and allocator of its domain.
 pub fn Hosting.of(
     take serving: Serving,
+    protocol: sys::ProtocolHash,
     take operations: mem::List[text::String],
     exec: task::Executor,
     alloc: mem::Alloc,
@@ -235,7 +243,7 @@ pub fn Hosting.of(
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: serving.keeping.is_some(), syncing: syncing.share(), alloc: alloc)
     let replies = pending.replies.share()
     let signal = pending.signal.share()
-    return Hosting(serving: take serving, operations: take operations, served: None, exec: exec, alloc: alloc, replier: sys::Minter[Replier, Pending, u8].of(take pending, alloc), replies: take replies, signal: take signal, syncing: take syncing)
+    return Hosting(serving: take serving, protocol: protocol, operations: take operations, served: None, exec: exec, alloc: alloc, replier: sys::Minter[Replier, Pending, u8].of(take pending, alloc), replies: take replies, signal: take signal, syncing: take syncing)
 } Hosting.of
 
 /// Keeps `served`, the protocol schema the bundle gives for the component, for the driver.
@@ -267,15 +275,15 @@ pub fn Hosting.take_checkpoint(mut self) -> Option[nanos::Checkpoint] {
 
 /// Revokes the runner capability of an instance the kernel never held.
 pub fn Hosting.close(take self) {
-    let Hosting(serving: _, operations: _, served: _, exec: _, alloc: _, replier: replier, replies: _, signal: _, syncing: _) = self
+    let Hosting(serving: _, protocol: _, operations: _, served: _, exec: _, alloc: _, replier: replier, replies: _, signal: _, syncing: _) = self
     take replier.close()
 } Hosting.close
 
 /// Runs the instance `instance` of the bundle's component as `Driven.run` runs one of the kernel image: resumes it, ends it at once when its health is not `Healthy`, then serves what its driver delivers, one call at a time, suspending it after the time without a message the driver sets and keeping its checkpoints. Told to stop, it handles every message that waits, keeps a checkpoint when the state is dirty, and ends the instance. Orders for its holder are refused. How the instance ended, or the trap that abandoned its domain.
 pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
-    let Hosting(serving: serving, operations: operations, served: served, exec: exec, alloc: alloc, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
+    let Hosting(serving: serving, protocol: protocol, operations: operations, served: served, exec: exec, alloc: alloc, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
     defer take replier.close()
-    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: _, updated: updated, config: _, forking: _, recorder: recorder) = serving
+    let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: _, updated: updated, replay: replay, config: _, forking: _, recorder: recorder) = serving
     var held = instance
     defer take held.abandon()
     let steps = mem::Shared.of(Steps(begun: core::atomic::AtomicU64.of(0), done: core::atomic::AtomicU64.of(0), wanted: core::atomic::AtomicU64.of(0), deadline: core::atomic::AtomicU64.of(os::NO_DEADLINE), posted: hw::SpinLock.of(None), operations: take operations), alloc)
@@ -285,11 +293,7 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
         Some(saved) => Some(saved.number)
         None => None
     }
-    let began = match attempt await begin_hosted(mut held, restored: restored.is_some(), updated, telling) {
-        Ok(healthy) => healthy
-        Err(nanos::InstanceError.Cancelled(cancelled)) => fail cancelled
-        Err(nanos::InstanceError.Ended) => false
-    }
+    let began = try await begin_replayed(mut held, take replay, restored: restored.is_some(), updated, exec, telling, alloc)
     if began {
         match served {
             Some(encoded) => try await tell(reports, incarnation, report: Report.Described(schema: take encoded))
@@ -319,7 +323,7 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
             discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
                 try await hand_over(queued, signal: ringing, reports: answering, incarnation)
             })
-            match attempt await hold_hosted(mut held, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), probe: probe.contents(), updated, telling) {
+            match attempt await hold_hosted(mut held, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), probe: probe.contents(), updated, protocol, telling) {
                 Ok(_) => {
                 }
                 Err(nanos::InstanceError.Ended) => fail Stopping.Ended
@@ -329,7 +333,7 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
         match looped {
             Err(Stopping.Cancelled(cancelled)) => fail cancelled
             Err(Stopping.Asked(hand: hand)) => {
-                match attempt await stop_hosted(mut held, keeping, dirty: due_at.is_some(), hand, telling) {
+                match attempt await stop_hosted(mut held, keeping, dirty: due_at.is_some(), hand, protocol, telling) {
                     Err(nanos::InstanceError.Cancelled(cancelled)) => fail cancelled
                     else => {
                     }
@@ -433,6 +437,7 @@ fn hold_hosted(
     quiet: core::atomic::AtomicU64,
     probe: core::atomic::AtomicBool,
     updated: bool,
+    protocol: sys::ProtocolHash,
     telling: Telling,
     ) fails nanos::InstanceError uses wait {
     let clock = telling.clock
@@ -484,7 +489,7 @@ fn hold_hosted(
                 }
             }
         }
-        if try await step_hosted(mut instance, telling) and due_at.is_none() {
+        if try await step_hosted(mut instance, protocol, telling) and due_at.is_none() {
             due_at = epoch_after(keeping, clock)
         }
     }
@@ -529,16 +534,17 @@ fn idle_hosted(mut instance: nanos::Instance, quiet: core::atomic::AtomicU64, te
 } idle_hosted
 
 /// Calls the handlers of every message waiting for the instance, starting the keyed tasks they spawn and counting each step for the dispatcher; tells the watchdog when they begin and how long they took, and returns whether it called any.
-fn step_hosted(mut instance: nanos::Instance, telling: Telling) -> bool fails nanos::InstanceError uses wait {
+fn step_hosted(mut instance: nanos::Instance, protocol: sys::ProtocolHash, telling: Telling) -> bool fails nanos::InstanceError uses wait {
     try await mark(telling.marks, marked: Mark.Began)
     let started = now(telling.clock)
     let counts = telling.steps.contents()
+    try await arm_hosted(instance, telling)
     var handled = false
     loop {
         discard counts.begun.fetch_add(1)
         let stepping = now(telling.clock)
         telling.begin_step(stepping)
-        let stepped = try await mut instance.step()
+        let stepped = try await recorded_hosted_step(mut instance, protocol, telling)
         match stepped {
             true => telling.end_taken(stepping, taken: counts.claimed())
             false => telling.end_step(stepping, stepped: None)
@@ -551,13 +557,137 @@ fn step_hosted(mut instance: nanos::Instance, telling: Telling) -> bool fails na
         discard try await mut instance.start_keyed()
     }
     try await mark(telling.marks, marked: Mark.Took(ns: now(telling.clock).saturating_sub(started)))
+    match telling.armed() {
+        Some(recorder) => {
+            if try await recorder.rebase_due() {
+                let base = try await state_of(instance)
+                try await recorder.rebase(base)
+            }
+        }
+        None => {
+        }
+    }
     return handled
 } step_hosted
 
-/// Keeps the quiescent state of the instance as its next checkpoint, telling the driver when that fails; whether it was kept.
-fn keep_hosted(instance: nanos::Instance, keeping: Keeping, telling: Telling) -> bool fails nanos::InstanceError uses wait {
+/// Has the instance handle the inputs `replay` gives, as the old code of a revert, then resumes it and probes its health; whether it runs healthy, `false` once it ended.
+fn begin_replayed(
+    mut instance: nanos::Instance,
+    take replay: Option[mem::List[os::RecordedInput]],
+    restored: bool,
+    updated: bool,
+    exec: task::Executor,
+    telling: Telling,
+    alloc: mem::Alloc,
+    ) -> bool fails task::Cancelled uses wait {
+    match replay {
+        Some(inputs) => {
+            match attempt await replay_hosted(mut instance, take inputs, exec, telling, alloc) {
+                Ok(_) => {
+                }
+                Err(nanos::InstanceError.Cancelled(cancelled)) => fail cancelled
+                Err(nanos::InstanceError.Ended) => return false
+            }
+        }
+        None => {
+        }
+    }
+    return match attempt await begin_hosted(mut instance, restored, updated, telling) {
+        Ok(healthy) => healthy
+        Err(nanos::InstanceError.Cancelled(cancelled)) => fail cancelled
+        Err(nanos::InstanceError.Ended) => false
+    }
+} begin_replayed
+
+/// Has the instance handle each input of `inputs` in order before it resumes, as the old code of a revert: posts each from a task of a scope and steps the instance until it handled it, dropping the messages its handler sent the component and the keyed tasks it spawned; tells the driver before each which it replays, then how many it replayed.
+fn replay_hosted(mut instance: nanos::Instance, take inputs: mem::List[os::RecordedInput], exec: task::Executor, telling: Telling, alloc: mem::Alloc) fails nanos::InstanceError uses wait {
+    let inbox = instance.inbox()
+    var count: u64 = 0
+    try await task::scope(exec, body: fn[mut instance, take inputs, mut count](s: task::Scope) fails nanos::InstanceError uses wait {
+        for input in inputs {
+            try await telling.tell(report: Report.Replaying(seq: input.seq))
+            var encoding = sys::Encoded.empty(alloc)
+            mut encoding.bytes.append(input.encoded.view())
+            let hash = input.hash
+            discard s.spawn(fn[take encoding]() fails task::Cancelled uses wait limits stack 16_384 {
+                discard attempt await inbox.call(hash, request: REPLAYED_REQUEST, take encoding, alloc)
+            })
+            loop {
+                try await instance.incoming()
+                if try await mut instance.step() {
+                    break
+                }
+            }
+            loop {
+                let Some(_) = try await mut instance.take_sent() else {
+                    break
+                }
+            }
+            for held in try await instance.held() {
+                discard try await mut instance.drop_held(held.key)
+            }
+            count += 1
+        }
+        s.cancel()
+    })
+    try await telling.tell(report: Report.ReplayDone(replayed: count))
+} replay_hosted
+
+/// Arms the flight recorder as an order left in it asks, from the quiescent state of the instance.
+fn arm_hosted(instance: nanos::Instance, telling: Telling) fails nanos::InstanceError uses wait {
+    let Some(recorder) = telling.recorder else {
+        return
+    }
+    let Some(Ordered(bundle: bundle, period: period, tape: tape)) = try await recorder.take_order() else {
+        return
+    }
+    let base = try await state_of(instance)
+    try await recorder.arm(base, bundle, period, take tape)
+} arm_hosted
+
+/// Steps the instance, an armed flight recorder recording the message the step handles, a call of the protocol `protocol`, with the clock and random reads its handler took; whether it handled one.
+fn recorded_hosted_step(mut instance: nanos::Instance, protocol: sys::ProtocolHash, telling: Telling) -> bool fails nanos::InstanceError uses wait {
+    let Some(recorder) = telling.armed() else {
+        return try await mut instance.step()
+    }
+    let Some(tape) = try await recorder.tape() else {
+        return try await mut instance.step()
+    }
+    let seq = recorder.next_seq()
+    tape.record()
+    let stepped = try await mut instance.step_encoded()
+    let recorded = tape.recorded(telling.alloc)
+    let Some(nanos::Stepped(handled: _, encoding: encoding)) = stepped else {
+        return false
+    }
+    try await recorder.take_input(os::RecordedInput(seq: seq, hash: protocol, encoded: take encoding.bytes, recorded: take recorded))
+    return true
+} recorded_hosted_step
+
+/// A copy of the quiescent state of the instance with its schema.
+fn state_of(instance: nanos::Instance) -> os::StateCopy fails nanos::InstanceError uses wait {
     let nanos::Checkpoint(schema: schema, bytes: bytes) = try await instance.checkpoint()
-    return try await keep_checkpoint(keeping, take bytes, schema, telling)
+    return os::StateCopy(schema: ident::HashValue(bytes: schema.bytes), state: take bytes)
+} state_of
+
+/// Keeps the quiescent state of the instance as its next checkpoint, telling the driver when that fails; whether it was kept. A checkpoint kept becomes the base of the armed flight recorder's recording, or ends its period, which the driver is told.
+fn keep_hosted(instance: nanos::Instance, keeping: Keeping, telling: Telling) -> bool fails nanos::InstanceError uses wait {
+    let base = try await state_of(instance)
+    var bytes = mem::Bytes.empty(telling.alloc)
+    mut bytes.append(base.state.view())
+    if not try await keep_checkpoint(keeping, take bytes, schema: mem::wire::SchemaHash(bytes: base.schema.bytes), telling) {
+        return false
+    }
+    match telling.armed() {
+        Some(recorder) => {
+            if try await recorder.checkpointed(base) {
+                try await telling.tell(report: Report.RecordingEnded)
+            }
+        }
+        None => {
+        }
+    }
+    return true
 } keep_hosted
 
 /// Ends the instance's service once told to stop: handles every message that waits, keeps a checkpoint when the state is `dirty` or it handled one, hands the driver the encoding of the state when `hand`, then tells the driver it ends.
@@ -566,9 +696,10 @@ fn stop_hosted(
     keeping: Option[Keeping],
     dirty: bool,
     hand: bool,
+    protocol: sys::ProtocolHash,
     telling: Telling,
     ) fails nanos::InstanceError uses wait {
-    let handled = try await step_hosted(mut instance, telling)
+    let handled = try await step_hosted(mut instance, protocol, telling)
     match first keeping {
         Some(kept) if handled or dirty => {
             discard try await keep_hosted(instance, keeping: kept, telling)
