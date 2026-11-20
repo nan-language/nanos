@@ -28,13 +28,18 @@ struct ForkRun {
     served: Option[os::Recorded]
 } ForkRun
 
-/// What a driver delivers to its instance's domain: a call with its header and the deadline of its dispatch, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns, handing the driver the encoding of its component's state when `hand`.
+/// What a driver delivers to its instance's domain: a call with its header and the deadline of its dispatch, the time without a message after which its component is suspended, never when 0, an order its holder carries out between handler calls, or the order to stop once the handler running returns, handing the driver the encoding of its component's state when `hand` holds.
 enum Delivery {
     Call(id: u64, hash: sys::ProtocolHash, encoded: sys::Encoded, request: bool, header: os::Header, deadline: u64)
     SuspendAfter(ms: u32)
     Hold(order: HolderOrder)
-    Stop(hand: bool)
+    Stop(hand: Option[Handing])
 } Delivery
+
+/// The encoding of its component's state an instance hands its driver as it stops, under the schema `under` when an inverse of the state converts to it.
+struct Handing derives Copy {
+    under: Option[ident::HashValue]
+} Handing
 
 /// What the task of an instance's domain tells its driver: among others, that it runs, with the names of its component's operations by number, how a hibernation it was ordered ended, with the image it took or none when the instance serves on, the encoding of the protocol schema the bundle of its component gives for it, the encoding of its component's state, of schema `schema`, as it stops for an update, whether a health probe found it healthy, that a checkpoint ended the armed period of its flight recorder, the number of the input it replays as the old code of a revert, and how many it replayed.
 enum Report {
@@ -85,9 +90,9 @@ pub open struct Served[S: sys::Component[Env, P] and Encode, Env: nanos::Environ
 pub open struct Driven[S: sys::Component[Env, P] and Encode, Env: Any and Send, P: sys::Protocol and Send] {
 } Driven
 
-/// The end of the delivery loop: the driver asked to stop, handing it the encoding of the state when `hand`, or released its deliveries, or the instance of a bundle's component ended.
+/// The end of the delivery loop: the driver asked to stop, handing it the encoding of the state when `hand` holds, or released its deliveries, or the instance of a bundle's component ended.
 enum Stopping {
-    Asked(hand: bool)
+    Asked(hand: Option[Handing])
     Ended
     Cancelled(task::Cancelled) from
 } Stopping
@@ -191,7 +196,7 @@ pub fn Driven.run(
     let hand = match looped {
         Err(Stopping.Cancelled(cancelled)) => fail cancelled
         Err(Stopping.Asked(hand: asked)) => asked
-        else => false
+        else => None
     }
     undefer stepper
     return match mut image.extract() {
@@ -200,13 +205,13 @@ pub fn Driven.run(
     }
 } Driven.run
 
-/// Ends the component behind `stepper` once told to stop: handles every message that waits, drops what its replays keep, keeps a checkpoint of it when it is `dirty` or handled a message, hands the driver the encoding of its state when `hand`, and ends the stepper, cancelling its keyed tasks with acknowledgement and handing its Env to `release`.
+/// Ends the component behind `stepper` once told to stop: handles every message that waits, drops what its replays keep, keeps a checkpoint of it when it is `dirty` or handled a message, hands the driver the encoding of its state when `hand` holds, and ends the stepper, cancelling its keyed tasks with acknowledgement and handing its Env to `release`.
 fn Driven.stop(
     take stepper: sys::Stepper[S, Env, P],
     mut holding: Holding[P],
     keeping: Option[Keeping],
     dirty: bool,
-    hand: bool,
+    hand: Option[Handing],
     telling: Telling,
     release: fn(take ended: Env) limits stack 8_192,
     ) -> Ended fails task::Cancelled uses wait {
@@ -221,10 +226,28 @@ fn Driven.stop(
         else => {
         }
     }
-    if hand {
-        var state = mem::Bytes.empty(telling.alloc)
-        mem::wire::Codec[S].encode(ending.state(), out: mut state)
-        try await telling.tell(report: Report.Handed(state: take state, schema: ident::HashValue(bytes: mem::wire::Codec[S].schema_hash().bytes)))
+    match hand {
+        Some(Handing(under: under)) => {
+            var state = mem::Bytes.empty(telling.alloc)
+            var schema = ident::HashValue(bytes: mem::wire::Codec[S].schema_hash().bytes)
+            var shaped = false
+            match under {
+                Some(shape) => {
+                    shaped = mem::wire::Codec[S].encode_as(ending.state(), schema: mem::wire::SchemaHash(bytes: shape.bytes), out: mut state, alloc: telling.alloc)
+                    if shaped {
+                        schema = shape
+                    }
+                }
+                None => {
+                }
+            }
+            if not shaped {
+                mem::wire::Codec[S].encode(ending.state(), out: mut state)
+            }
+            try await telling.tell(report: Report.Handed(state: take state, schema: schema))
+        }
+        None => {
+        }
     }
     try await telling.tell(report: Report.Ending)
     undefer ending
@@ -711,7 +734,7 @@ fn dispatch[P: sys::Protocol and Send](
     var signals = finishes
     loop {
         let Some(delivery) = try await mut receiver.receive() else {
-            fail Stopping.Asked(hand: false)
+            fail Stopping.Asked(hand: None)
         }
         match delivery {
             Delivery.Call(id: id, hash: hash, encoded: encoded, request: request, header: header, deadline: deadline) => {
@@ -791,7 +814,7 @@ fn finish_step(steps: Steps, mut signals: task::Receiver[u64]) fails Stopping us
     }
     loop {
         let Some(through) = try await mut signals.receive() else {
-            fail Stopping.Asked(hand: false)
+            fail Stopping.Asked(hand: None)
         }
         if through >= target {
             return

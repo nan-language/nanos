@@ -3,8 +3,8 @@
 /// The top bit of the in-memory id of an item-table node not yet written, above every address.
 const DIRTY_BIT: u64 = 0x8000_0000_0000_0000
 
-/// The most nodes the index keeps in memory once an index flush wrote them; past it its clean nodes leave memory, to be read again when needed.
-pkg const CACHED_NODES: usize = 512
+/// The most bytes of memory the index keeps nodes in; past them its clean nodes leave memory, to be read again when needed.
+pkg const CACHED_BYTES: u64 = 4_194_304
 
 /// Why an index operation failed.
 pkg enum TreeFailure derives Render {
@@ -87,12 +87,13 @@ struct Removed derives Copy {
     empty: bool
 } Removed
 
-/// The index: the item table's root, the next item id, the nodes in memory by item id and the item table's by address or dirty id, the item changes the next index flush applies, and the records gone stale since the last.
+/// The index: the item table's root, the next item id, the nodes in memory by item id and the item table's by address or dirty id with the bytes of memory they take, the item changes the next index flush applies, and the records gone stale since the last.
 pkg struct Index {
     pkg items: Root
     pkg next_item: u64
     nodes: mem::HashMap[u64, Node]
     table: mem::HashMap[u64, Node]
+    pkg held: u64
     next_dirty: u64
     changes: mem::HashMap[u64, ItemChange]
     pkg stale: mem::List[Retired]
@@ -102,7 +103,7 @@ pkg struct Index {
 
 /// The index of a volume whose item table's top node `items` names.
 pkg fn Index.of(items: Root, next_item: u64, alloc: mem::Alloc) -> Index {
-    return Index(items: items, next_item: next_item, nodes: mem::HashMap.empty(seed: 0x5354_4F52, alloc), table: mem::HashMap.empty(seed: 0x5441_424C, alloc), next_dirty: DIRTY_BIT, changes: mem::HashMap.empty(seed: 0x4348_4E47, alloc), stale: mem::List.empty(alloc), history_change: 0, agents_change: 0)
+    return Index(items: items, next_item: next_item, nodes: mem::HashMap.empty(seed: 0x5354_4F52, alloc), table: mem::HashMap.empty(seed: 0x5441_424C, alloc), held: 0, next_dirty: DIRTY_BIT, changes: mem::HashMap.empty(seed: 0x4348_4E47, alloc), stale: mem::List.empty(alloc), history_change: 0, agents_change: 0)
 } Index.of
 
 /// The index of an empty volume: an item table of one empty leaf.
@@ -595,30 +596,26 @@ fn Index.read_node[D: disk::Device](
     discard mut self.keep(tree, id, take node)
 } Index.read_node
 
-/// Drops the clean nodes from memory when it holds more than `most`.
-pkg fn Index.trim(mut self, most: usize, alloc: mem::Alloc) {
-    if self.nodes.len() + self.table.len() <= most {
-        return
-    }
-    var clean = mem::List[u64].empty(alloc)
-    for entry in self.nodes {
-        if not entry.value().dirty {
-            mut clean.push(entry.key())
-        }
-    }
-    for id in clean {
-        discard mut self.nodes.remove(id)
-    }
-    var clean_table = mem::List[u64].empty(alloc)
-    for entry in self.table {
-        if not entry.value().dirty {
-            mut clean_table.push(entry.key())
-        }
-    }
-    for id in clean_table {
-        discard mut self.table.remove(id)
+/// Drops the clean nodes from memory when the nodes it holds take more than `CACHED_BYTES`.
+pkg fn Index.trim(mut self) {
+    if self.held > CACHED_BYTES {
+        mut self.drop_clean()
     }
 } Index.trim
+
+/// Drops the clean nodes from memory.
+pkg fn Index.drop_clean(mut self) {
+    mut self.nodes.retain(fn(id: u64, node: Node) => node.dirty)
+    mut self.table.retain(fn(id: u64, node: Node) => node.dirty)
+    var held: u64 = 0
+    for entry in self.nodes {
+        held += entry.value().memory_bytes()
+    }
+    for entry in self.table {
+        held += entry.value().memory_bytes()
+    }
+    self.held = held
+} Index.drop_clean
 
 /// The node `id` of `tree` in memory.
 pkg proj fn Index.node_at(self, tree: u8, id: u64) -> Option[Node] {
@@ -630,19 +627,32 @@ pkg proj fn Index.node_at(self, tree: u8, id: u64) -> Option[Node] {
 
 /// Withdraws the node `id` of `tree` from memory.
 pkg fn Index.withdraw(mut self, tree: u8, id: u64) -> Option[Node] {
-    if tree == ITEM_TABLE {
-        return mut self.table.remove(id)
+    let withdrawn = match tree == ITEM_TABLE {
+        true => mut self.table.remove(id)
+        false => mut self.nodes.remove(id)
     }
-    return mut self.nodes.remove(id)
+    self.held = self.held.saturating_sub(memory_of(withdrawn))
+    return withdrawn
 } Index.withdraw
 
 /// Keeps the node `id` of `tree` in memory.
 pkg fn Index.keep(mut self, tree: u8, id: u64, take node: Node) -> Option[Node] {
-    if tree == ITEM_TABLE {
-        return mut self.table.insert(id, value: take node)
+    self.held += node.memory_bytes()
+    let replaced = match tree == ITEM_TABLE {
+        true => mut self.table.insert(id, value: take node)
+        false => mut self.nodes.insert(id, value: take node)
     }
-    return mut self.nodes.insert(id, value: take node)
+    self.held = self.held.saturating_sub(memory_of(replaced))
+    return replaced
 } Index.keep
+
+/// The bytes of memory `node` takes, 0 for none.
+fn memory_of(node: Option[Node]) -> u64 {
+    return match node {
+        Some(held) => held.memory_bytes()
+        None => 0
+    }
+} memory_of
 
 /// A new in-memory id for a node of `tree`: an item id, or a dirty id for an item-table node.
 fn Index.new_node_id(mut self, tree: u8) -> u64 {

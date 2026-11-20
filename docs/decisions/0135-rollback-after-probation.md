@@ -1,6 +1,6 @@
 # 0135. Rollback after probation
 
-Status: accepted
+Status: superseded by 0138
 
 ## Context
 

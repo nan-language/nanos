@@ -1,6 +1,6 @@
 # 0133. Update state schemas
 
-Status: accepted
+Status: superseded by 0138
 
 ## Context
 

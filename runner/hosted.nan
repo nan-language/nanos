@@ -1,11 +1,14 @@
 //! Instances of a bundle's components: the admission record describing each one's component, and the task of its domain, which reads the image of its bundle at each start and drives the instance the kernel holds for it as `Driven.run` drives a component of the kernel image.
 
-/// A bundle's component as the runner runs it: the name of the entry its bundle exports it under, the protocol it serves, its state schema and the frozen shapes its state's forward migrations convert from, the names of its operations by number, whether its Env takes a configuration record, the View of `/sys/code` its starts read its bundle's image through, `None` while `store` has no endpoint, and the encoding of the protocol schema its bundle gives for it once an incarnation told it.
+/// A bundle's component as the runner runs it: the name of the entry its bundle exports it under, the protocol it serves, its state schema, the earlier schemas its state's forward migrations convert from, those an inverse converts it back to and every earlier schema it reads, whether its state type is a flexible struct, the names of its operations by number, whether its Env takes a configuration record, the View of `/sys/code` its starts read its bundle's image through, `None` while `store` has no endpoint, and the encoding of the protocol schema its bundle gives for it once an incarnation told it.
 struct Hosted {
     entry: text::String
     protocol: sys::ProtocolHash
     schema: ident::HashValue
     migrations: mem::List[ident::HashValue]
+    inverses: mem::List[ident::HashValue]
+    reads: mem::List[ident::HashValue]
+    flexible: bool
     operations: mem::List[text::String]
     configured: bool
     code: Option[store::service::View]
@@ -51,10 +54,18 @@ validator fn hosted_in(record: Untrusted[Slice[u8]], component: Str, alloc: mem:
             mut operations.push(text::String.of(operation.name.as_str(), alloc))
         }
         var migrations = mem::List[ident::HashValue].empty(alloc)
-        for shape in described.migrations {
-            mut migrations.push(shape.schema)
+        var inverses = mem::List[ident::HashValue].empty(alloc)
+        var reads = mem::List[ident::HashValue].empty(alloc)
+        for earlier in described.earlier {
+            mut reads.push(earlier.schema)
+            if earlier.reading != code::Reading.Accepted {
+                mut migrations.push(earlier.schema)
+            }
+            if earlier.reading == code::Reading.Inverse {
+                mut inverses.push(earlier.schema)
+            }
         }
-        return Some(Hosted(entry: text::String.of(entry, alloc), protocol: sys::ProtocolHash(bytes: described.protocol.bytes), schema: described.schema, migrations: take migrations, operations: take operations, configured: described.config.is_some(), code: None, served: None))
+        return Some(Hosted(entry: text::String.of(entry, alloc), protocol: sys::ProtocolHash(bytes: described.protocol.bytes), schema: described.schema, migrations: take migrations, inverses: take inverses, reads: take reads, flexible: described.flexible, operations: take operations, configured: described.config.is_some(), code: None, served: None))
     }
     return None
 } hosted_in
@@ -397,7 +408,7 @@ fn dispatch_hosted(
     var signals = finishes
     loop {
         let Some(delivery) = try await mut receiver.receive() else {
-            fail Stopping.Asked(hand: false)
+            fail Stopping.Asked(hand: None)
         }
         match delivery {
             Delivery.Call(id: id, hash: hash, encoded: encoded, request: request, header: header, deadline: deadline) => {
@@ -696,12 +707,12 @@ fn keep_hosted(instance: nanos::Instance, keeping: Keeping, telling: Telling) ->
     return true
 } keep_hosted
 
-/// Ends the instance's service once told to stop: handles every message that waits, keeps a checkpoint when the state is `dirty` or it handled one, hands the driver the encoding of the state when `hand`, then tells the driver it ends.
+/// Ends the instance's service once told to stop: handles every message that waits, keeps a checkpoint when the state is `dirty` or it handled one, hands the driver the encoding of the state when `hand` holds, then tells the driver it ends.
 fn stop_hosted(
     mut instance: nanos::Instance,
     keeping: Option[Keeping],
     dirty: bool,
-    hand: bool,
+    hand: Option[Handing],
     protocol: sys::ProtocolHash,
     telling: Telling,
     ) fails nanos::InstanceError uses wait {
@@ -713,9 +724,25 @@ fn stop_hosted(
         else => {
         }
     }
-    if hand {
-        let nanos::Checkpoint(schema: schema, bytes: state) = try await instance.checkpoint()
-        try await telling.tell(report: Report.Handed(state: take state, schema: ident::HashValue(bytes: schema.bytes)))
+    match hand {
+        Some(Handing(under: under)) => {
+            var shaped: Option[nanos::Checkpoint] = None
+            match under {
+                Some(shape) => {
+                    shaped = try await instance.checkpoint_as(mem::wire::SchemaHash(bytes: shape.bytes))
+                }
+                None => {
+                }
+            }
+            let handed = match shaped {
+                Some(given) => given
+                None => try await instance.checkpoint()
+            }
+            let nanos::Checkpoint(schema: schema, bytes: state) = handed
+            try await telling.tell(report: Report.Handed(state: take state, schema: ident::HashValue(bytes: schema.bytes)))
+        }
+        None => {
+        }
     }
     try await telling.tell(report: Report.Ending)
 } stop_hosted

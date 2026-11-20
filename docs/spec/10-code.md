@@ -96,7 +96,7 @@ It states that `builder` checked the closure of code hash `code` with `toolchain
 5. **Requires-sets.** Each requires-set entry naming an item of the platform package or a kernel-implemented std item is satisfied, as [NaN 29 §Requires-sets](https://github.com/nan-language/nan/blob/main/docs/spec/29-identity-versioning.md#requires-sets) defines, by the running kernel image's releases: the interface file an image is lowered against records them, so they hold for every image step 13 takes.
 6. **Seals.** Every trust escape of the closure outside the std packages of the toolchain of step 4 carries an accepted seal by one of the policy's `sealers` ([policy](19-oversight.md#policy)) (`code.seal-missing`). A `device` or `priv` grant needs one by a `vendor.*`, `human.*` or `owner` principal, except a `device` grant confined to IOMMU domains on a machine with `iommu` (`code.seal-rejected`). No accepted seal is by an author of the sealed item's package or of a package holding an item of its closure entries (`code.seal-same-author`).
 7. **Authority.** Admission computes the closure summary ([NaN 14 §Authority summaries](https://github.com/nan-language/nan/blob/main/docs/spec/14-authority.md#authority-summaries)), whose entries include the OS capability kinds (requires [N27](22-nan.md#n27)). The [effect set](14-changes.md#the-effect-set) lists it, and for an `update`, as widenings, the entries the running bundle's summary lacks; the [policy](19-oversight.md#policy) decides the approvals they need.
-8. **Schemas.** For each instance an `update` step activates, the new component's state schema equals the running one, accepts its schema tree ([NaN 29 §Encode class](https://github.com/nan-language/nan/blob/main/docs/spec/29-identity-versioning.md#encode-class)), or is covered by a `migrate` of the new bundle from the running schema hash (requires [N5](22-nan.md#n5), [N20](22-nan.md#n20)); otherwise `code.schema-incompatible`. The step's **migration class** is `identical`, `additive` or `migrated` accordingly.
+8. **Schemas.** For each instance an `update` step activates, the new component's state schema equals the running one, or the new bundle's code roots record its state reading the running schema hash as an earlier schema, as its tree accepts it ([NaN 29 §Encode class](https://github.com/nan-language/nan/blob/main/docs/spec/29-identity-versioning.md#encode-class)) or through a `migrate` (requires [N5](22-nan.md#n5), [N20](22-nan.md#n20)); otherwise `code.schema-incompatible`. The step's **migration class** is `identical`, `additive` or `migrated` accordingly.
 9. **Protocols.** Every port wired to or from an activated instance joins compatible protocols ([protocols](07-communication.md#protocols); `port.incompatible`).
 10. **Reversibility.** Admission records the declared reversibility bound of each operation each component serves, the bundle's **reversibility profile**. Its checked digest respects each bound, except a bound lower than the class of the operations it calls, which only a sealed premise declares, a trust escape that step 6 checks ([declared classes](14-changes.md#declared-classes); requires [N16](22-nan.md#n16)).
 11. **Contributions.** Each contribution to a registry of the kernel image is admitted as [registries](#registries) states.
@@ -140,13 +140,20 @@ pub closed struct Component derives Encode {
     pub operations: mem::List[Operation]
     pub env: mem::List[Field]
     pub config: Option[text::String] // canonical path of its configuration type
-    pub migrations: mem::List[Shape] // the frozen shapes its state's forward migrations convert from
+    pub earlier: mem::List[Earlier] // the earlier schemas its state decodes
+    pub flexible: bool // its state type is a flexible struct
 } Component
 
-pub closed struct Shape derives Encode {
+pub closed struct Earlier derives Encode {
     pub schema: HashValue
-    pub inverse: bool // an inverse converts back to it
-} Shape
+    pub reading: Reading
+} Earlier
+
+pub closed enum Reading derives Encode {
+    Accepted // as its tree accepts it
+    Migrated // through a forward migration
+    Inverse // through a forward migration whose inverse converts back to it
+} Reading
 
 pub closed struct Operation derives Encode {
     pub name: text::String
