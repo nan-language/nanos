@@ -15,8 +15,8 @@ pub protocol Admitting {
     pub fn admit(bundle: store::service::View, base: ident::CommitId) -> code::Admission fails Refusal limits recorded
     /// Removes `/sys/code/<bundle>`: the admission record, bundle and image of the code hash `bundle`, unless a specification or a running instance names it.
     pub fn remove(bundle: ident::HashValue) fails Refusal limits recorded
-    /// Whether an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving` is additive, its new state schema accepting the running one, rather than identical; `code.schema-incompatible` when it is neither, or when the base bundle's state schema does not accept the new one of a `checkpointed` instance of a base component.
-    pub fn additive(running: ident::HashValue, moving: ident::HashValue, state: text::String, checkpointed: bool) -> bool fails Refusal limits recorded
+    /// The migration class of an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving`; `code.schema-incompatible` when the new state schema is not the running one and neither accepts nor migrates from it, or when the base bundle's state schema does not accept the new one of a `checkpointed` instance of a base component.
+    pub fn migration(running: ident::HashValue, moving: ident::HashValue, state: text::String, checkpointed: bool) -> code::Migration fails Refusal limits recorded
     /// The keyed task serving request `request` gives its reply.
     fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Admitting
@@ -94,7 +94,7 @@ pub fn Admitter.remove(mut self, take bundle: ident::HashValue, mut env: Env, mu
     fail Refusal.Unavailable
 } Admitter.remove
 
-pub fn Admitter.additive(
+pub fn Admitter.migration(
     mut self,
     take running: ident::HashValue,
     take moving: ident::HashValue,
@@ -102,18 +102,18 @@ pub fn Admitter.additive(
     take checkpointed: bool,
     mut env: Env,
     mut cx: sys::Cx[Admitting],
-    ) -> bool fails Refusal {
+    ) -> code::Migration fails Refusal {
     let Some(request) = mut cx.postpone() else {
         fail Refusal.Unavailable
     }
     let schemas = Schemas(code: env.code, base: env.base.share(), alloc: env.alloc)
     let alloc = env.alloc
     mut cx.spawn(key: SERVING + request, run: fn[take schemas, take state](out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 65_536 {
-        let outcome = try await schemas.additive(running, moving, state: state.as_str(), checkpointed)
+        let outcome = try await schemas.migration(running, moving, state: state.as_str(), checkpointed)
         discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
     })
     fail Refusal.Unavailable
-} Admitter.additive
+} Admitter.migration
 
 fn Admitter.answered(
     mut self,
@@ -247,23 +247,24 @@ struct Schemas {
     alloc: mem::Alloc
 } Schemas
 
-/// Step 8 of an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving`: whether it is additive rather than identical, or `code.schema-incompatible`.
-fn Schemas.additive(self, running: ident::HashValue, moving: ident::HashValue, state: Str, checkpointed: bool) -> Result[bool, Refusal] fails task::Cancelled uses wait {
+/// Step 8 of an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving`: its migration class, or `code.schema-incompatible`.
+fn Schemas.migration(self, running: ident::HashValue, moving: ident::HashValue, state: Str, checkpointed: bool) -> Result[code::Migration, Refusal] fails task::Cancelled uses wait {
     let alloc = self.alloc
     let refused = Refusal.SchemaIncompatible(state: text::String.of(state, alloc))
-    let was = match first try await self.state_schema(bundle: running, state) {
+    let was = match first try await self.component(bundle: running, state) {
         Ok(Some(found)) => found
         Ok(None) => return Err(take refused)
         Err(refusal) => return Err(take refusal)
     }
-    let now = match first try await self.state_schema(bundle: moving, state) {
+    let now = match first try await self.component(bundle: moving, state) {
         Ok(Some(found)) => found
         Ok(None) => return Err(take refused)
         Err(refusal) => return Err(take refusal)
     }
-    if was == now {
-        return Ok(false)
+    if was.schema == now.schema {
+        return Ok(code::Migration.Identical)
     }
+    let migrates = now.migrations.position(fn(shape: code::Shape) => shape.schema == was.schema).is_some()
     let older = match first try await self.tree(bundle: running, state) {
         Ok(Some(found)) => found
         Ok(None) => return Err(take refused)
@@ -278,14 +279,11 @@ fn Schemas.additive(self, running: ident::HashValue, moving: ident::HashValue, s
     if checkpointed {
         base = self.base_tree(state)
     }
-    return match first accepted_schemas(state, running: older, moving: newer, base, alloc) {
-        Ok(_) => Ok(true)
-        Err(refusal) => Err(take refusal)
-    }
-} Schemas.additive
+    return judged_schemas(state, running: older, moving: newer, migrates, base, alloc)
+} Schemas.migration
 
-/// The state schema of the component of state type `state` that the admission record of the bundle of code hash `bundle` describes, `None` when no record describes it.
-fn Schemas.state_schema(self, bundle: ident::HashValue, state: Str) -> Result[Option[ident::HashValue], Refusal] fails task::Cancelled uses wait {
+/// The component of state type `state` that the admission record of the bundle of code hash `bundle` describes, `None` when no record describes it.
+fn Schemas.component(self, bundle: ident::HashValue, state: Str) -> Result[Option[code::Component], Refusal] fails task::Cancelled uses wait {
     let alloc = self.alloc
     let node = match first attempt await self.code.get(code_path(bundle, name: "admission", alloc), at: None, alloc) {
         Ok(found) => found
@@ -298,13 +296,13 @@ fn Schemas.state_schema(self, bundle: ident::HashValue, state: Str) -> Result[Op
     let Ok(admission) = attempt mem::wire::Codec[code::Admission].decode(raw.view(), alloc) else {
         return Err(Refusal.Malformed)
     }
-    for described in admission.components {
+    for described in take admission.components {
         if described.state.as_str() == state {
-            return Ok(Some(described.schema))
+            return Ok(Some(take described))
         }
     }
     return Ok(None)
-} Schemas.state_schema
+} Schemas.component
 
 /// The schema tree of the state type `state` in the bundle of code hash `bundle`: the kernel image's for the base bundle, else the one the code root of its package records in the bundle blob; `None` when it has none.
 fn Schemas.tree(self, bundle: ident::HashValue, state: Str) -> Result[Option[mem::wire::Schema], Refusal] fails task::Cancelled uses wait {

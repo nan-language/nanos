@@ -54,8 +54,10 @@ const UNIT_TYPE: u64 = 1
 
 const NAMED_TYPE: u64 = 3
 
-/// The last part of every code root; the one after it, its protocols, is absent when it declares none.
+/// The last part of every code root; those after it, its protocols and its migrations, are absent when it declares none.
 const LAST_ROOT_PART: u64 = 10
+
+const MIGRATIONS_PART: u64 = 12
 
 const SEALS_PART: u64 = 3
 
@@ -93,6 +95,8 @@ pub closed struct Artefact {
     pub snapshots: mem::List[Snapshot]
     /// The protocols it declares.
     pub protocols: mem::List[Protocol]
+    /// The forward migrations of the types it declares.
+    pub migrations: mem::List[Migrations]
     pub seals: mem::List[Seal]
     /// Its publisher's signatures, absent from an unpublished artefact.
     pub publisher: Option[Publisher]
@@ -122,6 +126,12 @@ pub closed enum Typed {
     Named(path: text::String)
     Other
 } Typed
+
+/// The forward migrations of a type a code root records: the canonical path of the type and the frozen shapes they convert from, in byte order of schema hash.
+pub closed struct Migrations {
+    pub path: text::String
+    pub shapes: mem::List[Shape]
+} Migrations
 
 /// A schema tree a code root records: the canonical path of its type, its schema hash and the `mem::wire` encoding of the tree.
 pub closed struct Tree {
@@ -195,6 +205,19 @@ pub fn Artefact.tree(self, path: Str, alloc: mem::Alloc) -> Option[mem::wire::Sc
     return self.trees[at].decoded(alloc)
 } Artefact.tree
 
+/// The frozen shapes the forward migrations of the type of canonical path `path` convert from, none when it has none.
+pub fn Artefact.shapes(self, path: Str, alloc: mem::Alloc) -> mem::List[Shape] {
+    var shapes = mem::List[Shape].empty(alloc)
+    for migrated in self.migrations {
+        if migrated.path.as_str() == path {
+            for shape in migrated.shapes {
+                mut shapes.push(shape)
+            }
+        }
+    }
+    return shapes
+} Artefact.shapes
+
 /// The record of the schema tree `schema` of the type of canonical path `path`.
 pub fn Tree.of(path: Str, schema: mem::wire::Schema, alloc: mem::Alloc) -> Tree {
     var encoding = mem::Bytes.empty(alloc)
@@ -265,8 +288,7 @@ fn read_artefact(bytes: Slice[u8], alloc: mem::Alloc) -> Artefact fails core::De
         fail core::DecodeError.Invalid
     }
     let parts = try record_in(bytes, span: root, alloc)
-    let declares = parts.len() == usize.widen(LAST_ROOT_PART) + 1 and parts[usize.widen(LAST_ROOT_PART)].key == PROTOCOLS_PART
-    if not numbered(parts, count: LAST_ROOT_PART) and not declares {
+    if not are_root_parts(parts) {
         fail core::DecodeError.Invalid
     }
     let code_root = try hash_of_content(bytes, span: root)
@@ -278,8 +300,20 @@ fn read_artefact(bytes: Slice[u8], alloc: mem::Alloc) -> Artefact fails core::De
     let trees = try trees_in(bytes, span: try field(parts, key: SCHEMAS_PART), alloc)
     let snapshots = try snapshots_in(bytes, span: try field(parts, key: INTERFACE_PART), alloc)
     var protocols = mem::List[Protocol].empty(alloc)
-    if declares {
-        protocols = try protocols_in(bytes, span: try field(parts, key: PROTOCOLS_PART), alloc)
+    match optional_field(parts, key: PROTOCOLS_PART) {
+        Some(span) => {
+            protocols = try protocols_in(bytes, span, alloc)
+        }
+        None => {
+        }
+    }
+    var migrations = mem::List[Migrations].empty(alloc)
+    match optional_field(parts, key: MIGRATIONS_PART) {
+        Some(span) => {
+            migrations = try migrations_in(bytes, span, alloc)
+        }
+        None => {
+        }
     }
     let attested = try record_in(bytes, span: attestation, alloc)
     if not numbered(attested, count: SEALS_PART) {
@@ -290,7 +324,7 @@ fn read_artefact(bytes: Slice[u8], alloc: mem::Alloc) -> Artefact fails core::De
     let published = try published_in(bytes, sections: sections.fields, name: declared.name.as_str(), code_root, attestation: attestation_hash, alloc)
     let Declared(name: name, targets: targets, entries: entries) = declared
     let Published(publisher: publisher, authors: authors) = published
-    return Artefact(code_root: code_root, name: take name, targets: take targets, entries: take entries, required: take required, escapes: take escapes, authority: take authority, main: take main, trees: take trees, snapshots: take snapshots, protocols: take protocols, seals: take seals, publisher: take publisher, authors: take authors)
+    return Artefact(code_root: code_root, name: take name, targets: take targets, entries: take entries, required: take required, escapes: take escapes, authority: take authority, main: take main, trees: take trees, snapshots: take snapshots, protocols: take protocols, migrations: take migrations, seals: take seals, publisher: take publisher, authors: take authors)
 } read_artefact
 
 /// The name, targets and entries the manifest whose text form fills `span` of `bytes` declares, in canonical format.
@@ -898,6 +932,43 @@ fn trees_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> mem::List[Tree] 
     return trees
 } trees_in
 
+/// The forward migrations of the list filling `span` of `bytes`: per type, its canonical path and pairs of a frozen shape's schema hash and whether an inverse converts back to it.
+fn migrations_in(bytes: Slice[u8], span: Span, alloc: mem::Alloc) -> mem::List[Migrations] fails core::DecodeError {
+    let Some(count) = uvar_at(bytes, at: span.start) else {
+        fail core::DecodeError.Invalid
+    }
+    var migrations = mem::List[Migrations].empty(alloc)
+    var at = count.end
+    for _ in 0..<count.value {
+        let path = try form_at(bytes, at)
+        let Some(listed) = uvar_at(bytes, at: path.end) else {
+            fail core::DecodeError.Invalid
+        }
+        var shapes = mem::List[Shape].empty(alloc)
+        var next = listed.end
+        for _ in 0..<listed.value {
+            let hashed = try form_at(bytes, at: next)
+            let Some(inverse) = uvar_at(bytes, at: hashed.end) else {
+                fail core::DecodeError.Invalid
+            }
+            if inverse.value > 1 {
+                fail core::DecodeError.Invalid
+            }
+            mut shapes.push(Shape(schema: try hash_in(bytes, span: Span(start: next, end: hashed.end)), inverse: inverse.value == 1))
+            next = inverse.end
+        }
+        if next > span.end {
+            fail core::DecodeError.Invalid
+        }
+        mut migrations.push(Migrations(path: try text_in(bytes, span: Span(start: at, end: path.end), alloc), shapes: take shapes))
+        at = next
+    }
+    if at != span.end {
+        fail core::DecodeError.Invalid
+    }
+    return migrations
+} migrations_in
+
 /// The length of the name of the package whose item the canonical path `path` names.
 fn package_end(path: Str) -> usize {
     return path.find("::").value_or(path.byte_len())
@@ -929,6 +1000,34 @@ fn numbered(fields: mem::List[Part], count: u64) -> bool {
     }
     return true
 } numbered
+
+/// Whether `parts` are the parts of a code root: those numbered from 1 to the last every code root holds, then the optional ones in order.
+fn are_root_parts(parts: mem::List[Part]) -> bool {
+    if u64.widen(parts.len()) < LAST_ROOT_PART {
+        return false
+    }
+    var key: u64 = 1
+    for each in parts {
+        if key <= LAST_ROOT_PART and each.key != key {
+            return false
+        }
+        if each.key < key or each.key > MIGRATIONS_PART {
+            return false
+        }
+        key = each.key + 1
+    }
+    return true
+} are_root_parts
+
+/// The content of the field `key` of `fields`, `None` when they hold none.
+fn optional_field(fields: mem::List[Part], key: u64) -> Option[Span] {
+    for each in fields {
+        if each.key == key {
+            return Some(each.content)
+        }
+    }
+    return None
+} optional_field
 
 /// The content of the field `key` of `fields`.
 fn field(fields: mem::List[Part], key: u64) -> Span fails core::DecodeError {
@@ -1236,7 +1335,7 @@ fn meter_nir(alloc: mem::Alloc) -> mem::Bytes {
     return stream
 } meter_nir
 
-/// The code root of `meter`: its requires-set names items of `core`, `units` and its own, and its ledger holds a trusted block, a parsing and a declassifying validator, a device grant and a `todo`.
+/// The code root of `meter`: its requires-set names items of `core`, `units` and its own, and its ledger holds a trusted block, a parsing and a declassifying validator, a device grant and a `todo`, and a forward migration of `meter::Total` from the shape of `u32`, with an inverse.
 fn meter_root(alloc: mem::Alloc) -> mem::Bytes {
     var entries = uvar_of(4, alloc)
     push_entry(mut entries, path: "core::Option", alloc)
@@ -1249,7 +1348,7 @@ fn meter_root(alloc: mem::Alloc) -> mem::Bytes {
     push_ledger_entry(mut ledger, item: "meter::decode", kind: 4, lead: "declassifying", alloc)
     push_ledger_entry(mut ledger, item: "meter", kind: 6, lead: "device", alloc)
     push_ledger_entry(mut ledger, item: "meter::later", kind: 8, lead: "count laps", alloc)
-    var root = uvar_of(LAST_ROOT_PART, alloc)
+    var root = uvar_of(LAST_ROOT_PART + 1, alloc)
     push_field(mut root, key: 1, content: uvar_of(1, alloc).view())
     push_field(mut root, key: MANIFEST_PART, content: form_of(METER_MANIFEST.as_bytes(), alloc).view())
     push_field(mut root, key: 3, content: uvar_of(0, alloc).view())
@@ -1265,6 +1364,12 @@ fn meter_root(alloc: mem::Alloc) -> mem::Bytes {
     push_bytes(mut trees, bytes: total.path.as_bytes())
     push_bytes(mut trees, bytes: total.encoding.view())
     push_field(mut root, key: SCHEMAS_PART, content: trees.view())
+    var migrations = uvar_of(1, alloc)
+    push_bytes(mut migrations, bytes: b"meter::Total")
+    mut migrations.append(uvar_of(1, alloc).view())
+    push_bytes(mut migrations, bytes: mem::wire::Codec[u32].schema_hash().bytes.view())
+    mut migrations.append(uvar_of(1, alloc).view())
+    push_field(mut root, key: MIGRATIONS_PART, content: migrations.view())
     return root
 } meter_root
 
@@ -1393,6 +1498,8 @@ test published_artefacts_give_their_package_escapes_seals_and_signatures for Art
     let accepted = total.accepts(mem::wire::Codec[u64].schema(alloc), alloc)
     let other = read.tree("meter::Other", alloc)
     expect accepted and other.is_none()
+    let shapes = read.shapes("meter::Total", alloc)
+    expect shapes.len() == 1 and shapes[0] == Shape(schema: ident::HashValue(bytes: mem::wire::Codec[u32].schema_hash().bytes), inverse: true)
     expect read.authority.len() == 6 and read.authority[0].as_str() == "alloc" and read.authority[1].as_str() == "capability \"sys::Fs\"" and read.authority[2].as_str() == "escape grant \"meter\"" and read.authority[5].as_str() == "escape validator \"meter::parse\""
     expect read.verifies()
     let Some(main) = read.main else {

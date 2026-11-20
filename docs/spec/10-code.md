@@ -140,7 +140,13 @@ pub closed struct Component derives Encode {
     pub operations: mem::List[Operation]
     pub env: mem::List[Field]
     pub config: Option[text::String] // canonical path of its configuration type
+    pub migrations: mem::List[Shape] // the frozen shapes its state's forward migrations convert from
 } Component
+
+pub closed struct Shape derives Encode {
+    pub schema: HashValue
+    pub inverse: bool // an inverse converts back to it
+} Shape
 
 pub closed struct Operation derives Encode {
     pub name: text::String
