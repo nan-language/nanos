@@ -58,7 +58,7 @@ Desired state is the configuration record of `devices`, `/sys/config/devices`: `
 
 ### Matching
 
-The `drivers` registry is a load-time registry ([registries](10-code.md#registries)): its entries come from the kernel image and from loaded bundles (requires [N6](22-nan.md#n6)).
+The `drivers` registry is a load-time registry ([registries](10-code.md#registries)): its entries come from the kernel image and from loaded bundles (requires [N6](22-nan.md#n6), [N47](22-nan.md#n47)).
 
 | Field | Type | Meaning |
 | --- | --- | --- |

@@ -8,7 +8,7 @@ The **kernel image** is `kernel.elf`: one NaN final build of the program `kernel
 
 - Domains and components run in the kernel image (requires [N2](22-nan.md#n2), [N3](22-nan.md#n3)).
 - The components of the base instances form one [bundle](10-code.md#artefacts-and-bundles), so values move between base instances without encoding.
-- The image's registry tables are the initial entries of the load-time [registries](10-code.md#registries), among them [`drivers`](15-devices.md#drivers) and the [kernel policies](#kernel-policies) (requires [N6](22-nan.md#n6)).
+- The image's registry tables are the initial entries of the load-time [registries](10-code.md#registries), among them [`drivers`](15-devices.md#drivers) and the [kernel policies](#kernel-policies) (requires [N6](22-nan.md#n6), [N47](22-nan.md#n47)).
 - [21-performance](21-performance.md) bounds its size.
 
 ## Core
@@ -179,7 +179,7 @@ A **kernel policy** is a choice the core makes by calling the function field of 
 
 - The function field of each entry type demands `limits notrap, terminates, noalloc, stack N`. The kernel image contributes the default entry of each registry.
 - The core calls a policy with interrupts disabled and passes it at most 256 candidates.
-- Only the bundles that [registries](10-code.md#registries) names contribute a policy entry. The runner loads such a bundle into the shared space when the plan installing it applies; its entry replaces the active one as registries state, and the core calls it by N6's convention (requires [N6](22-nan.md#n6)).
+- Only the bundles that [registries](10-code.md#registries) names contribute a policy entry. The runner loads such a bundle into the shared space when the plan installing it applies; its entry replaces the active one as registries state, and the core calls it by N6's convention (requires [N6](22-nan.md#n6), [N47](22-nan.md#n47)).
 - The core reads the clock before and after every call. A call longer than 5 µs, or one whose result names no candidate, is an overrun.
 
 | State | Event | Next | Effect |

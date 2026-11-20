@@ -496,3 +496,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** a step gives the encoding of the message it handles, whoever posted it.
 - **Chapters:** [10](10-code.md), [17](17-observability.md).
 - **Issue:** [nan-language/nan#232](https://github.com/nan-language/nan/issues/232).
+
+## N47
+
+**Registry contributions of nanos bundles.**
+
+- **Language 1:** a bare bundle built against a kernel's interface file adds entries to its loaded registries (NaN 24 §Loading), while a nanos bundle contributes to none: a kernel enters nanos code only through `nanos::run` and `nanos::hold`.
+- **NaN OS requires:** a nanos bundle's contributions to a kernel's loaded registries, loaded, replaced and unloaded with the bundle, their function fields entered through gates that own the nanos code's extended state.
+- **Chapters:** [04](04-kernel.md), [10](10-code.md), [15](15-devices.md).
+- **Issue:** [nan-language/nan#269](https://github.com/nan-language/nan/issues/269).

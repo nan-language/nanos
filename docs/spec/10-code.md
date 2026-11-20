@@ -207,7 +207,7 @@ The frames of a loaded bundle are charged to the memory budget ([cells and limit
 
 ## Registries
 
-The registries of the kernel image are **load-time registries**: their tables at the kernel image's final build ([NaN 25 §Tables](https://github.com/nan-language/nan/blob/main/docs/spec/25-registries.md#tables)) are their initial entries, and loading a bundle adds its contributions (requires [N6](22-nan.md#n6)).
+The registries of the kernel image are **load-time registries**: their tables at the kernel image's final build ([NaN 25 §Tables](https://github.com/nan-language/nan/blob/main/docs/spec/25-registries.md#tables)) are their initial entries, and loading a bundle adds its contributions (requires [N6](22-nan.md#n6), [N47](22-nan.md#n47)).
 
 - A bundle contributes to a kernel registry through a contribution its root admits ([NaN 25 §Contributors](https://github.com/nan-language/nan/blob/main/docs/spec/25-registries.md#contributors)), declared in a release of the registry's package compatible with the kernel image's.
 - A contribution whose key equals a live entry's is refused (`code.registry-duplicate`), except to a kernel policy registry, where it replaces the active entry as [kernel policies](04-kernel.md#kernel-policies) states; the effect set lists each replacement.
