@@ -1,6 +1,6 @@
 # 0141. Load-time registries
 
-Status: accepted
+Status: superseded by 0146
 
 ## Context
 
