@@ -157,10 +157,11 @@ pub closed struct Env {
     pub alloc: mem::Alloc
 } Env
 
-/// The state of `devices`: each device's record, every bus path seen, whose position is its device's key, the bindings set, the sources of the `drivers` entries loaded bundles contribute, the volume views it created, the port of the UART the SPCR names, the drivers it assigned the class roles to, how many bindings, volume reads and views are under way, whether discovery has listed the devices and `boot-volume` is resolved, the `settled` requests waiting, the events queued for recording, the oldest being recorded, and the devices whose records wait to be published, while a batch is.
+/// The state of `devices`: each device's record, every bus path seen, whose position is its device's key, the devices the core keeps for itself, the bindings set, the sources of the `drivers` entries loaded bundles contribute, the volume views it created, the port of the UART the SPCR names, the drivers it assigned the class roles to, how many bindings, volume reads and views are under way, whether discovery has listed the devices and `boot-volume` is resolved, the `settled` requests waiting, the events queued for recording, the oldest being recorded, and the devices whose records wait to be published, while a batch is.
 pub closed struct Manager derives Render, Encode {
     pub records: mem::List[LiveDevice]
     pub paths: mem::List[BusPath]
+    pub core: mem::List[BusPath]
     pub bindings: mem::Map[BusPath, Binding]
     pub sources: mem::List[Sourced]
     pub views: mem::List[ViewRecord]
@@ -180,7 +181,7 @@ impl Manager: sys::Component[Env, Devices]
 
 impl Manager: sys::Resume[Env, Devices]
 
-pub fn Manager.start(mut env: Env) -> Manager = Manager(records: mem::List.empty(env.alloc), paths: mem::List.empty(env.alloc), bindings: mem::Map.empty(env.alloc), sources: mem::List.empty(env.alloc), views: mem::List.empty(env.alloc), console: None, holders: mem::Map.empty(env.alloc), store: Placement.Open, underway: 0, discovered: false, boot_resolved: false, waiting: mem::List.empty(env.alloc), queued: mem::List.empty(env.alloc), unshown: mem::List.empty(env.alloc), showing: false)
+pub fn Manager.start(mut env: Env) -> Manager = Manager(records: mem::List.empty(env.alloc), paths: mem::List.empty(env.alloc), core: mem::List.empty(env.alloc), bindings: mem::Map.empty(env.alloc), sources: mem::List.empty(env.alloc), views: mem::List.empty(env.alloc), console: None, holders: mem::Map.empty(env.alloc), store: Placement.Open, underway: 0, discovered: false, boot_resolved: false, waiting: mem::List.empty(env.alloc), queued: mem::List.empty(env.alloc), unshown: mem::List.empty(env.alloc), showing: false)
 
 /// Once started, lists the devices the keeper holds, the platform devices of the AML namespace declared first.
 pub fn Manager.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Devices]) {
@@ -275,6 +276,7 @@ fn Manager.add(
         let at = self.records.len() - 1
         if core {
             self.records[at].status = Status.Converged
+            mut self.core.push(path)
         }
         mut self.show(at, mut env, mut cx)
         if core {
@@ -499,16 +501,7 @@ pub fn Manager.rematch(
     mut env: Env,
     mut cx: sys::Cx[Devices],
     ) {
-    var rerun = mem::List[usize].empty(env.alloc)
-    for at in 0..<self.records.len() {
-        let affected = match self.records[at].entry {
-            Some(name) => listed_in_sources(self.sources.view(), name) or listed_in_sources(sources.view(), name)
-            None => true
-        }
-        if affected {
-            mut rerun.push(at)
-        }
-    }
+    let rerun = rematched(self.records.view(), core: self.core.view(), previous: self.sources.view(), current: sources.view(), alloc: env.alloc)
     self.sources = sources
     for at in rerun {
         mut self.reconcile(at, reached, mut env, mut cx)
@@ -522,7 +515,7 @@ pub fn Manager.starts(mut self, take contributed: mem::List[DriverEntry], mut en
     }
     var started = mem::List[ident::Moniker].empty(env.alloc)
     for record in self.records {
-        if record.entry.is_some() {
+        if record.entry.is_some() or not matchable(record, core: self.core.view()) {
             continue
         }
         let set = self.binding_of(record.path)
@@ -539,6 +532,40 @@ pub fn Manager.starts(mut self, take contributed: mem::List[DriverEntry], mut en
     }
     return started
 } Manager.starts
+
+/// The positions of the records `records` a change of the sources of the loaded `drivers` entries from `previous` to `current` reruns matching for: the unbound devices matching may give a driver, and those bound to an entry either names.
+fn rematched(
+    records: Slice[LiveDevice],
+    core: Slice[BusPath],
+    previous: Slice[Sourced],
+    current: Slice[Sourced],
+    alloc: mem::Alloc,
+    ) -> mem::List[usize] {
+    var rerun = mem::List[usize].empty(alloc)
+    for at in 0..<records.len() {
+        let affected = match records[at].entry {
+            Some(name) => listed_in_sources(previous, name) or listed_in_sources(current, name)
+            None => matchable(records[at], core)
+        }
+        if affected {
+            mut rerun.push(at)
+        }
+    }
+    return rerun
+} rematched
+
+/// Whether matching may give the device of `record` a driver: the core does not keep it for itself, as `core` lists, and its firmware description and resources were read.
+fn matchable(record: LiveDevice, core: Slice[BusPath]) -> bool {
+    for path in core {
+        if path == record.path {
+            return false
+        }
+    }
+    return match record.status {
+        Status.Failed(Code.Aml) or Status.Failed(Code.BarUnassigned) => false
+        else => true
+    }
+} matchable
 
 /// Whether `sources` holds the key `name`.
 fn listed_in_sources(sources: Slice[Sourced], name: text::Fixed[20]) -> bool {
@@ -1159,3 +1186,32 @@ fn Manager.recorded(mut self, mut env: Env, mut cx: sys::Cx[Devices]) {
         self.record_oldest(env.root, mut cx)
     }
 } Manager.recorded
+
+test rematches_rerun_matchable_unbound_devices_and_those_of_changed_entries for rematched {
+    let alloc = testing::world().alloc
+    let code = ident::HashValue.of_content(b"bundle")
+    var previous = mem::List[Sourced].empty(alloc)
+    mut previous.push(Sourced(key: text::Fixed[20].of("gone"), source: Source.Bundle(code: code, automatic: true)))
+    var current = mem::List[Sourced].empty(alloc)
+    mut current.push(Sourced(key: text::Fixed[20].of("probe"), source: Source.Bundle(code: code, automatic: true)))
+    var records = mem::List[LiveDevice].empty(alloc)
+    mut records.push(device_at(1, entry: None, status: Status.Converged, alloc))
+    mut records.push(device_at(2, entry: None, status: Status.Converged, alloc))
+    mut records.push(device_at(3, entry: None, status: Status.Failed(Code.BarUnassigned), alloc))
+    mut records.push(device_at(4, entry: Some("virtio-blk"), status: Status.Converged, alloc))
+    mut records.push(device_at(5, entry: Some("gone"), status: Status.Converged, alloc))
+    mut records.push(device_at(6, entry: None, status: Status.Failed(Code.StartTimeout), alloc))
+    var core = mem::List[BusPath].empty(alloc)
+    mut core.push(records[1].path)
+    let rerun = rematched(records.view(), core: core.view(), previous: previous.view(), current: current.view(), alloc)
+    expect rerun.len() == 3 and rerun[0] == 0 and rerun[1] == 4 and rerun[2] == 5
+} rematches_rerun_matchable_unbound_devices_and_those_of_changed_entries
+
+fn device_at(slot: u8, entry: Option[Str], status: Status, alloc: mem::Alloc) -> LiveDevice {
+    let named = match entry {
+        Some(name) => Some(text::Fixed[20].of(name))
+        None => None
+    }
+    let ids = DeviceIds.Pci(vendor: 0x1AF4, device: 0x1041, subsystem_vendor: 0x1AF4, subsystem: 1, class: 0x02_0000, revision: 1)
+    return LiveDevice(path: BusPath.Pci(PciAddress(segment: 0, bus: 0, device: slot, function: 0)), ids: ids, resources: mem::List.empty(alloc), dma: Dma.None, entry: named, driver: None, role: None, power: Power.Off, status: status, units: mem::List.empty(alloc))
+} device_at
