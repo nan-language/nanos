@@ -1,28 +1,123 @@
-//! The cleaner: a full segment holding little live data read batch by batch, each live record appended unchanged to the log with its entry pointed at the copy, and the segment freed.
+//! The cleaner: a full segment holding little live data read a batch at a time, each live record appended unchanged to the log with its entry pointed at the copy, and the segment freed once its last batch is read; a step after each run of writes while the log grows, and every candidate while free segments run low.
 
-/// Cleans one segment when a full one holds less than a quarter of live data, and gives whether it cleaned one; a live node of the item table there is left for the next index flush to rewrite.
+/// The segment bytes a step of the cleaner reads at least, unless the segment ends first.
+const STEP_BYTES: u64 = 1_048_576
+
+/// The segment the cleaner is emptying: its number, the block of its next batch, and that batch's number once the first is read.
+pkg struct Cleaning derives Copy, Eq {
+    pkg segment: u32
+    pkg block: u64
+    pkg batch: Option[u64]
+} Cleaning
+
+/// Cleans while the log grows: a step after the writes since the last index flush, and steps until none is left while free segments, those freed awaiting their index flushes counted, are at most 4 plus 1% of all segments.
+pub fn Store.keep_clean[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) fails StoreError uses wait {
+    if self.read_only or self.first_logged == 0 {
+        return
+    }
+    loop {
+        if not try await mut self.clean(device, now, alloc) or not self.space_low() {
+            return
+        }
+    }
+} Store.keep_clean
+
+/// Whether free segments, those freed awaiting their index flushes counted, are at most 4 plus 1% of all segments.
+pkg fn Store.space_low(self) -> bool {
+    var free = self.log.free_segments()
+    for segment in self.log.segments {
+        if segment.state == log::SegmentState.Freed {
+            free += 1
+        }
+    }
+    return free <= 4 + self.superblock.segments / 100
+} Store.space_low
+
+/// Whether cleaning or index flushes could free space: a segment is being cleaned or awaits its index flushes, a full one holds less than a quarter of live data, or the log grew since the last index flush.
+pkg fn Store.reclaimable(self, now: ident::WallTime) -> bool {
+    if self.cleaning.is_some() or self.log.appended > 0 or self.log.cleaning_candidate(now: now.utc_ns, skipped: self.unclean).is_some() {
+        return true
+    }
+    for segment in self.log.segments {
+        if segment.state == log::SegmentState.Freed {
+            return true
+        }
+    }
+    return false
+} Store.reclaimable
+
+/// Cleans a step: the next batches of the segment being emptied, or else of the full segment of least live data for its age, until a megabyte is read or the segment ends, their live records moved and the copies made durable; gives whether there was a segment to clean. A segment ends after its last batch or before a batch not following the one before; one whose batch fails its checksum stays full, and the cleaner tells of the corruption and passes it over until the next mount.
 pub fn Store.clean[D: disk::Device](mut self, device: D, now: ident::WallTime, alloc: mem::Alloc) -> bool fails StoreError uses wait {
     if self.read_only {
         fail StoreError.ReadOnly
     }
-    let Some(segment) = self.log.cleaning_candidate(now: now.utc_ns) else {
+    if self.cleaning.is_none() {
+        let Some(segment) = self.log.cleaning_candidate(now: now.utc_ns, skipped: self.unclean) else {
+            return false
+        }
+        self.cleaning = Some(Cleaning(segment: segment, block: 1, batch: None))
+    }
+    let Some(started) = self.cleaning else {
         return false
     }
-    let records = try await mut self.segment_records(device, segment, alloc)
-    for record in records {
-        if record.kind == disk::RecordKind.Index and record.key.view().u64_le(0) == 0 {
-            match attempt await mut self.index.rewrite_table_node(device, address: record.address, payload: record.payload.view(), alloc) {
-                Ok(_) => {
-                }
-                Err(failure) => fail StoreError.of_tree(take failure)
-            }
-            continue
+    var at = started
+    try await mut self.bound_log(device, adding: STEP_BYTES, now, alloc)
+    var read: u64 = 0
+    while read < STEP_BYTES {
+        let Some(header) = try await mut self.next_batch(device, at, alloc) else {
+            mut self.log.freed(at.segment, flush: self.flush)
+            self.cleaning = None
+            break
         }
-        try await mut self.move_if_live(device, record, now, alloc)
+        let start = disk::segment_start(at.segment) + at.block
+        let address = start * u64.widen(disk::BLOCK_BYTES)
+        let whole = try await read_blocks(device, block: start, count: header.blocks, alloc)
+        let records = match disk::batch_verifies(whole.view(), alloc) {
+            true => disk::batch_records(whole.view(), header, alloc)
+            false => None
+        }
+        let Some(placed) = records else {
+            mut self.events.push(Event.Corruption(address: address, kind: 0))
+            discard mut self.unclean.insert(at.segment)
+            self.cleaning = None
+            break
+        }
+        for record in take placed {
+            let length = u32.truncate(record.record.payload.byte_len())
+            try await mut self.move_live(device, record: Lying(address: address + u64.widen(record.offset), kind: record.record.kind, key: record.record.key, length: length, payload: take record.record.payload), now, alloc)
+        }
+        at.block += u64.widen(header.blocks)
+        at.batch = Some(header.batch + 1)
+        if header.ends_segment {
+            at.block = disk::SEGMENT_BLOCKS
+        }
+        read += u64.widen(header.blocks) * u64.widen(disk::BLOCK_BYTES)
+        self.cleaning = Some(at)
     }
-    mut self.log.freed(segment, flush: self.flush)
+    if self.log.has_pending() {
+        try await mut self.flush_log(device, alloc)
+    }
     return true
 } Store.clean
+
+/// The header of the batch at `at` of the segment being emptied, `None` past its last: at its end, or where no batch follows the one before.
+fn Store.next_batch[D: disk::Device](mut self, device: D, at: Cleaning, alloc: mem::Alloc) -> Option[disk::BatchHeader] fails StoreError uses wait {
+    if at.block >= disk::SEGMENT_BLOCKS {
+        return None
+    }
+    let opening = try await read_blocks(device, block: disk::segment_start(at.segment) + at.block, count: 1, alloc)
+    let Some(header) = disk::BatchHeader.read(opening.view()) else {
+        return None
+    }
+    let follows = match at.batch {
+        Some(number) => header.batch == number
+        None => true
+    }
+    if not follows or header.blocks == 0 or u64.widen(header.blocks) > disk::SEGMENT_BLOCKS - at.block {
+        return None
+    }
+    return Some(header)
+} Store.next_batch
 
 /// A record of a segment: where it lies, its kind, key and length, and its payload.
 pkg struct Lying {
@@ -33,38 +128,24 @@ pkg struct Lying {
     pkg payload: Untrusted[mem::Bytes]
 } Lying
 
-/// The records of the batches segment `segment` holds, up to the first batch that fails its checksum.
-fn Store.segment_records[D: disk::Device](mut self, device: D, segment: u32, alloc: mem::Alloc) -> mem::List[Lying] fails StoreError uses wait {
-    var records = mem::List[Lying].empty(alloc)
-    var block: u64 = 1
-    while block < disk::SEGMENT_BLOCKS {
-        let start = disk::segment_start(segment) + block
-        let opening = try await read_blocks(device, block: start, count: 1, alloc)
-        let Some(header) = disk::BatchHeader.read(opening.view()) else {
-            break
+/// Moves `record` when an entry names it: a live node of the item table is left for the next index flush to rewrite, any other record is copied.
+fn Store.move_live[D: disk::Device](
+    mut self,
+    device: D,
+    record: Lying,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    if record.kind == disk::RecordKind.Index and record.key.view().u64_le(0) == 0 {
+        match attempt await mut self.index.rewrite_table_node(device, address: record.address, payload: record.payload.view(), alloc) {
+            Ok(_) => {
+            }
+            Err(failure) => fail StoreError.of_tree(take failure)
         }
-        if header.blocks == 0 or u64.widen(header.blocks) > disk::SEGMENT_BLOCKS - block {
-            break
-        }
-        let whole = try await read_blocks(device, block: start, count: header.blocks, alloc)
-        if not disk::batch_verifies(whole.view(), alloc) {
-            mut self.events.push(Event.Corruption(address: start * u64.widen(disk::BLOCK_BYTES), kind: 0))
-            break
-        }
-        let Some(placed) = disk::batch_records(whole.view(), header, alloc) else {
-            break
-        }
-        for record in take placed {
-            let length = u32.truncate(record.record.payload.byte_len())
-            mut records.push(Lying(address: start * u64.widen(disk::BLOCK_BYTES) + u64.widen(record.offset), kind: record.record.kind, key: record.record.key, length: length, payload: take record.record.payload))
-        }
-        block += u64.widen(header.blocks)
-        if header.ends_segment {
-            break
-        }
+        return
     }
-    return records
-} Store.segment_records
+    try await mut self.move_if_live(device, record, now, alloc)
+} Store.move_live
 
 /// Appends `record` unchanged to the log when an entry names it, and points that entry at the copy.
 fn Store.move_if_live[D: disk::Device](

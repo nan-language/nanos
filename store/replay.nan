@@ -17,6 +17,8 @@ pkg fn Store.replay[D: disk::Device](
     }
     var replay = begun
     var applied: u64 = 0
+    var passed = mem::List[u32].empty(alloc)
+    mut passed.push(record.segment)
     loop {
         let next = match attempt await mut replay.next_batch(device, alloc) {
             Ok(found) => found
@@ -24,6 +26,9 @@ pkg fn Store.replay[D: disk::Device](
         }
         let Some(batch) = next else {
             break
+        }
+        if passed[passed.len() - 1] != batch.segment {
+            mut passed.push(batch.segment)
         }
         mut self.log.set_state(batch.segment, state: log::SegmentState.Open)
         let base = (disk::segment_start(batch.segment) + u64.widen(batch.block)) * u64.widen(disk::BLOCK_BYTES)
@@ -39,6 +44,11 @@ pkg fn Store.replay[D: disk::Device](
     if applied == 0 {
         return
     }
+    for segment in passed {
+        if segment != replay.segment {
+            mut self.log.set_state(segment, state: log::SegmentState.Full)
+        }
+    }
     let ended = log::Position(segment: replay.segment, sequence: replay.sequence, next: replay.next, block: replay.block, batch: replay.batch)
     match attempt mut self.log.continue_after(ended, time: now.utc_ns, alloc) {
         Ok(_) => {
@@ -48,7 +58,7 @@ pkg fn Store.replay[D: disk::Device](
     try await mut self.index_flush(device, now, alloc)
 } Store.replay
 
-/// Registers or applies one replayed record lying at `address`, and gives whether it is one a commit names.
+/// Registers or applies one replayed record lying at `address`, and gives whether it is one a commit names; the copy the cleaner made of an earlier commit's record is neither.
 fn Store.replay_record[D: disk::Device](
     mut self,
     device: D,
@@ -60,10 +70,17 @@ fn Store.replay_record[D: disk::Device](
     let pointer = disk::Pointer(target: address, length: length, kind: record.kind.code(), by_item: false, checksum: disk::placed_checksum(record.key, payload: record.payload.view(), alloc))
     match record.kind {
         disk::RecordKind.Commit => {
+            if record.key.view().u64_le(0) < self.counters.commit {
+                return false
+            }
             let decoded = try decode_commit_record(record.payload.view(), alloc)
             try await mut self.reapply(device, record: take decoded, pointer, alloc)
         }
-        disk::RecordKind.Value => mut self.index.place(record.key.view().u64_le(0), address, length, kind: record.kind.code())
+        disk::RecordKind.Value => {
+            let item = record.key.view().u64_le(0)
+            mut self.index.reserve(item)
+            mut self.index.place(item, address, length, kind: record.kind.code())
+        }
         disk::RecordKind.Piece => try await mut self.register_piece(device, key: record.key, pointer, alloc)
         disk::RecordKind.Stream => try await mut self.register_run(device, record, pointer, alloc)
         disk::RecordKind.Blob => try await mut self.register_blob(device, record, pointer, alloc)

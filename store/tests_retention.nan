@@ -113,7 +113,7 @@ test the_cleaner_frees_segments_of_little_live_data for Store.clean {
     expect cleaned
     while try await mut store.clean(device, now: at_second(9_000), alloc) {
     }
-    expect store.log.cleaning_candidate(now: at_second(9_000).utc_ns).is_none()
+    expect store.log.cleaning_candidate(now: at_second(9_000).utc_ns, skipped: store.unclean).is_none()
     try await mut store.index_flush(device, now: at_second(9_001), alloc)
     try await mut store.index_flush(device, now: at_second(9_002), alloc)
     let level = try await level_on(mut store, device, branch: "main", text: "/data/big/7", alloc)
@@ -124,6 +124,127 @@ test the_cleaner_frees_segments_of_little_live_data for Store.clean {
     let discarded = try await device.discarded()
     expect discarded > 0
 } the_cleaner_frees_segments_of_little_live_data
+
+/// The path `/data/` and the decimal `number`.
+fn numbered_path(number: u32, alloc: mem::Alloc) -> ident::Path {
+    let name = decimal_name(u64.widen(number), alloc)
+    var text = text::String.of("/data/", alloc)
+    mut text.append(text_of_name(name.view(), alloc).as_str())
+    return ident::Path(text: take text)
+} numbered_path
+
+test writes_past_a_full_volume_lose_nothing for Store.make_space {
+    let alloc = testing::world().alloc
+    let device = disk::MemoryVolume.of_blocks(16_384, alloc)
+    var store = try await genesis_store(device, alloc)
+    var written: u32 = 0
+    var refused: u32 = 0
+    while refused < 12 {
+        let outcome = attempt await mut store.commit(device, branch: "main", transaction: blind(single(Write.Put(path: numbered_path(written, alloc), value: doubled_setting(written, doublings: 20, alloc)), alloc), alloc), stamp: system_stamp(alloc), now: at_second(10), alloc)
+        match first outcome {
+            Ok(_) => {
+                written += 1
+            }
+            Err(StoreError.Full) => {
+                refused += 1
+            }
+            Err(failure) => fail failure
+        }
+    }
+    discard attempt await mut store.index_flush(device, now: at_second(11), alloc)
+    mut store.drop_clean_nodes()
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(12), alloc)
+    for number in 0..<written {
+        let held = try await numbered_level(mut store, device, number, alloc)
+        let remounted = try await numbered_level(mut mounted, device, number, alloc)
+        expect held == number and remounted == number
+    }
+} writes_past_a_full_volume_lose_nothing
+
+/// The level of the setting at the path [numbered_path] gives for `number` on `main`.
+fn numbered_level(mut store: Store, device: disk::MemoryVolume, number: u32, alloc: mem::Alloc) -> u32 fails StoreError uses wait {
+    let node = try await mut store.get(device, branch: "main", path: numbered_path(number, alloc), now: at_second(12), alloc)
+    let Some(value) = node.value else {
+        return 0
+    }
+    return read_level(value.view(), alloc)
+} numbered_level
+
+/// Appends pads of `size` bytes to the log until no segment is free beside the open one's successor.
+fn fill_log(mut store: Store, size: usize, alloc: mem::Alloc) fails StoreError {
+    let filler = mem::Bytes.zeroed(size, alloc)
+    loop {
+        match first attempt mut store.log.append(disk::RecordKind.Pad, key: Array[u8, 32].filled(0), payload: filler.view(), time: 0, alloc) {
+            Ok(_) => {
+            }
+            Err(log::LogFailure.Full) => return
+            Err(failure) => fail StoreError.of_log(take failure)
+        }
+    }
+} fill_log
+
+test an_index_flush_lacking_room_keeps_its_nodes for Store.index_flush {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    discard try await commit_at(mut store, device, writes: single(put("/data/kept", level: 7, alloc), alloc), second: 3, alloc)
+    try fill_log(mut store, size: 65_536, alloc)
+    try fill_log(mut store, size: 4_096, alloc)
+    let flushed = attempt await mut store.index_flush(device, now: at_second(4), alloc)
+    let refused = match flushed {
+        Err(StoreError.Full) => true
+        else => false
+    }
+    expect refused
+    let level = try await level_at(mut store, device, text: "/data/kept", alloc)
+    expect level == 7
+} an_index_flush_lacking_room_keeps_its_nodes
+
+test the_cleaner_keeps_free_segments_under_steady_writes for Store.keep_clean {
+    let alloc = testing::world().alloc
+    let device = disk::MemoryVolume.of_blocks(16_384, alloc)
+    var store = try await genesis_store(device, alloc)
+    var least = store.log.free_segments()
+    for round in 1..=300u32 {
+        let slot = decimal_name(u64.widen(round % 4), alloc)
+        var path = text::String.of("/state/", alloc)
+        mut path.append(text_of_name(slot.view(), alloc).as_str())
+        let now = at_second(i64.widen(round) * 5)
+        discard try await mut store.commit(device, branch: "main", transaction: blind(single(Write.Put(path: path_of(path.as_str(), alloc), value: doubled_setting(round, doublings: 17, alloc)), alloc), alloc), stamp: system_stamp(alloc), now, alloc)
+        if store.flush_due(now) {
+            try await mut store.index_flush(device, now, alloc)
+        }
+        try await mut store.keep_clean(device, now, alloc)
+        if store.log.free_segments() < least {
+            least = store.log.free_segments()
+        }
+    }
+    expect least > 2
+    let level = try await level_at(mut store, device, text: "/state/0", alloc)
+    expect level == 300
+} the_cleaner_keeps_free_segments_under_steady_writes
+
+test commit_records_the_cleaner_copied_replay_as_nothing for Store.replay_record {
+    let alloc = testing::world().alloc
+    let device = test_volume(alloc)
+    var store = try await genesis_store(device, alloc)
+    var level: u32 = 0
+    while store.log.position.segment == 1 {
+        level += 1
+        discard try await commit_at(mut store, device, writes: single(put("/data/x", level, alloc), alloc), second: 3, alloc)
+        discard try await commit_at(mut store, device, writes: single(Write.Put(path: path_of("/state/junk", alloc), value: doubled_setting(level, doublings: 18, alloc)), alloc), second: 3, alloc)
+    }
+    level += 1
+    discard try await commit_at(mut store, device, writes: single(put("/data/x", level, alloc), alloc), second: 3, alloc)
+    try await mut store.index_flush(device, now: at_second(4), alloc)
+    while try await mut store.clean(device, now: at_second(5), alloc) {
+    }
+    discard try await commit_at(mut store, device, writes: single(put("/data/y", level: 1, alloc), alloc), second: 6, alloc)
+    var mounted = try await Store.mount(device, volume_id: Array[u8, 16].filled(9), now: at_second(7), alloc)
+    mut mounted.know("store::Setting", schema: mem::wire::Codec[Setting].schema(alloc), decoder: Decoder(schema: mem::wire::Codec[Setting].schema_hash(), canonical: setting_canonical), alloc)
+    let after = try await level_at(mut mounted, device, text: "/data/x", alloc)
+    expect after == level
+} commit_records_the_cleaner_copied_replay_as_nothing
 
 test scrub_finds_damage_and_repairs_superblocks for Store.scrub {
     let alloc = testing::world().alloc

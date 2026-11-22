@@ -1,5 +1,8 @@
 //! The log: records laid out in batches within segments, each segment's header naming the segment the log continues in, written by log flushes and replayed at mount.
 
+/// The bytes past which a batch takes no further record.
+const BATCH_BYTES: usize = 1_048_576
+
 /// A segment's state: free, open for the log, full, or freed by the cleaner and free once the second index flush after its freeing is durable.
 pkg enum SegmentState derives Copy, Eq {
     Free
@@ -116,6 +119,13 @@ pkg fn Log.append(
     if most_record_span() < disk::record_span(length) + disk::BLOCK_BYTES {
         fail LogFailure.TooLarge
     }
+    let laid = match self.batch {
+        Some(bytes) => bytes.len()
+        None => 0
+    }
+    if laid >= BATCH_BYTES {
+        mut self.seal_batch(ends_segment: false, alloc)
+    }
     if not self.fits(kind, length) {
         try mut self.end_segment(time, alloc)
     }
@@ -138,9 +148,9 @@ pkg fn Log.seal(mut self, alloc: mem::Alloc) {
     mut self.seal_batch(ends_segment: false, alloc)
 } Log.seal
 
-/// Continues the log after replay ended at `position`: the segment replay ended in is full, and the log opens its successor.
+/// Continues the log after replay ended at `position`: the segment replay ended in ends there, and the log opens its successor.
 pkg fn Log.continue_after(mut self, position: Position, time: i64, alloc: mem::Alloc) fails LogFailure {
-    self.position = Position(segment: position.segment, sequence: position.sequence, next: position.next, block: u32.truncate(disk::SEGMENT_BLOCKS), batch: position.batch)
+    self.position = position
     try mut self.end_segment(time, alloc)
 } Log.continue_after
 
@@ -156,14 +166,14 @@ pkg fn Log.free_freed(mut self, flushed: u64, alloc: mem::Alloc) -> mem::List[u3
     return freed
 } Log.free_freed
 
-/// The full segment the cleaner takes next at time `now`: of live fraction u below a quarter, the highest (1 − u) · age / (1 + u), `None` when no segment is one.
-pkg fn Log.cleaning_candidate(self, now: i64) -> Option[u32] {
+/// The full segment the cleaner takes next at time `now`, `skipped` aside: of live fraction u below a quarter, the highest (1 − u) · age / (1 + u), `None` when no segment is one.
+pkg fn Log.cleaning_candidate(self, now: i64, skipped: mem::Set[u32]) -> Option[u32] {
     let capacity = disk::SEGMENT_BLOCKS * u64.widen(disk::BLOCK_BYTES)
     var best: Option[u32] = None
     var best_score: u64 = 0
     for at in 0..<self.segments.len() {
         let segment = self.segments[at]
-        if segment.state != SegmentState.Full or segment.live * 4 >= capacity {
+        if segment.state != SegmentState.Full or segment.live * 4 >= capacity or skipped.contains(u32.truncate(at + 1)) {
             continue
         }
         let age = u64.saturate(now.saturating_sub(segment.written)) / 1_000_000 + 1
@@ -238,17 +248,16 @@ fn Log.fits(self, kind: disk::RecordKind, length: u32) -> bool {
     return needed <= room
 } Log.fits
 
-/// Ends the open segment: seals the batch being laid out as its last, or marks its end by an empty batch when one fits, then opens its successor.
+/// Ends the open segment: seals the batch being laid out as its last, or marks its end by an empty batch when one fits, then opens its successor; changes nothing when no free segment remains to follow that successor.
 fn Log.end_segment(mut self, time: i64, alloc: mem::Alloc) fails LogFailure {
+    let opened = self.position.next
+    let next = try self.choose_free(not_segment: opened)
     if self.batch.is_some() or u64.widen(self.position.block) < disk::SEGMENT_BLOCKS {
         mut self.start_batch(time, alloc)
         mut self.seal_batch(ends_segment: true, alloc)
     }
-    let ended = self.position.segment
-    mut self.set_state(ended, state: SegmentState.Full)
-    let opened = self.position.next
+    mut self.set_state(self.position.segment, state: SegmentState.Full)
     mut self.set_state(opened, state: SegmentState.Open)
-    let next = try self.choose_free(not_segment: opened)
     self.position = Position(segment: opened, sequence: self.position.sequence + 1, next: next, block: 1, batch: self.position.batch)
     mut self.write_header(alloc)
 } Log.end_segment

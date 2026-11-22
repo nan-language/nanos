@@ -95,7 +95,7 @@ A **log batch** starts and ends at block boundaries within one segment:
 | time | 32 | 8 | wall time, UTC nanoseconds |
 | checksum | 40 | 16 | of the whole batch with this field zero |
 
-Records follow from offset 56, each starting at a multiple of 8; padding fills the last block.
+Records follow from offset 56, each starting at a multiple of 8; padding fills the last block. A batch holding 1 MiB or more takes no further record.
 
 ## Log records
 
@@ -240,7 +240,7 @@ A device failure at any step fails the index flush with `store.io` and leaves th
 3. Check the format version ([Format versions and upgrades](#format-versions-and-upgrades)): `store.format-unsupported`.
 4. On a volume whose superblock flag bit 0 or 2 is set, have `keys` unseal the volume key ([Volumes](#volumes)): `store.locked`.
 5. Read the flush ring and take the valid record with the highest flush number whose catalog and item-table nodes verify, or else the valid record before it: `store.corrupt`.
-6. Replay the log from its position, following batches in sequence through segments by `next`, checking each batch's checksum and stopping before any invalid or out-of-sequence batch; register every record and apply every commit record, reading 16 MiB at most from the latest record and 32 MiB at most from the one before it. A read failure: `store.io`.
+6. Replay the log from its position, following batches in sequence through segments by `next`, checking each batch's checksum and stopping before any invalid or out-of-sequence batch; register every record and apply every commit record numbered after those applied, a copy the cleaner moved being passed over, reading 16 MiB at most from the latest record and 32 MiB at most from the one before it. A read failure: `store.io`.
 7. Free the records that no replayed commit or flushed structure references.
 8. When replay applied any record, perform an index flush; the log continues in a new segment.
 9. Rewrite the stale copy of each keyring block whose copies differ ([Secret records](#secret-records)), and emit `store.mounted`.
@@ -271,7 +271,7 @@ The cleaner turns segments holding little live data into free ones. A segment mo
 | freed | the second index flush after its freeing is durable | free | it is discarded |
 
 1. Choose the full segment whose live fraction u is below 25% with the highest (1 − u) · age / (1 + u), age being the time since its newest batch.
-2. Read its records; a record is live when its item table, piece or catalog entry points at it. A record failing its checksum emits `store.corruption`, and the segment stays full.
+2. Read its batches in order, one at a time; a record is live when its item table, piece or catalog entry points at it. A batch failing its checksum emits `store.corruption`, and the segment stays full.
 3. Append each live record unchanged to the log and point its entry at the copy; mark live item-table nodes dirty, so that the next index flush rewrites them.
 
 The cleaner runs at the `background` class ([08-scheduling.md](08-scheduling.md#cpu-classes)) while the log grows and a candidate exists, and at the `normal` class when free segments fall to 4 plus 1% of all segments; an idle store never cleans. [21-performance.md](21-performance.md#requirements) bounds its write amplification. The store keeps 2 segments plus 0.5% of all segments free for itself: a write adding data that needs them fails with `store.full` as thinning states ([11-store.md](11-store.md#thinning)).
