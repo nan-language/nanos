@@ -1,6 +1,6 @@
 # Requirements on NaN
 
-This chapter defines the features NaN OS requires of NaN beyond language 1 as the toolchain v0.1.0 implements it. Each requirement states what language 1 provides, what NaN OS requires, the chapters whose rules depend on it, and the issue of the NaN repository that requests it. A rule elsewhere followed by `(requires Nn)`, linked to its entry here, depends on Nn. The identifiers are stable; N18 is unassigned.
+This chapter defines the features NaN OS requires of NaN beyond language 1 as the toolchain v0.1.0 implements it. Each requirement states what language 1 provides, what NaN OS requires, the chapters whose rules depend on it, and the issue of the NaN repository that requests it. A rule elsewhere followed by `(requires Nn)`, linked to its entry here, depends on Nn. The identifiers are stable; N18 and N51 are unassigned.
 
 ## N1
 
@@ -532,3 +532,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** loaded registries whose entries hold text and are keyed by it.
 - **Chapters:** [15](15-devices.md).
 - **Issue:** [nan-language/nan#271](https://github.com/nan-language/nan/issues/271).
+
+## N52
+
+**Lowering for a kernel a host built.**
+
+- **Language 1:** a bundle builds only against an interface file recording the building toolchain's hash (NaN 30 §Bundles), which covers the code roots of the toolchain's closure (NaN 36 §Toolchain hash), its program's manifest included, and a program declares one target (NaN 27 §Programs and libraries): the toolchain built for a nanos target never has the hash of one built for a host target.
+- **NaN OS requires:** the toolchain the `nan` job runs building bundles against the interface file of the kernel image a generation ships, which a toolchain built for a host target built.
+- **Chapters:** [10](10-code.md), [20](20-base.md).
+- **Issue:** [nan-language/nan#280](https://github.com/nan-language/nan/issues/280).

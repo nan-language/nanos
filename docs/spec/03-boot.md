@@ -15,6 +15,7 @@ The **boot volume** is the FAT EFI system partition holding the loader, the gene
 | `/nanos/gen/<n>/` | generation n, n in decimal: `manifest`, its signed manifest; `kernel.elf`, its kernel image; `genesis`, its genesis record | the installer, `boot` |
 | `/nanos/store.img` | the store, on a machine without a store partition ([12-store-format](12-store-format.md#placement)) | `devices`, through `fat` ([15-devices](15-devices.md#volumes-and-roles)) |
 | `/kernel.elf` | the kernel image of a development boot | `nan run` |
+| `/nan.nbun`, `/nan.ntree`, `/kernel.nlif` | the toolchain bundle a development boot's [`nan` job](20-base.md#jobs) runs, its tree hash, and the interface file of the kernel image it is built against | `nan run` |
 
 An installer writes the loader, one generation, and a boot record holding that generation in slot A as `good` and as recovery generation. At run time only the [base instance](20-base.md#boot) `boot` changes the boot volume, `/nanos/store.img` excepted; it mirrors the boot record in `/sys/boot` ([13-tree](13-tree.md#sys)).
 
@@ -193,7 +194,7 @@ The flags are, by bit: 0, a development loader; 1, `record written`, step 6 wrot
 
 The **handoff block** is a range of pages below 4 GiB, in usable memory outside the kernel's segments, holding the start information, the handoff record, the genesis record and the event log copy.
 
-- On x86_64 the loader enters the kernel at its PVH 32-bit entry (requires [N14](22-nan.md#n14)) with `ebx` holding the address of a PVH start information structure, version 1, in the handoff block. Its module list holds module 0, the handoff record, and module 1, the genesis record, absent when the image holds it; `rsdp_paddr` is the ACPI RSDP of the EFI configuration table and `cmdline_paddr` is 0. Its memory map gives each range of the final UEFI memory map a type: 1 for `EfiConventionalMemory`, `EfiBootServicesCode`, `EfiBootServicesData`, `EfiLoaderCode` and `EfiLoaderData`; 3 for `EfiACPIReclaimMemory`; 4 for `EfiACPIMemoryNVS`; 5 for `EfiUnusableMemory`; 7 for `EfiPersistentMemory`; and 2 for the handoff block and every other type.
+- On x86_64 the loader enters the kernel at its PVH 32-bit entry (requires [N14](22-nan.md#n14)) with `ebx` holding the address of a PVH start information structure, version 1, in the handoff block. Its module list holds module 0, the handoff record, module 1, the genesis record, absent when the image holds it, and a [development boot](#development-loader)'s toolchain modules; `rsdp_paddr` is the ACPI RSDP of the EFI configuration table and `cmdline_paddr` is 0. Its memory map gives each range of the final UEFI memory map a type: 1 for `EfiConventionalMemory`, `EfiBootServicesCode`, `EfiBootServicesData`, `EfiLoaderCode` and `EfiLoaderData`; 3 for `EfiACPIReclaimMemory`; 4 for `EfiACPIMemoryNVS`; 5 for `EfiUnusableMemory`; 7 for `EfiPersistentMemory`; and 2 for the handoff block and every other type.
 - On AArch64 the loader enters the image at EL1 with the MMU off and `x0` holding the address of a flattened device tree in the handoff block: the firmware's device tree when the EFI configuration table holds one, else a tree holding the memory of the final map and `/chosen/nanos,acpi-rsdp`. It adds `/chosen/nanos,handoff` and `/chosen/nanos,genesis`, each an address and a size in two 64-bit cells, and lists the handoff block in the memory reservation block (requires [N30](22-nan.md#n30)).
 - At start the kernel emits `boot.started`, then one `boot.candidate-failed` per failure entry.
 
@@ -210,6 +211,7 @@ The **handoff block** is a range of pages below 4 GiB, in usable memory outside 
 
 - A development loader is built with the `loader` package's `DEVELOPMENT` constant set to true. Its `/kernel.elf` candidate boots unverified, in `dev` mode, as generation 0. A production loader never boots a kernel image without a verifying manifest.
 - A development boot has no manifest. Its kernel commits the genesis record its image holds ([13-tree](13-tree.md#genesis)).
+- When the boot volume holds `/nan.nbun`, `/nan.ntree` and `/kernel.nlif`, a development loader passes each to the kernel as the module named by its file name: the toolchain of the [`nan` job](20-base.md#jobs).
 - Flag 0 of the handoff record and `/live/security` mark a development loader. A vendor must not sign a development loader for secure boot.
 
 ## Direct boot

@@ -169,7 +169,7 @@ Admits, lowers again and removes bundles ([Code](10-code.md)).
 | `remove` | `bundle: HashValue` | — | `code.in-use` | `recorded` |
 | `recompute` | `changed: Option[u64]`, the commit that changed the policy | — | — | `recorded` |
 
-The plan step `install` runs `admit`, and [toolchain updates](10-code.md#toolchain-updates) run `lower`. `recompute` judges every admitted bundle again under the keys and, once its check of `changed` is done, the policy, as [provenance](09-authority.md#provenance) and [rotation and revocation](09-authority.md#rotation-and-revocation) state. Wiring: a View of `/sys/code`; Views reading `/sys/instances` and `/live/instances`, where `remove` finds the specifications and running instances naming a code hash; ports to `store`, `keys`, `policy`, `devices` and `journal`; the core's load-time registries; a `Control` grant with `lifecycle`, failing the instances of a bundle `recompute` refuses, and `spawn`, running the `nan` job.
+The plan step `install` runs `admit`, and [toolchain updates](10-code.md#toolchain-updates) run `lower`. `recompute` judges every admitted bundle again under the keys and, once its check of `changed` is done, the policy, as [provenance](09-authority.md#provenance) and [rotation and revocation](09-authority.md#rotation-and-revocation) state. Wiring: a View of `/sys/code`; Views reading `/sys/instances` and `/live/instances`, where `remove` finds the specifications and running instances naming a code hash; ports to `store`, `keys`, `policy`, `devices` and `journal`; the core's load-time registries; a `Control` grant with `lifecycle`, failing the instances of a bundle `recompute` refuses, and `spawn`, running the `nan` job (requires [N52](22-nan.md#n52)).
 
 ## `boot`
 
@@ -232,15 +232,17 @@ Model inference. Its configuration `InferConfig { models: mem::List[Model] }` at
 
 ## Jobs
 
-A generation ships five jobs, admitted bundles of provenance `vendor` that the plan step `run` or the named operation starts ([jobs](06-execution.md#jobs)). Its kernel image runs `selftest`, `scrub` and `replay`, each the bundle whose code hash is that of the `CodeId` rooted at its name with the base bundle's code hash as its one code root ([genesis](13-tree.md#genesis)):
+A generation ships five jobs, admitted bundles of provenance `vendor` that the plan step `run` or the named operation starts ([jobs](06-execution.md#jobs)). Its kernel image runs `selftest`, `scrub` and `replay`, each the bundle whose code hash is that of the `CodeId` rooted at its name with the base bundle's code hash as its one code root ([genesis](13-tree.md#genesis)), and `nan`, whose code roots are the base bundle's code hash and the tree hash of the toolchain it runs:
 
 | Job | Does | Input → result | Started by |
 | --- | --- | --- | --- |
-| `nan` | the NaN toolchain over a store tree: `check` in verify mode (requires [N26](22-nan.md#n26)), `test`, `build` and lowering (requires [N44](22-nan.md#n44)); only on a machine with at least 4 GiB of RAM ([derived defaults](01-machines.md#derived-defaults)) | `NanRequest { command, tree, scope }` → `NanReport { verdict, records }` | `admission`, `run` |
+| `nan` | the NaN toolchain over a store tree: `check` in verify mode (requires [N26](22-nan.md#n26)), `verify`, `test`, `build` and lowering (requires [N44](22-nan.md#n44), [N52](22-nan.md#n52)); only on a machine with at least 4 GiB of RAM ([derived defaults](01-machines.md#derived-defaults)) | `NanRequest { command, tree, scope }` → `NanReport { verdict, records }` | `admission` (requires [N52](22-nan.md#n52)), `run` |
 | `scrub` | verifies the store's checksums and blob identities ([scrub](12-store-format.md#scrub)) and the whole retained [audit chain](17-observability.md#audit-chain) | → `ScrubReport` | `store`'s `scrub`, `run` |
 | `selftest` | checks that every base instance is `converged`, `/live/memory` sums to RAM, the policy record verifies, every grant lies within its parent and every specification's bundle is admitted | → a list of `Check { name, passed, detail }` | `run` |
 | `bench` | measures the requirements of [Performance](21-performance.md#measurement) | `BenchRequest` → `BenchReport` | `run` |
 | `replay` | re-runs a recorded transition on a fork ([replay](17-observability.md#replay)) | `ReplayRequest` → `ReplayReport` | `run` |
+
+The `nan` job runs the toolchain bundle a generation ships, built against its kernel image's interface file ([development loader](03-boot.md#development-loader)). At start, on a machine with at least 4 GiB of RAM, the kernel isolates it and sets 896 MiB of frames aside, on which it runs each run in an [isolated space](04-kernel.md#isolated-spaces) of its own, one at a time. A run's arguments are the request's command and scope, a `build` being against the running kernel's interface file. Its file system is the dir `tree` names in the job's file view, empty for its root, holding in memory the toolchain's user directory `home` and, at its root, the toolchain's tree hash as `image.ntree` and the interface file as `kernel.nlif` ([NaN 36 §Toolchain hash](https://github.com/nan-language/nan/blob/main/docs/spec/36-builds.md#toolchain-hash)); its other services are those of the job's world. The report's `verdict` is the last line the toolchain writes to its standard streams, and `records` the lines before it.
 
 ## Classical equivalents
 

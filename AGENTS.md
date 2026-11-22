@@ -18,7 +18,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `bootfmt/` | The `bootfmt` package: the boot record, the handoff record and the kernel image |
 | `acpi/` | The `acpi` package: the ACPI tables NaN OS reads |
 | `crypto/` | The `crypto` package: XChaCha20-Poly1305 sealing and BLAKE3 key derivation on secret values |
-| `code/` | The `code` package: the records of bundle files, their code hash and their admission, reading their artefacts, and making a bundle from what a bundle build writes |
+| `code/` | The `code` package: the records of bundle files, their code hash and their admission, reading their artefacts, making a bundle from what a bundle build writes, and the `nan` job's request and report |
 | `admission/` | The `admission` package: the `admission` instance, judging bundles by the steps of admission |
 | `os/` | The `os` package: the records instances and the core share, message headers, and the capability kinds `Port`, `Control`, `Live`, `Callers`, `Accounts` and `Meter` |
 | `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints, dead letters, flight recorders, forks, pauses, replays, hibernations, updates and their probations, jobs with their streams and file views, and the accounts of sessions |
@@ -38,7 +38,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `loader/` | The `loader` package |
 | `jobs/` | The jobs a generation ships, one package each |
 | `kernel/` | The `kernel` package |
-| `tools/` | The `install`, `sandbox` and `transcripts` scripts, and in `bundler/` the host program making bundle files |
+| `tools/` | The `install`, `sandbox`, `toolchain` and `transcripts` scripts, and in `bundler/` the host program making bundle files |
 | `docs/` | Documentation: the specification in `docs/spec/`, ADRs in `docs/decisions/` |
 
 One row per top-level directory; deeper only where the tree alone would not tell an agent where a change belongs.
@@ -54,6 +54,7 @@ One row per top-level directory; deeper only where the tree alone would not tell
 | `nan build [<scope>]` | Build the images of the scope's programs, applying the final-build rules |
 | `tools/sandbox start [<instance>]` | Boot NaN OS under QEMU from a fresh copy of the working tree, its serial console on standard output |
 | `tools/sandbox reset [<instance>]` | Delete a sandbox instance |
+| `tools/toolchain [<workspace>]` | Build the `nan` job's toolchain from the pinned release's source against the workspace's kernel interface file into its `.nan/images/x86_64-nanos/`, the repository's by default |
 | `tools/transcripts [<instance>]` | Boot a fresh sandbox instance and run each link transcript of `link/transcripts/` on its serial console |
 | `nan run bundler -- key <seed file>` | Print the public key of a builder's seed file, writing a random seed when it is missing |
 | `nan run bundler -- bundle <root> <images dir> <interface file> <builder> <seed file> <out> [<vendor> <vendor seed file>]` | Write the bundle file of the bundle build of `root`, certified by `builder` with the seed's key and signed by `vendor` with its seed's key when given, and print its code hash and blob id |

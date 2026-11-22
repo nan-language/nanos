@@ -1,0 +1,291 @@
+//! The `nan` job: the toolchain the generation ships run for a job's request in an isolated space over the job's workspace, and the core task running each run on the frames the start sets aside.
+
+/// The frames the start sets aside for the toolchain's spaces: those of a space's boot heap, 768 MiB, and 128 MiB for its images, stacks and tables.
+const SPACE_FRAMES: u64 = 229_376
+
+/// The least RAM of a machine that runs the `nan` job.
+const TOOLCHAIN_RAM: u64 = 4_294_967_296
+
+/// The boot modules the start holds back from the frame allocator while it isolates the toolchain they ship.
+linear struct Shipping {
+    held: mem::List[boot::Module]
+} Shipping
+
+/// The modules `modules` holds that ship the toolchain, the regions of the others inserted into `regions`.
+fn Shipping.of(take modules: mem::List[boot::Module], mut regions: mem::List[hw::Region], alloc: mem::Alloc) -> Shipping {
+    var shipping = Shipping(held: mem::List.empty(alloc))
+    for module in take modules {
+        match mut shipping.hold(take module, alloc) {
+            Some(other) => insert_region(mut regions, region: take other.into_region())
+            None => {
+            }
+        }
+    }
+    return shipping
+} Shipping.of
+
+/// The toolchain `shipping` holds, isolated through `loader` on a machine of `ram` bytes of RAM that runs the `nan` job; the memory of its modules then goes to the frame allocator of `memory`.
+fn shipped_toolchain(
+    take shipping: Shipping,
+    loader: sys::load::Loader,
+    ram: u64,
+    mut memory: frames::Memory,
+    alloc: mem::Alloc,
+    ) -> Option[toolchain::Shipped] {
+    let shipped = match ram >= TOOLCHAIN_RAM {
+        true => shipping.isolated(loader, alloc)
+        false => None
+    }
+    take shipping.release(mut memory, scratch: alloc)
+    return shipped
+} shipped_toolchain
+
+/// The minted toolchain capabilities of `shipped`, when the start isolated one, whose runs go to `runs`.
+fn minted_toolchain(shipped: Option[toolchain::Shipped], runs: task::Sender[toolchain::Run], alloc: mem::Alloc) -> Option[toolchain::MintedToolchain] {
+    return match shipped {
+        Some(given) => Some(toolchain::MintedToolchain.of(runs, shipped: given, alloc))
+        None => None
+    }
+} minted_toolchain
+
+/// The tree hash of `shipped`, when the start isolated one.
+fn toolchain_tree(shipped: Option[toolchain::Shipped]) -> Option[ident::HashValue] {
+    return match shipped {
+        Some(given) => Some(given.tree)
+        None => None
+    }
+} toolchain_tree
+
+/// The frames set aside from `frames` for the spaces of `shipped`, when the start isolated one.
+fn spaces_of(shipped: Option[toolchain::Shipped], mut frames: frames::Frames, alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] {
+    return match shipped {
+        Some(_) => mut frames.lend(SPACE_FRAMES, alloc)
+        None => mem::List.empty(alloc)
+    }
+} spaces_of
+
+/// Holds `module` back when it is one the toolchain ships in, giving it back otherwise.
+fn Shipping.hold(mut self, take module: boot::Module, alloc: mem::Alloc) -> Option[boot::Module] {
+    let name = module.name(alloc)
+    if is_named(name, wanted: toolchain::IMAGE_MODULE) or is_named(name, wanted: toolchain::TREE_MODULE) or is_named(name, wanted: toolchain::INTERFACE_MODULE) {
+        mut self.held.push(take module)
+        return None
+    }
+    return Some(take module)
+} Shipping.hold
+
+/// Whether the module name `raw` is `wanted`.
+validator fn is_named(raw: Untrusted[mem::Bytes], wanted: Str) -> bool {
+    return raw.inspect().view() == wanted.as_bytes()
+} is_named
+
+/// The position of the held module named `wanted`.
+fn Shipping.position(self, wanted: Str, alloc: mem::Alloc) -> Option[usize] {
+    return self.held.position(fn(module: boot::Module) => is_named(module.name(alloc), wanted))
+} Shipping.position
+
+/// The toolchain the held modules ship, isolated through `loader`; `None` unless all three are held and it isolates.
+fn Shipping.isolated(self, loader: sys::load::Loader, alloc: mem::Alloc) -> Option[toolchain::Shipped] {
+    let Some(image) = self.position(toolchain::IMAGE_MODULE, alloc) else {
+        return None
+    }
+    let Some(tree) = self.position(toolchain::TREE_MODULE, alloc) else {
+        return None
+    }
+    let Some(nlif) = self.position(toolchain::INTERFACE_MODULE, alloc) else {
+        return None
+    }
+    return toolchain::Shipped.of(loader, image: self.held[image].contents(), tree: self.held[tree].contents(), nlif: self.held[nlif].contents(), alloc)
+} Shipping.isolated
+
+/// Gives the memory of the held modules to the frame allocator of `memory`.
+fn Shipping.release(take self, mut memory: frames::Memory, scratch: mem::Alloc) {
+    let Shipping(held: held) = self
+    for module in take held {
+        mut memory.add(take module.into_region(), scratch)
+    }
+} Shipping.release
+
+/// A toolchain capability `toolchains` mints, when there is one.
+fn mint_toolchain(toolchains: Option[toolchain::MintedToolchain]) -> Option[toolchain::Toolchain] {
+    return match toolchains {
+        Some(minted) => Some(minted.mint())
+        None => None
+    }
+} mint_toolchain
+
+/// Revokes the toolchain capabilities `toolchains` mints.
+fn close_toolchains(take toolchains: Option[toolchain::MintedToolchain]) {
+    match toolchains {
+        Some(minted) => take minted.close()
+        None => {
+        }
+    }
+} close_toolchains
+
+/// Runs the toolchain `shipped`, when the start isolated one, for each run `runs` brings, one at a time, in an isolated space on `cpu` over `frames`, which the start set aside for it.
+fn serve_toolchain(
+    cpu: hw::Ring0,
+    shipped: Option[toolchain::Shipped],
+    take runs: task::Receiver[toolchain::Run],
+    mut frames: mem::List[hw::PhysFrame[4_096]],
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    let Some(toolchain) = shipped else {
+        discard runs
+        return
+    }
+    var receiver = runs
+    loop {
+        let Some(run) = try await mut receiver.receive() else {
+            return
+        }
+        try await toolchain.run(cpu, take run, mut frames, exec, alloc)
+    }
+} serve_toolchain
+
+/// Runs the `nan` job with `input`, the encoding of its `code::NanRequest`, on `world`: the toolchain's command over the workspace the request names in the job's file view, in an isolated space the core runs, its result the `code::NanReport` of what the toolchain wrote; `code.no-image` on a machine running no toolchain.
+fn Base.run_nan(self, take input: mem::Bytes, take world: nanos::World, alloc: mem::Alloc) -> os::JobOutcome fails task::Cancelled uses wait {
+    let Some(toolchain) = self.toolchain else {
+        return os::JobOutcome.Failed(text: text::String.of("code.no-image", alloc))
+    }
+    let Some(tree) = toolchain.tree() else {
+        return os::JobOutcome.Failed(text: text::String.of("code.no-image", alloc))
+    }
+    let Ok(request) = attempt mem::wire::Codec[code::NanRequest].decode(Untrusted.of(input.view()), alloc) else {
+        return mismatch(alloc)
+    }
+    let disk = match request.tree.is_empty() {
+        true => world.fs
+        false => match attempt world.fs.subdir(request.tree.as_str()) {
+            Ok(dir) => dir
+            Err(_) => return os::JobOutcome.Failed(text: text::String.of("store.not-found", alloc))
+        }
+    }
+    let nlif = toolchain.nlif(alloc)
+    let task::Channel(sender: ordering, receiver: orders) = toolchain::orders_of(alloc)
+    let workspace = toolchain::MintedWorkspace.of(ordering, alloc)
+    defer take workspace.close()
+    let capture = toolchain::MintedCapture.of(alloc)
+    defer take capture.close()
+    var ended: Result[nanos::Ended, text::Fixed[32]] = Err(text::Fixed[32].of("instance.env-incomplete"))
+    let served = attempt sys::Fs.served(workspace.mint())
+    let streams = attempt sys::Stdio.served(capture.mint())
+    var serving = Some(take orders)
+    match served {
+        Ok(fs) => match streams {
+            Ok(stdio) => {
+                let services = nanos::Services(clock: world.clock, log: world.log, stdio: stdio, random: world.random, fs: fs)
+                try await task::scope(world.exec, body: fn[mut serving, mut ended](s: task::Scope) fails task::Cancelled uses wait {
+                    let Some(given) = mut serving.extract() else {
+                        return
+                    }
+                    discard s.spawn(fn[take given]() fails task::Cancelled uses wait limits stack 65_536 {
+                        try await toolchain::serve_workspace(disk, tree, nlif: nlif.view(), orders: take given, alloc)
+                    })
+                    ended = try await toolchain.run(host_input(request, alloc), services, alloc)
+                    s.cancel()
+                })
+            }
+            Err(_) => {
+            }
+        }
+        Err(_) => {
+        }
+    }
+    discard serving
+    let written = try await capture.written(alloc)
+    return match ended {
+        Ok(nanos::Ended.Returned(_)) => {
+            var bytes = mem::Bytes.empty(alloc)
+            mem::wire::Codec[code::NanReport].encode(report_of(written.view(), alloc), out: mut bytes)
+            return os::JobOutcome.Returned(bytes: take bytes)
+        }
+        Ok(nanos::Ended.Trapped(trap)) => os::JobOutcome.Trapped(text: text::String.of(journal::trap_code(trap.kind()).as_str(), alloc))
+        Ok(nanos::Ended.Cancelled) or Ok(nanos::Ended.Abandoned) => os::JobOutcome.Cancelled(reason: text::String.empty(alloc))
+        Ok(nanos::Ended.Failed(text)) => os::JobOutcome.Failed(text: take text)
+        Ok(nanos::Ended.Undecodable) => mismatch(alloc)
+        Err(code) => os::JobOutcome.Failed(text: text::String.of(code.as_str(), alloc))
+    }
+} Base.run_nan
+
+/// The `nanos::HostInput` of the toolchain's command line for `request`: its command and scope, a build being against the running kernel's interface file.
+fn host_input(request: code::NanRequest, alloc: mem::Alloc) -> mem::Bytes {
+    var args = mem::List[mem::Bytes].empty(alloc)
+    let command = match request.command {
+        code::NanCommand.Check => "check"
+        code::NanCommand.Verify => "verify"
+        code::NanCommand.Test => "test"
+        code::NanCommand.Build => "build"
+    }
+    mut args.push(bytes_of(command, alloc))
+    if not request.scope.is_empty() {
+        mut args.push(bytes_of(request.scope.as_str(), alloc))
+    }
+    if request.command == code::NanCommand.Build {
+        mut args.push(bytes_of("--against", alloc))
+        mut args.push(bytes_of("/kernel.nlif", alloc))
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[nanos::HostInput].encode(nanos::HostInput(args: take args, environment: mem::Map.empty(alloc)), out: mut bytes)
+    return bytes
+} host_input
+
+fn bytes_of(text: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(text.as_bytes())
+    return bytes
+} bytes_of
+
+/// The report of what the toolchain wrote, `written`: its last line as the verdict, and the lines before it but a first one repeating it.
+fn report_of(written: Slice[u8], alloc: mem::Alloc) -> code::NanReport {
+    var lines = mem::List[text::String].empty(alloc)
+    var start: usize = 0
+    for at in 0..=written.len() {
+        if at < written.len() and written[at] != b'\n' {
+            continue
+        }
+        match line_at(written, start, end: at, alloc) {
+            Some(line) => mut lines.push(take line)
+            None => {
+            }
+        }
+        start = at + 1
+    }
+    let Some(verdict) = mut lines.pop() else {
+        return code::NanReport(verdict: text::String.empty(alloc), records: take lines)
+    }
+    if lines.len() > 0 and lines[0].as_str() == verdict.as_str() {
+        discard mut lines.remove(0)
+    }
+    return code::NanReport(verdict: take verdict, records: take lines)
+} report_of
+
+/// The text of the bytes of `written` from `start` to `end`, `None` when empty or not UTF-8.
+fn line_at(written: Slice[u8], start: usize, end: usize, alloc: mem::Alloc) -> Option[text::String] {
+    if end <= start {
+        return None
+    }
+    let Some(parts) = written.split_at(start) else {
+        return None
+    }
+    let Some(line) = parts.tail.prefix(end - start) else {
+        return None
+    }
+    return match attempt text::String.try_from_utf8(line, alloc) {
+        Ok(decoded_line) => Some(take decoded_line)
+        Err(_) => None
+    }
+} line_at
+
+test reports_take_the_last_line_as_verdict_and_drop_the_first_repeating_it for report_of {
+    let alloc = testing::world().alloc
+    let report = report_of(b"failed check hello: errors 1, incomplete 0\nerror type.mismatch hello/hello.nan:4 main\n    because note - - expected u8\n\nfailed check hello: errors 1, incomplete 0\n", alloc)
+    expect report.verdict.as_str() == "failed check hello: errors 1, incomplete 0"
+    expect report.records.len() == 2
+    expect report.records[0].as_str() == "error type.mismatch hello/hello.nan:4 main"
+    expect report.records[1].as_str() == "    because note - - expected u8"
+    let silent = report_of(b"", alloc)
+    expect silent.verdict.is_empty() and silent.records.len() == 0
+} reports_take_the_last_line_as_verdict_and_drop_the_first_repeating_it

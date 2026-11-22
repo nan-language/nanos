@@ -18,7 +18,7 @@ installs `nan`, the NaN toolchain release the project pins, as `~/.local/bin/nan
 tools/sandbox start
 ```
 
-builds NaN OS and boots it under QEMU, its serial console on the terminal, until Ctrl-C. [docs/sandbox.md](docs/sandbox.md) describes the sandbox.
+builds NaN OS and boots it under QEMU with 5 GiB of memory, its serial console on the terminal, until Ctrl-C; the first start also fetches and builds the NaN toolchain its `nan` job runs. [docs/sandbox.md](docs/sandbox.md) describes the sandbox.
 
 ## Specification
 
