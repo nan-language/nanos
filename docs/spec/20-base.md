@@ -48,7 +48,7 @@ The lazy base instances have `lazy` set, start at their first message ([lazy sta
 
 ## `supervisor`
 
-`supervisor` reconciles `/sys/instances` and `/sys/config` with the instances that run ([Execution](06-execution.md)), supervises every top-level instance, and runs [health windows](14-changes.md#health-windows) and [probations](10-code.md#probation). Its operations write desired state ([desired and observed state](13-tree.md#desired-and-observed-state)):
+`supervisor` reconciles `/sys/instances` and `/sys/config` with the instances that run ([Execution](06-execution.md)) and `/sys/code` with the bundles loaded for their [contributions](10-code.md#registries), has `admission` run `recompute` when `/sys/policy` or `/sys/principals` change, supervises every top-level instance, and runs [health windows](14-changes.md#health-windows) and [probations](10-code.md#probation). Its operations write desired state ([desired and observed state](13-tree.md#desired-and-observed-state)):
 
 | Operation | Arguments | Result | Failures | Reversibility |
 | --- | --- | --- | --- | --- |
@@ -164,11 +164,12 @@ Admits, lowers again and removes bundles ([Code](10-code.md)).
 
 | Operation | Arguments | Result | Failures | Reversibility |
 | --- | --- | --- | --- | --- |
-| `admit` | `bundle: View`, reading the bundle blob alone, and `base: CommitId` | the admission record | the codes of [admission](10-code.md#admission) | `recorded` |
+| `admit` | `bundle: View`, reading the bundle blob alone, and `base: CommitId` | the admission record, and the drivers the load of its contributions would start ([matching](15-devices.md#matching)) | the codes of [admission](10-code.md#admission) | `recorded` |
 | `lower` | `bundle: HashValue` | — | `code.no-image`, `code.recheck-failed` | `recorded` |
 | `remove` | `bundle: HashValue` | — | `code.in-use` | `recorded` |
+| `recompute` | `changed: Option[u64]`, the commit that changed the policy | — | — | `recorded` |
 
-The plan step `install` runs `admit`, and [toolchain updates](10-code.md#toolchain-updates) run `lower`. Wiring: a View of `/sys/code`; Views reading `/sys/instances` and `/live/instances`, where `remove` finds the specifications and running instances naming a code hash; ports to `store`, `keys`, `policy` and `journal`; a `Control` grant with `spawn` to run the `nan` job.
+The plan step `install` runs `admit`, and [toolchain updates](10-code.md#toolchain-updates) run `lower`. `recompute` judges every admitted bundle again under the keys and, once its check of `changed` is done, the policy, as [provenance](09-authority.md#provenance) and [rotation and revocation](09-authority.md#rotation-and-revocation) state. Wiring: a View of `/sys/code`; Views reading `/sys/instances` and `/live/instances`, where `remove` finds the specifications and running instances naming a code hash; ports to `store`, `keys`, `policy`, `devices` and `journal`; the core's load-time registries; a `Control` grant with `lifecycle`, failing the instances of a bundle `recompute` refuses, and `spawn`, running the `nan` job.
 
 ## `boot`
 

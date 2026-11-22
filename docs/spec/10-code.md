@@ -200,7 +200,7 @@ pub closed struct Lowered derives Encode {
 } Lowered
 ```
 
-`Provenance` is the type of [provenance](09-authority.md#provenance), and the other named types are those of [identifiers](02-identifiers.md#types). `admitted` is the base commit of the plan admitting the bundle. `admission` rewrites `image` when it lowers again, and `provenance` and `shared` when it recomputes them ([provenance](09-authority.md#provenance)). The revocation of a key whose signature an admission relied on runs admission again for that bundle ([rotation and revocation](09-authority.md#rotation-and-revocation)); when it refuses the bundle, its instances stop and enter `failed` with the refusal's code. The operation `remove` of `admission` ([admission](20-base.md#admission)) deletes the dir; it fails with `code.in-use` while a spec or a job names the code hash.
+`Provenance` is the type of [provenance](09-authority.md#provenance), and the other named types are those of [identifiers](02-identifiers.md#types). `admitted` is the base commit of the plan admitting the bundle. `admission` rewrites `image` when it lowers again, and `provenance` and `shared` when it recomputes them ([provenance](09-authority.md#provenance)). The revocation of a key whose signature an admission relied on runs admission again for that bundle ([rotation and revocation](09-authority.md#rotation-and-revocation)); when it refuses the bundle, its instances stop and enter `failed` with the refusal's code, and `admission` deletes its dir. The operation `remove` of `admission` ([admission](20-base.md#admission)) deletes the dir; it fails with `code.in-use` while a spec or a job names the code hash.
 
 ## Loading
 
@@ -221,6 +221,7 @@ The registries of the kernel image are **load-time registries**: their tables at
 - The kernel policy registries `sched.pick`, `sched.place`, `mem.reclaim`, `power.idle` and `power.perf` take contributions only from bundles of provenance `vendor` or `reviewed` whose `shared` field holds (`code.registry-denied`).
 - Loading replaces a table atomically: a reader of the previous table finishes with it. A function field of a contributed entry is called through N6's convention across closures.
 - Unloading removes the bundle's entries and restores those they replaced.
+- The runner loads each admitted bundle whose [admission record](#admission-record) lists contributions into the shared space when the plan installing it applies and at each boot, as `supervisor` finds it in `/sys/code`, and unloads it once that record is removed.
 
 ## Live update
 

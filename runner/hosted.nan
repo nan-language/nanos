@@ -18,7 +18,7 @@ struct Hosted {
 /// The longest an instance started by an update waits for a message before its holder looks for a health probe to run, in nanoseconds; such an instance is never suspended.
 const PROBED_WAIT_NS: u64 = 1_000_000_000
 
-/// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, the protocol its component serves and the names of its operations by number, the encoding of the protocol schema its bundle gives for it, the executor and allocator of its domain, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
+/// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, the protocol its component serves and the names of its operations by number, the encoding of the protocol schema its bundle gives for it, the executor and allocator of its domain, the cell it draws what it hands the driver through, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
 pub open linear struct Hosting {
     serving: Serving
     protocol: sys::ProtocolHash
@@ -26,6 +26,7 @@ pub open linear struct Hosting {
     served: Option[mem::Bytes]
     exec: task::Executor
     alloc: mem::Alloc
+    handing: mem::Budget
     replier: sys::Minter[Replier, Pending, u8]
     replies: mem::Shared[hw::SpinLock[mem::Bounded[Handed, QUEUED_REPLIES]]]
     signal: mem::Shared[hw::Signal[Unit]]
@@ -251,10 +252,11 @@ pub fn Hosting.of(
     alloc: mem::Alloc,
     ) -> Hosting {
     let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
-    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: serving.keeping.is_some(), syncing: syncing.share(), alloc: alloc)
+    let handing = alloc.split(HANDED_LIMIT)
+    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: serving.keeping.is_some(), syncing: syncing.share(), alloc: handing.alloc())
     let replies = pending.replies.share()
     let signal = pending.signal.share()
-    return Hosting(serving: take serving, protocol: protocol, operations: take operations, served: None, exec: exec, alloc: alloc, replier: sys::Minter[Replier, Pending, u8].of(take pending, alloc), replies: take replies, signal: take signal, syncing: take syncing)
+    return Hosting(serving: take serving, protocol: protocol, operations: take operations, served: None, exec: exec, alloc: alloc, handing: take handing, replier: sys::Minter[Replier, Pending, u8].of(take pending, alloc), replies: take replies, signal: take signal, syncing: take syncing)
 } Hosting.of
 
 /// Keeps `served`, the protocol schema the bundle gives for the component, for the driver.
@@ -286,14 +288,17 @@ pub fn Hosting.take_checkpoint(mut self) -> Option[nanos::Checkpoint] {
 
 /// Revokes the runner capability of an instance the kernel never held.
 pub fn Hosting.close(take self) {
-    let Hosting(serving: _, protocol: _, operations: _, served: _, exec: _, alloc: _, replier: replier, replies: _, signal: _, syncing: _) = self
+    let Hosting(serving: _, protocol: _, operations: _, served: _, exec: _, alloc: _, handing: handing, replier: replier, replies: _, signal: _, syncing: _) = self
     take replier.close()
+    take handing.close()
 } Hosting.close
 
 /// Runs the instance `instance` of the bundle's component as `Driven.run` runs one of the kernel image: resumes it, ends it at once when its health is not `Healthy`, then serves what its driver delivers, one call at a time, suspending it after the time without a message the driver sets and keeping its checkpoints. Told to stop, it handles every message that waits, keeps a checkpoint when the state is dirty, and ends the instance. Orders for its holder are refused. How the instance ended, or the trap that abandoned its domain.
 pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
-    let Hosting(serving: serving, protocol: protocol, operations: operations, served: served, exec: exec, alloc: alloc, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
+    let Hosting(serving: serving, protocol: protocol, operations: operations, served: served, exec: exec, alloc: alloc, handing: handing, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
+    defer take handing.close()
     defer take replier.close()
+    let handed = handing.alloc()
     let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: _, updated: updated, replay: replay, config: _, forking: _, recorder: recorder) = serving
     var held = instance
     defer take held.abandon()
@@ -326,7 +331,7 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
             let setting = quiet.share()
             let probing = probe.share()
             discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take setting, take probing]() fails Stopping uses wait limits stack 40_960 {
-                try await dispatch_hosted(inbox, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, quiet: setting, probe: probing, alloc)
+                try await dispatch_hosted(inbox, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, quiet: setting, probe: probing, handed, alloc)
             })
             let answering = reports.split()
             let queued = replies.share()
@@ -392,7 +397,7 @@ fn begin_hosted(mut instance: nanos::Instance, restored: bool, updated: bool, te
     }
 } begin_hosted
 
-/// Serves each call delivered to the instance through `inbox`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which it is suspended, setting `probe` for each health probe ordered and refusing each other order for its holder.
+/// Serves each call delivered to the instance through `inbox`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which it is suspended, setting `probe` for each health probe ordered, refusing each other order for its holder and drawing the replies it hands the driver through `handed`.
 fn dispatch_hosted(
     inbox: nanos::Inbox,
     take deliveries: task::Receiver[Delivery],
@@ -402,6 +407,7 @@ fn dispatch_hosted(
     incarnation: u64,
     quiet: mem::Shared[core::atomic::AtomicU64],
     probe: mem::Shared[core::atomic::AtomicBool],
+    handed: mem::Alloc,
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
     var receiver = deliveries
@@ -424,7 +430,7 @@ fn dispatch_hosted(
                     return try await inbox.call(hash, request: id, encoding: take given, alloc)
                 })
                 counts.post(None)
-                try await settle_call(take outcome, id, request, steps: counts, mut signals, reports, incarnation)
+                try await settle_call(take outcome, id, request, steps: counts, mut signals, reports, incarnation, handed)
                 counts.deadline.store(os::NO_DEADLINE)
             }
             Delivery.SuspendAfter(ms: ms) => quiet.contents().store(u64.widen(ms))

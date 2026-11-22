@@ -21,7 +21,7 @@ pub protocol Oversight {
     pub fn appended(subscription: u64, path: ident::Path, seq: u64) limits traceless
     pub fn lost(subscription: u64, commits: u64) limits traceless
     /// The record of `/sys/policy` was checked: `policy` when it is valid, else the code of the check it failed.
-    fn checked(outcome: Checked) limits traceless
+    fn checked(outcome: Checked, read: u64) limits traceless
 } Oversight
 
 /// What `explain` gives: the rules matching the subject, and its decision.
@@ -30,12 +30,13 @@ pub closed struct Explanation derives Render, Encode {
     pub decision: Decision
 } Explanation
 
-/// What `trust` gives: the principal globs of the policy's reviewers, sealers and builders, and its `agent_shared_space`.
+/// What `trust` gives: the principal globs of the policy's reviewers, sealers and builders, its `agent_shared_space`, and the commit that wrote the record of `/sys/policy` the latest check read, 0 before one did.
 pub closed struct Trust derives Render, Encode {
     pub reviewers: mem::List[text::String]
     pub sealers: mem::List[text::String]
     pub builders: mem::List[text::String]
     pub agent_shared_space: bool
+    pub read: u64
 } Trust
 
 /// The outcome of checking the record of `/sys/policy`: its policy, or the code of the validity check it failed.
@@ -70,10 +71,11 @@ pub open struct Env derives Send {
     alloc: mem::Alloc
 } Env
 
-/// The state of `policy`: the policy it decides by, and whether it accepted it or decides by `locked` for want of one.
+/// The state of `policy`: the policy it decides by, whether it accepted it or decides by `locked` for want of one, and the commit that wrote the record the latest check read.
 pub closed struct Overseer derives Render, Encode {
     pub policy: Policy
     pub accepted: bool
+    pub read: u64
 } Overseer
 
 impl Overseer: sys::Component[Env, Oversight]
@@ -98,7 +100,7 @@ pub fn Env.of(
 } Env.of
 
 pub fn Overseer.start(mut env: Env) -> Overseer {
-    return Overseer(policy: Preset.Locked.policy(version: 0, machine: Array[u8, 16].filled(0), alloc: env.alloc), accepted: false)
+    return Overseer(policy: Preset.Locked.policy(version: 0, machine: Array[u8, 16].filled(0), alloc: env.alloc), accepted: false, read: 0)
 } Overseer.start
 
 /// Draws the machine id when its configuration holds none, then checks the record of `/sys/policy` and subscribes to its changes, from a keyed task.
@@ -141,7 +143,7 @@ pub fn Overseer.explain(mut self, take subject: Subject, mut env: Env, mut cx: s
 } Overseer.explain
 
 pub fn Overseer.trust(mut self, mut env: Env, mut cx: sys::Cx[Oversight]) -> Trust {
-    return Trust(reviewers: copies(self.policy.reviewers, alloc: env.alloc), sealers: copies(self.policy.sealers, alloc: env.alloc), builders: copies(self.policy.builders, alloc: env.alloc), agent_shared_space: self.policy.agent_shared_space)
+    return Trust(reviewers: copies(self.policy.reviewers, alloc: env.alloc), sealers: copies(self.policy.sealers, alloc: env.alloc), builders: copies(self.policy.builders, alloc: env.alloc), agent_shared_space: self.policy.agent_shared_space, read: self.read)
 } Overseer.trust
 
 /// Whether one of the principal globs `patterns` matches `principal`.
@@ -189,7 +191,8 @@ pub fn Overseer.lost(
 } Overseer.lost
 
 /// Decides by the policy checked when it is valid, emitting `policy.changed`, else by `locked`, emitting `policy.invalid`.
-fn Overseer.checked(mut self, take outcome: Checked, mut env: Env, mut cx: sys::Cx[Oversight]) {
+fn Overseer.checked(mut self, take outcome: Checked, take read: u64, mut env: Env, mut cx: sys::Cx[Oversight]) {
+    self.read = read
     let events = env.events
     let alloc = env.alloc
     match outcome {
@@ -253,23 +256,23 @@ fn Checking.check(self, machine: Array[u8, 16], out: sys::Outbox[Oversight]) fai
         Ok(found) => found
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(_) => {
-            discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("store.not-found", alloc)))
+            discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("store.not-found", alloc)), read: 0)
             return
         }
     }
     let Some(value) = node.value else {
-        discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("store.not-found", alloc)))
+        discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("store.not-found", alloc)), read: node.version.number)
         return
     }
     let Some(signed) = signed_of(value.view(), alloc) else {
-        discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("schema.invalid", alloc)))
+        discard attempt await out.checked(outcome: Checked.Invalid(code: text::String.of("schema.invalid", alloc)), read: node.version.number)
         return
     }
     let outcome = match try await self.validity(signed, machine) {
         Some(code) => Checked.Invalid(code: text::String.of(code.as_str(), alloc))
         None => Checked.Valid(policy: take signed.policy)
     }
-    discard attempt await out.checked(take outcome)
+    discard attempt await out.checked(take outcome, read: node.version.number)
 } Checking.check
 
 /// The code of the first validity check `signed` fails for the machine `machine`, `None` when it passes them all: its signature by the owner key, unless it is the genesis record's policy or the boot is in `dev` mode; a version above the one accepted and the machine id, the genesis policy excepted; patterns that parse; no approver, reviewer or sealer glob that can match an agent or an instance; and on a machine without `iommu`, no `autonomous` preset and no agent code in the shared space.

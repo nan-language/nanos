@@ -23,7 +23,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `os/` | The `os` package: the records instances and the core share, message headers, and the capability kinds `Port`, `Control`, `Live`, `Callers`, `Accounts` and `Meter` |
 | `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints, dead letters, flight recorders, forks, pauses, replays, hibernations, updates and their probations, jobs with their streams and file views, and the accounts of sessions |
 | `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |
-| `devices/` | The `devices` package: the device protocols and `fat`'s, the `drivers` registry, the AML evaluator, partition tables, volume views and the device manager |
+| `devices/` | The `devices` package: the device protocols and `fat`'s, the `drivers` registry and the capability through which the core previews and holds bundles' contributions, the AML evaluator, partition tables, volume views and the device manager |
 | `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries |
 | `fat/` | The `fat` package: the boot volume's file system |
 | `store/` | The `store` package: the store's engine, its log, index trees, item table, blob cache and keyring, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol, Views and mappings |

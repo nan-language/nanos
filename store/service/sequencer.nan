@@ -9,7 +9,7 @@ const CAUGHT_UP: u32 = 64
 /// The grants one listing of `/sys/grants` gives at a mount.
 const GRANTS_LISTED: u32 = 256
 
-/// What the sequencer draws on besides its hand-off: the volume's port, the clocks, the random source, the reporter and its cell.
+/// What the sequencer draws on besides its hand-off: the volume's port, the clocks, the random source, the reporter, its cell, and the cell it draws what it sends out of the store's domain through.
 struct Surroundings derives Copy {
     volume: os::Port[devices::Block]
     clock: sys::Clock
@@ -20,6 +20,7 @@ struct Surroundings derives Copy {
     devices: os::Port[devices::Devices]
     keys: Option[os::Port[Sealing]]
     alloc: mem::Alloc
+    transport: mem::Alloc
 } Surroundings
 
 /// A subscription: its number, the subtree and branch it watches, its port, and the commits it could not be told of since it was last told.
@@ -118,7 +119,7 @@ fn sequence(
 /// The engine on the volume behind the port of `world`, which genesis fills when it holds no commit, its retention that of `/sys/config/store`, and the base instances of `main` brought up to date with `genesis` otherwise.
 fn mount(world: Surroundings, take genesis: Genesis, boot: TypedValue) -> Sequencer fails store::StoreError uses wait {
     let alloc = world.alloc
-    let volume = try await Volume.of(world.volume, alloc)
+    let volume = try await Volume.of(world.volume, transport: world.transport, alloc)
     var id = Array[u8, 16].filled(0)
     discard attempt world.random.fill(mut id.view_mut())
     var engine = try await store::Store.mount(volume, volume_id: id, now: world.now(), alloc)
@@ -155,12 +156,12 @@ fn mount(world: Surroundings, take genesis: Genesis, boot: TypedValue) -> Sequen
         Err(_) => {
         }
     }
-    return Sequencer(engine: take engine, volume: volume, subscriptions: mem::List.empty(alloc), placement: try await placement_of(world.devices, alloc), cached: 0, nodes: 0)
+    return Sequencer(engine: take engine, volume: volume, subscriptions: mem::List.empty(alloc), placement: try await placement_of(world.devices, transport: world.transport, alloc), cached: 0, nodes: 0)
 } mount
 
-/// Where `devices` placed the volume, unplaced when it does not tell.
-fn placement_of(devices: os::Port[devices::Devices], alloc: mem::Alloc) -> devices::StorePlacement fails store::StoreError uses wait {
-    var call = sys::Encoded.empty(alloc)
+/// Where `devices` placed the volume, unplaced when it does not tell, its call drawn through `transport`.
+fn placement_of(devices: os::Port[devices::Devices], transport: mem::Alloc, alloc: mem::Alloc) -> devices::StorePlacement fails store::StoreError uses wait {
+    var call = sys::Encoded.empty(transport)
     let reply = sys::Wire[devices::Devices].placement(mut call)
     return match first attempt await devices.call(take call, reply, alloc) {
         Ok(placed) => placed
@@ -321,7 +322,7 @@ fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::O
     for commit in commits {
         mut branches.push(text::String.of(commit.branch.as_str(), alloc))
     }
-    let outcomes = try await mut self.engine.commit_all(self.volume, requests: take commits, secrets: Sealer(keys: world.keys, random: world.random), now: world.now(), alloc)
+    let outcomes = try await mut self.engine.commit_all(self.volume, requests: take commits, secrets: Sealer(keys: world.keys, random: world.random, transport: world.transport), now: world.now(), alloc)
     var at: usize = 0
     for outcome in take outcomes {
         var reply = mem::Bytes.empty(alloc)
@@ -330,7 +331,7 @@ fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::O
                 if branches[at].as_str() == "main" {
                     try await mut self.tell_grants(paths[at], whole: false, world)
                 }
-                try await mut self.tell(branch: branches[at].as_str(), commit: done.number, paths: paths[at], alloc)
+                try await mut self.tell(branch: branches[at].as_str(), commit: done.number, paths: paths[at], transport: world.transport, alloc)
                 let accepted: Result[store::Committed, Failure] = Ok(take done)
                 reply = encoded(accepted, alloc)
             }
@@ -374,14 +375,14 @@ fn Sequencer.hold_grants(mut self, world: Surroundings) fails task::Cancelled us
 /// Tells the core of the grants `/sys/grants/g<n>` among `paths` as `main` holds them, `None` for those it no longer holds, as every grant when `whole`, and waits until it holds them; nothing when `paths` names none and not `whole`.
 fn Sequencer.tell_grants(mut self, paths: mem::List[ident::Path], whole: bool, world: Surroundings) fails task::Cancelled uses wait {
     let alloc = world.alloc
-    var grants = mem::Map[u64, Option[os::Grant]].empty(alloc)
+    var grants = mem::Map[u64, Option[os::Grant]].empty(world.transport)
     for path in paths {
         let Some(number) = grant_number(path, alloc) else {
             continue
         }
         let grant = match first attempt await mut self.engine.get(self.volume, branch: "main", path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), now: world.now(), alloc) {
             Ok(node) => match node.value {
-                Some(value) => match attempt mem::wire::Codec[os::Grant].decode(value.view(), alloc) {
+                Some(value) => match attempt mem::wire::Codec[os::Grant].decode(value.view(), alloc: world.transport) {
                     Ok(decoded) => Some(take decoded)
                     Err(_) => None
                 }
@@ -395,7 +396,7 @@ fn Sequencer.tell_grants(mut self, paths: mem::List[ident::Path], whole: bool, w
     if grants.len() == 0 and not whole {
         return
     }
-    try await world.reporter.grants(take grants, whole, alloc)
+    try await world.reporter.grants(take grants, whole, alloc: world.transport)
 } Sequencer.tell_grants
 
 /// The number of the grant `/sys/grants/g<n>` that `path` names.
@@ -419,12 +420,13 @@ fn grant_number(path: ident::Path, alloc: mem::Alloc) -> Option[u64] {
     return Some(number)
 } grant_number
 
-/// Tells each subscription on `branch` of the commit `commit`, which wrote `paths`, naming those below its prefix.
+/// Tells each subscription on `branch` of the commit `commit`, which wrote `paths`, naming those below its prefix, through calls drawn through `transport`.
 fn Sequencer.tell(
     mut self,
     branch: Str,
     commit: ident::CommitId,
     paths: mem::List[ident::Path],
+    transport: mem::Alloc,
     alloc: mem::Alloc,
     ) fails task::Cancelled uses wait {
     var at: usize = 0
@@ -439,7 +441,7 @@ fn Sequencer.tell(
             }
         }
         if watched.len() > 0 {
-            self.subscriptions[at].lost = try await changed(subscription, commit, paths: take watched, alloc)
+            self.subscriptions[at].lost = try await changed(subscription, commit, paths: take watched, alloc: transport)
         }
         at += 1
     }

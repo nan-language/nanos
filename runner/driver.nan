@@ -149,6 +149,7 @@ struct Outstanding {
 /// What follows the stop of the running incarnation.
 enum Then derives Copy, Eq {
     Stop
+    Fail
     Restart
     Update
 } Then
@@ -753,6 +754,12 @@ fn Shared.order_lifecycle[J: Journal](
             try await self.end_probation(mut driver, ended: journal::ProbationEnd.Stop, journal)
             try await self.stop(mut driver, then: Then.Stop, journal)
         }
+        os::Action.Fail(code: code) => {
+            mut driver.waiters.push(Waiter(done: take done, awaits: Awaited.Stopped))
+            mut driver.showing.faulted(text::String.of(code.as_str(), alloc: self.config.alloc))
+            try await self.end_probation(mut driver, ended: journal::ProbationEnd.Stop, journal)
+            try await self.stop(mut driver, then: Then.Fail, journal)
+        }
         os::Action.Cancel(principal: principal) => {
             if not driver.runs_job() {
                 discard attempt await done.send(Err(os::ControlError.Invalid))
@@ -784,7 +791,7 @@ fn Shared.order_lifecycle[J: Journal](
 /// Whether the order `action` changes the instance's lifecycle.
 fn changes_lifecycle(action: os::Action) -> bool {
     return match action {
-        os::Action.Start or os::Action.Stop or os::Action.Restart or os::Action.Cancel(principal: _) or os::Action.Delete(unplugged: _) or os::Action.Hibernate or os::Action.Wake => true
+        os::Action.Start or os::Action.Stop or os::Action.Fail(code: _) or os::Action.Restart or os::Action.Cancel(principal: _) or os::Action.Delete(unplugged: _) or os::Action.Hibernate or os::Action.Wake => true
         else => false
     }
 } changes_lifecycle
@@ -1393,11 +1400,13 @@ fn Folds.charged(self, held: Held, folded: Folded) -> u64 {
     return held.account.used_ns().saturating_sub(self.out_ns).saturating_add(folded.since(self.in_base).ns)
 } Folds.charged
 
-/// Stops the instance, or has it start again once stopped when `then` is `Restart`: queued calls stay for a restart and are dropped or failed for a stop, what a hibernation left it is dropped, and an instance not yet created is created `stopped`.
+/// Stops the instance, or has it start again once stopped when `then` is `Restart`, or enter `failed` when it is `Fail`: queued calls stay for a restart and are dropped or failed otherwise, what a hibernation left it is dropped, and an instance not yet created is created `stopped`.
 fn Shared.stop[J: Journal](self, mut driver: Driver, then: Then, journal: J) fails task::Cancelled uses wait {
     mut driver.forget_hibernation()
     if then == Then.Stop {
         driver.spec.stopped = true
+    }
+    if then == Then.Stop or then == Then.Fail {
         driver.gate.set(open: false)
         try await mut driver.refuse_queued()
     }
@@ -1411,6 +1420,9 @@ fn Shared.stop[J: Journal](self, mut driver: Driver, then: Then, journal: J) fai
         Some(os::Lifecycle.Starting) or Some(os::Lifecycle.Hibernated) => {
             if driver.domain.is_none() {
                 mut driver.stopped(journal, abandoned: false)
+                if then == Then.Fail {
+                    try await self.give_up(mut driver, journal, cause: driver.cause)
+                }
                 return
             }
         }
@@ -1418,9 +1430,17 @@ fn Shared.stop[J: Journal](self, mut driver: Driver, then: Then, journal: J) fai
             if then == Then.Stop {
                 driver.lifecycle = Some(os::Lifecycle.Stopped)
             }
+            if then == Then.Fail {
+                driver.lifecycle = Some(os::Lifecycle.Failed)
+            }
             return
         }
-        else => return
+        else => {
+            if then == Then.Fail {
+                try await self.give_up(mut driver, journal, cause: driver.cause)
+            }
+            return
+        }
     }
     driver.lifecycle = Some(os::Lifecycle.Stopping)
     driver.then = then
@@ -1492,9 +1512,7 @@ fn Shared.ended[J: Journal](
     match outcome {
         Ok(Ended.Stopped) or Ok(Ended.Hibernated) => {
             mut driver.stopped(journal, abandoned: false)
-            if driver.then != Then.Stop {
-                try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
-            }
+            try await self.after_stop(mut driver, sender, journal, s)
         }
         Ok(Ended.EnvIncomplete) or Ok(Ended.Unhealthy) or Ok(Ended.CheckpointUndecodable) => try await self.give_up(mut driver, journal, cause: driver.cause)
         Ok(Ended.Unloadable(code: code)) => {
@@ -1517,6 +1535,16 @@ fn Shared.ended[J: Journal](
     }
     try await mut driver.settle()
 } Shared.ended
+
+/// Carries out what follows the stop of the instance: nothing for a stop, `failed` for a failure, and a start otherwise.
+fn Shared.after_stop[J: Journal](self, mut driver: Driver, sender: task::Sender[Input], journal: J, s: task::Scope) fails task::Cancelled uses wait {
+    match driver.then {
+        Then.Stop => {
+        }
+        Then.Fail => try await self.give_up(mut driver, journal, cause: driver.cause)
+        Then.Restart or Then.Update => try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
+    }
+} Shared.after_stop
 
 /// Restarts the old code of the update that `outcome`, the end of its new code's domain, reverted, the message `dead` a trap's handler took becoming a dead letter.
 fn Shared.restart_reverted[J: Journal](
@@ -1560,9 +1588,7 @@ fn Shared.after_trap[J: Journal](
     ) fails task::Cancelled uses wait {
     if driver.abandonment == Abandonment.Lingered {
         mut driver.stopped(journal, abandoned: true)
-        if driver.then != Then.Stop {
-            try await self.create_or_start(mut driver, sender, journal, s, lazily: false)
-        }
+        try await self.after_stop(mut driver, sender, journal, s)
         return
     }
     match dead {
@@ -2164,7 +2190,7 @@ fn Driver.counted(self) {
 fn Driver.takes_calls(self) -> bool {
     return match self.lifecycle {
         Some(os::Lifecycle.Starting) or Some(os::Lifecycle.Running) or Some(os::Lifecycle.Hibernated) => true
-        Some(os::Lifecycle.Stopping) => self.then != Then.Stop
+        Some(os::Lifecycle.Stopping) => self.then == Then.Restart or self.then == Then.Update
         else => false
     }
 } Driver.takes_calls

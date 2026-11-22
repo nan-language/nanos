@@ -1,4 +1,14 @@
-//! Bundles in the shared space: the loader the core keeps, loading a bundle once for every job and instance of it, and unloading it once the last of them ends, the runs of jobs' `main`, and the instances of bundles' components.
+//! Bundles in the shared space: the loader the core keeps, loading a bundle once for every job and instance of it and for the hold of its contributions, and unloading it once the last of them ends, the previews of what bundles contribute to the load-time registries, the runs of jobs' `main`, and the instances of bundles' components.
+
+/// The magic of a bundle, its format version, and the key of its body's contributions.
+const BUNDLE_MAGIC: Slice[u8] = b"NBUN"
+
+const BUNDLE_VERSION: u64 = 1
+
+const CONTRIBUTIONS_PART: u64 = 7
+
+/// The placements previews keep for bundles not loaded yet, the oldest retired first.
+const PREVIEWS_KEPT: usize = 4
 
 /// A capability having the core load bundle images and unload them.
 pkg struct Loading {
@@ -11,11 +21,26 @@ struct Loads {
     orders: task::Sender[LoadOrder]
 } Loads
 
-/// What the core does with a bundle: load the image of the bundle of code hash `code`, unless it is loaded, and tell `loaded` of a load of it and the number its bundle is kept under, or the code of the failure; or let go of the bundle kept under `number` for one of its users.
+/// What the core does with a bundle: load the image of the bundle of code hash `code`, unless it is loaded, and tell `loaded` of a load of it and the number its bundle is kept under, or the code of the failure; let go of the bundle kept under `number` for one of its users; or carry out an order of the registries.
 pkg enum LoadOrder {
     Load(image: mem::Bytes, code: ident::HashValue, loaded: task::Sender[Result[Loaded, text::Fixed[32]]])
     Unload(number: u64)
+    Registry(devices::RegistryOrder)
 } LoadOrder
+
+/// The channels of the loading task: its orders of loading, each order `room` deep, and its orders of the registries, each with its sending end.
+pkg struct Channels {
+    pkg loads: task::Sender[LoadOrder]
+    pkg load_orders: task::Receiver[LoadOrder]
+    pkg registered: task::Sender[devices::RegistryOrder]
+    pkg registry_orders: task::Receiver[devices::RegistryOrder]
+} Channels
+
+pkg fn Channels.of(room: usize, alloc: mem::Alloc) -> Channels {
+    let task::Channel(sender: loads, receiver: load_orders) = task::Channel[LoadOrder].bounded(room, alloc)
+    let task::Channel(sender: registered, receiver: registry_orders) = task::Channel[devices::RegistryOrder].bounded(1, alloc)
+    return Channels(loads: take loads, load_orders: take load_orders, registered: take registered, registry_orders: take registry_orders)
+} Channels.of
 
 /// A bundle the core loaded: the number it is kept under and a load of it.
 pkg struct Loaded {
@@ -23,13 +48,22 @@ pkg struct Loaded {
     load: sys::load::Load
 } Loaded
 
-/// A bundle the core keeps loaded, under its number: its code hash and the jobs and instances using it.
+/// A bundle the core keeps loaded, under its number: its code hash, the jobs and instances using it, whether a hold of its contributions keeps it, the entries it adds to `drivers`, and its bundle.
 linear struct Kept {
     number: u64
     code: ident::HashValue
     users: u64
+    held: bool
+    drivers: mem::List[devices::DriverEntry]
     bundle: sys::load::Bundle
 } Kept
+
+/// A bundle the core placed to preview its contributions, kept placed until it loads: its code hash, the entries it adds to `drivers`, and its placement.
+linear struct Placed {
+    code: ident::HashValue
+    drivers: mem::List[devices::DriverEntry]
+    prepared: sys::load::Prepared
+} Placed
 
 /// The root entry of the loading capabilities the core mints, revoked when it closes.
 pkg linear struct MintedLoading {
@@ -49,10 +83,68 @@ pkg fn MintedLoading.close(take self) {
     take minter.close()
 } MintedLoading.close
 
-/// Carries out the orders of loading through `loader` until they end, then unloads the bundles it keeps; each first load and last unload of a bundle is recorded in `rings`.
-pkg fn load_bundles(take orders: task::Receiver[LoadOrder], take loader: sys::load::Loader, rings: rings::Rings, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Carries out the orders of loading `orders` and of the registries `registrations` through `loader` until cancelled, then unloads the bundles it keeps; each first load and last unload of a bundle is recorded in `rings`.
+pkg fn load_bundles(
+    take orders: task::Receiver[LoadOrder],
+    take registrations: task::Receiver[devices::RegistryOrder],
+    take loader: sys::load::Loader,
+    rings: rings::Rings,
+    exec: task::Executor,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    let task::Channel(sender: merging, receiver: merged) = task::Channel[LoadOrder].bounded(1, alloc)
+    let carried = merging.split()
+    var given = Some(Merging(orders: take orders, registrations: take registrations, merging: take merging, carried: take carried, merged: take merged, loader: take loader))
+    try await task::scope(exec, body: fn[mut given](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(Merging(orders: loads, registrations: registered, merging: into_loads, carried: into_registered, merged: all_orders, loader: owned)) = mut given.extract() else {
+            return
+        }
+        discard s.spawn(fn[take loads, take into_loads]() fails task::Cancelled uses wait limits stack 4_096 {
+            try await forward(take loads, into: take into_loads, alter: fn(take order: LoadOrder) -> LoadOrder limits stack 512 {
+                return order
+            })
+        })
+        discard s.spawn(fn[take registered, take into_registered]() fails task::Cancelled uses wait limits stack 4_096 {
+            try await forward(take registered, into: take into_registered, alter: fn(take order: devices::RegistryOrder) -> LoadOrder limits stack 512 {
+                return LoadOrder.Registry(take order)
+            })
+        })
+        try await serve_loads(take all_orders, loader: take owned, rings, alloc)
+    })
+} load_bundles
+
+/// What the tasks of `load_bundles` take: the orders of loading and of the registries, the sending ends merging them, the merged orders, and the loader.
+struct Merging {
+    orders: task::Receiver[LoadOrder]
+    registrations: task::Receiver[devices::RegistryOrder]
+    merging: task::Sender[LoadOrder]
+    carried: task::Sender[LoadOrder]
+    merged: task::Receiver[LoadOrder]
+    loader: sys::load::Loader
+} Merging
+
+/// Hands each order `orders` takes to `into`, as `alter` makes it, until either ends.
+fn forward[O: Send](take orders: task::Receiver[O], take into: task::Sender[LoadOrder], alter: fn(take order: O) -> LoadOrder limits stack 512) fails task::Cancelled uses wait {
+    var receiver = orders
+    loop {
+        let Some(order) = try await mut receiver.receive() else {
+            return
+        }
+        match attempt await into.send(alter(take order)) {
+            Ok(_) => {
+            }
+            Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+            Err(task::SendError.Closed) => return
+        }
+    }
+} forward
+
+/// Carries out the orders `orders` takes through `loader`, then unloads the bundles it keeps and retires the placements of previews.
+fn serve_loads(take orders: task::Receiver[LoadOrder], take loader: sys::load::Loader, rings: rings::Rings, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var kept = mem::List[Kept].empty(alloc)
     defer unload_all(take kept)
+    var previewed = mem::List[Placed].empty(alloc)
+    defer retire_all(take previewed)
     var next: u64 = 0
     var receiver = orders
     loop {
@@ -69,7 +161,7 @@ pkg fn load_bundles(take orders: task::Receiver[LoadOrder], take loader: sys::lo
                     }
                     None => {
                         next += 1
-                        outcome = loaded_bundle(loader, image: image.view(), code, number: next, mut kept, rings, alloc)
+                        outcome = loaded_bundle(loader, image: image.view(), code, number: next, held: false, mut kept, mut previewed, rings, alloc)
                     }
                 }
                 discard attempt await loaded.send(take outcome)
@@ -79,49 +171,271 @@ pkg fn load_bundles(take orders: task::Receiver[LoadOrder], take loader: sys::lo
                     continue
                 }
                 kept[at].users -= 1
-                if kept[at].users == 0 {
-                    let Kept(number: _, code: code, users: _, bundle: bundle) = mut kept.remove(at)
-                    take bundle.unload()
-                    runner::Journal.record(rings, slot: 0, cause: 0, event: runner::Event.Unloaded(code: code))
+                unload_unused(mut kept, at, rings)
+            }
+            LoadOrder.Registry(devices::RegistryOrder.Preview(code: code, image: image, done: done)) => {
+                discard attempt await done.send(preview(loader, image: image.view(), code, kept: kept.view(), mut previewed, alloc))
+            }
+            LoadOrder.Registry(devices::RegistryOrder.Hold(code: code, image: image, done: done)) => {
+                var outcome: Result[Unit, text::Fixed[32]] = Ok(Unit)
+                match kept.position(fn(held: Kept) => held.code == code) {
+                    Some(at) => {
+                        kept[at].held = true
+                    }
+                    None => {
+                        next += 1
+                        match loaded_bundle(loader, image: image.view(), code, number: next, held: true, mut kept, mut previewed, rings, alloc) {
+                            Ok(_) => {
+                            }
+                            Err(failure) => {
+                                outcome = Err(failure)
+                            }
+                        }
+                    }
                 }
+                discard attempt await done.send(outcome)
+            }
+            LoadOrder.Registry(devices::RegistryOrder.Release(code: code, done: done)) => {
+                match kept.position(fn(held: Kept) => held.code == code) {
+                    Some(at) => {
+                        kept[at].held = false
+                        unload_unused(mut kept, at, rings)
+                    }
+                    None => {
+                    }
+                }
+                discard attempt await done.send(Unit)
             }
         }
     }
-} load_bundles
+} serve_loads
 
-/// Loads the bundle of code hash `code` whose image is `image` through `loader`, keeping it in `kept` under `number` for one user and recording `code.loaded` in `rings`, and gives a load of it, or the code of the failure.
+/// Unloads the bundle kept at `at` once no job, instance or hold uses it, recording `code.unloaded` in `rings`.
+fn unload_unused(mut kept: mem::List[Kept], at: usize, rings: rings::Rings) {
+    if kept[at].users > 0 or kept[at].held {
+        return
+    }
+    let Kept(number: _, code: code, users: _, held: _, drivers: _, bundle: bundle) = mut kept.remove(at)
+    take bundle.unload()
+    runner::Journal.record(rings, slot: 0, cause: 0, event: runner::Event.Unloaded(code: code))
+} unload_unused
+
+/// Loads the bundle of code hash `code` whose image is `image` through `loader`, from the placement a preview kept in `previewed` when there is one, keeping it in `kept` under `number` for one user or, when `held`, for the hold of its contributions, and recording `code.loaded` in `rings`; gives a load of it, or the code of the failure.
 fn loaded_bundle(
     loader: sys::load::Loader,
     image: Slice[u8],
     code: ident::HashValue,
     number: u64,
+    held: bool,
     mut kept: mem::List[Kept],
+    mut previewed: mem::List[Placed],
     rings: rings::Rings,
     alloc: mem::Alloc,
     ) -> Result[Loaded, text::Fixed[32]] {
-    let placed = trusted "admission took the image as one the toolchain built against the kernel's interface, and the runner checked its blob id against the one admission recorded" { attempt loader.prepare_unverified(image, alloc) }
-    let prepared = match placed {
-        Ok(given) => given
-        Err(failed) => return Err(load_code(failed))
+    let placed = match previewed.position(fn(each: Placed) => each.code == code) {
+        Some(at) => mut previewed.remove(at)
+        None => match placement(loader, image, code, alloc) {
+            Ok(made) => made
+            Err(failure) => return Err(failure)
+        }
     }
+    let Placed(code: _, drivers: drivers, prepared: prepared) = placed
     let bundle = match attempt take prepared.load() {
         Ok(published) => published
         Err(failed) => return Err(load_code(failed))
     }
     let load = bundle.share()
-    let bytes = u64.widen(image.len())
-    mut kept.push(Kept(number: number, code: code, users: 1, bundle: take bundle))
-    runner::Journal.record(rings, slot: 0, cause: 0, event: runner::Event.Loaded(code: code, bytes: bytes))
+    let users: u64 = match held {
+        true => 0
+        false => 1
+    }
+    mut kept.push(Kept(number: number, code: code, users: users, held: held, drivers: take drivers, bundle: take bundle))
+    runner::Journal.record(rings, slot: 0, cause: 0, event: runner::Event.Loaded(code: code, bytes: u64.widen(image.len())))
     return Ok(Loaded(number: number, load: take load))
 } loaded_bundle
+
+/// The placement of the bundle of code hash `code` whose image is `image`, with the entries it adds to `drivers`, each from that bundle and binding a device by itself only once its holder says so.
+fn placement(loader: sys::load::Loader, image: Slice[u8], code: ident::HashValue, alloc: mem::Alloc) -> Result[Placed, text::Fixed[32]] {
+    let made = trusted "admission took the image as one the toolchain built against the kernel's interface, and the runner and the holder of contributions checked its blob id against the one admission recorded" { attempt loader.prepare_unverified(image, alloc) }
+    let prepared = match made {
+        Ok(given) => given
+        Err(failed) => return Err(load_code(failed))
+    }
+    let source = devices::Source.Bundle(code: code, automatic: false)
+    var malformed = false
+    let drivers = prepared.entries(devices::drivers, body: fn[mut malformed](entries: Slice[devices::Registration]) -> mem::List[devices::DriverEntry] {
+        var copies = mem::List[devices::DriverEntry].empty(alloc)
+        for entry in entries {
+            match devices::DriverEntry.of(entry, source) {
+                Some(copy) => mut copies.push(copy)
+                None => {
+                    malformed = true
+                }
+            }
+        }
+        return copies
+    })
+    if malformed {
+        retire(take prepared)
+        return Err(text::Fixed[32].of("code.malformed"))
+    }
+    return Ok(Placed(code: code, drivers: take drivers, prepared: take prepared))
+} placement
+
+/// What the image `image` of the bundle of code hash `code` contributes: the entries of the bundle `kept` holds, else of the placement `previewed` holds, else of a placement made for it and kept there, retiring the oldest beyond `PREVIEWS_KEPT`; an image contributing nothing is not placed.
+fn preview(
+    loader: sys::load::Loader,
+    image: Slice[u8],
+    code: ident::HashValue,
+    kept: Slice[Kept],
+    mut previewed: mem::List[Placed],
+    alloc: mem::Alloc,
+    ) -> Result[devices::Previewed, text::Fixed[32]] {
+    for held in kept {
+        if held.code == code {
+            return Ok(devices::Previewed(drivers: copied(held.drivers.view(), alloc), duplicate: None))
+        }
+    }
+    match previewed.position(fn(each: Placed) => each.code == code) {
+        Some(at) => return Ok(previewed_of(previewed[at].drivers.view(), alloc))
+        None => {
+        }
+    }
+    if not contributes(image) {
+        return Ok(devices::Previewed(drivers: mem::List.empty(alloc), duplicate: None))
+    }
+    let placed = match placement(loader, image, code, alloc) {
+        Ok(made) => made
+        Err(failure) => return Err(failure)
+    }
+    let answer = previewed_of(placed.drivers.view(), alloc)
+    if previewed.len() >= PREVIEWS_KEPT {
+        let Placed(code: _, drivers: _, prepared: oldest) = mut previewed.remove(0)
+        retire(take oldest)
+    }
+    mut previewed.push(take placed)
+    return Ok(take answer)
+} preview
+
+/// What the entries `drivers` add to `drivers`, with the name of the first whose key a loaded entry or an earlier one of them has.
+fn previewed_of(drivers: Slice[devices::DriverEntry], alloc: mem::Alloc) -> devices::Previewed {
+    var duplicate: Option[text::Fixed[20]] = None
+    for at in 0..<drivers.len() {
+        let name = drivers[at].name
+        var taken = devices::drivers.read(fn(live: Slice[devices::Registration]) -> bool {
+            for entry in live {
+                if entry.name == name {
+                    return true
+                }
+            }
+            return false
+        })
+        for earlier in 0..<at {
+            taken = taken or drivers[earlier].name == name
+        }
+        if taken {
+            duplicate = Some(name)
+            break
+        }
+    }
+    return devices::Previewed(drivers: copied(drivers, alloc), duplicate: duplicate)
+} previewed_of
+
+/// A copy of `drivers`.
+fn copied(drivers: Slice[devices::DriverEntry], alloc: mem::Alloc) -> mem::List[devices::DriverEntry] {
+    var copies = mem::List[devices::DriverEntry].empty(alloc)
+    for entry in drivers {
+        mut copies.push(entry)
+    }
+    return copies
+} copied
+
+/// Whether the bundle `image` holds contributions: its body has the part listing them.
+fn contributes(image: Slice[u8]) -> bool {
+    if image.prefix(4) != Some(BUNDLE_MAGIC) {
+        return false
+    }
+    let Some(version) = uvar_at(image, at: 4) else {
+        return false
+    }
+    if version.value != BUNDLE_VERSION {
+        return false
+    }
+    let Some(length) = uvar_at(image, at: version.end) else {
+        return false
+    }
+    let end = length.end + usize.widen(length.value)
+    let Some(count) = uvar_at(image, at: length.end) else {
+        return false
+    }
+    var at = count.end
+    for _ in 0..<count.value {
+        let Some(key) = uvar_at(image, at) else {
+            return false
+        }
+        if key.value == CONTRIBUTIONS_PART {
+            return true
+        }
+        let Some(size) = uvar_at(image, at: key.end) else {
+            return false
+        }
+        at = size.end + usize.widen(size.value)
+        if at > end {
+            return false
+        }
+    }
+    return false
+} contributes
+
+/// A uvar read from bytes, and the offset after it.
+struct Uvar derives Copy {
+    value: u64
+    end: usize
+} Uvar
+
+/// The uvar at offset `at` of `bytes`.
+fn uvar_at(bytes: Slice[u8], at: usize) -> Option[Uvar] {
+    var value: u64 = 0
+    var shift: u32 = 0
+    var next = at
+    loop {
+        if next >= bytes.len() or shift > 63 {
+            return None
+        }
+        let byte = bytes[next]
+        next += 1
+        value = value | (u64.widen(byte & 0x7F) << shift)
+        if (byte & 0x80) == 0 {
+            return Some(Uvar(value: value, end: next))
+        }
+        shift += 7
+    }
+} uvar_at
 
 /// Unloads the bundles `kept` holds.
 fn unload_all(take kept: mem::List[Kept]) {
     for each in take kept {
-        let Kept(number: _, code: _, users: _, bundle: bundle) = each
+        let Kept(number: _, code: _, users: _, held: _, drivers: _, bundle: bundle) = each
         take bundle.unload()
     }
 } unload_all
+
+/// Retires the placements `previewed` holds.
+fn retire_all(take previewed: mem::List[Placed]) {
+    for each in take previewed {
+        let Placed(code: _, drivers: _, prepared: prepared) = each
+        retire(take prepared)
+    }
+} retire_all
+
+/// Retires the placement `prepared` holds: loading it publishes its entries, which the unload at once withdraws; a load refusing a duplicate retires it publishing nothing.
+fn retire(take prepared: sys::load::Prepared) {
+    match attempt take prepared.load() {
+        Ok(bundle) => take bundle.unload()
+        Err(_) => {
+        }
+    }
+} retire
 
 /// The code of a load's failure: `code.no-image` for an image built against another interface, `code.registry-duplicate` for a contribution whose key or unique field another entry has, `code.malformed` otherwise.
 fn load_code(failed: sys::load::LoadError) -> text::Fixed[32] {

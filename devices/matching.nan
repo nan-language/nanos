@@ -7,7 +7,7 @@ pub closed enum DeviceIds derives Copy, Eq, Render, Encode {
 } DeviceIds
 
 /// What a `drivers` entry drives, from most to least specific; `None` pads an entry's list.
-pub closed enum DeviceMatch derives Copy, Eq {
+pub closed enum DeviceMatch derives Copy, Eq, Render, Encode {
     None
     PciSubsystem(vendor: u16, device: u16, subsystem_vendor: u16, subsystem: u16)
     PciDevice(vendor: u16, device: u16)
@@ -23,8 +23,9 @@ pub fn matches(head: DeviceMatch, rest: DeviceMatch) -> Array[DeviceMatch, 4] li
     return listed
 } matches
 
-/// An entry of the `drivers` registry: its name, the devices it drives, the device protocol its instances serve, the canonical path of their component, and its tie-break among equally specific matches, higher first.
+/// An entry of the `drivers` registry: its key, which `entry_key` gives its name, its name, 1 to 20 bytes, the devices it drives, the device protocol its instances serve, the canonical path of their component, and its tie-break among equally specific matches, higher first.
 pub closed struct Registration derives Copy, Eq {
+    pub key: u64
     pub name: text::Fixed[20]
     pub matches: Array[DeviceMatch, 4]
     pub class: Class
@@ -32,7 +33,83 @@ pub closed struct Registration derives Copy, Eq {
     pub priority: u8
 } Registration
 
-pub registry drivers: Registration keyed by name
+pub loaded registry drivers: Registration keyed by key
+
+/// The key of the `drivers` entry named `name`: the FNV-1a hash of its bytes.
+pub fn entry_key(name: Str) -> u64 limits pure {
+    var hash: u64 = 0xCBF2_9CE4_8422_2325
+    for byte in name.as_bytes() {
+        hash = (hash ^ u64.widen(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+    }
+    return hash
+} entry_key
+
+/// Where a `drivers` entry comes from: the kernel image, or the loaded bundle of code hash `code`, whose entries bind devices by themselves only when `automatic`, its provenance being `vendor` or `reviewed`.
+pub closed enum Source derives Copy, Eq, Render, Encode {
+    Image
+    Bundle(code: ident::HashValue, automatic: bool)
+} Source
+
+/// A `drivers` entry as `devices` chooses among them: its fields and where it comes from.
+pub closed struct DriverEntry derives Copy, Eq, Render, Encode {
+    pub name: text::Fixed[20]
+    pub matches: Array[DeviceMatch, 4]
+    pub class: Class
+    pub component: text::Fixed[48]
+    pub priority: u8
+    pub source: Source
+} DriverEntry
+
+/// The key of a `drivers` entry a loaded bundle contributes, and its source.
+pub closed struct Sourced derives Copy, Eq, Render, Encode {
+    pub key: text::Fixed[20]
+    pub source: Source
+} Sourced
+
+/// A copy of `entry` from `source`; `None` when its name is empty or its key is not the one its name gives.
+pub fn DriverEntry.of(entry: Registration, source: Source) -> Option[DriverEntry] {
+    if entry.name.byte_len() == 0 or entry.key != entry_key(entry.name.as_str()) {
+        return None
+    }
+    return Some(DriverEntry(name: entry.name, matches: entry.matches, class: entry.class, component: entry.component, priority: entry.priority, source: source))
+} DriverEntry.of
+
+/// The entries of the `drivers` registry, each from the source `sources` gives its key, else from the kernel image.
+pub fn loaded_entries(sources: Slice[Sourced], alloc: mem::Alloc) -> mem::List[DriverEntry] {
+    return drivers.read(fn(entries: Slice[Registration]) -> mem::List[DriverEntry] {
+        var listed = mem::List[DriverEntry].empty(alloc)
+        for entry in entries {
+            match DriverEntry.of(entry, source: source_of(sources, key: entry.name.as_str())) {
+                Some(held) => mut listed.push(held)
+                None => {
+                }
+            }
+        }
+        return listed
+    })
+} loaded_entries
+
+/// The class of the `drivers` entry `name`, `None` when the registry holds none.
+pub fn class_of_entry(name: text::Fixed[20]) -> Option[Class] {
+    return drivers.read(fn(entries: Slice[Registration]) -> Option[Class] {
+        for entry in entries {
+            if entry.name == name {
+                return Some(entry.class)
+            }
+        }
+        return None
+    })
+} class_of_entry
+
+/// The source `sources` gives the key `key`, the kernel image when it gives none.
+fn source_of(sources: Slice[Sourced], key: Str) -> Source {
+    for sourced in sources {
+        if sourced.key.as_str() == key {
+            return sourced.source
+        }
+    }
+    return Source.Image
+} source_of
 
 /// How a device's binding chooses its driver: the most specific matching entry, none, or the entry it names.
 pub closed enum DriverChoice derives Copy, Eq, Render, Encode {
@@ -78,7 +155,7 @@ fn acpi_rank(id: text::Fixed[8], hid: text::Fixed[8], cids: Array[text::Fixed[8]
 } acpi_rank
 
 /// How specifically an entry matches `ids`: its best match, 0 when none matches.
-pub fn Registration.rank(self, ids: DeviceIds) -> u8 {
+pub fn DriverEntry.rank(self, ids: DeviceIds) -> u8 {
     var best: u8 = 0
     for wanted in self.matches {
         let rank = wanted.rank(ids)
@@ -87,7 +164,32 @@ pub fn Registration.rank(self, ids: DeviceIds) -> u8 {
         }
     }
     return best
-} Registration.rank
+} DriverEntry.rank
+
+/// Whether the entry binds a device by itself: one of the kernel image, or of a bundle whose provenance lets it.
+pub fn DriverEntry.binds_alone(self) -> bool {
+    return match self.source {
+        Source.Image => true
+        Source.Bundle(code: _, automatic: automatic) => automatic
+    }
+} DriverEntry.binds_alone
+
+/// Whether the entry drives a device of `ids` before `other`: by a more specific match, then a higher priority, then as an entry of the kernel image beside a bundle's, then by a lower name.
+fn DriverEntry.before(self, other: DriverEntry, ids: DeviceIds) -> bool {
+    let rank = self.rank(ids)
+    let other_rank = other.rank(ids)
+    if rank != other_rank {
+        return rank > other_rank
+    }
+    if self.priority != other.priority {
+        return self.priority > other.priority
+    }
+    let imaged = self.source == Source.Image
+    if imaged != (other.source == Source.Image) {
+        return imaged
+    }
+    return self.name < other.name
+} DriverEntry.before
 
 /// The outcome of choosing a device's driver.
 pub closed enum Choice derives Copy, Eq {
@@ -96,8 +198,8 @@ pub closed enum Choice derives Copy, Eq {
     Mismatch
 } Choice
 
-/// The driver `choice` gives a device identified by `ids` among `entries`: the entry a binding names when it matches, else the most specific match, ties going to the higher priority, then to the lower name.
-pub fn choose(ids: DeviceIds, choice: DriverChoice, entries: Slice[Registration]) -> Choice {
+/// The driver `choice` gives a device identified by `ids` among `entries`: the entry a binding names when it matches, else the first, by `DriverEntry.before`, of the matching entries that bind a device by themselves.
+pub fn choose(ids: DeviceIds, choice: DriverChoice, entries: Slice[DriverEntry]) -> Choice {
     match choice {
         DriverChoice.Unbound => return Choice.Unbound
         DriverChoice.Entry(name) => {
@@ -111,15 +213,14 @@ pub fn choose(ids: DeviceIds, choice: DriverChoice, entries: Slice[Registration]
         DriverChoice.Automatic => {
         }
     }
-    var best: Option[Registration] = None
+    var best: Option[DriverEntry] = None
     for entry in entries {
-        let rank = entry.rank(ids)
-        if rank == 0 {
+        if entry.rank(ids) == 0 or not entry.binds_alone() {
             continue
         }
         let better = match best {
             None => true
-            Some(held) => rank > held.rank(ids) or (rank == held.rank(ids) and (entry.priority > held.priority or (entry.priority == held.priority and entry.name < held.name)))
+            Some(held) => entry.before(held, ids)
         }
         if better {
             best = Some(entry)
@@ -131,8 +232,8 @@ pub fn choose(ids: DeviceIds, choice: DriverChoice, entries: Slice[Registration]
     }
 } choose
 
-fn registration(name: Str, head: DeviceMatch, priority: u8) -> Registration {
-    return Registration(name: text::Fixed[20].of(name), matches: matches(head, rest: DeviceMatch.None), class: Class.Block, component: text::Fixed[48].of("drivers::probe::Probe"), priority: priority)
+fn registration(name: Str, head: DeviceMatch, priority: u8) -> DriverEntry {
+    return DriverEntry(name: text::Fixed[20].of(name), matches: matches(head, rest: DeviceMatch.None), class: Class.Block, component: text::Fixed[48].of("drivers::probe::Probe"), priority: priority, source: Source.Image)
 } registration
 
 fn bound(choice: Choice) -> text::Fixed[20] {
@@ -146,7 +247,7 @@ fn bound(choice: Choice) -> text::Fixed[20] {
 /// A virtio disk among entries matching its class, its identifiers at two priorities and under two names, and a 16550 by `_HID` or `_CID`.
 test the_most_specific_entry_drives_a_device for choose {
     let world = testing::world()
-    var entries = mem::List[Registration].empty(world.alloc)
+    var entries = mem::List[DriverEntry].empty(world.alloc)
     mut entries.push(registration("class", head: DeviceMatch.PciClass(class: 0x01_0000, mask: 0xFF_0000), priority: 9))
     mut entries.push(registration("plain", head: DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1042), priority: 0))
     mut entries.push(registration("raised", head: DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1042), priority: 1))
@@ -166,3 +267,22 @@ test the_most_specific_entry_drives_a_device for choose {
     expect bound(choose(uart, choice: DriverChoice.Automatic, entries: entries.view())).as_str() == "by-hid"
     expect bound(choose(other, choice: DriverChoice.Automatic, entries: entries.view())).as_str() == "unbound"
 } the_most_specific_entry_drives_a_device
+
+/// A bundle's entries bind a device by themselves only when its provenance lets them, a binding naming one binds it whatever its provenance, and the kernel image's entry goes first among equal matches.
+test bundles_bind_alone_only_when_their_provenance_lets_them for choose {
+    let world = testing::world()
+    let nic = DeviceIds.Pci(vendor: 0x1AF4, device: 0x1041, subsystem_vendor: 0x1AF4, subsystem: 1, class: 0x02_0000, revision: 1)
+    let code = ident::HashValue.of_content(b"bundle")
+    var entries = mem::List[DriverEntry].empty(world.alloc)
+    var agent = registration("agent-net", head: DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1041), priority: 5)
+    agent.source = Source.Bundle(code: code, automatic: false)
+    mut entries.push(agent)
+    expect bound(choose(nic, choice: DriverChoice.Automatic, entries: entries.view())).as_str() == "unbound"
+    expect bound(choose(nic, choice: DriverChoice.Entry(text::Fixed[20].of("agent-net")), entries: entries.view())).as_str() == "agent-net"
+    var vendor = registration("vendor-net", head: DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1041), priority: 0)
+    vendor.source = Source.Bundle(code: code, automatic: true)
+    mut entries.push(vendor)
+    expect bound(choose(nic, choice: DriverChoice.Automatic, entries: entries.view())).as_str() == "vendor-net"
+    mut entries.push(registration("z-image-net", head: DeviceMatch.PciDevice(vendor: 0x1AF4, device: 0x1041), priority: 0))
+    expect bound(choose(nic, choice: DriverChoice.Automatic, entries: entries.view())).as_str() == "z-image-net"
+} bundles_bind_alone_only_when_their_provenance_lets_them

@@ -130,7 +130,9 @@ pub fn Driven.run(
     }
     let Serving(deliveries: deliveries, reports: reports, marks: marks, incarnation: incarnation, clock: clock, abandoner: _, suspend_ms: suspend_ms, keeping: keeping, restore: restore, revival: revival, updated: updated, replay: replay, config: _, forking: _, recorder: recorder) = serving
     let syncing = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
-    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: alloc)
+    let handing = alloc.split(HANDED_LIMIT)
+    defer take handing.close()
+    let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: keeping.is_some(), syncing: syncing.share(), alloc: handing.alloc())
     let replies = pending.replies.share()
     let signal = pending.signal.share()
     let replier = sys::Minter[Replier, Pending, u8].of(take pending, alloc)
@@ -182,7 +184,7 @@ pub fn Driven.run(
         let setting = quiet.share()
         let ordering = orders.share()
         discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take known, take setting, take ordering]() fails Stopping uses wait limits stack 40_960 {
-            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, peers: known, quiet: setting, orders: ordering, alloc)
+            try await dispatch(out, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, peers: known, quiet: setting, orders: ordering, handed: handing.alloc(), alloc)
         })
         let answering = reports.split()
         let queued = replies.share()
@@ -717,7 +719,7 @@ struct Given {
     peers: mem::List[sys::ProtocolSchema]
 } Given
 
-/// Serves each call delivered through the protocol P, or one whose schema `peers` holds, on the component behind `out`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which the component is suspended and handing each order for the holder to `orders`.
+/// Serves each call delivered through the protocol P, or one whose schema `peers` holds, on the component behind `out`, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which the component is suspended, handing each order for the holder to `orders` and drawing the replies it hands the driver through `handed`.
 fn dispatch[P: sys::Protocol and Send](
     out: sys::Outbox[P],
     take deliveries: task::Receiver[Delivery],
@@ -728,6 +730,7 @@ fn dispatch[P: sys::Protocol and Send](
     peers: mem::List[sys::ProtocolSchema],
     quiet: mem::Shared[core::atomic::AtomicU64],
     orders: Orders,
+    handed: mem::Alloc,
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
     var receiver = deliveries
@@ -739,7 +742,7 @@ fn dispatch[P: sys::Protocol and Send](
         match delivery {
             Delivery.Call(id: id, hash: hash, encoded: encoded, request: request, header: header, deadline: deadline) => {
                 steps.contents().deadline.store(deadline)
-                try await serve_call(out, id, hash, take encoded, request, header: header.dispatched(deadline), steps, mut signals, reports, incarnation, peers, alloc)
+                try await serve_call(out, id, hash, take encoded, request, header: header.dispatched(deadline), steps, mut signals, reports, incarnation, peers, handed, alloc)
                 steps.contents().deadline.store(os::NO_DEADLINE)
             }
             Delivery.SuspendAfter(ms: ms) => quiet.contents().store(u64.widen(ms))
@@ -751,7 +754,7 @@ fn dispatch[P: sys::Protocol and Send](
     }
 } dispatch
 
-/// Serves the call `id` of header `header` on the component behind `out`, its handler call doing the instance's work under the call's header: a request is answered once its handler returns, or reported postponed, and a one-way call is reported taken once the handler call that took it has returned.
+/// Serves the call `id` of header `header` on the component behind `out`, its handler call doing the instance's work under the call's header: a request is answered once its handler returns, its reply drawn through `handed`, or reported postponed, and a one-way call is reported taken once the handler call that took it has returned.
 fn serve_call[P: sys::Protocol and Send](
     out: sys::Outbox[P],
     id: u64,
@@ -764,6 +767,7 @@ fn serve_call[P: sys::Protocol and Send](
     reports: task::Sender[Input],
     incarnation: u64,
     peers: mem::List[sys::ProtocolSchema],
+    handed: mem::Alloc,
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
     let work = header.handled_by(os::Header.current().sender)
@@ -773,10 +777,10 @@ fn serve_call[P: sys::Protocol and Send](
         return try await sys::Wire[P].serve(out, request: id, hash, peers: peers.view(), raw: Untrusted.of(encoded.bytes.view()), handles: encoded.handles.view(), alloc)
     })
     steps.contents().post(None)
-    try await settle_call(take outcome, id, request, steps: steps.contents(), mut signals, reports, incarnation)
+    try await settle_call(take outcome, id, request, steps: steps.contents(), mut signals, reports, incarnation, handed)
 } serve_call
 
-/// Tells the driver how the call `id` its component was served ended with `outcome`: a request answered or postponed, or a one-way call taken once the handler call that took it has returned.
+/// Tells the driver how the call `id` its component was served ended with `outcome`: a request answered, its reply copied through `handed`, or postponed, or a one-way call taken once the handler call that took it has returned.
 fn settle_call(
     take outcome: Result[Option[sys::Encoded], sys::CallError[Never]],
     id: u64,
@@ -785,6 +789,7 @@ fn settle_call(
     mut signals: task::Receiver[u64],
     reports: task::Sender[Input],
     incarnation: u64,
+    handed: mem::Alloc,
     ) fails Stopping uses wait {
     if not request {
         if outcome.is_ok() {
@@ -794,7 +799,7 @@ fn settle_call(
         return
     }
     let answer = match outcome {
-        Ok(Some(reply)) => os::Answer.Replied(take reply)
+        Ok(Some(reply)) => os::Answer.Replied(encoded_of(reply.bytes.view(), handles: reply.handles.view(), alloc: handed))
         Ok(None) => {
             try await tell(reports, incarnation, report: Report.Postponed(id: id))
             return
@@ -1020,6 +1025,9 @@ fn now(clock: sys::Clock) -> u64 {
 /// The replies an incarnation's queue holds before a task of its domain hands them to the driver.
 const QUEUED_REPLIES: usize = 64
 
+/// The limit of the cell an incarnation draws what it hands its driver through, which the incarnation's own cell bounds.
+const HANDED_LIMIT: usize = 0xFFFF_FFFF_FFFF_FFFF
+
 /// The runner capability of an incarnation's component, which takes the replies to the requests it postponed and its requests for checkpoints.
 pub open struct Replier {
 } Replier
@@ -1037,6 +1045,16 @@ struct Pending {
     alloc: mem::Alloc
 } Pending
 
+/// A reply of `bytes` and the handles beside them, drawn through `alloc`.
+fn encoded_of(bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded {
+    var reply = sys::Encoded.empty(alloc)
+    mut reply.bytes.append(bytes)
+    for handle in handles {
+        mut reply.handles.push(handle)
+    }
+    return reply
+} encoded_of
+
 /// What the component hands its driver: the reply to the request the driver numbered `request`, or the summary it published.
 enum Handed {
     Reply(request: u64, reply: sys::Encoded)
@@ -1046,12 +1064,7 @@ enum Handed {
 /// Queues the reply to the request `request` for the driver, its bytes and the handles beside them; unknown when the queue is full.
 pub fn Replier.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
     let queued = sys::reach(self, body: fn(state: Pending, record: u8) -> bool {
-        var reply = sys::Encoded.empty(state.alloc)
-        mut reply.bytes.append(bytes)
-        for handle in handles {
-            mut reply.handles.push(handle)
-        }
-        return state.hand(handed: Handed.Reply(request: request, reply: take reply))
+        return state.hand(handed: Handed.Reply(request: request, reply: encoded_of(bytes, handles, alloc: state.alloc)))
     })
     if queued != Some(true) {
         fail sys::RunnerError.Unknown

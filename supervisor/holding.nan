@@ -1,0 +1,181 @@
+//! The bundles whose contributions the core holds: a pass over the admission records of `/sys/code` holds each admitted bundle contributing `drivers` entries and lets go of the others, then has `devices` rematch its devices when the sources of the entries changed.
+
+/// The children of `/sys/code` one listing gives.
+const CODE_PAGE: u32 = 64
+
+/// The canonical path of the registry of drivers.
+const DRIVERS_TABLE: Str = "devices::drivers"
+
+/// The bundles the core holds for their contributions, by code hash, and the sources of the `drivers` entries they contribute.
+pub closed struct Holding derives Render, Encode {
+    pub held: mem::List[ident::HashValue]
+    pub sources: mem::List[devices::Sourced]
+} Holding
+
+pub fn Holding.none(alloc: mem::Alloc) -> Holding = Holding(held: mem::List.empty(alloc), sources: mem::List.empty(alloc))
+
+pub fn Holding.copied(self, alloc: mem::Alloc) -> Holding {
+    var copy = Holding.none(alloc)
+    for code in self.held {
+        mut copy.held.push(code)
+    }
+    for sourced in self.sources {
+        mut copy.sources.push(sourced)
+    }
+    return copy
+} Holding.copied
+
+/// What a holding pass reaches: the View of `/sys`, the core's load-time registries and the port to `devices`.
+pub closed struct Holder derives Copy {
+    pub view: store::service::View
+    pub registries: devices::Registries
+    pub devices: Option[os::Port[devices::Devices]]
+} Holder
+
+/// An admitted bundle contributing `drivers` entries: its code hash and the sources of its entries.
+struct Contributing {
+    code: ident::HashValue
+    sources: mem::List[devices::Sourced]
+} Contributing
+
+/// Holds each admitted bundle contributing `drivers` entries, from `before`, the holding of the pass before, and lets go of those no longer admitted; has `devices` rematch its devices when the sources of the entries changed, each driver it starts reaching the commit `reached`.
+pub fn Holder.pass(self, take before: Holding, reached: Option[u64], alloc: mem::Alloc) -> Holding fails task::Cancelled uses wait {
+    var held = mem::List[ident::HashValue].empty(alloc)
+    var sources = mem::List[devices::Sourced].empty(alloc)
+    for each in try await self.contributing(alloc) {
+        if before.held.position(fn(code: ident::HashValue) => code == each.code).is_none() and not try await self.hold(each.code, alloc) {
+            continue
+        }
+        mut held.push(each.code)
+        for sourced in each.sources {
+            mut sources.push(sourced)
+        }
+    }
+    for code in before.held {
+        if held.position(fn(kept: ident::HashValue) => kept == code).is_none() {
+            try await self.registries.release(code, alloc)
+        }
+    }
+    if not same_sources(before.sources.view(), after: sources.view()) {
+        try await self.rematch(sources.view(), reached, alloc)
+    }
+    return Holding(held: take held, sources: take sources)
+} Holder.pass
+
+/// Has the core hold the bundle of code hash `code` for its contributions, reading its image from `/sys/code`; whether it holds it.
+fn Holder.hold(self, code: ident::HashValue, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
+    var path = text::String.of("/code/", alloc)
+    mut path.append(code.full_form().as_str())
+    mut path.append("/image")
+    let image = match first attempt await self.view.read_blob(ident::Path(text: take path), alloc) {
+        Ok(read) => read
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return false
+    }
+    return (try await self.registries.hold(code, take image, alloc)).is_ok()
+} Holder.hold
+
+/// Has `devices` take `sources` as the sources of the `drivers` entries loaded bundles contribute.
+fn Holder.rematch(self, sources: Slice[devices::Sourced], reached: Option[u64], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(manager) = self.devices else {
+        return
+    }
+    var copies = mem::List[devices::Sourced].empty(alloc)
+    for sourced in sources {
+        mut copies.push(sourced)
+    }
+    var call = sys::Encoded.empty(alloc)
+    sys::Wire[devices::Devices].rematch(mut call, sources: take copies, reached)
+    match attempt await manager.post(take call) {
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} Holder.rematch
+
+/// The admitted bundles of `/sys/code` whose admission records list `drivers` entries, each binding a device by itself when the bundle's provenance is `vendor` or `reviewed`.
+fn Holder.contributing(self, alloc: mem::Alloc) -> mem::List[Contributing] fails task::Cancelled uses wait {
+    var found = mem::List[Contributing].empty(alloc)
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await self.view.list(ident::Path(text: text::String.of("/code", alloc)), take after, limit: CODE_PAGE, alloc) {
+            Ok(listed) => listed
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return found
+        }
+        for entry in listing.entries {
+            let Some(ident::HashText.Full(code)) = ident::HashText.parse(entry.name.as_str()) else {
+                continue
+            }
+            let Some(admission) = try await self.admission_of(entry.name.as_str(), alloc) else {
+                continue
+            }
+            let sources = sources_of(admission.contributions.view(), provenance: admission.provenance, code, alloc)
+            if sources.len() > 0 {
+                mut found.push(Contributing(code: code, sources: take sources))
+            }
+        }
+        let Some(next) = listing.next else {
+            return found
+        }
+        after = Some(take next)
+    }
+} Holder.contributing
+
+/// The admission record at `/sys/code/<name>/admission`, `None` when none decodes.
+fn Holder.admission_of(self, name: Str, alloc: mem::Alloc) -> Option[code::Admission] fails task::Cancelled uses wait {
+    var path = text::String.of("/code/", alloc)
+    mut path.append(name)
+    mut path.append("/admission")
+    let node = match first attempt await self.view.get(ident::Path(text: take path), at: None, alloc) {
+        Ok(got) => got
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(value) = node.value else {
+        return None
+    }
+    return match attempt mem::wire::Codec[code::Admission].decode(value.view(), alloc) {
+        Ok(record) => Some(take record)
+        Err(_) => None
+    }
+} Holder.admission_of
+
+/// The sources of the `drivers` entries of `contributions`, those of the bundle of code hash `code` and provenance `provenance`.
+fn sources_of(contributions: Slice[code::Contribution], provenance: os::Provenance, code: ident::HashValue, alloc: mem::Alloc) -> mem::List[devices::Sourced] {
+    let source = devices::Source.Bundle(code: code, automatic: provenance != os::Provenance.Agent)
+    var sources = mem::List[devices::Sourced].empty(alloc)
+    for contribution in contributions {
+        if contribution.table.as_str() != DRIVERS_TABLE or contribution.key.as_str().byte_len() > 20 {
+            continue
+        }
+        mut sources.push(devices::Sourced(key: text::Fixed[20].of(contribution.key.as_str()), source: source))
+    }
+    return sources
+} sources_of
+
+/// Whether `before` and `after` list the same sources in the same order.
+fn same_sources(before: Slice[devices::Sourced], after: Slice[devices::Sourced]) -> bool {
+    if before.len() != after.len() {
+        return false
+    }
+    for at in 0..<before.len() {
+        if before[at] != after[at] {
+            return false
+        }
+    }
+    return true
+} same_sources
+
+test sources_follow_the_drivers_contributions_and_the_provenance for sources_of {
+    let alloc = testing::world().alloc
+    var contributions = mem::List[code::Contribution].empty(alloc)
+    mut contributions.push(code::Contribution(table: text::String.of(DRIVERS_TABLE, alloc), key: text::String.of("virtio-net", alloc), replaces: false))
+    mut contributions.push(code::Contribution(table: text::String.of("sched::pick", alloc), key: text::String.of("fair", alloc), replaces: true))
+    let code = ident::HashValue.of_content(b"probe")
+    let reviewed = sources_of(contributions.view(), provenance: os::Provenance.Reviewed, code, alloc)
+    expect reviewed.len() == 1 and reviewed[0] == devices::Sourced(key: text::Fixed[20].of("virtio-net"), source: devices::Source.Bundle(code: code, automatic: true))
+    let agents = sources_of(contributions.view(), provenance: os::Provenance.Agent, code, alloc)
+    expect agents.len() == 1 and agents[0].source == devices::Source.Bundle(code: code, automatic: false)
+    expect not same_sources(reviewed.view(), after: agents.view()) and same_sources(agents.view(), after: agents.view())
+} sources_follow_the_drivers_contributions_and_the_provenance

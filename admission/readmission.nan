@@ -1,0 +1,150 @@
+//! Judging admitted bundles again after a change of the policy or of the principals' keys: each admission record takes the provenance class and `shared` field the bundle's signatures give now, and a bundle whose signatures no longer verify is removed, its instances failing with the refusal's code.
+
+/// How long a recomputation waits for the policy to check the record a commit wrote.
+const POLICY_WAIT_MS: u64 = 30_000
+
+/// The pause between two readings of the policy's trust while a recomputation waits.
+const POLICY_POLL_MS: u64 = 200
+
+/// What a recomputation reaches: a judge of bundles, the users of bundles, a `Control` over instances, the base bundle's code hash, and the clock.
+struct Readmission derives Copy {
+    judge: Judge
+    users: Users
+    control: os::Control
+    base: ident::HashValue
+    clock: sys::Clock
+} Readmission
+
+/// Judges each admitted bundle but the base one again, under the policy once it has checked the record the commit `changed` wrote when it names one.
+fn Readmission.recompute(self, changed: Option[u64]) fails task::Cancelled uses wait {
+    let alloc = self.judge.alloc
+    let Some(trust) = try await self.trust(changed) else {
+        return
+    }
+    var after: Option[text::String] = None
+    loop {
+        let listing = match first attempt await self.judge.code.list(ident::Path(text: text::String.of("/", alloc)), take after, limit: PAGE, alloc) {
+            Ok(found) => found
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return
+        }
+        for entry in listing.entries {
+            let Some(ident::HashText.Full(code)) = ident::HashText.parse(entry.name.as_str()) else {
+                continue
+            }
+            if code != self.base {
+                try await self.readmit(code, trust)
+            }
+        }
+        let Some(next) = listing.next else {
+            return
+        }
+        after = Some(take next)
+    }
+} Readmission.recompute
+
+/// The policy's trust once its latest check read the record the commit `changed` wrote, or after `POLICY_WAIT_MS`; `None` when the policy does not answer.
+fn Readmission.trust(self, changed: Option[u64]) -> Option[policy::Trust] fails task::Cancelled uses wait {
+    let alloc = self.judge.alloc
+    var waited: u64 = 0
+    loop {
+        var call = sys::Encoded.empty(alloc)
+        let reply = sys::Wire[policy::Oversight].trust(mut call)
+        let trust = match first attempt await self.judge.oversight.call(take call, reply, alloc) {
+            Ok(given) => given
+            Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => return None
+        }
+        let current = match changed {
+            Some(commit) => trust.read >= commit
+            None => true
+        }
+        if current or waited >= POLICY_WAIT_MS {
+            return Some(take trust)
+        }
+        try await self.clock.sleep_ns(POLICY_POLL_MS * 1_000_000)
+        waited += POLICY_POLL_MS
+    }
+} Readmission.trust
+
+/// Judges the bundle of code hash `code` again under `trust`: rewrites its admission record when its provenance class or `shared` field changes, and refuses it when a signature no longer verifies.
+fn Readmission.readmit(self, code: ident::HashValue, trust: policy::Trust) fails task::Cancelled uses wait {
+    let alloc = self.judge.alloc
+    let Some(record) = try await self.record(code) else {
+        return
+    }
+    let blob = match first try await read_blob(self.judge.code, path: code_path(code, name: "bundle", alloc), alloc) {
+        Ok(read) => read
+        Err(_) => return
+    }
+    let decoded = match first Decoded.of(blob.bytes.view(), target: self.judge.target.as_str(), alloc) {
+        Ok(made) => made
+        Err(_) => return
+    }
+    let signers = match first decoded.signers(alloc) {
+        Ok(listed) => listed
+        Err(_) => return
+    }
+    for signer in signers {
+        match first try await self.judge.verified(signer, former: true) {
+            Some(Refusal.Unavailable) => return
+            Some(refusal) => {
+                try await self.refuse(code, take refusal)
+                return
+            }
+            None => {
+            }
+        }
+    }
+    let judged = match first decoded.judged(trust, machine: self.judge.machine, admitted: record.admitted, alloc) {
+        Ok(made) => made
+        Err(_) => return
+    }
+    if judged.admission.provenance == record.provenance and judged.admission.shared == record.shared {
+        return
+    }
+    var rewritten = record
+    rewritten.provenance = judged.admission.provenance
+    rewritten.shared = judged.admission.shared
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[code::Admission].encode(rewritten, out: mut bytes)
+    var writes = mem::List[store::Write].empty(alloc)
+    mut writes.push(store::Write.Put(path: code_path(code, name: "admission", alloc), value: store::Value.Record(type: store::TypeRef.of(code::ADMISSION_TYPE, schema: mem::wire::Codec[code::Admission].schema_hash(), alloc), bytes: take bytes, secret: false)))
+    discard try await self.users.commit(take writes)
+} Readmission.readmit
+
+/// The admission record of the bundle of code hash `code`, `None` when none decodes.
+fn Readmission.record(self, code: ident::HashValue) -> Option[code::Admission] fails task::Cancelled uses wait {
+    let alloc = self.judge.alloc
+    let node = match first attempt await self.judge.code.get(code_path(code, name: "admission", alloc), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(value) = node.value else {
+        return None
+    }
+    return match attempt mem::wire::Codec[code::Admission].decode(value.view(), alloc) {
+        Ok(record) => Some(take record)
+        Err(_) => None
+    }
+} Readmission.record
+
+/// Fails each instance whose specification or running instance names the bundle of code hash `code` with the code of `refusal`, then removes the bundle.
+fn Readmission.refuse(self, code: ident::HashValue, take refusal: Refusal) fails task::Cancelled uses wait {
+    let alloc = self.judge.alloc
+    let reason = refusal.code()
+    var monikers = mem::List[text::String].empty(alloc)
+    try await self.users.gather(self.users.specs, bundle: code, live: false, mut monikers)
+    try await self.users.gather(self.users.running, bundle: code, live: true, mut monikers)
+    for moniker in monikers {
+        var name = text::Fixed[59].empty()
+        mut name.append(moniker.as_str())
+        match attempt await self.control.fault(ident::Moniker(text: name), code: reason.as_str(), alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    }
+    discard try await self.users.delete(code)
+} Readmission.refuse

@@ -1,4 +1,10 @@
-//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, and uploads the image it takes as a draft blob; it judges the state schemas of updates; and it removes admitted bundles no instance uses.
+//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, the core previewing the image's contributions, and uploads the image it takes as a draft blob; it judges the state schemas of updates; it judges the admitted bundles again when the policy or the principals' keys change; and it removes admitted bundles no instance uses.
+
+/// The canonical path of the registry of drivers.
+const DRIVERS_TABLE: Str = "devices::drivers"
+
+/// The key of the keyed task judging the admitted bundles again.
+const RECOMPUTING: u64 = 1
 
 /// The keys of the keyed tasks serving requests start here.
 const SERVING: u64 = 0x1_0000_0000
@@ -11,30 +17,42 @@ const CHUNK_BYTES: u32 = 1_048_576
 
 /// What `admission` serves.
 pub protocol Admitting {
-    /// Admits the bundle blob `bundle` reads alone, for the plan of base commit `base`: its admission record, the image it takes uploaded as a draft blob.
-    pub fn admit(bundle: store::service::View, base: ident::CommitId) -> code::Admission fails Refusal limits recorded
+    /// Admits the bundle blob `bundle` reads alone, for the plan of base commit `base`: its admission record and the drivers its contributions would start, the image it takes uploaded as a draft blob.
+    pub fn admit(bundle: store::service::View, base: ident::CommitId) -> Admitted fails Refusal limits recorded
     /// Removes `/sys/code/<bundle>`: the admission record, bundle and image of the code hash `bundle`, unless a specification or a running instance names it.
     pub fn remove(bundle: ident::HashValue) fails Refusal limits recorded
     /// The migration class of an update of an instance of state type `state` from the bundle of code hash `running` to that of code hash `moving`; `code.schema-incompatible` when the new state schema is not the running one and neither accepts nor migrates from it, or when the base bundle's state schema does not accept the new one of a `checkpointed` instance of a base component.
     pub fn migration(running: ident::HashValue, moving: ident::HashValue, state: text::String, checkpointed: bool) -> code::Migration fails Refusal limits recorded
     /// Whether moving an instance of state type `state` from the bundle of code hash `running` back to that of code hash `moving` keeps its state: the state has one schema in both, an inverse of the running state converts back to the schema of `moving`, or the state type of `moving` is a flexible struct whose tree accepts the running one, keeping the fields it does not know.
     pub fn keeps(running: ident::HashValue, moving: ident::HashValue, state: text::String) -> bool fails Refusal limits recorded
+    /// Judges every admitted bundle but the base one again, with the keys as they are and the policy once it has checked the record the commit `changed` wrote, when it names one: rewrites the provenance and `shared` of each record whose class changed, and removes each bundle whose signatures no longer verify, failing its instances with the refusal's code.
+    pub fn recompute(changed: Option[u64]) limits recorded
     /// The keyed task serving request `request` gives its reply.
     fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Admitting
 
-/// The Env of `admission`: its View of `/sys/code`, its reading Views of `/sys/instances` and `/live/instances`, its ports to `keys` and `policy`, the machine it judges for and the nanos target of its architecture, the base bundle, and its cell.
+/// The Env of `admission`: its View of `/sys/code`, its reading Views of `/sys/instances` and `/live/instances`, its ports to `keys`, `policy` and `devices`, the core's load-time registries, a `Control` over instances, its clock, the machine it judges for and the nanos target of its architecture, the base bundle, and its cell.
 pub open struct Env derives Send {
     code: store::service::View
     specs: store::service::View
     running: store::service::View
     keys: os::Port[keys::Keys]
     oversight: os::Port[policy::Oversight]
+    devices: os::Port[devices::Devices]
+    registries: devices::Registries
+    control: os::Control
+    clock: sys::Clock
     machine: Machine
     target: text::Fixed[16]
     base: mem::Shared[Base]
     alloc: mem::Alloc
 } Env
+
+/// What admitting a bundle gives: its admission record, and the driver instances the load of its contributions would start.
+pub closed struct Admitted derives Render, Encode {
+    pub admission: code::Admission
+    pub starts: mem::List[ident::Moniker]
+} Admitted
 
 /// The base bundle as the kernel image holds it: its code hash and the schema trees of its components' states.
 pub closed struct Base {
@@ -54,13 +72,23 @@ pub fn Env.of(
     running: store::service::View,
     keys: os::Port[keys::Keys],
     oversight: os::Port[policy::Oversight],
+    devices: os::Port[devices::Devices],
+    registries: devices::Registries,
+    control: os::Control,
+    clock: sys::Clock,
     machine: Machine,
     target: Str,
     take base: Base,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(code: code, specs: specs, running: running, keys: keys, oversight: oversight, machine: machine, target: text::Fixed[16].of(target), base: mem::Shared.of(take base, alloc), alloc: alloc)
+    return Env(code: code, specs: specs, running: running, keys: keys, oversight: oversight, devices: devices, registries: registries, control: control, clock: clock, machine: machine, target: text::Fixed[16].of(target), base: mem::Shared.of(take base, alloc), alloc: alloc)
 } Env.of
+
+/// What an admission's keyed task reaches of the Env.
+fn Env.judge(self) -> Judge = Judge(code: self.code, keys: self.keys, oversight: self.oversight, devices: self.devices, registries: self.registries, machine: self.machine, target: self.target, alloc: self.alloc)
+
+/// What finding the users of a bundle reaches of the Env.
+fn Env.users(self) -> Users = Users(code: self.code, specs: self.specs, running: self.running, alloc: self.alloc)
 
 pub fn Admitter.start(mut env: Env) -> Admitter = Admitter()
 
@@ -70,11 +98,11 @@ pub fn Admitter.admit(
     take base: ident::CommitId,
     mut env: Env,
     mut cx: sys::Cx[Admitting],
-    ) -> code::Admission fails Refusal {
+    ) -> Admitted fails Refusal {
     let Some(request) = mut cx.postpone() else {
         fail Refusal.Unavailable
     }
-    let judge = Judge(code: env.code, keys: env.keys, oversight: env.oversight, machine: env.machine, target: env.target, alloc: env.alloc)
+    let judge = env.judge()
     let alloc = env.alloc
     mut cx.spawn(key: SERVING + request, run: fn[take bundle](out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 65_536 {
         let outcome = try await judge.admitted(bundle, base)
@@ -87,7 +115,7 @@ pub fn Admitter.remove(mut self, take bundle: ident::HashValue, mut env: Env, mu
     let Some(request) = mut cx.postpone() else {
         fail Refusal.Unavailable
     }
-    let users = Users(code: env.code, specs: env.specs, running: env.running, alloc: env.alloc)
+    let users = env.users()
     let alloc = env.alloc
     mut cx.spawn(key: SERVING + request, run: fn(out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 32_768 {
         let outcome = try await users.removed(bundle)
@@ -137,6 +165,13 @@ pub fn Admitter.keeps(
     fail Refusal.Unavailable
 } Admitter.keeps
 
+pub fn Admitter.recompute(mut self, take changed: Option[u64], mut env: Env, mut cx: sys::Cx[Admitting]) {
+    let readmission = Readmission(judge: env.judge(), users: env.users(), control: env.control, base: env.base.contents().code, clock: env.clock)
+    mut cx.spawn(key: RECOMPUTING, run: fn(out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 65_536 {
+        try await readmission.recompute(changed)
+    })
+} Admitter.recompute
+
 fn Admitter.answered(
     mut self,
     take request: u64,
@@ -148,18 +183,20 @@ fn Admitter.answered(
     mut cx.cancel(key: SERVING + request)
 } Admitter.answered
 
-/// What an admission's keyed task reaches: the Env's View, ports, machine and target.
+/// What an admission's keyed task reaches: the Env's View, ports, registries, machine and target.
 struct Judge derives Copy {
     code: store::service::View
     keys: os::Port[keys::Keys]
     oversight: os::Port[policy::Oversight]
+    devices: os::Port[devices::Devices]
+    registries: devices::Registries
     machine: Machine
     target: text::Fixed[16]
     alloc: mem::Alloc
 } Judge
 
-/// The admission record of the bundle blob `bundle` reads, for the plan of base commit `base`, the image it takes uploaded as a draft blob.
-fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId) -> Result[code::Admission, Refusal] fails task::Cancelled uses wait {
+/// The admission record of the bundle blob `bundle` reads, for the plan of base commit `base`, and the drivers its contributions would start, the image it takes uploaded as a draft blob.
+fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId) -> Result[Admitted, Refusal] fails task::Cancelled uses wait {
     let alloc = self.alloc
     let blob = match first try await read_blob(bundle, path: ident::Path(text: text::String.of("/", alloc)), alloc) {
         Ok(read) => read
@@ -192,14 +229,76 @@ fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId) -> 
         Ok(made) => made
         Err(refusal) => return Err(take refusal)
     }
-    let Judged(admission: admission, image: chosen) = judged
-    match first try await self.upload(decoded.bundle.images[chosen].bytes.view(), expected: admission.image.image) {
+    let Judged(admission: judged_record, image: chosen) = judged
+    var record = judged_record
+    let image = decoded.bundle.images[chosen].bytes.view()
+    let contributed = match first try await self.contributed(image, code: decoded.code, provenance: record.provenance) {
+        Ok(found) => found
+        Err(refusal) => return Err(take refusal)
+    }
+    for entry in contributed {
+        mut record.contributions.push(code::Contribution(table: text::String.of(DRIVERS_TABLE, alloc), key: text::String.of(entry.name.as_str(), alloc), replaces: false))
+    }
+    let starts = match first try await self.starts(take contributed) {
+        Ok(found) => found
+        Err(refusal) => return Err(take refusal)
+    }
+    match first try await self.upload(image, expected: record.image.image) {
         Some(refusal) => return Err(take refusal)
         None => {
         }
     }
-    return Ok(take admission)
+    return Ok(Admitted(admission: take record, starts: take starts))
 } Judge.admitted
+
+/// Step 11: the `drivers` entries the image `image` of the bundle of code hash `code` contributes, as the core previews them, each binding a device by itself when the provenance `provenance` is `vendor` or `reviewed`; `code.registry-duplicate` naming the first whose key a live entry has.
+fn Judge.contributed(self, image: Slice[u8], code: ident::HashValue, provenance: os::Provenance) -> Result[mem::List[devices::DriverEntry], Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(image)
+    let previewed = match first try await self.registries.preview(code, image: take bytes, alloc) {
+        Ok(given) => given
+        Err(failure) => return Err(self.load_refusal(failure.as_str()))
+    }
+    let devices::Previewed(drivers: drivers, duplicate: duplicate) = previewed
+    match duplicate {
+        Some(name) => return Err(Refusal.RegistryDuplicate(entry: text::String.of(name.as_str(), alloc)))
+        None => {
+        }
+    }
+    let source = devices::Source.Bundle(code: code, automatic: provenance != os::Provenance.Agent)
+    var entries = mem::List[devices::DriverEntry].empty(alloc)
+    for entry in drivers {
+        var sourced = entry
+        sourced.source = source
+        mut entries.push(sourced)
+    }
+    return Ok(take entries)
+} Judge.contributed
+
+/// The refusal of the core's load of an image failing with `code`.
+fn Judge.load_refusal(self, code: Str) -> Refusal {
+    return match code {
+        "code.no-image" => Refusal.NoImage(level: self.machine.level, support: self.machine.support)
+        "code.malformed" => Refusal.Malformed
+        else => Refusal.Unavailable
+    }
+} Judge.load_refusal
+
+/// The driver instances `devices` says a load of the `drivers` entries `contributed` would start.
+fn Judge.starts(self, take contributed: mem::List[devices::DriverEntry]) -> Result[mem::List[ident::Moniker], Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    if contributed.len() == 0 {
+        return Ok(mem::List.empty(alloc))
+    }
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Devices].starts(mut call, take contributed)
+    return match first attempt await self.devices.call(take call, reply, alloc) {
+        Ok(given) => Ok(take given)
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => Err(Refusal.Unavailable)
+    }
+} Judge.starts
 
 /// Whether `/sys/code/<code hash>/bundle` holds the blob `blob`, whose signatures a former key then verifies.
 fn Judge.holds(self, code_hash: ident::HashValue, blob: ident::HashValue) -> bool fails task::Cancelled uses wait {
@@ -437,7 +536,6 @@ struct Users derives Copy {
 
 /// Removes `/sys/code/<bundle>`: `code.in-use` naming the first specification or running instance whose bundle is `bundle`, the store's refusal when the delete fails.
 fn Users.removed(self, bundle: ident::HashValue) -> Result[Unit, Refusal] fails task::Cancelled uses wait {
-    let alloc = self.alloc
     match first try await self.user(self.specs, bundle, live: false) {
         Ok(Some(moniker)) => return Err(Refusal.InUse(moniker: take moniker))
         Ok(None) => {
@@ -450,47 +548,91 @@ fn Users.removed(self, bundle: ident::HashValue) -> Result[Unit, Refusal] fails 
         }
         Err(refusal) => return Err(take refusal)
     }
-    var path = text::String.of("/", alloc)
+    return try await self.delete(bundle)
+} Users.removed
+
+/// Deletes `/sys/code/<bundle>`; the store's refusal when the delete fails.
+fn Users.delete(self, bundle: ident::HashValue) -> Result[Unit, Refusal] fails task::Cancelled uses wait {
+    var path = text::String.of("/", alloc: self.alloc)
     mut path.append(bundle.full_form().as_str())
-    var writes = mem::List[store::Write].empty(alloc)
+    var writes = mem::List[store::Write].empty(self.alloc)
     mut writes.push(store::Write.Delete(path: ident::Path(text: take path)))
-    let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: None)
-    return match first attempt await self.code.commit(take transaction, typed: false, alloc) {
+    return try await self.commit(take writes)
+} Users.delete
+
+/// Commits `writes` through the View of `/sys/code`; the store's refusal when the commit fails.
+fn Users.commit(self, take writes: mem::List[store::Write]) -> Result[Unit, Refusal] fails task::Cancelled uses wait {
+    let transaction = store::Transaction(base: None, reads: mem::List.empty(self.alloc), expects: mem::List.empty(self.alloc), writes: take writes, key: None, plan: None, intent: None)
+    return match first attempt await self.code.commit(take transaction, typed: false, alloc: self.alloc) {
         Ok(_) => Ok(Unit)
         Err(failure) => Err(try refusal_of(take failure))
     }
-} Users.removed
+} Users.commit
 
 /// The moniker of the first child of `view` naming `bundle`: an `os::InstanceSpec`, or an `os::LiveInstance` when `live`; the store's refusal when the View cannot be read.
 fn Users.user(self, view: store::service::View, bundle: ident::HashValue, live: bool) -> Result[Option[text::String], Refusal] fails task::Cancelled uses wait {
+    var found = mem::List[text::String].empty(self.alloc)
+    return match first try await self.listing(view, bundle, live, mut found, only_one: true) {
+        Some(refusal) => Err(take refusal)
+        None => Ok(mut found.pop())
+    }
+} Users.user
+
+/// Adds to `monikers` each child of `view` naming `bundle` it does not hold yet: an `os::InstanceSpec`, or an `os::LiveInstance` when `live`; nothing when the View cannot be read.
+fn Users.gather(self, view: store::service::View, bundle: ident::HashValue, live: bool, mut monikers: mem::List[text::String]) fails task::Cancelled uses wait {
+    discard try await self.listing(view, bundle, live, found: mut monikers, only_one: false)
+} Users.gather
+
+/// Adds to `found` the children of `view` naming `bundle` it does not hold yet, an `os::InstanceSpec`, or an `os::LiveInstance` when `live`, only the first when `only_one`; the store's refusal when the View cannot be read.
+fn Users.listing(
+    self,
+    view: store::service::View,
+    bundle: ident::HashValue,
+    live: bool,
+    mut found: mem::List[text::String],
+    only_one: bool,
+    ) -> Option[Refusal] fails task::Cancelled uses wait {
     let alloc = self.alloc
     var after: Option[text::String] = None
     loop {
         let listing = match first attempt await view.list(ident::Path(text: text::String.of("/", alloc)), take after, limit: PAGE, alloc) {
-            Ok(found) => found
-            Err(failure) => return Err(try refusal_of(take failure))
+            Ok(listed) => listed
+            Err(failure) => return Some(try refusal_of(take failure))
         }
         for entry in listing.entries {
             var path = text::String.of("/", alloc)
             mut path.append(entry.name.as_str())
             let node = match first attempt await view.get(ident::Path(text: take path), at: None, alloc) {
-                Ok(found) => found
+                Ok(got) => got
                 Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
                 Err(_) => continue
             }
             let Some(raw) = node.value else {
                 continue
             }
-            if names(raw.view(), bundle, live, alloc) {
-                return Ok(Some(text::String.of(entry.name.as_str(), alloc)))
+            if not names(raw.view(), bundle, live, alloc) or holds_text(found.view(), text: entry.name.as_str()) {
+                continue
+            }
+            mut found.push(text::String.of(entry.name.as_str(), alloc))
+            if only_one {
+                return None
             }
         }
         let Some(next) = listing.next else {
-            return Ok(None)
+            return None
         }
         after = Some(take next)
     }
-} Users.user
+} Users.listing
+
+fn holds_text(texts: Slice[text::String], text: Str) -> bool {
+    for each in texts {
+        if each.as_str() == text {
+            return true
+        }
+    }
+    return false
+} holds_text
 
 /// Whether `raw`, an `os::InstanceSpec`, or an `os::LiveInstance` when `live`, names the bundle `bundle`.
 fn names(raw: Untrusted[Slice[u8]], bundle: ident::HashValue, live: bool, alloc: mem::Alloc) -> bool {
