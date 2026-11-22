@@ -514,3 +514,31 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** the entries a bundle would add to each loaded registry, typed by the registry's entry type, read before it loads.
 - **Chapters:** [10](10-code.md), [15](15-devices.md).
 - **Issue:** [nan-language/nan#270](https://github.com/nan-language/nan/issues/270).
+
+## N49
+
+**Prepared bundles dropped unpublished.**
+
+- **Language 1:** a kernel prepares a bundle and loads it (NaN 24 §Loading); a prepared bundle is linear and only `load` consumes it, publishing its contributions.
+- **NaN OS requires:** a prepared bundle dropped without publishing its contributions, for the previews of bundles no plan installs.
+- **Chapters:** [10](10-code.md).
+- **Issue:** [nan-language/nan#272](https://github.com/nan-language/nan/issues/272).
+
+## N50
+
+**Text keys of loaded registries.**
+
+- **Language 1:** a loaded registry may be keyed by a `Str` field (NaN 25 §Loaded registries), but an entry type holding a `Str` is a view and `sys::load::Table` refuses views.
+- **NaN OS requires:** loaded registries whose entries hold text and are keyed by it.
+- **Chapters:** [15](15-devices.md).
+- **Issue:** [nan-language/nan#271](https://github.com/nan-language/nan/issues/271).
+
+## N51
+
+**The toolchain in a NaN OS workspace.**
+
+- **Language 1:** the toolchain's packages belong to the NaN repository alone, so no other workspace builds the toolchain.
+- **NaN OS requires:** the toolchain built into the `nan` job's bundle against the interface file of the kernel image a generation ships.
+- **Chapters:** [20](20-base.md).
+- **Issue:** [nan-language/nan#273](https://github.com/nan-language/nan/issues/273).
+
