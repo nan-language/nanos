@@ -1,0 +1,220 @@
+//! The check of a bundle from its sources with the toolchain of the `nan` job: a workspace holding them in the memory of `admission`, over which the core runs the toolchain's release gate, then a bundle build of the root against the running kernel; and the results of the latest checks.
+
+/// The checks whose results `admission` keeps.
+const CHECKS_KEPT: usize = 4
+
+/// What checking bundles from their sources reaches: the toolchain of the `nan` job, the results of the latest checks, and the executor the tasks serving their workspaces run on.
+pub open struct Checking derives Send {
+    toolchain: code::Toolchain
+    checks: task::Cown[Checks]
+    exec: task::Executor
+} Checking
+
+/// The results of the latest checks, oldest first.
+struct Checks {
+    kept: mem::List[Kept]
+} Checks
+
+/// A check's result kept for checks of the same closure from the same sources: the hash of what was checked, and the encoding of its result.
+struct Kept {
+    key: ident::HashValue
+    checked: mem::Bytes
+} Kept
+
+/// What a check of a closure from its sources gives: the report of the release gate or, once that passed, of the bundle build, and the closure the build wrote.
+struct Checked derives Encode {
+    report: code::NanReport
+    built: Option[Built]
+} Checked
+
+/// The closure a bundle build wrote: its code hash, and its image.
+struct Built derives Encode {
+    code: ident::HashValue
+    image: code::Image
+} Built
+
+/// Checking with `toolchain`, keeping no results yet, the tasks serving workspaces running on `exec`.
+pub fn Checking.of(toolchain: code::Toolchain, exec: task::Executor, alloc: mem::Alloc) -> Checking {
+    return Checking(toolchain: toolchain, checks: task::Cown.of(Checks(kept: mem::List.empty(alloc)), alloc), exec: exec)
+} Checking.of
+
+/// The same checking, sharing its results.
+fn Checking.share(self) -> Checking {
+    return Checking(toolchain: self.toolchain, checks: self.checks.share(), exec: self.exec)
+} Checking.share
+
+/// The check of the closure of the root package `root` from `sources`, building for the nanos target `target`, the toolchain reaching `clock`, `log` and `random`: the result kept for the same root and sources, else that of the release gate and, once it passed, of the bundle build; the code of what kept the toolchain from running otherwise.
+fn Checking.checked(
+    self,
+    take sources: mem::List[code::SourceFile],
+    root: Str,
+    target: Str,
+    clock: sys::Clock,
+    log: sys::Log,
+    random: sys::Random,
+    alloc: mem::Alloc,
+    ) -> Result[Checked, text::Fixed[32]] fails task::Cancelled uses wait {
+    let key = check_key(root, sources: sources.view(), alloc)
+    let checks = self.checks.share()
+    let kept = await when checks => kept_check(checks.kept.view(), key, alloc)
+    match kept {
+        Some(again) => match attempt mem::wire::Codec[Checked].decode(Untrusted.of(again.view()), alloc) {
+            Ok(result) => return Ok(take result)
+            Err(_) => {
+            }
+        }
+        None => {
+        }
+    }
+    let outcome = try await self.ran(take sources, root, target, clock, log, random, alloc)
+    let Ok(result) = outcome else {
+        return outcome
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Checked].encode(result, out: mut bytes)
+    var keeping = Some(Kept(key: key, checked: take bytes))
+    await when mut checks {
+        if checks.kept.len() == CHECKS_KEPT {
+            discard mut checks.kept.remove(0)
+        }
+        match mut keeping.extract() {
+            Some(entry) => mut checks.kept.push(take entry)
+            None => {
+            }
+        }
+    }
+    return Ok(take result)
+} Checking.checked
+
+/// The hash of the encoding of the root package `root` and the sources `sources` a check is of.
+fn check_key(root: Str, sources: Slice[code::SourceFile], alloc: mem::Alloc) -> ident::HashValue {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[text::String].encode(text::String.of(root, alloc), out: mut bytes)
+    for file in sources {
+        mem::wire::Codec[code::SourceFile].encode(file, out: mut bytes)
+    }
+    return ident::HashValue.of_content(bytes.view())
+} check_key
+
+/// A copy of the encoding of the result `kept` holds for the check of hash `key`.
+fn kept_check(kept: Slice[Kept], key: ident::HashValue, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let Some(at) = kept.position(fn(each: Kept) => each.key == key) else {
+        return None
+    }
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(kept[at].checked.view())
+    return Some(take copy)
+} kept_check
+
+/// The check of the closure of the root package `root` from `sources` over a workspace in memory holding them, which a task serves.
+fn Checking.ran(
+    self,
+    take sources: mem::List[code::SourceFile],
+    root: Str,
+    target: Str,
+    clock: sys::Clock,
+    log: sys::Log,
+    random: sys::Random,
+    alloc: mem::Alloc,
+    ) -> Result[Checked, text::Fixed[32]] fails task::Cancelled uses wait {
+    let Some(tree) = self.toolchain.tree() else {
+        return Err(text::Fixed[32].of("code.no-image"))
+    }
+    let nlif = self.toolchain.nlif(alloc)
+    let task::Channel(sender: ordering, receiver: orders) = code::orders_of(alloc)
+    let reading = code::MintedWorkspace.of(ordering, alloc)
+    defer take reading.close()
+    let Ok(fs) = attempt sys::Fs.served(reading.mint()) else {
+        return Err(text::Fixed[32].of("instance.env-incomplete"))
+    }
+    let toolchain = self.toolchain
+    var outcome: Result[Checked, text::Fixed[32]] = Err(text::Fixed[32].of("instance.env-incomplete"))
+    var awaiting = Some(take orders)
+    var files = Some(take sources)
+    try await task::scope(self.exec, body: fn[mut awaiting, mut files, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(given) = mut awaiting.extract() else {
+            return
+        }
+        let Some(held) = mut files.extract() else {
+            return
+        }
+        discard s.spawn(fn[take given, take held]() fails task::Cancelled uses wait limits stack 65_536 {
+            try await code::serve_memory(files: take held, tree, nlif: nlif.view(), orders: take given, alloc)
+        })
+        outcome = try await gated(toolchain, root, target, workspace: ordering, fs, nlif: nlif.view(), clock, log, random, alloc)
+        s.cancel()
+    })
+    discard awaiting
+    discard files
+    return outcome
+} Checking.ran
+
+/// The release gate of the closure of the package `root` in the workspace whose orders go to `workspace`, then, once it passed, its bundle build for the nanos target `target` against the interface file `nlif`, and the closure that build wrote, read through `fs`.
+fn gated(
+    toolchain: code::Toolchain,
+    root: Str,
+    target: Str,
+    workspace: task::Sender[code::FsOrder],
+    fs: sys::Fs,
+    take nlif: Slice[u8],
+    clock: sys::Clock,
+    log: sys::Log,
+    random: sys::Random,
+    alloc: mem::Alloc,
+    ) -> Result[Checked, text::Fixed[32]] fails task::Cancelled uses wait {
+    let gate = match try await reported(toolchain, command: code::NanCommand.Verify, root, workspace, clock, log, random, alloc) {
+        Ok(report) => report
+        Err(code) => return Err(code)
+    }
+    if not gate.passed() {
+        return Ok(Checked(report: take gate, built: None))
+    }
+    let build = match try await reported(toolchain, command: code::NanCommand.Build, root, workspace, clock, log, random, alloc) {
+        Ok(report) => report
+        Err(code) => return Err(code)
+    }
+    if not build.passed() {
+        return Ok(Checked(report: take build, built: None))
+    }
+    let image = match attempt await fs.read_all(code::built_path(workspace: "", root, target, extension: ".nbun", alloc).as_str(), alloc) {
+        Ok(read) => read
+        Err(_) => return Err(text::Fixed[32].of("code.malformed"))
+    }
+    let artefacts = match attempt await fs.read_all(code::built_path(workspace: "", root, target, extension: ".narts", alloc).as_str(), alloc) {
+        Ok(read) => read
+        Err(_) => return Err(text::Fixed[32].of("code.malformed"))
+    }
+    let Some(made) = code::Bundle.made(root, image: image.view(), artefacts: artefacts.view(), interface_file: Untrusted.of(take nlif), sources: mem::List.empty(alloc), alloc) else {
+        return Err(text::Fixed[32].of("code.malformed"))
+    }
+    let code::Made(bundle: bundle, code: code_hash) = made
+    var images = bundle.images
+    let Some(lowered) = mut images.pop() else {
+        return Err(text::Fixed[32].of("code.malformed"))
+    }
+    return Ok(Checked(report: take build, built: Some(Built(code: code_hash, image: take lowered))))
+} gated
+
+/// The report of a run of the toolchain's `command` over `root` that returned; the code of what kept it from running, or of how it ended otherwise.
+fn reported(
+    toolchain: code::Toolchain,
+    command: code::NanCommand,
+    root: Str,
+    workspace: task::Sender[code::FsOrder],
+    clock: sys::Clock,
+    log: sys::Log,
+    random: sys::Random,
+    alloc: mem::Alloc,
+    ) -> Result[code::NanReport, text::Fixed[32]] fails task::Cancelled uses wait {
+    let ran = match try await toolchain.run(command, scope: root, workspace, clock, log, random, alloc) {
+        Ok(given) => given
+        Err(code) => return Err(code)
+    }
+    let code::Ran(ended: ended, written: written) = ran
+    return match ended {
+        nanos::Ended.Returned(_) => Ok(code::report_of(written.view(), alloc))
+        nanos::Ended.Trapped(trap) => Err(journal::trap_code(trap.kind()))
+        nanos::Ended.Cancelled or nanos::Ended.Abandoned => Err(text::Fixed[32].of("instance.cancelled"))
+        nanos::Ended.Failed(_) or nanos::Ended.Undecodable => Err(text::Fixed[32].of("instance.input-mismatch"))
+    }
+} reported

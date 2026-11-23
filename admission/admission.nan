@@ -1,4 +1,4 @@
-//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, the core previewing the image's contributions, and uploads the image it takes as a draft blob; it judges the state schemas of updates; it judges the admitted bundles again when the policy or the principals' keys change; and it removes admitted bundles no instance uses.
+//! The `admission` instance: it admits the bundle blob a View reads, judging it by chapter 10's steps, checking the bundle from its sources with the toolchain of the `nan` job on a machine running it and the core previewing the image's contributions, and uploads the image it takes as a draft blob; it judges the state schemas of updates; it judges the admitted bundles again when the policy or the principals' keys change; and it removes admitted bundles no instance uses.
 
 /// The canonical path of the registry of drivers.
 const DRIVERS_TABLE: Str = "devices::drivers"
@@ -31,7 +31,7 @@ pub protocol Admitting {
     fn answered(request: u64, reply: sys::Encoded) limits traceless
 } Admitting
 
-/// The Env of `admission`: its View of `/sys/code`, its reading Views of `/sys/instances` and `/live/instances`, its ports to `keys`, `policy` and `devices`, the core's load-time registries, a `Control` over instances, its clock, the machine it judges for and the nanos target of its architecture, the base bundle, and its cell.
+/// The Env of `admission`: its View of `/sys/code`, its reading Views of `/sys/instances` and `/live/instances`, its ports to `keys`, `policy` and `devices`, the core's load-time registries, its checking of bundles from their sources on a machine running the `nan` job, a `Control` over instances, the clock, log and random source the toolchain reaches, the machine it judges for and the nanos target of its architecture, the base bundle, and its cell.
 pub open struct Env derives Send {
     code: store::service::View
     specs: store::service::View
@@ -40,8 +40,11 @@ pub open struct Env derives Send {
     oversight: os::Port[policy::Oversight]
     devices: os::Port[devices::Devices]
     registries: devices::Registries
+    checks: Option[Checking]
     control: os::Control
     clock: sys::Clock
+    log: sys::Log
+    random: sys::Random
     machine: Machine
     target: text::Fixed[16]
     base: mem::Shared[Base]
@@ -74,18 +77,34 @@ pub fn Env.of(
     oversight: os::Port[policy::Oversight],
     devices: os::Port[devices::Devices],
     registries: devices::Registries,
+    toolchain: Option[code::Toolchain],
     control: os::Control,
     clock: sys::Clock,
+    log: sys::Log,
+    random: sys::Random,
+    exec: task::Executor,
     machine: Machine,
     target: Str,
     take base: Base,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(code: code, specs: specs, running: running, keys: keys, oversight: oversight, devices: devices, registries: registries, control: control, clock: clock, machine: machine, target: text::Fixed[16].of(target), base: mem::Shared.of(take base, alloc), alloc: alloc)
+    let checking = match toolchain {
+        Some(given) => Some(Checking.of(toolchain: given, exec, alloc))
+        None => None
+    }
+    return Env(code: code, specs: specs, running: running, keys: keys, oversight: oversight, devices: devices, registries: registries, checks: take checking, control: control, clock: clock, log: log, random: random, machine: machine, target: text::Fixed[16].of(target), base: mem::Shared.of(take base, alloc), alloc: alloc)
 } Env.of
 
 /// What an admission's keyed task reaches of the Env.
-fn Env.judge(self) -> Judge = Judge(code: self.code, keys: self.keys, oversight: self.oversight, devices: self.devices, registries: self.registries, machine: self.machine, target: self.target, alloc: self.alloc)
+fn Env.judge(self) -> Judge = Judge(code: self.code, keys: self.keys, oversight: self.oversight, devices: self.devices, registries: self.registries, clock: self.clock, log: self.log, random: self.random, machine: self.machine, target: self.target, alloc: self.alloc)
+
+/// The Env's checking of bundles from their sources, sharing its results.
+fn Env.checking(self) -> Option[Checking] {
+    return match self.checks {
+        Some(given) => Some(given.share())
+        None => None
+    }
+} Env.checking
 
 /// What finding the users of a bundle reaches of the Env.
 fn Env.users(self) -> Users = Users(code: self.code, specs: self.specs, running: self.running, alloc: self.alloc)
@@ -103,9 +122,10 @@ pub fn Admitter.admit(
         fail Refusal.Unavailable
     }
     let judge = env.judge()
+    let checking = env.checking()
     let alloc = env.alloc
-    mut cx.spawn(key: SERVING + request, run: fn[take bundle](out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 65_536 {
-        let outcome = try await judge.admitted(bundle, base)
+    mut cx.spawn(key: SERVING + request, run: fn[take bundle, take checking](out: sys::Outbox[Admitting]) fails task::Cancelled uses wait limits stack 65_536 {
+        let outcome = try await judge.admitted(bundle, base, take checking)
         discard attempt await out.answered(request, reply: reply_of(outcome, alloc))
     })
     fail Refusal.Unavailable
@@ -183,26 +203,29 @@ fn Admitter.answered(
     mut cx.cancel(key: SERVING + request)
 } Admitter.answered
 
-/// What an admission's keyed task reaches: the Env's View, ports, registries, machine and target.
+/// What an admission's keyed task reaches: the Env's View, ports, registries, clock, log, random source, machine and target.
 struct Judge derives Copy {
     code: store::service::View
     keys: os::Port[keys::Keys]
     oversight: os::Port[policy::Oversight]
     devices: os::Port[devices::Devices]
     registries: devices::Registries
+    clock: sys::Clock
+    log: sys::Log
+    random: sys::Random
     machine: Machine
     target: text::Fixed[16]
     alloc: mem::Alloc
 } Judge
 
-/// The admission record of the bundle blob `bundle` reads, for the plan of base commit `base`, and the drivers its contributions would start, the image it takes uploaded as a draft blob.
-fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId) -> Result[Admitted, Refusal] fails task::Cancelled uses wait {
+/// The admission record of the bundle blob `bundle` reads, for the plan of base commit `base`, and the drivers its contributions would start, the image it takes uploaded as a draft blob, its sources checked through `checking` when given.
+fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId, take checking: Option[Checking]) -> Result[Admitted, Refusal] fails task::Cancelled uses wait {
     let alloc = self.alloc
     let blob = match first try await read_blob(bundle, path: ident::Path(text: text::String.of("/", alloc)), alloc) {
         Ok(read) => read
         Err(refusal) => return Err(take refusal)
     }
-    let decoded = match first Decoded.of(blob.bytes.view(), target: self.target.as_str(), alloc) {
+    var decoded = match first Decoded.of(blob.bytes.view(), target: self.target.as_str(), alloc) {
         Ok(made) => made
         Err(refusal) => return Err(take refusal)
     }
@@ -225,13 +248,24 @@ fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId) -> 
         Err(os::PortError.Cancelled(cancelled)) => fail cancelled
         Err(_) => return Err(Refusal.Unavailable)
     }
-    let judged = match first decoded.judged(trust, machine: self.machine, admitted: base, alloc) {
+    var verified: Option[code::Image] = None
+    match checking {
+        Some(given) => match first try await self.checked(take given, mut decoded) {
+            Ok(lowered) => {
+                verified = Some(take lowered)
+            }
+            Err(refusal) => return Err(take refusal)
+        }
+        None => {
+        }
+    }
+    let judged = match first decoded.judged(trust, machine: self.machine, admitted: base, take verified, alloc) {
         Ok(made) => made
         Err(refusal) => return Err(take refusal)
     }
-    let Judged(admission: judged_record, image: chosen) = judged
+    let Judged(admission: judged_record, image: taken) = judged
     var record = judged_record
-    let image = decoded.bundle.images[chosen].bytes.view()
+    let image = taken.bytes.view()
     let contributed = match first try await self.contributed(image, code: decoded.code, provenance: record.provenance) {
         Ok(found) => found
         Err(refusal) => return Err(take refusal)
@@ -250,6 +284,66 @@ fn Judge.admitted(self, bundle: store::service::View, base: ident::CommitId) -> 
     }
     return Ok(Admitted(admission: take record, starts: take starts))
 } Judge.admitted
+
+/// Step 4 on a machine running the `nan` job: the image the check through `checking` of the decoded bundle's sources, which it takes from the bundle, lowered once their release gate passed and their build gave the bundle's closure; `code.check-failed` with the toolchain's diagnostics or a note otherwise.
+fn Judge.checked(self, take checking: Checking, mut decoded: Decoded) -> Result[code::Image, Refusal] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    if decoded.bundle.sources.len() == 0 {
+        return Err(noted("the bundle carries no sources", alloc))
+    }
+    var sources = mem::List[code::SourceFile].empty(alloc)
+    loop {
+        let Some(file) = mut decoded.bundle.sources.pop() else {
+            break
+        }
+        mut sources.push(take file)
+    }
+    let checked = match first try await checking.checked(take sources, root: decoded.bundle.root.as_str(), target: self.target.as_str(), clock: self.clock, log: self.log, random: self.random, alloc) {
+        Ok(given) => given
+        Err(failure) => {
+            var note = text::String.of("the toolchain did not run: ", alloc)
+            mut note.append(failure.as_str())
+            return Err(noted(note.as_str(), alloc))
+        }
+    }
+    let Checked(report: report, built: built) = checked
+    let Some(made) = built else {
+        return Err(Refusal.CheckFailed(because: diagnostics_of(report, alloc)))
+    }
+    let Built(code: code_hash, image: image) = made
+    if code_hash != decoded.code {
+        return Err(noted("the sources build another closure", alloc))
+    }
+    return Ok(take image)
+} Judge.checked
+
+/// The refusal of the check with the note `note`.
+fn noted(note: Str, alloc: mem::Alloc) -> Refusal {
+    var because = mem::List[text::String].empty(alloc)
+    var line = text::String.of("note ", alloc)
+    mut line.append(note)
+    mut because.push(take line)
+    return Refusal.CheckFailed(because: take because)
+} noted
+
+/// The causes of a failed check: each diagnostic the toolchain reported, else its verdict.
+fn diagnostics_of(report: code::NanReport, alloc: mem::Alloc) -> mem::List[text::String] {
+    var because = mem::List[text::String].empty(alloc)
+    for record in report.records {
+        if record.as_str().starts_with(" ") {
+            continue
+        }
+        var line = text::String.of("diagnostic ", alloc)
+        mut line.append(record.as_str())
+        mut because.push(take line)
+    }
+    if because.len() == 0 {
+        var line = text::String.of("note ", alloc)
+        mut line.append(report.verdict.as_str())
+        mut because.push(take line)
+    }
+    return because
+} diagnostics_of
 
 /// Step 11: the `drivers` entries the image `image` of the bundle of code hash `code` contributes, as the core previews them, each binding a device by itself when the provenance `provenance` is `vendor` or `reviewed`; `code.registry-duplicate` naming the first whose key a live entry has.
 fn Judge.contributed(self, image: Slice[u8], code: ident::HashValue, provenance: os::Provenance) -> Result[mem::List[devices::DriverEntry], Refusal] fails task::Cancelled uses wait {

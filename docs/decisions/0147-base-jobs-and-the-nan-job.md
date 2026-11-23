@@ -1,6 +1,6 @@
 # 0147. Base jobs and the nan job
 
-Status: accepted
+Status: superseded by 0150
 
 ## Context
 

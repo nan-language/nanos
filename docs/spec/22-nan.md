@@ -541,3 +541,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** the toolchain the `nan` job runs building bundles against the interface file of the kernel image a generation ships, which a toolchain built for a host target built.
 - **Chapters:** [10](10-code.md), [20](20-base.md).
 - **Issue:** [nan-language/nan#280](https://github.com/nan-language/nan/issues/280).
+
+## N53
+
+**Lowering for a kernel another toolchain built.**
+
+- **Language 1:** a bundle builds only against an interface file recording the building toolchain's hash (NaN 30 §Bundles), however much of the kernel's exports its code reaches.
+- **NaN OS requires:** a toolchain building bundles against the interface file of a kernel another toolchain built when the kernel exports what their code reaches, for the bundles it lowers again after a toolchain update.
+- **Chapters:** [10](10-code.md), [20](20-base.md).
+- **Issue:** [nan-language/nan#283](https://github.com/nan-language/nan/issues/283).

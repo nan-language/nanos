@@ -1,0 +1,155 @@
+//! The sources of a bundle: the source and machine files of the packages of its closure outside std, as the workspace holding them lays them out.
+
+/// The file of a package's manifest, the dir of its machine files, and the dir of its API snapshots within that dir.
+const MANIFEST_FILE: Str = "package.nan"
+
+const MACHINE_DIR: Str = ".nan"
+
+const SNAPSHOTS_DIR: Str = "api"
+
+/// The suffix of the names of source and machine files.
+const NAN_SUFFIX: Str = ".nan"
+
+/// A dir of the workspace still to visit: its path from the workspace's root, and whether its source files are those of a package wanted.
+struct Visit {
+    dir: text::String
+    gathering: bool
+} Visit
+
+/// The source and machine files of the packages named `packages` among those of the workspace at the dir `workspace` of `fs`, its root for the empty path, each with its path from that dir, in byte order of path. A package is a dir holding a `package.nan`; its source files are the `.nan` files of its dir and of its subdirs holding no `package.nan`, and its machine files the lock, history, principals file, passes file and API snapshots of its `.nan` dir. No other dir whose name starts with a dot is visited.
+pub fn sources_of(fs: sys::Fs, workspace: Str, packages: Slice[text::String], alloc: mem::Alloc) -> mem::List[SourceFile] fails sys::fs::FsError uses wait {
+    var sources = mem::List[SourceFile].empty(alloc)
+    var pending = mem::List[Visit].empty(alloc)
+    mut pending.push(Visit(dir: text::String.empty(alloc), gathering: false))
+    loop {
+        let Some(visit) = mut pending.pop() else {
+            return sources
+        }
+        let dir = visit.dir.as_str()
+        let entries = try await fs.list(joined(workspace, name: dir, alloc).as_str(), alloc)
+        var gathering = visit.gathering
+        if entries.position(fn(entry: sys::fs::Entry) => entry.kind == sys::fs::Kind.File and entry.name.as_str() == MANIFEST_FILE).is_some() {
+            let manifest = try await fs.read_all(joined(workspace, name: joined(dir, name: MANIFEST_FILE, alloc).as_str(), alloc).as_str(), alloc)
+            gathering = match package_name(copied(manifest, alloc).view(), alloc) {
+                Some(name) => packages.position(fn(wanted: text::String) => wanted.as_str() == name.as_str()).is_some()
+                None => false
+            }
+        }
+        for entry in entries {
+            let name = entry.name.as_str()
+            let path = joined(dir, name, alloc)
+            if entry.kind == sys::fs::Kind.Directory {
+                if name == MACHINE_DIR and gathering {
+                    try await gather_machine_files(fs, workspace, dir: path.as_str(), mut sources, alloc)
+                } else if not name.starts_with(".") {
+                    mut pending.push(Visit(dir: take path, gathering: gathering))
+                }
+            } else if gathering and entry.kind == sys::fs::Kind.File and name.ends_with(NAN_SUFFIX) {
+                try await gather_file(fs, workspace, take path, mut sources, alloc)
+            }
+        }
+    }
+} sources_of
+
+/// Adds to `sources` the machine files of the `.nan` dir `dir` NaN reads: its lock, history, principals file and passes file, and the API snapshots of its `api` dir.
+fn gather_machine_files(
+    fs: sys::Fs,
+    workspace: Str,
+    dir: Str,
+    mut sources: mem::List[SourceFile],
+    alloc: mem::Alloc,
+    ) fails sys::fs::FsError uses wait {
+    for entry in try await fs.list(joined(workspace, name: dir, alloc).as_str(), alloc) {
+        let name = entry.name.as_str()
+        let path = joined(dir, name, alloc)
+        if entry.kind == sys::fs::Kind.File and is_machine_file(name) {
+            try await gather_file(fs, workspace, take path, mut sources, alloc)
+        } else if entry.kind == sys::fs::Kind.Directory and name == SNAPSHOTS_DIR {
+            for snapshot in try await fs.list(joined(workspace, name: path.as_str(), alloc).as_str(), alloc) {
+                if snapshot.kind == sys::fs::Kind.File and snapshot.name.as_str().ends_with(NAN_SUFFIX) {
+                    try await gather_file(fs, workspace, path: joined(path.as_str(), name: snapshot.name.as_str(), alloc), mut sources, alloc)
+                }
+            }
+        }
+    }
+} gather_machine_files
+
+/// Whether `name` names a machine file of a `.nan` dir other than an API snapshot.
+fn is_machine_file(name: Str) -> bool {
+    return name == "lock.nan" or name == "history.nan" or name == "principals.nan" or name == "passes.nan"
+} is_machine_file
+
+/// Adds to `sources`, in byte order of path, the file at `path` from the workspace's root.
+fn gather_file(
+    fs: sys::Fs,
+    workspace: Str,
+    take path: text::String,
+    mut sources: mem::List[SourceFile],
+    alloc: mem::Alloc,
+    ) fails sys::fs::FsError uses wait {
+    let read = try await fs.read_all(joined(workspace, name: path.as_str(), alloc).as_str(), alloc)
+    var at: usize = 0
+    while at < sources.len() and sources[at].path.as_str() < path.as_str() {
+        at += 1
+    }
+    mut sources.insert(at, value: SourceFile(path: take path, bytes: copied(read, alloc)))
+} gather_file
+
+/// The path of `name` in the dir `dir`, either empty standing for the root or for the dir itself.
+fn joined(dir: Str, name: Str, alloc: mem::Alloc) -> text::String {
+    var path = text::String.of(dir, alloc)
+    if not dir.is_empty() and not name.is_empty() {
+        mut path.append("/")
+    }
+    mut path.append(name)
+    return path
+} joined
+
+/// A file's bytes, which a bundle carries as they are.
+validator fn copied(raw: Untrusted[mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect().view())
+    return bytes
+} copied
+
+/// Writes `data` to the file at `path` of `fs`, creating the dirs above it.
+fn put(fs: sys::Fs, path: Str, data: Slice[u8]) fails sys::fs::FsError uses wait {
+    let bytes = path.as_bytes()
+    for at in 0..<bytes.len() {
+        if bytes[at] != b'/' {
+            continue
+        }
+        let Some(dir) = path.slice_bytes(0, end: at) else {
+            fail sys::fs::FsError.InvalidPath
+        }
+        match attempt await fs.kind(dir) {
+            Ok(_) => {
+            }
+            Err(_) => try await fs.create_dir(dir)
+        }
+    }
+    try await fs.write_all(path, data)
+} put
+
+test bundles_carry_the_source_and_machine_files_of_the_packages_they_name for sources_of {
+    let world = testing::world()
+    let alloc = world.alloc
+    try await put(world.fs, path: "ws/hello/package.nan", data: b"package hello {\n    language 1\n} hello\n")
+    try await put(world.fs, path: "ws/hello/hello.nan", data: b"fn main() {\n} main\n")
+    try await put(world.fs, path: "ws/hello/notes.txt", data: b"notes\n")
+    try await put(world.fs, path: "ws/hello/parts/parts.nan", data: b"fn part() {\n} part\n")
+    try await put(world.fs, path: "ws/hello/.nan/lock.nan", data: b"nan lock 1\n")
+    try await put(world.fs, path: "ws/hello/.nan/images/hello.nbun", data: b"image")
+    try await put(world.fs, path: "ws/hello/.nan/api/hello.nan", data: b"nan api 1\n")
+    try await put(world.fs, path: "ws/hello/inner/package.nan", data: b"package inner {\n    language 1\n} inner\n")
+    try await put(world.fs, path: "ws/other/package.nan", data: b"package other {\n    language 1\n} other\n")
+    var wanted = mem::List[text::String].empty(alloc)
+    mut wanted.push(text::String.of("hello", alloc))
+    let sources = try await sources_of(world.fs, workspace: "ws", packages: wanted.view(), alloc)
+    expect sources.len() == 5
+    expect sources[0].path.as_str() == "hello/.nan/api/hello.nan"
+    expect sources[1].path.as_str() == "hello/.nan/lock.nan"
+    expect sources[2].path.as_str() == "hello/hello.nan"
+    expect sources[3].path.as_str() == "hello/package.nan"
+    expect sources[4].path.as_str() == "hello/parts/parts.nan" and sources[4].bytes.view() == b"fn part() {\n} part\n"
+} bundles_carry_the_source_and_machine_files_of_the_packages_they_name

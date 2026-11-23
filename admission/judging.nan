@@ -7,6 +7,7 @@ pub closed enum Refusal derives Eq, Render, Encode {
     ClosureIncomplete(name: text::String)
     BadSignature(signer: text::String)
     Unsigned
+    CheckFailed(because: mem::List[text::String])
     SealMissing(item: text::String)
     SealRejected(item: text::String)
     SealSameAuthor(item: text::String)
@@ -54,10 +55,10 @@ struct Exports {
     program: Option[code::Program]
 } Exports
 
-/// What judging a bundle gives: its admission record, and the position in the bundle of the image it takes.
+/// What judging a bundle gives: its admission record, and the image it takes.
 pub closed struct Judged {
     pub admission: code::Admission
-    pub image: usize
+    pub image: code::Image
 } Judged
 
 pub fn Refusal.code(self) -> text::Fixed[32] {
@@ -67,6 +68,7 @@ pub fn Refusal.code(self) -> text::Fixed[32] {
         Refusal.ClosureIncomplete(name: _) => text::Fixed[32].of("code.closure-incomplete")
         Refusal.BadSignature(signer: _) => text::Fixed[32].of("auth.bad-signature")
         Refusal.Unsigned => text::Fixed[32].of("code.unsigned")
+        Refusal.CheckFailed(because: _) => text::Fixed[32].of("code.check-failed")
         Refusal.SealMissing(item: _) => text::Fixed[32].of("code.seal-missing")
         Refusal.SealRejected(item: _) => text::Fixed[32].of("code.seal-rejected")
         Refusal.SealSameAuthor(item: _) => text::Fixed[32].of("code.seal-same-author")
@@ -222,23 +224,67 @@ pub fn Decoded.signers(self, alloc: mem::Alloc) -> Result[mem::List[Signer], Ref
     return Ok(take signers)
 } Decoded.signers
 
-/// The admission record of the decoded bundle, whose signatures `keys` verified, under the policy's trust `trust`, on `machine`, admitted by the plan of base commit `admitted`: steps 4, 6, 7, 12 and 13 of a program bundle.
+/// The admission record of the decoded bundle, whose signatures `keys` verified, under the policy's trust `trust`, on `machine`, admitted by the plan of base commit `admitted`, `verified` being on a machine running the `nan` job the image its toolchain lowered from the bundle's sources once their release gate passed: steps 4, 6, 7, 12 and 13 of a program bundle.
 pub fn Decoded.judged(
     self,
     trust: policy::Trust,
     machine: Machine,
     admitted: ident::CommitId,
+    take verified: Option[code::Image],
     alloc: mem::Alloc,
     ) -> Result[Judged, Refusal] {
-    let Some(certificate) = self.bundle.certificate else {
-        return Err(Refusal.Unsigned)
-    }
-    if certificate.code != self.code or not policy::matches_any(trust.builders, principal: certificate.builder.text.as_str(), alloc) {
+    let Some(check) = self.check_of(verifier: lowered_by(verified), trust, alloc) else {
         return Err(Refusal.Unsigned)
     }
     let Some(Exports(components: components, program: program)) = self.exports(alloc) else {
         return Err(Refusal.Malformed)
     }
+    let classed = match self.classed(trust, machine, alloc) {
+        Ok(found) => found
+        Err(refusal) => return Err(take refusal)
+    }
+    let Classed(escapes: escapes, provenance: provenance, shared: shared) = classed
+    let Some(image) = self.image(certified: self.certified(trust, alloc), vendor: self.bundle.signatures.len() > 0, machine, take verified, alloc) else {
+        return Err(Refusal.NoImage(level: machine.level, support: machine.support))
+    }
+    let lowered = code::Lowered(level: image.level, toolchain: image.toolchain, support: image.support, image: ident::HashValue.of_content(image.bytes.view()), code_bytes: u64.widen(image.bytes.len()))
+    let admission = code::Admission(root: text::String.of(self.artefacts[self.root].name.as_str(), alloc), packages: self.packages(alloc), components: take components, program: take program, authority: self.summary(alloc), escapes: take escapes, contributions: mem::List.empty(alloc), provenance: provenance, shared: shared, check: take check, image: take lowered, admitted: admitted)
+    return Ok(Judged(admission: take admission, image: take image))
+} Decoded.judged
+
+/// Step 4's check of the decoded bundle: by the toolchain `verifier` of the `nan` job once it passed the bundle's sources, else by its certificate when a builder `trust` names signed it; `None` for neither.
+fn Decoded.check_of(self, verifier: Option[ident::HashValue], trust: policy::Trust, alloc: mem::Alloc) -> Option[code::CodeCheck] {
+    match verifier {
+        Some(toolchain) => return Some(code::CodeCheck.Verified(toolchain: toolchain))
+        None => {
+        }
+    }
+    let Some(certificate) = self.bundle.certificate else {
+        return None
+    }
+    if not self.certified(trust, alloc) {
+        return None
+    }
+    return Some(code::CodeCheck.Certified(builder: ident::Principal(text: certificate.builder.text), toolchain: certificate.toolchain))
+} Decoded.check_of
+
+/// The toolchain that lowered `verified`, when there is such an image.
+fn lowered_by(verified: Option[code::Image]) -> Option[ident::HashValue] {
+    return match verified {
+        Some(image) => Some(image.toolchain)
+        None => None
+    }
+} lowered_by
+
+/// What steps 6 and 12 give of a bundle: the trust escapes of its closure with the sealers admission accepts, its provenance class, and whether it may share the shared space.
+pub closed struct Classed {
+    pub escapes: mem::List[code::Escape]
+    pub provenance: os::Provenance
+    pub shared: bool
+} Classed
+
+/// Steps 6 and 12 of the decoded bundle under the policy's trust `trust` on `machine`.
+pub fn Decoded.classed(self, trust: policy::Trust, machine: Machine, alloc: mem::Alloc) -> Result[Classed, Refusal] {
     let vendor = self.bundle.signatures.len() > 0
     var escapes = mem::List[code::Escape].empty(alloc)
     var reviewed = true
@@ -287,14 +333,8 @@ pub fn Decoded.judged(
         }
     }
     let placeable = provenance != os::Provenance.Agent or (not escaping and trust.agent_shared_space and machine.iommu)
-    let Some(chosen) = self.image(certificate, vendor, machine, alloc) else {
-        return Err(Refusal.NoImage(level: machine.level, support: machine.support))
-    }
-    let image = self.bundle.images[chosen]
-    let lowered = code::Lowered(level: image.level, toolchain: image.toolchain, support: image.support, image: ident::HashValue.of_content(image.bytes.view()), code_bytes: u64.widen(image.bytes.len()))
-    let admission = code::Admission(root: text::String.of(self.artefacts[self.root].name.as_str(), alloc), packages: self.packages(alloc), components: take components, program: take program, authority: self.summary(alloc), escapes: take escapes, contributions: mem::List.empty(alloc), provenance: provenance, shared: placeable and vouched, check: code::CodeCheck.Certified(builder: ident::Principal(text: certificate.builder.text), toolchain: certificate.toolchain), image: take lowered, admitted: admitted)
-    return Ok(Judged(admission: take admission, image: chosen))
-} Decoded.judged
+    return Ok(Classed(escapes: take escapes, provenance: provenance, shared: placeable and vouched))
+} Decoded.classed
 
 /// What the root of the decoded bundle exports: the program its `main` runs when `main` is its only entry, else the components its entries name; `None` when an entry names neither.
 /// Whether `signers` checks `key` as the key of `principal` for signatures of kind `kind` already.
@@ -376,33 +416,61 @@ fn Decoded.authored(self, name: Str, principal: Str) -> bool {
     return false
 } Decoded.authored
 
-/// The position of the image step 13 takes: a trusted image, of the vendor's bundle or listed by the certificate `certificate`, whose support routines are the machine's kernel's, at the machine's level or else the highest lower one of its architecture.
+/// Whether the bundle carries a certificate for its code hash by a builder `trust` names.
+fn Decoded.certified(self, trust: policy::Trust, alloc: mem::Alloc) -> bool {
+    let Some(certificate) = self.bundle.certificate else {
+        return false
+    }
+    return certificate.code == self.code and policy::matches_any(trust.builders, principal: certificate.builder.text.as_str(), alloc)
+} Decoded.certified
+
+/// The image step 13 takes: a trusted image, of the vendor's bundle or listed by its certificate when `certified`, whose support routines are the machine's kernel's, at the machine's level; else `verified`, the image the `nan` job lowered; else such a trusted image of the highest lower level of its architecture.
 fn Decoded.image(
     self,
-    certificate: code::Certificate,
+    certified: bool,
     vendor: bool,
     machine: Machine,
+    take verified: Option[code::Image],
     alloc: mem::Alloc,
-    ) -> Option[usize] {
+    ) -> Option[code::Image] {
     var chosen: Option[usize] = None
     for at in 0..<self.bundle.images.len() {
         let image = self.bundle.images[at]
         let arm = image.level >= code::Level.Armv80
         let fits = image.support == machine.support and arm == (machine.level >= code::Level.Armv80) and image.level <= machine.level
-        var certified = vendor
+        var assured = vendor
         let blob = ident::HashValue.of_content(image.bytes.view())
-        for listed in certificate.images {
-            certified = certified or listed == blob
+        match self.bundle.certificate {
+            Some(certificate) => {
+                for listed in certificate.images {
+                    assured = assured or (certified and listed == blob)
+                }
+            }
+            None => {
+            }
         }
         let higher = match chosen {
             Some(earlier) => image.level > self.bundle.images[earlier].level
             None => true
         }
-        if fits and certified and higher {
+        if fits and assured and higher {
             chosen = Some(at)
         }
     }
-    return chosen
+    let at_level = match chosen {
+        Some(at) => self.bundle.images[at].level == machine.level
+        None => false
+    }
+    if not at_level and verified.is_some() {
+        return verified
+    }
+    let Some(at) = chosen else {
+        return None
+    }
+    let image = self.bundle.images[at]
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(image.bytes.view())
+    return Some(code::Image(level: image.level, toolchain: image.toolchain, support: image.support, bytes: take bytes))
 } Decoded.image
 
 /// The packages of the closure: each name, code root, authors NaN OS can name, and the principal of its review signature.
@@ -633,7 +701,7 @@ fn hello_of(
     mut listed.push(ident::HashValue.of_content(b"haswell"))
     let code_hash = ident::HashValue.of_content(b"code of hello")
     let certificate = code::Certificate(builder: ident::Principal(text: text::Fixed[64].of(builder)), code: code_hash, toolchain: ident::HashValue.of_content(b"toolchain"), images: take listed, signature: ident::Signature(bytes: Array[u8, 64].filled(0)))
-    let bundle = code::Bundle(root: text::String.of("hello", alloc), artefacts: mem::List.empty(alloc), images: take images, certificate: Some(take certificate), signatures: mem::List.empty(alloc))
+    let bundle = code::Bundle(root: text::String.of("hello", alloc), artefacts: mem::List.empty(alloc), images: take images, sources: mem::List.empty(alloc), certificate: Some(take certificate), signatures: mem::List.empty(alloc))
     return Decoded(bundle: take bundle, artefacts: take artefacts, root: 0, code: code_hash, hash: ident::HashValue.of_content(b"bundle of hello"))
 } hello_of
 
@@ -658,13 +726,13 @@ test certified_programs_take_their_best_trusted_image_and_record_their_closure f
     let alloc = testing::world().alloc
     let machine = Machine(level: code::Level.X86v3, support: ident::HashValue.of_content(b"kernel interface"), iommu: true)
     let decoded = hello_of("vendor.acme", kind: "trusted", granted: None, builder: "builder.ci", alloc)
-    let outcome = decoded.judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 7), alloc)
+    let outcome = decoded.judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 7), verified: None, alloc)
     let Ok(judged) = outcome else {
         expect false
         return
     }
-    let Judged(admission: admission, image: chosen) = judged
-    expect chosen == 1 and admission.image.level == code::Level.X86v3 and admission.image.image == ident::HashValue.of_content(b"haswell") and admission.image.code_bytes == 7
+    let Judged(admission: admission, image: image) = judged
+    expect image.bytes.view() == b"haswell" and admission.image.level == code::Level.X86v3 and admission.image.image == ident::HashValue.of_content(b"haswell") and admission.image.code_bytes == 7
     expect admission.authority.len() == 2 and admission.authority[0].as_str() == "units alloc" and admission.authority[1].as_str() == "units escape trusted \"units::raw\""
     expect admission.escapes.len() == 1 and admission.escapes[0].item.as_str() == "units::raw" and admission.escapes[0].sealers.len() == 1
     expect admission.provenance == os::Provenance.Agent and not admission.shared and admission.packages.len() == 3 and admission.admitted == ident::CommitId(number: 7)
@@ -676,6 +744,46 @@ test certified_programs_take_their_best_trusted_image_and_record_their_closure f
     }
     expect typed
 } certified_programs_take_their_best_trusted_image_and_record_their_closure
+
+test bundles_the_nan_job_verified_need_no_certificate_and_take_its_image_below_a_trusted_one_at_the_machine_level for Decoded.judged {
+    let alloc = testing::world().alloc
+    let support = ident::HashValue.of_content(b"kernel interface")
+    let toolchain = ident::HashValue.of_content(b"machine toolchain")
+    let older = Machine(level: code::Level.X86v2, support: support, iommu: true)
+    let newer = Machine(level: code::Level.X86v3, support: support, iommu: true)
+    let uncertified = hello_of("vendor.acme", kind: "trusted", granted: None, builder: "human.ann", alloc)
+    let Ok(verified) = uncertified.judged(trust_of(false, alloc), machine: newer, admitted: ident::CommitId(number: 1), verified: Some(lowered_of(toolchain, support, alloc)), alloc) else {
+        expect false
+        return
+    }
+    expect verified_by(verified.admission.check, toolchain) and verified.image.bytes.view() == b"lowered"
+    let certified = hello_of("vendor.acme", kind: "trusted", granted: None, builder: "builder.ci", alloc)
+    let Ok(trusted_at_level) = certified.judged(trust_of(false, alloc), machine: newer, admitted: ident::CommitId(number: 1), verified: Some(lowered_of(toolchain, support, alloc)), alloc) else {
+        expect false
+        return
+    }
+    expect verified_by(trusted_at_level.admission.check, toolchain) and trusted_at_level.image.bytes.view() == b"haswell"
+    let Ok(below_level) = certified.judged(trust_of(false, alloc), machine: older, admitted: ident::CommitId(number: 1), verified: Some(lowered_of(toolchain, support, alloc)), alloc) else {
+        expect false
+        return
+    }
+    expect below_level.image.bytes.view() == b"lowered"
+} bundles_the_nan_job_verified_need_no_certificate_and_take_its_image_below_a_trusted_one_at_the_machine_level
+
+/// Whether `check` is a check by the `nan` job's toolchain `toolchain`.
+fn verified_by(check: code::CodeCheck, toolchain: ident::HashValue) -> bool {
+    return match check {
+        code::CodeCheck.Verified(toolchain: by) => by == toolchain
+        code::CodeCheck.Certified(builder: _, toolchain: _) => false
+    }
+} verified_by
+
+/// The image the `nan` job's toolchain `toolchain` lowers at level 1 against the support routines `support`.
+fn lowered_of(toolchain: ident::HashValue, support: ident::HashValue, alloc: mem::Alloc) -> code::Image {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(b"lowered")
+    return code::Image(level: code::Level.X86v1, toolchain: toolchain, support: support, bytes: take bytes)
+} lowered_of
 
 test seals_by_one_key_are_checked_once for Decoded.signers {
     let alloc = testing::world().alloc
@@ -715,11 +823,11 @@ test escapes_sealed_by_strangers_or_authors_and_grants_sealed_by_builders_are_re
     let alloc = testing::world().alloc
     let machine = Machine(level: code::Level.X86v3, support: ident::HashValue.of_content(b"kernel interface"), iommu: true)
     let older = Machine(level: code::Level.X86v3, support: ident::HashValue.of_content(b"older kernel"), iommu: true)
-    let stranger = refused_with(hello_of("agent.ops", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), alloc), code: "code.seal-missing")
-    let author = refused_with(hello_of("human.bob", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), alloc), code: "code.seal-same-author")
-    let unvouched = refused_with(hello_of("builder.ci", kind: "grant", granted: Some("device"), builder: "builder.ci", alloc).judged(trust_of(true, alloc), machine, admitted: ident::CommitId(number: 1), alloc), code: "code.seal-rejected")
-    let uncertified = refused_with(hello_of("vendor.acme", kind: "trusted", granted: None, builder: "human.ann", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), alloc), code: "code.unsigned")
-    let imageless = refused_with(hello_of("vendor.acme", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine: older, admitted: ident::CommitId(number: 1), alloc), code: "code.no-image")
+    let stranger = refused_with(hello_of("agent.ops", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), verified: None, alloc), code: "code.seal-missing")
+    let author = refused_with(hello_of("human.bob", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), verified: None, alloc), code: "code.seal-same-author")
+    let unvouched = refused_with(hello_of("builder.ci", kind: "grant", granted: Some("device"), builder: "builder.ci", alloc).judged(trust_of(true, alloc), machine, admitted: ident::CommitId(number: 1), verified: None, alloc), code: "code.seal-rejected")
+    let uncertified = refused_with(hello_of("vendor.acme", kind: "trusted", granted: None, builder: "human.ann", alloc).judged(trust_of(false, alloc), machine, admitted: ident::CommitId(number: 1), verified: None, alloc), code: "code.unsigned")
+    let imageless = refused_with(hello_of("vendor.acme", kind: "trusted", granted: None, builder: "builder.ci", alloc).judged(trust_of(false, alloc), machine: older, admitted: ident::CommitId(number: 1), verified: None, alloc), code: "code.no-image")
     expect stranger and author and unvouched and uncertified and imageless
 } escapes_sealed_by_strangers_or_authors_and_grants_sealed_by_builders_are_refused
 

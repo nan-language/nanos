@@ -28,9 +28,15 @@ pub closed struct Bundle derives Encode {
     pub root: text::String
     pub artefacts: mem::List[mem::Bytes] // one NaN artefact per package
     pub images: mem::List[Image]
+    pub sources: mem::List[SourceFile]
     pub certificate: Option[Certificate]
     pub signatures: mem::List[Signed] // bundle signatures
 } Bundle
+
+pub closed struct SourceFile derives Encode {
+    pub path: text::String // from the root of the workspace holding the packages
+    pub bytes: mem::Bytes
+} SourceFile
 
 pub closed struct Image derives Encode {
     pub level: Level
@@ -55,6 +61,7 @@ pub closed struct Signed derives Encode {
 ```
 
 - `artefacts` holds one artefact per package of the closure, std included, in byte order of code root hash (requires [N43](22-nan.md#n43)).
+- `sources` holds, in byte order of path, the source files and machine files of the packages of the closure outside std ([NaN 35 §Machine files](https://github.com/nan-language/nan/blob/main/docs/spec/35-format.md#machine-files)): those of each package's dir and of its subdirs holding no `package.nan`, at their paths in the workspace holding the packages, so that NaN checks the closure from them as it checks a release from its source tree ([NaN 30 §Releases](https://github.com/nan-language/nan/blob/main/docs/spec/30-artefacts.md#releases)).
 - `images` holds at most one image per level, toolchain and support table. `toolchain` is a [toolchain hash](https://github.com/nan-language/nan/blob/main/docs/spec/36-builds.md#toolchain-hash); `support` is the hash of the support-routine table the image imports, and an image loads only into a kernel exporting a table with that hash, the running kernel's being `LiveBoot.support` ([/live](13-tree.md#live); requires [N6](22-nan.md#n6), [N45](22-nan.md#n45)).
 - `X86v1` to `X86v4` are the x86-64 microarchitecture levels 1 to 4 of the System V psABI, `Armv80` is Armv8.0-A and `Armv82` Armv8.2-A with the dot product instructions. A machine's level is `Machine.level` ([measured facts](01-machines.md#measured-facts)); an image runs on a machine of its level or above (requires [N17](22-nan.md#n17)).
 - The **bundle hash** is the hash of kind `bundle` of the bundle's encoding with `signatures` empty; each entry of `signatures` is a `bundle` signature ([signatures](09-authority.md#signatures)).
@@ -92,7 +99,7 @@ It states that `builder` checked the closure of code hash `code` with `toolchain
 1. **Decode.** The blob decodes as the canonical encoding of a `Bundle` and each artefact decodes (`code.malformed`). The root package declares the nanos target of the machine's architecture (`code.target-mismatch`).
 2. **Closure.** The bundle holds exactly one artefact per package name, and every package an artefact's requires-set names is one of them (`code.closure-incomplete`).
 3. **Signatures.** Every signature of the bundle, its certificate, its signature sections and its seals verifies against a principal record as [signatures](09-authority.md#signatures) states (`auth.bad-signature`).
-4. **Check.** On a machine running the [`nan` job](20-base.md#jobs), admission checks the closure in verify mode: well-formedness, every obligation decided anew and every example run, whatever the requires-sets (requires [N26](22-nan.md#n26), [N52](22-nan.md#n52)); an error fails with `code.check-failed`, the NaN diagnostic in its because chain. On any other machine, the bundle needs a certificate for its code hash by a builder the policy trusts (`code.unsigned`).
+4. **Check.** On a machine running the [`nan` job](20-base.md#jobs), admission checks the closure in verify mode from the bundle's sources: it has the core run the job's toolchain over a workspace in its memory holding them, the release gate, then a bundle build of the root package against the running kernel, which decides every obligation anew and runs every example, whatever the requires-sets (requires [N26](22-nan.md#n26), [N52](22-nan.md#n52)). A bundle carrying no sources, an error, or a build of another closure than the bundle's fails with `code.check-failed`, the NaN diagnostics or a note in its because chain. On any other machine, the bundle needs a certificate for its code hash by a builder the policy trusts (`code.unsigned`).
 5. **Requires-sets.** Each requires-set entry naming an item of the platform package or a kernel-implemented std item is satisfied, as [NaN 29 §Requires-sets](https://github.com/nan-language/nan/blob/main/docs/spec/29-identity-versioning.md#requires-sets) defines, by the running kernel image's releases: the interface file an image is lowered against records them, so they hold for every image step 13 takes.
 6. **Seals.** Every trust escape of the closure outside the std packages of the toolchain of step 4 carries an accepted seal by one of the policy's `sealers` ([policy](19-oversight.md#policy)) (`code.seal-missing`). A `device` or `priv` grant needs one by a `vendor.*`, `human.*` or `owner` principal, except a `device` grant confined to IOMMU domains on a machine with `iommu` (`code.seal-rejected`). No accepted seal is by an author of the sealed item's package or of a package holding an item of its closure entries (`code.seal-same-author`).
 7. **Authority.** Admission computes the closure summary ([NaN 14 §Authority summaries](https://github.com/nan-language/nan/blob/main/docs/spec/14-authority.md#authority-summaries)), whose entries include the OS capability kinds (requires [N27](22-nan.md#n27)). The [effect set](14-changes.md#the-effect-set) lists it, and for an `update`, as widenings, the entries the running bundle's summary lacks; the [policy](19-oversight.md#policy) decides the approvals they need.
@@ -101,7 +108,7 @@ It states that `builder` checked the closure of code hash `code` with `toolchain
 10. **Reversibility.** Admission records the declared reversibility bound of each operation each component serves, the bundle's **reversibility profile**. Its checked digest respects each bound, except a bound lower than the class of the operations it calls, which only a sealed premise declares, a trust escape that step 6 checks ([declared classes](14-changes.md#declared-classes); requires [N16](22-nan.md#n16)).
 11. **Contributions.** Each contribution to a registry of the kernel image is admitted as [registries](#registries) states (requires [N48](22-nan.md#n48), [N49](22-nan.md#n49)).
 12. **Provenance and placement.** Admission computes the provenance class and the `shared` field ([provenance](09-authority.md#provenance), [placement](09-authority.md#placement)); a step starting an instance whose placement the machine cannot give is refused with its `place` code.
-13. **Lowering.** Admission takes a trusted image of the machine's level whose `support` is the running kernel's; else, with the `nan` job, it lowers the closure for that level (requires [N6](22-nan.md#n6), [N17](22-nan.md#n17), [N52](22-nan.md#n52)); else it takes such an image of the highest lower level; else it fails with `code.no-image`, whose `expected:` line gives `Machine.level` and `LiveBoot.support`.
+13. **Lowering.** Admission takes a trusted image of the machine's level whose `support` is the running kernel's; else, with the `nan` job, the image the bundle build of step 4 lowered against the running kernel (requires [N6](22-nan.md#n6), [N52](22-nan.md#n52)); else such a trusted image of the highest lower level; else it fails with `code.no-image`, whose `expected:` line gives `Machine.level` and `LiveBoot.support`.
 14. **Record.** The apply writes the [admission record](#admission-record), the bundle blob and the image in the plan's commit, and emits `code.admitted`.
 
 Admitting a code hash already admitted runs steps 7 to 12 only. Admission is charged to the session's [account](08-scheduling.md#accounting), and results of verify mode and lowering are reused across previews of one bundle.
@@ -277,7 +284,7 @@ A new generation's kernel image folds in the bundles of updated base instances, 
 
 ## Toolchain updates
 
-A **toolchain update** installs a new bundle of the `nan` program and makes it the one the `nan` job runs ([jobs](20-base.md#jobs); requires [N52](22-nan.md#n52)). After it, `admission` checks again in verify mode and lowers again, in CPU class `background` ([CPU classes](08-scheduling.md#cpu-classes)), every admitted bundle an instance uses, against the running kernel's support routines. Each bundle lowered emits `code.relowered`, gains the image in its record, and its instances update to the same code hash with the new image: an update of class `identical`, with probation. A bundle failing the check keeps its image and emits `code.recheck-failed`.
+A **toolchain update** installs a new bundle of the `nan` program and makes it the one the `nan` job runs ([jobs](20-base.md#jobs); requires [N52](22-nan.md#n52), [N53](22-nan.md#n53)). After it, `admission` checks again in verify mode and lowers again, in CPU class `background` ([CPU classes](08-scheduling.md#cpu-classes)), every admitted bundle an instance uses, against the running kernel's support routines. Each bundle lowered emits `code.relowered`, gains the image in its record, and its instances update to the same code hash with the new image: an update of class `identical`, with probation. A bundle failing the check keeps its image and emits `code.recheck-failed`.
 
 ## Events
 
@@ -299,7 +306,7 @@ A **toolchain update** installs a new bundle of the `nan` program and makes it t
 | `code.malformed` | the bundle or one of its artefacts does not decode canonically | [Admission](#admission) |
 | `code.target-mismatch` | the root declares no nanos target of the machine's architecture | [Admission](#admission) |
 | `code.closure-incomplete` | a package is missing or present twice, or a requires-set names a package without an artefact | [Admission](#admission) |
-| `code.check-failed` | verify mode found an error | [Admission](#admission) |
+| `code.check-failed` | verify mode found an error, or the bundle carries no sources or those of another closure | [Admission](#admission) |
 | `code.unsigned` | no toolchain and no certificate by a trusted builder | [Admission](#admission) |
 | `code.seal-missing` | a trust escape has no accepted seal by an accepted sealer | [Admission](#admission) |
 | `code.seal-rejected` | a `device` or `priv` grant sealed by neither a vendor nor a human | [Admission](#admission) |

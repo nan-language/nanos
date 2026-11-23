@@ -1,0 +1,982 @@
+//! The file system a run of the toolchain of the `nan` job reaches: a workspace, on a job's file view or in memory, and in memory the toolchain's home and the files it reads at its root, served by a task over the orders its capabilities give, each carrying at most a piece of a file.
+
+/// The files the toolchain reads at the root of its file system, and the dir it keeps its user directory in.
+const TREE_NAME: Str = "image.ntree"
+
+const INTERFACE_NAME: Str = "kernel.nlif"
+
+const HOME_DIR: Str = "home"
+
+/// The bytes of a file one order carries at most.
+const FILE_PIECE: usize = 65_536
+
+/// A capability reaching the file system a task serves for a run of the toolchain.
+pub open struct Workspace {
+} Workspace
+
+impl Workspace: sys::Kind[Working, u8]
+
+impl Workspace: sys::FsService
+
+/// What a capability of a run's file system reaches: the task serving it, and the allocator its orders and their answers are drawn through.
+struct Working {
+    orders: task::Sender[FsOrder]
+    alloc: mem::Alloc
+} Working
+
+/// What the task serving a run's file system carries out, each order telling its answer to the sender it holds: opening a file to read or creating one to write, giving its number; reading a whole file, sending its pieces then `None`, or writing one from the pieces it receives until `None`, writing nothing when they stop before it; removing a node; reading from or writing to an open file; its length; releasing it; making a dir; renaming a node; the kind of a node; the entries of a dir.
+pub open enum FsOrder derives Send {
+    Open(path: text::String, answer: task::Sender[Result[u64, sys::fs::FsError]])
+    Create(path: text::String, answer: task::Sender[Result[u64, sys::fs::FsError]])
+    ReadAll(path: text::String, pieces: task::Sender[Result[Option[mem::Bytes], sys::fs::FsError]])
+    WriteAll(path: text::String, pieces: task::Receiver[Option[mem::Bytes]], answer: task::Sender[Result[Unit, sys::fs::FsError]])
+    Remove(path: text::String, answer: task::Sender[Result[Unit, sys::fs::FsError]])
+    Read(file: u64, length: usize, answer: task::Sender[Result[mem::Bytes, sys::fs::FsError]])
+    Write(file: u64, bytes: mem::Bytes, answer: task::Sender[Result[usize, sys::fs::FsError]])
+    Length(file: u64, answer: task::Sender[Result[u64, sys::fs::FsError]])
+    Release(file: u64)
+    MakeDir(path: text::String, answer: task::Sender[Result[Unit, sys::fs::FsError]])
+    Rename(from: text::String, to: text::String, answer: task::Sender[Result[Unit, sys::fs::FsError]])
+    KindOf(path: text::String, answer: task::Sender[Result[sys::fs::Kind, sys::fs::FsError]])
+    List(path: text::String, answer: task::Sender[Result[mem::List[sys::fs::Entry], sys::fs::FsError]])
+} FsOrder
+
+/// The root entry of the capabilities of a run's file system, revoked when it closes.
+pub open linear struct MintedWorkspace {
+    minter: sys::Minter[Workspace, Working, u8]
+} MintedWorkspace
+
+/// The capabilities giving their orders to `orders`, drawing them and their answers through `alloc`.
+pub fn MintedWorkspace.of(orders: task::Sender[FsOrder], alloc: mem::Alloc) -> MintedWorkspace {
+    return MintedWorkspace(minter: sys::Minter[Workspace, Working, u8].of(Working(orders: orders.split(), alloc: alloc), alloc))
+} MintedWorkspace.of
+
+pub fn MintedWorkspace.mint(self) -> Workspace {
+    return self.minter.mint(0)
+} MintedWorkspace.mint
+
+/// Revokes every capability of this root entry.
+pub fn MintedWorkspace.close(take self) {
+    let MintedWorkspace(minter: minter) = self
+    take minter.close()
+} MintedWorkspace.close
+
+/// The channel of a run's file system orders.
+pub fn orders_of(alloc: mem::Alloc) -> task::Channel[FsOrder] {
+    return task::Channel[FsOrder].bounded(1, alloc)
+} orders_of
+
+/// The task serving the run's file system that `self` reaches, failing as denied once it is gone.
+fn Workspace.working(self) -> Working fails sys::fs::FsError {
+    let Some(working) = sys::reach(self, body: fn(working: Working, record: u8) => Working(orders: working.orders.split(), alloc: working.alloc)) else {
+        fail sys::fs::FsError.Denied
+    }
+    return working
+} Workspace.working
+
+/// Gives the task serving the file system `order`, failing as denied once it is gone.
+fn Working.give(self, take order: FsOrder) fails sys::fs::FsError uses wait {
+    match attempt await self.orders.send(take order) {
+        Ok(_) => {
+        }
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        Err(task::SendError.Closed) => fail sys::fs::FsError.Denied
+    }
+} Working.give
+
+/// The answer `answers` receives, failing as denied when none comes.
+fn answer_of[T: Send](take answers: task::Receiver[Result[T, sys::fs::FsError]]) -> T fails sys::fs::FsError uses wait {
+    var receiver = answers
+    let Some(answer) = try await mut receiver.receive() else {
+        fail sys::fs::FsError.Denied
+    }
+    return match answer {
+        Ok(value) => value
+        Err(failed) => fail failed
+    }
+} answer_of
+
+/// A copy of the piece of `data` from `at`, of at most `FILE_PIECE` bytes, drawn through `alloc`.
+fn piece_of(data: Slice[u8], at: usize, alloc: mem::Alloc) -> mem::Bytes {
+    var piece = mem::Bytes.empty(alloc)
+    let Some(parts) = data.split_at(at) else {
+        return piece
+    }
+    let Some(part) = parts.tail.prefix(FILE_PIECE.min(parts.tail.len())) else {
+        return piece
+    }
+    mut piece.append(part)
+    return piece
+} piece_of
+
+/// Whether the task serving a file system took `piece`, false once it takes no more.
+fn piece_taken(pieces: task::Sender[Option[mem::Bytes]], take piece: Option[mem::Bytes]) -> bool fails task::Cancelled uses wait {
+    match attempt await pieces.send(take piece) {
+        Ok(_) => return true
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        Err(task::SendError.Closed) => return false
+    }
+} piece_taken
+
+pub fn Workspace.open(self, path: Str) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[u64, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.Open(path: text::String.of(path, alloc: working.alloc), answer: take answer))
+    return try await answer_of(take answers)
+} Workspace.open
+
+pub fn Workspace.create(self, path: Str) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[u64, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.Create(path: text::String.of(path, alloc: working.alloc), answer: take answer))
+    return try await answer_of(take answers)
+} Workspace.create
+
+pub fn Workspace.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: pieces, receiver: received) = task::Channel[Result[Option[mem::Bytes], sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.ReadAll(path: text::String.of(path, alloc: working.alloc), pieces: take pieces))
+    var bytes = mem::Bytes.empty(alloc)
+    var receiver = received
+    loop {
+        let Some(piece) = try await mut receiver.receive() else {
+            fail sys::fs::FsError.Denied
+        }
+        match piece {
+            Ok(Some(read)) => mut bytes.append(read.view())
+            Ok(None) => return bytes
+            Err(failed) => fail failed
+        }
+    }
+} Workspace.read_all
+
+pub fn Workspace.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: pieces, receiver: given) = task::Channel[Option[mem::Bytes]].bounded(1, alloc: working.alloc)
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[Unit, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.WriteAll(path: text::String.of(path, alloc: working.alloc), pieces: take given, answer: take answer))
+    var at: usize = 0
+    var taken = true
+    while taken and at < data.len() {
+        let piece = piece_of(data, at, alloc: working.alloc)
+        at += piece.len()
+        taken = try await piece_taken(pieces, piece: Some(take piece))
+    }
+    if taken {
+        discard try await piece_taken(pieces, piece: None)
+    }
+    discard pieces
+    try await answer_of(take answers)
+} Workspace.write_all
+
+pub fn Workspace.remove(self, path: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[Unit, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.Remove(path: text::String.of(path, alloc: working.alloc), answer: take answer))
+    try await answer_of(take answers)
+} Workspace.remove
+
+pub fn Workspace.read(self, file: u64, mut buf: SliceMut[u8]) -> usize fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    var filled: usize = 0
+    while filled < buf.len() {
+        let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[mem::Bytes, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+        try await working.give(FsOrder.Read(file: file, length: FILE_PIECE.min(buf.len() - filled), answer: take answer))
+        let read = try await answer_of(take answers)
+        let count = read.len().min(buf.len() - filled)
+        if count == 0 {
+            break
+        }
+        for at in 0..<count {
+            buf[filled + at] = read[at]
+        }
+        filled += count
+    }
+    return filled
+} Workspace.read
+
+pub fn Workspace.write(self, file: u64, data: Slice[u8]) -> usize fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    var written: usize = 0
+    while written < data.len() {
+        let piece = piece_of(data, at: written, alloc: working.alloc)
+        let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[usize, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+        try await working.give(FsOrder.Write(file: file, bytes: take piece, answer: take answer))
+        let count = try await answer_of(take answers)
+        if count == 0 {
+            break
+        }
+        written += count
+    }
+    return written
+} Workspace.write
+
+pub fn Workspace.byte_len(self, file: u64) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[u64, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.Length(file: file, answer: take answer))
+    return try await answer_of(take answers)
+} Workspace.byte_len
+
+pub fn Workspace.release(self, file: u64) limits stack 4_096 {
+    let Some(orders) = sys::reach(self, body: fn(working: Working, record: u8) => working.orders.split()) else {
+        return
+    }
+    discard orders.offer(FsOrder.Release(file: file))
+} Workspace.release
+
+pub fn Workspace.create_dir(self, path: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[Unit, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.MakeDir(path: text::String.of(path, alloc: working.alloc), answer: take answer))
+    try await answer_of(take answers)
+} Workspace.create_dir
+
+pub fn Workspace.rename(self, from: Str, to: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[Unit, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.Rename(from: text::String.of(from, alloc: working.alloc), to: text::String.of(to, alloc: working.alloc), answer: take answer))
+    try await answer_of(take answers)
+} Workspace.rename
+
+pub fn Workspace.kind(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[sys::fs::Kind, sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.KindOf(path: text::String.of(path, alloc: working.alloc), answer: take answer))
+    return try await answer_of(take answers)
+} Workspace.kind
+
+pub fn Workspace.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError uses wait limits stack 4_096 {
+    let working = try self.working()
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[Result[mem::List[sys::fs::Entry], sys::fs::FsError]].bounded(1, alloc: working.alloc)
+    try await working.give(FsOrder.List(path: text::String.of(path, alloc: working.alloc), answer: take answer))
+    let given = try await answer_of(take answers)
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    for entry in given {
+        mut entries.push(sys::fs::Entry(name: text::String.of(entry.name.as_str(), alloc), kind: entry.kind))
+    }
+    return entries
+} Workspace.list
+
+/// A node the run's file system keeps in memory.
+enum Held {
+    File(mem::Bytes)
+    Dir
+} Held
+
+/// A file the run's file system holds open: one of the workspace, or one in memory with how much of it was read and whether it is being written.
+enum Opened {
+    Disk(sys::fs::File)
+    Memory(path: text::String, at: usize, writing: bool)
+} Opened
+
+/// What the task serving a run's file system holds: the file system of the workspace, `None` for a workspace in memory, the nodes in memory by path, the open files by number, and the number the next one gets.
+struct Served {
+    disk: Option[sys::Fs]
+    held: mem::Map[text::String, Held]
+    open: mem::Map[u64, Opened]
+    next: u64
+} Served
+
+/// Serves the file system of a run whose workspace is `disk`, holding in memory the empty dir `home` and the files `image.ntree`, the hash `tree`, and `kernel.nlif`, the interface file `nlif`, until every sender of `orders` is gone.
+pub fn serve_workspace(
+    disk: sys::Fs,
+    tree: ident::HashValue,
+    nlif: Slice[u8],
+    take orders: task::Receiver[FsOrder],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var served = Served.of(disk: Some(disk), files: mem::List.empty(alloc), tree, nlif, alloc)
+    var receiver = orders
+    loop {
+        let Some(order) = try await mut receiver.receive() else {
+            return
+        }
+        try await mut served.carry_out(take order, alloc)
+    }
+} serve_workspace
+
+/// Serves the file system of a run whose workspace is the files `files` in memory, holding there too the empty dir `home` and the files `image.ntree`, the hash `tree`, and `kernel.nlif`, the interface file `nlif`, until every sender of `orders` is gone.
+pub fn serve_memory(
+    take files: mem::List[SourceFile],
+    tree: ident::HashValue,
+    nlif: Slice[u8],
+    take orders: task::Receiver[FsOrder],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    var served = Served.of(disk: None, take files, tree, nlif, alloc)
+    var receiver = orders
+    loop {
+        let Some(order) = try await mut receiver.receive() else {
+            return
+        }
+        try await mut served.carry_out_in_memory(take order, alloc)
+    }
+} serve_memory
+
+/// A file system holding the files `files` in memory with the empty dir `home` and the files `image.ntree`, the hash `tree`, and `kernel.nlif`, the interface file `nlif`, and the other nodes on `disk` when given.
+fn Served.of(
+    disk: Option[sys::Fs],
+    take files: mem::List[SourceFile],
+    tree: ident::HashValue,
+    nlif: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> Served {
+    var served = Served(disk: disk, held: mem::Map.empty(alloc), open: mem::Map.empty(alloc), next: 1)
+    for file in take files {
+        let SourceFile(path: path, bytes: bytes) = file
+        discard mut served.memory_written(path.as_str(), take bytes, alloc)
+    }
+    discard mut served.held.insert(text::String.of(HOME_DIR, alloc), value: Held.Dir)
+    var hash = mem::Bytes.empty(alloc)
+    mut hash.append(tree.bytes.view())
+    discard mut served.held.insert(text::String.of(TREE_NAME, alloc), value: Held.File(take hash))
+    var file = mem::Bytes.empty(alloc)
+    mut file.append(nlif)
+    discard mut served.held.insert(text::String.of(INTERFACE_NAME, alloc), value: Held.File(take file))
+    return served
+} Served.of
+
+/// The file system holding the node `path` names, `None` for a node in memory: the toolchain's home and the files it reads at its root, and every node of a workspace in memory.
+fn Served.on_disk(self, path: Str) -> Option[sys::Fs] {
+    if path == HOME_DIR or path.starts_with("home/") or path == TREE_NAME or path == INTERFACE_NAME {
+        return None
+    }
+    return self.disk
+} Served.on_disk
+
+/// Carries out `order`, telling its answer.
+fn Served.carry_out(mut self, take order: FsOrder, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    match order {
+        FsOrder.Open(path: path, answer: answer) => {
+            discard attempt await answer.send(try await mut self.opened(path.as_str(), writing: false, alloc))
+        }
+        FsOrder.Create(path: path, answer: answer) => {
+            discard attempt await answer.send(try await mut self.opened(path.as_str(), writing: true, alloc))
+        }
+        FsOrder.ReadAll(path: path, pieces: pieces) => try await sent_in_pieces(try await self.read_whole(path.as_str(), alloc), take pieces, alloc)
+        FsOrder.WriteAll(path: path, pieces: pieces, answer: answer) => {
+            let written = match try await received_in_pieces(take pieces, alloc) {
+                Ok(bytes) => try await mut self.write_whole(path.as_str(), take bytes, alloc)
+                Err(failed) => Err(take failed)
+            }
+            discard attempt await answer.send(take written)
+        }
+        FsOrder.Remove(path: path, answer: answer) => {
+            discard attempt await answer.send(try await mut self.removed(path.as_str(), alloc))
+        }
+        FsOrder.Read(file: file, length: length, answer: answer) => {
+            discard attempt await answer.send(try await mut self.read(file, length: length.min(FILE_PIECE), alloc))
+        }
+        FsOrder.Write(file: file, bytes: bytes, answer: answer) => {
+            discard attempt await answer.send(try await mut self.write(file, data: bytes.view(), alloc))
+        }
+        FsOrder.Length(file: file, answer: answer) => {
+            discard attempt await answer.send(try await self.length(file))
+        }
+        FsOrder.Release(file: file) => {
+            discard mut self.open.remove(file)
+        }
+        FsOrder.MakeDir(path: path, answer: answer) => {
+            discard attempt await answer.send(try await mut self.dir_made(path.as_str(), alloc))
+        }
+        FsOrder.Rename(from: from, to: to, answer: answer) => {
+            discard attempt await answer.send(try await mut self.moved(from: from.as_str(), to: to.as_str(), alloc))
+        }
+        FsOrder.KindOf(path: path, answer: answer) => {
+            discard attempt await answer.send(try await self.kind_of(path.as_str()))
+        }
+        FsOrder.List(path: path, answer: answer) => {
+            discard attempt await answer.send(try await self.listing(path.as_str(), alloc))
+        }
+    }
+} Served.carry_out
+
+/// Carries out `order` on a file system whose nodes are all in memory, telling its answer.
+fn Served.carry_out_in_memory(mut self, take order: FsOrder, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    match order {
+        FsOrder.Open(path: path, answer: answer) => {
+            discard attempt await answer.send(mut self.memory_opened(path.as_str(), writing: false, alloc))
+        }
+        FsOrder.Create(path: path, answer: answer) => {
+            discard attempt await answer.send(mut self.memory_opened(path.as_str(), writing: true, alloc))
+        }
+        FsOrder.ReadAll(path: path, pieces: pieces) => try await sent_in_pieces(self.memory_contents(path.as_str(), alloc), take pieces, alloc)
+        FsOrder.WriteAll(path: path, pieces: pieces, answer: answer) => {
+            let written = match try await received_in_pieces(take pieces, alloc) {
+                Ok(bytes) => mut self.memory_written(path.as_str(), take bytes, alloc)
+                Err(failed) => Err(take failed)
+            }
+            discard attempt await answer.send(take written)
+        }
+        FsOrder.Remove(path: path, answer: answer) => {
+            discard attempt await answer.send(mut self.memory_removed(path.as_str(), alloc))
+        }
+        FsOrder.Read(file: file, length: length, answer: answer) => {
+            discard attempt await answer.send(mut self.memory_read(file, length: length.min(FILE_PIECE), alloc))
+        }
+        FsOrder.Write(file: file, bytes: bytes, answer: answer) => {
+            discard attempt await answer.send(mut self.memory_write(file, data: bytes.view(), alloc))
+        }
+        FsOrder.Length(file: file, answer: answer) => {
+            discard attempt await answer.send(self.memory_length(file))
+        }
+        FsOrder.Release(file: file) => {
+            discard mut self.open.remove(file)
+        }
+        FsOrder.MakeDir(path: path, answer: answer) => {
+            discard attempt await answer.send(mut self.memory_dir_made(path.as_str(), alloc))
+        }
+        FsOrder.Rename(from: from, to: to, answer: answer) => {
+            discard attempt await answer.send(mut self.memory_moved(from: from.as_str(), to: to.as_str(), alloc))
+        }
+        FsOrder.KindOf(path: path, answer: answer) => {
+            discard attempt await answer.send(self.memory_kind(path.as_str()))
+        }
+        FsOrder.List(path: path, answer: answer) => {
+            discard attempt await answer.send(self.memory_listing(path.as_str(), alloc))
+        }
+    }
+} Served.carry_out_in_memory
+
+/// Opens the file `path` names to read it, or, when `writing`, creates or empties it to write it, giving its number.
+fn Served.opened(mut self, path: Str, writing: bool, alloc: mem::Alloc) -> Result[u64, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(disk) = self.on_disk(path) else {
+        return mut self.memory_opened(path, writing, alloc)
+    }
+    let given = match writing {
+        true => attempt await disk.create(path)
+        false => attempt await disk.open(path)
+    }
+    return match given {
+        Ok(file) => mut self.numbered(Opened.Disk(take file))
+        Err(failed) => Err(take failed)
+    }
+} Served.opened
+
+/// The contents of the file `path` names.
+fn Served.read_whole(self, path: Str, alloc: mem::Alloc) -> Result[mem::Bytes, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(disk) = self.on_disk(path) else {
+        return self.memory_contents(path, alloc)
+    }
+    return match attempt await disk.read_all(path, alloc) {
+        Ok(given) => Ok(trusted_bytes(given, alloc))
+        Err(failed) => Err(take failed)
+    }
+} Served.read_whole
+
+/// Sends `whole`, the contents of a file, through `pieces` a piece at a time, then `None`, or the failure that read it.
+fn sent_in_pieces(take whole: Result[mem::Bytes, sys::fs::FsError], take pieces: task::Sender[Result[Option[mem::Bytes], sys::fs::FsError]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let bytes = match whole {
+        Ok(read) => read
+        Err(failed) => {
+            discard attempt await pieces.send(Err(take failed))
+            return
+        }
+    }
+    var at: usize = 0
+    while at < bytes.len() {
+        let piece = piece_of(bytes.view(), at, alloc)
+        at += piece.len()
+        match attempt await pieces.send(Ok(Some(take piece))) {
+            Ok(_) => {
+            }
+            Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+            Err(task::SendError.Closed) => return
+        }
+    }
+    discard attempt await pieces.send(Ok(None))
+} sent_in_pieces
+
+/// The contents of a file the pieces `pieces` brings until `None`, denied when it closes before.
+fn received_in_pieces(take pieces: task::Receiver[Option[mem::Bytes]], alloc: mem::Alloc) -> Result[mem::Bytes, sys::fs::FsError] fails task::Cancelled uses wait {
+    var bytes = mem::Bytes.empty(alloc)
+    var receiver = pieces
+    loop {
+        let Some(given) = try await mut receiver.receive() else {
+            return Err(sys::fs::FsError.Denied)
+        }
+        let Some(piece) = given else {
+            return Ok(take bytes)
+        }
+        mut bytes.append(piece.view())
+    }
+} received_in_pieces
+
+/// Replaces the contents of the file `path` names with `bytes`.
+fn Served.write_whole(mut self, path: Str, take bytes: mem::Bytes, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(disk) = self.on_disk(path) else {
+        return mut self.memory_written(path, take bytes, alloc)
+    }
+    return attempt await disk.write_all(path, data: bytes.view())
+} Served.write_whole
+
+/// Removes the file or empty dir `path` names.
+fn Served.removed(mut self, path: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(disk) = self.on_disk(path) else {
+        return mut self.memory_removed(path, alloc)
+    }
+    return attempt await disk.remove(path)
+} Served.removed
+
+/// Creates the dir `path` names.
+fn Served.dir_made(mut self, path: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(disk) = self.on_disk(path) else {
+        return mut self.memory_dir_made(path, alloc)
+    }
+    return attempt await disk.create_dir(path)
+} Served.dir_made
+
+/// Moves the node `from` names to `to`, both in memory or both in the workspace's file system.
+fn Served.moved(mut self, from: Str, to: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] fails task::Cancelled uses wait {
+    let source = self.on_disk(from)
+    let target = self.on_disk(to)
+    if source.is_some() != target.is_some() {
+        return Err(sys::fs::FsError.Denied)
+    }
+    let Some(disk) = source else {
+        return mut self.memory_moved(from, to, alloc)
+    }
+    return attempt await disk.rename(from, to)
+} Served.moved
+
+/// The kind of the node `path` names, the root a dir.
+fn Served.kind_of(self, path: Str) -> Result[sys::fs::Kind, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(disk) = self.on_disk(path) else {
+        return self.memory_kind(path)
+    }
+    if path.is_empty() {
+        return Ok(sys::fs::Kind.Directory)
+    }
+    return attempt await disk.kind(path)
+} Served.kind_of
+
+/// The entries directly in the dir `path` names.
+fn Served.listing(self, path: Str, alloc: mem::Alloc) -> Result[mem::List[sys::fs::Entry], sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(disk) = self.on_disk(path) else {
+        return self.memory_listing(path, alloc)
+    }
+    return attempt await disk.list(path, alloc)
+} Served.listing
+
+/// The bytes a read of the workspace gave.
+validator fn trusted_bytes(raw: Untrusted[mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect().view())
+    return bytes
+} trusted_bytes
+
+/// Keeps `opened` under the next number, which it gives.
+fn Served.numbered(mut self, take opened: Opened) -> Result[u64, sys::fs::FsError] {
+    let number = self.next
+    self.next += 1
+    discard mut self.open.insert(number, value: take opened)
+    return Ok(number)
+} Served.numbered
+
+/// Opens the file in memory `path` names to read it, or, when `writing`, creates or empties it and its missing dirs to write it.
+fn Served.memory_opened(mut self, path: Str, writing: bool, alloc: mem::Alloc) -> Result[u64, sys::fs::FsError] {
+    if writing {
+        match mut self.memory_written(path, bytes: mem::Bytes.empty(alloc), alloc) {
+            Ok(_) => {
+            }
+            Err(failed) => return Err(take failed)
+        }
+    } else {
+        match self.held.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+            Some(Held.File(_)) => {
+            }
+            Some(Held.Dir) => return Err(sys::fs::FsError.Denied)
+            None => return Err(sys::fs::FsError.NotFound)
+        }
+    }
+    return mut self.numbered(Opened.Memory(path: text::String.of(path, alloc), at: 0, writing: writing))
+} Served.memory_opened
+
+/// The contents of the file in memory `path` names.
+fn Served.memory_contents(self, path: Str, alloc: mem::Alloc) -> Result[mem::Bytes, sys::fs::FsError] {
+    return match self.held.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Held.File(bytes)) => {
+            var copy = mem::Bytes.empty(alloc)
+            mut copy.append(bytes.view())
+            return Ok(take copy)
+        }
+        Some(Held.Dir) => Err(sys::fs::FsError.Denied)
+        None => Err(sys::fs::FsError.NotFound)
+    }
+} Served.memory_contents
+
+/// Replaces the contents of the file in memory `path` names with `bytes`, creating it and its missing dirs.
+fn Served.memory_written(mut self, path: Str, take bytes: mem::Bytes, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] {
+    match self.held.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Held.Dir) => return Err(sys::fs::FsError.Denied)
+        else => {
+        }
+    }
+    match mut self.memory_parents(path, alloc) {
+        Ok(_) => {
+        }
+        Err(failed) => return Err(take failed)
+    }
+    discard mut self.held.insert(text::String.of(path, alloc), value: Held.File(take bytes))
+    return Ok(Unit)
+} Served.memory_written
+
+/// Creates each missing dir in memory above `path`, failing where a file is.
+fn Served.memory_parents(mut self, path: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] {
+    let bytes = path.as_bytes()
+    for at in 0..<bytes.len() {
+        if bytes[at] != b'/' {
+            continue
+        }
+        let Some(dir) = path.slice_bytes(0, end: at) else {
+            return Err(sys::fs::FsError.InvalidPath)
+        }
+        match self.held.get_by(fn(key: text::String) => key.as_str().cmp(dir)) {
+            Some(Held.Dir) => {
+            }
+            Some(Held.File(_)) => return Err(sys::fs::FsError.Denied)
+            None => {
+                discard mut self.held.insert(text::String.of(dir, alloc), value: Held.Dir)
+            }
+        }
+    }
+    return Ok(Unit)
+} Served.memory_parents
+
+/// Creates the dir in memory `path` names and its missing dirs, doing nothing where one is.
+fn Served.memory_dir_made(mut self, path: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] {
+    match self.held.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Held.Dir) => return Ok(Unit)
+        Some(Held.File(_)) => return Err(sys::fs::FsError.Denied)
+        None => {
+        }
+    }
+    match mut self.memory_parents(path, alloc) {
+        Ok(_) => {
+        }
+        Err(failed) => return Err(take failed)
+    }
+    discard mut self.held.insert(text::String.of(path, alloc), value: Held.Dir)
+    return Ok(Unit)
+} Served.memory_dir_made
+
+/// Removes the file or empty dir in memory `path` names.
+fn Served.memory_removed(mut self, path: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] {
+    match self.held.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Held.File(_)) => {
+        }
+        Some(Held.Dir) => {
+            if self.children(path) > 0 {
+                return Err(sys::fs::FsError.Denied)
+            }
+        }
+        None => return Err(sys::fs::FsError.NotFound)
+    }
+    discard mut self.held.remove(text::String.of(path, alloc))
+    return Ok(Unit)
+} Served.memory_removed
+
+/// Moves the node in memory `from` names, with what a dir holds, to `to`, replacing a file there and creating the missing dirs above it.
+fn Served.memory_moved(mut self, from: Str, to: Str, alloc: mem::Alloc) -> Result[Unit, sys::fs::FsError] {
+    match self.held.get_by(fn(key: text::String) => key.as_str().cmp(from)) {
+        Some(_) => {
+        }
+        None => return Err(sys::fs::FsError.NotFound)
+    }
+    match self.held.get_by(fn(key: text::String) => key.as_str().cmp(to)) {
+        Some(Held.Dir) => return Err(sys::fs::FsError.Denied)
+        else => {
+        }
+    }
+    match mut self.memory_parents(to, alloc) {
+        Ok(_) => {
+        }
+        Err(failed) => return Err(take failed)
+    }
+    var moving = mem::List[text::String].empty(alloc)
+    for entry in self.held {
+        let key = entry.key().as_str()
+        if key == from or below(key, dir: from) {
+            mut moving.push(text::String.of(key, alloc))
+        }
+    }
+    for key in moving {
+        let Some(node) = mut self.held.remove(text::String.of(key.as_str(), alloc)) else {
+            continue
+        }
+        let Some(rest) = key.as_str().slice_bytes(from.byte_len(), end: key.as_str().byte_len()) else {
+            continue
+        }
+        var target = text::String.of(to, alloc)
+        mut target.append(rest)
+        discard mut self.held.insert(take target, value: take node)
+    }
+    return Ok(Unit)
+} Served.memory_moved
+
+/// The kind of the node in memory `path` names, the root of the file system for the empty path.
+fn Served.memory_kind(self, path: Str) -> Result[sys::fs::Kind, sys::fs::FsError] {
+    if path.is_empty() {
+        return Ok(sys::fs::Kind.Directory)
+    }
+    return match self.held.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Held.File(_)) => Ok(sys::fs::Kind.File)
+        Some(Held.Dir) => Ok(sys::fs::Kind.Directory)
+        None => Err(sys::fs::FsError.NotFound)
+    }
+} Served.memory_kind
+
+/// The entries directly in the dir in memory `path` names, in byte order of name.
+fn Served.memory_listing(self, path: Str, alloc: mem::Alloc) -> Result[mem::List[sys::fs::Entry], sys::fs::FsError] {
+    let kind = match self.memory_kind(path) {
+        Ok(found) => found
+        Err(failed) => return Err(take failed)
+    }
+    if kind != sys::fs::Kind.Directory {
+        return Err(sys::fs::FsError.Denied)
+    }
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    for entry in self.held {
+        let key = entry.key().as_str()
+        if not directly_in(key, dir: path) {
+            continue
+        }
+        let Some(name) = key.slice_bytes(child_start(path), end: key.byte_len()) else {
+            continue
+        }
+        let entry_kind = match entry.value() {
+            Held.File(_) => sys::fs::Kind.File
+            Held.Dir => sys::fs::Kind.Directory
+        }
+        mut entries.push(sys::fs::Entry(name: text::String.of(name, alloc), kind: entry_kind))
+    }
+    return Ok(take entries)
+} Served.memory_listing
+
+/// The number of entries directly in the dir in memory `path` names.
+fn Served.children(self, path: Str) -> usize {
+    var count: usize = 0
+    for entry in self.held {
+        let key = entry.key().as_str()
+        if directly_in(key, dir: path) {
+            count += 1
+        }
+    }
+    return count
+} Served.children
+
+/// Whether `key` names an entry directly in the dir `dir`.
+fn directly_in(key: Str, dir: Str) -> bool {
+    if not below(key, dir) {
+        return false
+    }
+    let Some(parts) = key.as_bytes().split_at(child_start(dir)) else {
+        return false
+    }
+    return parts.tail.position(fn(byte: u8) => byte == b'/').is_none()
+} directly_in
+
+/// Whether `key` lies below the dir `dir`, the root for the empty path.
+fn below(key: Str, dir: Str) -> bool {
+    if dir.is_empty() {
+        return not key.is_empty()
+    }
+    return key.byte_len() > dir.byte_len() and key.starts_with(dir) and key.as_bytes()[dir.byte_len()] == b'/'
+} below
+
+/// Where the paths below the dir `dir` give the path within it.
+fn child_start(dir: Str) -> usize {
+    return match dir.is_empty() {
+        true => 0
+        false => dir.byte_len() + 1
+    }
+} child_start
+
+/// Reads up to `length` bytes of the open file `file` from where its reads reached.
+fn Served.read(mut self, file: u64, length: usize, alloc: mem::Alloc) -> Result[mem::Bytes, sys::fs::FsError] fails task::Cancelled uses wait {
+    match self.open.get(file) {
+        Some(Opened.Disk(_)) => {
+        }
+        else => return mut self.memory_read(file, length, alloc)
+    }
+    let Some(Opened.Disk(held)) = mut self.open.remove(file) else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    var handle = held
+    var buffer = Untrusted.of(mem::Bytes.zeroed(length, alloc))
+    let read = attempt await mut handle.read(mut buffer.view_mut())
+    discard mut self.open.insert(file, value: Opened.Disk(take handle))
+    return match read {
+        Ok(count) => Ok(trusted_bytes(buffer.copy_prefix(count, alloc), alloc))
+        Err(failed) => Err(take failed)
+    }
+} Served.read
+
+/// Reads up to `length` bytes of the file in memory open as `file` from where its reads reached.
+fn Served.memory_read(mut self, file: u64, length: usize, alloc: mem::Alloc) -> Result[mem::Bytes, sys::fs::FsError] {
+    let Some(Opened.Memory(path: path, at: at, writing: writing)) = mut self.open.remove(file) else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    let piece = self.memory_piece(path.as_str(), at, length, alloc)
+    let reached = at + piece.len()
+    discard mut self.open.insert(file, value: Opened.Memory(path: take path, at: reached, writing: writing))
+    if writing {
+        return Err(sys::fs::FsError.Denied)
+    }
+    return Ok(take piece)
+} Served.memory_read
+
+/// Up to `length` bytes of the file in memory `path` names from `at`.
+fn Served.memory_piece(
+    self,
+    path: Str,
+    at: usize,
+    length: usize,
+    alloc: mem::Alloc,
+    ) -> mem::Bytes {
+    var piece = mem::Bytes.empty(alloc)
+    let Some(Held.File(bytes)) = self.held.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+        return piece
+    }
+    let Some(parts) = bytes.view().split_at(at.min(bytes.len())) else {
+        return piece
+    }
+    let Some(part) = parts.tail.prefix(length.min(parts.tail.len())) else {
+        return piece
+    }
+    mut piece.append(part)
+    return piece
+} Served.memory_piece
+
+/// Appends `data` to the file in memory `path` names.
+fn Served.memory_appended(mut self, path: Str, data: Slice[u8], alloc: mem::Alloc) -> Result[usize, sys::fs::FsError] {
+    let key = text::String.of(path, alloc)
+    let Some(Held.File(held)) = mut self.held.remove(text::String.of(path, alloc)) else {
+        return Err(sys::fs::FsError.NotFound)
+    }
+    var bytes = held
+    mut bytes.append(data)
+    discard mut self.held.insert(take key, value: Held.File(take bytes))
+    return Ok(data.len())
+} Served.memory_appended
+
+/// Writes `data` at the end of the open file `file`.
+fn Served.write(mut self, file: u64, data: Slice[u8], alloc: mem::Alloc) -> Result[usize, sys::fs::FsError] fails task::Cancelled uses wait {
+    match self.open.get(file) {
+        Some(Opened.Disk(_)) => {
+        }
+        else => return mut self.memory_write(file, data, alloc)
+    }
+    let Some(Opened.Disk(held)) = mut self.open.remove(file) else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    var handle = held
+    let written = attempt await mut handle.write(data)
+    discard mut self.open.insert(file, value: Opened.Disk(take handle))
+    return written
+} Served.write
+
+/// Writes `data` at the end of the file in memory open as `file`.
+fn Served.memory_write(mut self, file: u64, data: Slice[u8], alloc: mem::Alloc) -> Result[usize, sys::fs::FsError] {
+    let Some(Opened.Memory(path: path, at: at, writing: writing)) = mut self.open.remove(file) else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    var outcome: Result[usize, sys::fs::FsError] = Err(sys::fs::FsError.Denied)
+    if writing {
+        outcome = mut self.memory_appended(path.as_str(), data, alloc)
+    }
+    discard mut self.open.insert(file, value: Opened.Memory(path: take path, at: at, writing: writing))
+    return outcome
+} Served.memory_write
+
+/// The length of the open file `file`.
+fn Served.length(self, file: u64) -> Result[u64, sys::fs::FsError] fails task::Cancelled uses wait {
+    let Some(Opened.Disk(handle)) = self.open.get(file) else {
+        return self.memory_length(file)
+    }
+    return attempt await handle.byte_len()
+} Served.length
+
+/// The length of the file in memory open as `file`.
+fn Served.memory_length(self, file: u64) -> Result[u64, sys::fs::FsError] {
+    let Some(Opened.Memory(path: path, at: _, writing: _)) = self.open.get(file) else {
+        return Err(sys::fs::FsError.Denied)
+    }
+    let Some(Held.File(bytes)) = self.held.get_by(fn(key: text::String) => key.as_str().cmp(path.as_str())) else {
+        return Err(sys::fs::FsError.NotFound)
+    }
+    return Ok(u64.widen(bytes.len()))
+} Served.memory_length
+
+test workspaces_in_memory_move_files_whole_and_by_reads_across_pieces for serve_memory {
+    let world = testing::world()
+    let alloc = world.alloc
+    let task::Channel(sender: ordering, receiver: orders) = orders_of(alloc)
+    let minted = MintedWorkspace.of(ordering, alloc)
+    defer take minted.close()
+    var sources = mem::List[SourceFile].empty(alloc)
+    mut sources.push(SourceFile(path: text::String.of("hello/package.nan", alloc), bytes: bytes_of("package hello {\n} hello\n", alloc)))
+    var given = Some(take orders)
+    var files = Some(take sources)
+    var kept = false
+    try await task::scope(world.exec, body: fn[mut given, mut files, mut kept](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(receiver) = mut given.extract() else {
+            return
+        }
+        let Some(held) = mut files.extract() else {
+            return
+        }
+        discard s.spawn(fn[take receiver, take held]() fails task::Cancelled uses wait limits stack 65_536 {
+            try await serve_memory(files: take held, tree: ident::HashValue.of_content(b"tree"), nlif: b"NLIF", orders: take receiver, alloc)
+        })
+        kept = try await moved_in_pieces(minted.mint(), alloc)
+        s.cancel()
+    })
+    expect kept
+} workspaces_in_memory_move_files_whole_and_by_reads_across_pieces
+
+/// Whether a file of several pieces written whole to `workspace` reads back whole and by one read, beside its source file and its home.
+fn moved_in_pieces(workspace: Workspace, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
+    let Ok(fs) = attempt sys::Fs.served(workspace) else {
+        return false
+    }
+    var data = mem::Bytes.empty(alloc)
+    for at in 0..<(FILE_PIECE * 2 + 3) {
+        let byte = Array[u8, 1].filled(u8.truncate(at % 251))
+        mut data.append(byte.view())
+    }
+    let Ok(_) = attempt await fs.write_all("hello/big.bin", data: data.view()) else {
+        return false
+    }
+    let Ok(whole) = attempt await fs.read_all("hello/big.bin", alloc) else {
+        return false
+    }
+    let Ok(opened) = attempt await fs.open("hello/big.bin") else {
+        return false
+    }
+    var file = opened
+    var buffer = Untrusted.of(mem::Bytes.zeroed(data.len(), alloc))
+    let Ok(count) = attempt await mut file.read(mut buffer.view_mut()) else {
+        return false
+    }
+    let Ok(source) = attempt await fs.read_all("hello/package.nan", alloc) else {
+        return false
+    }
+    let Ok(home) = attempt await fs.kind("home") else {
+        return false
+    }
+    return trusted_bytes(whole, alloc).view() == data.view() and count == data.len() and trusted_bytes(buffer, alloc).view() == data.view() and trusted_bytes(source, alloc).view() == b"package hello {\n} hello\n" and home == sys::fs::Kind.Directory
+} moved_in_pieces
+
+test whole_files_whose_pieces_stop_before_their_end_are_not_written for received_in_pieces {
+    let alloc = testing::world().alloc
+    let task::Channel(sender: pieces, receiver: given) = task::Channel[Option[mem::Bytes]].bounded(2, alloc)
+    discard attempt await pieces.send(Some(bytes_of("part", alloc)))
+    discard pieces
+    let received = try await received_in_pieces(take given, alloc)
+    expect match received {
+        Err(sys::fs::FsError.Denied) => true
+        else => false
+    }
+} whole_files_whose_pieces_stop_before_their_end_are_not_written

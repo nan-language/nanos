@@ -1,4 +1,4 @@
-//! The `nan` job's input and result: a command of the NaN toolchain over a workspace of the job's file view, and what the toolchain wrote.
+//! The toolchain of the `nan` job: the job's input and result, a command of the NaN toolchain over a workspace of the job's file view and what the toolchain wrote, and the capability through which the core runs the toolchain over a file system a task serves.
 
 /// A command of the NaN toolchain.
 pub closed enum NanCommand derives Copy, Eq, Render, Encode {
@@ -20,3 +20,186 @@ pub closed struct NanReport derives Render, Encode {
     pub verdict: text::String
     pub records: mem::List[text::String]
 } NanReport
+
+/// Whether the report's verdict is a success.
+pub fn NanReport.passed(self) -> bool = self.verdict.as_str().starts_with("ok ")
+
+/// A capability having the core run the toolchain.
+pub open struct Toolchain {
+} Toolchain
+
+impl Toolchain: sys::Kind[Runs, u8]
+
+/// Where the core takes the runs of the toolchain, and the files the toolchain reads at its root.
+struct Runs {
+    orders: task::Sender[Run]
+    tree: ident::HashValue
+    nlif: mem::Shared[mem::Bytes]
+} Runs
+
+/// A run of the toolchain: the encoding of its `nanos::HostInput`, where the orders of the file system it reaches go, the clock, log and random source its space reaches, the end that closes once nothing awaits the run, and where its end goes.
+pub closed struct Run {
+    pub input: mem::Bytes
+    pub workspace: task::Sender[FsOrder]
+    pub clock: sys::Clock
+    pub log: sys::Log
+    pub random: sys::Random
+    pub stop: task::Receiver[Unit]
+    pub done: task::Sender[Result[Ran, text::Fixed[32]]]
+} Run
+
+/// How a run of the toolchain ended, and what it wrote to its standard streams.
+pub closed struct Ran {
+    pub ended: nanos::Ended
+    pub written: mem::Bytes
+} Ran
+
+/// The root entry of the toolchain capabilities the core mints, revoked when it closes.
+pub open linear struct MintedToolchain {
+    minter: sys::Minter[Toolchain, Runs, u8]
+} MintedToolchain
+
+/// The toolchain capabilities whose runs go to `orders`, the toolchain of tree hash `tree` reading the interface file `nlif`.
+pub fn MintedToolchain.of(orders: task::Sender[Run], tree: ident::HashValue, nlif: Slice[u8], alloc: mem::Alloc) -> MintedToolchain {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(nlif)
+    return MintedToolchain(minter: sys::Minter[Toolchain, Runs, u8].of(Runs(orders: orders.split(), tree: tree, nlif: mem::Shared.of(take copy, alloc)), alloc))
+} MintedToolchain.of
+
+pub fn MintedToolchain.mint(self) -> Toolchain {
+    return self.minter.mint(0)
+} MintedToolchain.mint
+
+/// Revokes every capability of this root entry.
+pub fn MintedToolchain.close(take self) {
+    let MintedToolchain(minter: minter) = self
+    take minter.close()
+} MintedToolchain.close
+
+/// The toolchain's tree hash, `None` once the capability is revoked.
+pub fn Toolchain.tree(self) -> Option[ident::HashValue] {
+    return sys::reach(self, body: fn(runs: Runs, record: u8) => runs.tree)
+} Toolchain.tree
+
+/// A copy of the running kernel's interface file drawn through `alloc`, empty once the capability is revoked.
+pub fn Toolchain.nlif(self, alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    match sys::reach(self, body: fn(runs: Runs, record: u8) => runs.nlif.share()) {
+        Some(shared) => mut copy.append(shared.contents().view())
+        None => {
+        }
+    }
+    return copy
+} Toolchain.nlif
+
+/// Has the core run the toolchain's `command` over `scope`, a build being against the running kernel's interface file, on the file system whose orders go to `workspace`, its space reaching `clock`, `log` and `random`: how the run ended and what it wrote, or the code of what kept it from running; the run stops once this call is cancelled.
+pub fn Toolchain.run(
+    self,
+    command: NanCommand,
+    scope: Str,
+    workspace: task::Sender[FsOrder],
+    clock: sys::Clock,
+    log: sys::Log,
+    random: sys::Random,
+    alloc: mem::Alloc,
+    ) -> Result[Ran, text::Fixed[32]] fails task::Cancelled uses wait {
+    let Some(orders) = sys::reach(self, body: fn(runs: Runs, record: u8) => runs.orders.split()) else {
+        return Err(text::Fixed[32].of("code.no-image"))
+    }
+    let task::Channel(sender: stopping, receiver: stop) = task::Channel[Unit].bounded(1, alloc)
+    let task::Channel(sender: done, receiver: ended) = task::Channel[Result[Ran, text::Fixed[32]]].bounded(1, alloc)
+    let run = Run(input: host_input(command, scope, alloc), workspace: workspace.split(), clock: clock, log: log, random: random, stop: take stop, done: take done)
+    match attempt await orders.send(take run) {
+        Ok(_) => {
+        }
+        Err(task::SendError.Closed) => return Err(text::Fixed[32].of("code.no-image"))
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+    }
+    var receiver = ended
+    let outcome = try await mut receiver.receive()
+    discard stopping
+    return match outcome {
+        Some(given) => given
+        None => Err(text::Fixed[32].of("code.no-image"))
+    }
+} Toolchain.run
+
+/// The `nanos::HostInput` of the toolchain's command line for `command` over `scope`, a build being against the running kernel's interface file.
+fn host_input(command: NanCommand, scope: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var args = mem::List[mem::Bytes].empty(alloc)
+    let name = match command {
+        NanCommand.Check => "check"
+        NanCommand.Verify => "verify"
+        NanCommand.Test => "test"
+        NanCommand.Build => "build"
+    }
+    mut args.push(bytes_of(name, alloc))
+    if not scope.is_empty() {
+        mut args.push(bytes_of(scope, alloc))
+    }
+    if command == NanCommand.Build {
+        mut args.push(bytes_of("--against", alloc))
+        mut args.push(bytes_of("/kernel.nlif", alloc))
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[nanos::HostInput].encode(nanos::HostInput(args: take args, environment: mem::Map.empty(alloc)), out: mut bytes)
+    return bytes
+} host_input
+
+fn bytes_of(text: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(text.as_bytes())
+    return bytes
+} bytes_of
+
+/// The report of what the toolchain wrote, `written`: its last line as the verdict, and the lines before it but a first one repeating it.
+pub fn report_of(written: Slice[u8], alloc: mem::Alloc) -> NanReport {
+    var lines = mem::List[text::String].empty(alloc)
+    var start: usize = 0
+    for at in 0..=written.len() {
+        if at < written.len() and written[at] != b'\n' {
+            continue
+        }
+        match line_at(written, start, end: at, alloc) {
+            Some(line) => mut lines.push(take line)
+            None => {
+            }
+        }
+        start = at + 1
+    }
+    let Some(verdict) = mut lines.pop() else {
+        return NanReport(verdict: text::String.empty(alloc), records: take lines)
+    }
+    if lines.len() > 0 and lines[0].as_str() == verdict.as_str() {
+        discard mut lines.remove(0)
+    }
+    return NanReport(verdict: take verdict, records: take lines)
+} report_of
+
+/// The text of the bytes of `written` from `start` to `end`, `None` when empty or not UTF-8.
+fn line_at(written: Slice[u8], start: usize, end: usize, alloc: mem::Alloc) -> Option[text::String] {
+    if end <= start {
+        return None
+    }
+    let Some(parts) = written.split_at(start) else {
+        return None
+    }
+    let Some(line) = parts.tail.prefix(end - start) else {
+        return None
+    }
+    return match attempt text::String.try_from_utf8(line, alloc) {
+        Ok(decoded_line) => Some(take decoded_line)
+        Err(_) => None
+    }
+} line_at
+
+test reports_take_the_last_line_as_verdict_and_drop_the_first_repeating_it for report_of {
+    let alloc = testing::world().alloc
+    let report = report_of(b"failed check hello: errors 1, incomplete 0\nerror type.mismatch hello/hello.nan:4 main\n    because note - - expected u8\n\nfailed check hello: errors 1, incomplete 0\n", alloc)
+    expect report.verdict.as_str() == "failed check hello: errors 1, incomplete 0"
+    expect report.records.len() == 2
+    expect report.records[0].as_str() == "error type.mismatch hello/hello.nan:4 main"
+    expect report.records[1].as_str() == "    because note - - expected u8"
+    let silent = report_of(b"", alloc)
+    expect silent.verdict.is_empty() and silent.records.len() == 0
+} reports_take_the_last_line_as_verdict_and_drop_the_first_repeating_it
