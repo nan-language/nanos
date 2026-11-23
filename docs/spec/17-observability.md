@@ -53,8 +53,8 @@ Every event kind of this specification, its severity, and the section that defin
 | `port.undecodable` | `warn` | [07](07-communication.md#events) |
 | `auth.granted`, `auth.revoked`, `auth.delegated`, `auth.key-rotated`, `auth.key-revoked`, `place.moved` | `notice` | [09](09-authority.md#events) |
 | `code.admitted`, `update.started`, `update.passed` | `notice` | [10](10-code.md#events) |
-| `code.loaded`, `code.unloaded`, `code.relowered` | `info` | [10](10-code.md#events) |
-| `code.recheck-failed`, `update.reverted` | `error` | [10](10-code.md#events) |
+| `code.loaded`, `code.unloaded` | `info` | [10](10-code.md#events) |
+| `update.reverted` | `error` | [10](10-code.md#events) |
 | `store.mounted`, `store.scrubbed` | `info` | [12](12-store-format.md#events) |
 | `store.history-thinned` | `notice` | [11](11-store.md#events) |
 | `store.format-upgraded` | `notice` | [12](12-store-format.md#events) |

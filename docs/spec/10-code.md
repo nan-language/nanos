@@ -1,6 +1,6 @@
 # Code
 
-This chapter defines the units of code, the bundle file with its signatures, certificate and provenance, admission step by step, the admission record, loading and unloading, load-time registries, live update, probation and its revert, rollback after probation, base instances, the generation switch, toolchain updates, and the `code` and `update` code families.
+This chapter defines the units of code, the bundle file with its signatures, certificate and provenance, admission step by step, the admission record, loading and unloading, load-time registries, live update, probation and its revert, rollback after probation, base instances, the generation switch, and the `code` and `update` code families.
 
 ## Artefacts and bundles
 
@@ -207,7 +207,7 @@ pub closed struct Lowered derives Encode {
 } Lowered
 ```
 
-`Provenance` is the type of [provenance](09-authority.md#provenance), and the other named types are those of [identifiers](02-identifiers.md#types). `admitted` is the base commit of the plan admitting the bundle. `admission` rewrites `image` when it lowers again, and `provenance` and `shared` when it recomputes them ([provenance](09-authority.md#provenance)). The revocation of a key whose signature an admission relied on runs admission again for that bundle ([rotation and revocation](09-authority.md#rotation-and-revocation)); when it refuses the bundle, its instances stop and enter `failed` with the refusal's code, and `admission` deletes its dir. The operation `remove` of `admission` ([admission](20-base.md#admission)) deletes the dir; it fails with `code.in-use` while a spec or a job names the code hash.
+`Provenance` is the type of [provenance](09-authority.md#provenance), and the other named types are those of [identifiers](02-identifiers.md#types). `admitted` is the base commit of the plan admitting the bundle. `admission` rewrites `image` when it lowers the bundle for a new generation's kernel ([generation switch](#generation-switch)), and `provenance` and `shared` when it recomputes them ([provenance](09-authority.md#provenance)). The revocation of a key whose signature an admission relied on runs admission again for that bundle ([rotation and revocation](09-authority.md#rotation-and-revocation)); when it refuses the bundle, its instances stop and enter `failed` with the refusal's code, and `admission` deletes its dir. The operation `remove` of `admission` ([admission](20-base.md#admission)) deletes the dir; it fails with `code.in-use` while a spec or a job names the code hash.
 
 ## Loading
 
@@ -282,10 +282,6 @@ A new generation's kernel image folds in the bundles of updated base instances, 
 2. `power` reboots the machine ([power off and reboot](08-scheduling.md#power-off-and-reboot)). When the reboot fails with `fault.power-failed`, `next once` still names the new generation's slot, and the next boot starts it.
 3. The new generation runs on the branch `trial/<n>` ([trial branches](11-store.md#trial-branches)), and the [health gate](03-boot.md#health-gate) decides it; a failing generation gives way to the previous one. Admission lowers the images it lacks before their instances start, and each instance restores from its checkpoint under the new code as [starting](06-execution.md#starting) states.
 
-## Toolchain updates
-
-A **toolchain update** installs a new bundle of the `nan` program and makes it the one the `nan` job runs ([jobs](20-base.md#jobs); requires [N52](22-nan.md#n52), [N53](22-nan.md#n53)). After it, `admission` checks again in verify mode and lowers again, in CPU class `background` ([CPU classes](08-scheduling.md#cpu-classes)), every admitted bundle an instance uses, against the running kernel's support routines. Each bundle lowered emits `code.relowered`, gains the image in its record, and its instances update to the same code hash with the new image: an update of class `identical`, with probation. A bundle failing the check keeps its image and emits `code.recheck-failed`.
-
 ## Events
 
 | Kind | Payload | Section |
@@ -293,8 +289,6 @@ A **toolchain update** installs a new bundle of the `nan` program and makes it t
 | `code.admitted` | code hash, root, provenance, `shared`, check | [Admission](#admission) |
 | `code.loaded` | code hash, space, code bytes | [Loading](#loading) |
 | `code.unloaded` | code hash, space | [Loading](#loading) |
-| `code.relowered` | code hash, toolchain, level | [Toolchain updates](#toolchain-updates) |
-| `code.recheck-failed` | code hash, toolchain, diagnostic | [Toolchain updates](#toolchain-updates) |
 | `update.started` | moniker, old and new code hash, migration class | [Live update](#live-update) |
 | `update.passed` | moniker, code hash, messages handled, what ended it: its bounds, the recording bound, a stop or a restart | [Probation](#probation) |
 | `update.reverted` | moniker, old and new code hash, reason, inputs replayed, inputs dead-lettered | [Live update](#live-update), [Probation](#probation) |

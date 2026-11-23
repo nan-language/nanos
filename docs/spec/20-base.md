@@ -160,16 +160,15 @@ ok console claim: records 1
 
 ## `admission`
 
-Admits, lowers again and removes bundles ([Code](10-code.md)).
+Admits and removes bundles ([Code](10-code.md)).
 
 | Operation | Arguments | Result | Failures | Reversibility |
 | --- | --- | --- | --- | --- |
 | `admit` | `bundle: View`, reading the bundle blob alone, and `base: CommitId` | the admission record, and the drivers the load of its contributions would start ([matching](15-devices.md#matching)) | the codes of [admission](10-code.md#admission) | `recorded` |
-| `lower` | `bundle: HashValue` | — | `code.no-image`, `code.recheck-failed` | `recorded` |
 | `remove` | `bundle: HashValue` | — | `code.in-use` | `recorded` |
 | `recompute` | `changed: Option[u64]`, the commit that changed the policy | — | — | `recorded` |
 
-The plan step `install` runs `admit`, and [toolchain updates](10-code.md#toolchain-updates) run `lower` (requires [N53](22-nan.md#n53)). `recompute` judges every admitted bundle again under the keys and, once its check of `changed` is done, the policy, as [provenance](09-authority.md#provenance) and [rotation and revocation](09-authority.md#rotation-and-revocation) state. Wiring: a View of `/sys/code`; Views reading `/sys/instances` and `/live/instances`, where `remove` finds the specifications and running instances naming a code hash; ports to `store`, `keys`, `policy`, `devices` and `journal`; the core's load-time registries; a `Control` grant with `lifecycle`, failing the instances of a bundle `recompute` refuses; and on a machine running the `nan` job, the job's toolchain, which the core runs over the workspaces admission serves (requires [N52](22-nan.md#n52)).
+The plan step `install` runs `admit`. `recompute` judges every admitted bundle again under the keys and, once its check of `changed` is done, the policy, as [provenance](09-authority.md#provenance) and [rotation and revocation](09-authority.md#rotation-and-revocation) state. Wiring: a View of `/sys/code`; Views reading `/sys/instances` and `/live/instances`, where `remove` finds the specifications and running instances naming a code hash; ports to `store`, `keys`, `policy`, `devices` and `journal`; the core's load-time registries; a `Control` grant with `lifecycle`, failing the instances of a bundle `recompute` refuses; and on a machine running the `nan` job, the job's toolchain, which the core runs over the workspaces admission serves (requires [N52](22-nan.md#n52)).
 
 ## `boot`
 
