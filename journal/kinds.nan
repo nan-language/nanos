@@ -97,6 +97,9 @@ pub const UPDATE_REVERTED: u16 = 31
 /// `fault.iommu-failed`, its argument the register base of the IOMMU unit and its continuation holding the reason.
 pub const IOMMU_FAILED: u16 = 32
 
+/// `place.moved`, whose payload `Wide` lays out: the label of the space the instance left, then of the one it moved to.
+pub const PLACE_MOVED: u16 = 33
+
 /// The payload bytes of a record of a kind of two continuations: its argument's 8 bytes, least significant first, then the bytes of each continuation.
 pub closed struct Wide derives Copy {
     pub bytes: Array[u8, 72]
@@ -141,6 +144,13 @@ pub closed struct CodeLoaded derives Render, Encode {
     pub space: text::String
     pub code_bytes: u64
 } CodeLoaded
+
+/// The payload of `place.moved`: the instance that restarted in another space, the label of the space it left and of the one it runs in.
+pub closed struct PlaceMoved derives Render, Encode {
+    pub moniker: ident::Moniker
+    pub old: text::String
+    pub new: text::String
+} PlaceMoved
 
 /// The payload of `code.unloaded`: the bundle's code hash and the space it left.
 pub closed struct CodeUnloaded derives Render, Encode {
@@ -340,6 +350,7 @@ pub fn kind_name(kind: u16) -> text::Fixed[32] {
         UPDATE_PASSED => "update.passed"
         UPDATE_REVERTED => "update.reverted"
         IOMMU_FAILED => "fault.iommu-failed"
+        PLACE_MOVED => "place.moved"
         else => "unknown"
     })
 } kind_name
@@ -373,7 +384,7 @@ pub fn RingRecord.continued(self) -> bool = (self.flags & CONTINUED) != 0
 
 /// The continuations a continued record of kind `kind` has: two for the kinds `Wide` lays out, one otherwise.
 pub fn continuations(kind: u16) -> usize {
-    if kind >= CODE_LOADED and kind <= UPDATE_REVERTED {
+    if (kind >= CODE_LOADED and kind <= UPDATE_REVERTED) or kind == PLACE_MOVED {
         return 2
     }
     return 1
@@ -399,18 +410,22 @@ pub fn Wide.continuation(self, index: usize) -> RingRecord {
     return RingRecord.from_bits(part)
 } Wide.continuation
 
-/// The payload of `code.loaded` or `code.unloaded` of the bundle `code` in the shared space, of `code_bytes` code bytes: those bytes, the hash, then the space's name.
-pub fn Wide.of_code(code: ident::HashValue, code_bytes: u64) -> Wide {
+/// The payload of `code.loaded` or `code.unloaded` of the bundle `code` in the space labelled `space`, of `code_bytes` code bytes: those bytes, the hash, then the label cut to 31 bytes.
+pub fn Wide.of_code(code: ident::HashValue, code_bytes: u64, space: Str) -> Wide {
     var wide = Wide(bytes: Array[u8, 72].filled(0))
     mut wide.put_number(at: 0, value: code_bytes)
     mut wide.put_hash(at: 8, hash: code)
-    var at: usize = 41
-    for byte in SHARED_SPACE.as_bytes() {
-        wide.bytes[at] = byte
-        at += 1
-    }
+    mut wide.put_text(from: 41, to: 72, text: space)
     return wide
 } Wide.of_code
+
+/// The payload of `place.moved` from the space labelled `old` to the one labelled `new`: each label in 36 bytes.
+pub fn Wide.of_move(old: Str, new: Str) -> Wide {
+    var wide = Wide(bytes: Array[u8, 72].filled(0))
+    mut wide.put_text(from: 0, to: 36, text: old)
+    mut wide.put_text(from: 36, to: 72, text: new)
+    return wide
+} Wide.of_move
 
 /// The payload of `update.started` from `old` to `new` of migration class `class`: the class in its first byte, then both hashes.
 pub fn Wide.of_start(old: ident::HashValue, new: ident::HashValue, class: MigrationClass) -> Wide {
@@ -504,21 +519,30 @@ fn Wide.count(self, at: usize) -> u64 {
     return u64.widen(self.bytes[at]) | (u64.widen(self.bytes[at + 1]) << 8)
 } Wide.count
 
-/// The name of the space the payload's bytes from 41 hold.
-fn Wide.space(self, alloc: mem::Alloc) -> text::String {
-    var space = text::String.empty(alloc)
-    for at in 41..<72usize {
+/// Writes the bytes of `text` that fit from `from` to `to`.
+fn Wide.put_text(mut self, from: usize, to: usize, text: Str) {
+    var at = from
+    for byte in text.as_bytes() {
+        if at >= to {
+            return
+        }
+        self.bytes[at] = byte
+        at += 1
+    }
+} Wide.put_text
+
+/// The text the payload's bytes from `from` to `to` hold, up to the first 0.
+fn Wide.text(self, from: usize, to: usize, alloc: mem::Alloc) -> text::String {
+    var text = text::String.empty(alloc)
+    for at in from..<to {
         let byte = self.bytes[at]
         if byte == 0 {
             break
         }
-        mut space.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+        mut text.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
     }
-    return space
-} Wide.space
-
-/// The name of the only space bundles load into until isolated spaces are built.
-const SHARED_SPACE: Str = "shared"
+    return text
+} Wide.text
 
 /// The reason's number in `update.reverted`'s payload.
 fn RevertReason.number(self) -> u8 {
@@ -611,8 +635,9 @@ fn CoreRecord.payload(self, alloc: mem::Alloc) -> Payload {
         STORE_WRITES_REFUSED => payload_of(WritesRefused(free: argument), alloc)
         BOOT_STARTED => payload_of(started_of(generation: argument, more), alloc)
         BOOT_CANDIDATE_FAILED => payload_of(CandidateFailed(generation: argument, code: text_of(more, alloc)), alloc)
-        CODE_LOADED => payload_of(CodeLoaded(code: self.wide().hash(at: 8), space: self.wide().space(alloc), code_bytes: argument), alloc)
-        CODE_UNLOADED => payload_of(CodeUnloaded(code: self.wide().hash(at: 8), space: self.wide().space(alloc)), alloc)
+        CODE_LOADED => payload_of(CodeLoaded(code: self.wide().hash(at: 8), space: self.wide().text(from: 41, to: 72, alloc), code_bytes: argument), alloc)
+        CODE_UNLOADED => payload_of(CodeUnloaded(code: self.wide().hash(at: 8), space: self.wide().text(from: 41, to: 72, alloc)), alloc)
+        PLACE_MOVED => payload_of(PlaceMoved(moniker: ident::Moniker(text: self.source.text), old: self.wide().text(from: 0, to: 36, alloc), new: self.wide().text(from: 36, to: 72, alloc)), alloc)
         UPDATE_STARTED => payload_of(UpdateStarted(moniker: ident::Moniker(text: self.source.text), old: self.wide().hash(at: 1), new: self.wide().hash(at: 34), class: match self.wide().bytes[0] {
             1 => MigrationClass.Additive
             2 => MigrationClass.Migrated
@@ -768,6 +793,33 @@ test wide_records_carry_two_code_hashes_through_their_continuations for Wide.of_
     }
     expect begun.old == ident::HashValue(bytes: old) and begun.new == ident::HashValue(bytes: new) and begun.class == MigrationClass.Additive
 } wide_records_carry_two_code_hashes_through_their_continuations
+
+test events_carry_the_labels_of_their_spaces for Wide.of_move {
+    let alloc = testing::world().alloc
+    let wide = Wide.of_move(old: "owner/agent", new: "shared")
+    var more = mem::List[RingRecord].empty(alloc)
+    mut more.push(wide.continuation(0))
+    mut more.push(wide.continuation(1))
+    let moved = CoreRecord(record: RingRecord(time: 5, cause: 0, source: 4, kind: PLACE_MOVED, severity: 2, flags: CONTINUED, argument: wide.argument()), more: take more, source: ident::Moniker(text: text::Fixed[59].of("counter")), sender: None).event(ident::Cause.of(boot: 2, number: 1), alloc)
+    let Ok(payload) = attempt mem::wire::Codec[PlaceMoved].decode(Untrusted.of(moved.payload.bytes.view()), alloc) else {
+        expect false
+        return
+    }
+    expect moved.kind.as_str() == "place.moved" and continuations(PLACE_MOVED) == 2
+    expect payload.moniker.text.as_str() == "counter" and payload.old.as_str() == "owner/agent" and payload.new.as_str() == "shared"
+    var code = Array[u8, 33].filled(0x33)
+    code[0] = 0x01
+    let loading = Wide.of_code(ident::HashValue(bytes: code), code_bytes: 9, space: "agent.ops/reviewed")
+    var loaded_more = mem::List[RingRecord].empty(alloc)
+    mut loaded_more.push(loading.continuation(0))
+    mut loaded_more.push(loading.continuation(1))
+    let loaded = CoreRecord(record: RingRecord(time: 5, cause: 0, source: 0, kind: CODE_LOADED, severity: 1, flags: CONTINUED, argument: loading.argument()), more: take loaded_more, source: ident::Moniker(text: text::Fixed[59].of("kernel")), sender: None).event(ident::Cause.of(boot: 2, number: 1), alloc)
+    let Ok(into) = attempt mem::wire::Codec[CodeLoaded].decode(Untrusted.of(loaded.payload.bytes.view()), alloc) else {
+        expect false
+        return
+    }
+    expect into.space.as_str() == "agent.ops/reviewed" and into.code_bytes == 9 and into.code == ident::HashValue(bytes: code)
+} events_carry_the_labels_of_their_spaces
 
 test traps_give_fault_records_and_boots_their_system_cause for CoreRecord.fault {
     let alloc = testing::world().alloc

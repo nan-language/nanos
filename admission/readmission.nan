@@ -1,4 +1,4 @@
-//! Judging admitted bundles again after a change of the policy or of the principals' keys: each admission record takes the provenance class and `shared` field the bundle's signatures give now, and a bundle whose signatures no longer verify is removed, its instances failing with the refusal's code.
+//! Judging admitted bundles again after a change of the policy or of the principals' keys: each admission record takes the provenance class and `shared` field the bundle's signatures give now, each running instance its record places in another space restarting there, and a bundle whose signatures no longer verify is removed, its instances failing with the refusal's code.
 
 /// How long a recomputation waits for the policy to check the record a commit wrote.
 const POLICY_WAIT_MS: u64 = 30_000
@@ -67,7 +67,7 @@ fn Readmission.trust(self, changed: Option[u64]) -> Option[policy::Trust] fails 
     }
 } Readmission.trust
 
-/// Judges the bundle of code hash `code` again under `trust`: rewrites its admission record when its provenance class or `shared` field changes, and refuses it when a signature no longer verifies.
+/// Judges the bundle of code hash `code` again under `trust`: rewrites its admission record when its provenance class or `shared` field changes, restarting the instances it places in another space, and refuses it when a signature no longer verifies.
 fn Readmission.readmit(self, code: ident::HashValue, trust: policy::Trust) fails task::Cancelled uses wait {
     let alloc = self.judge.alloc
     let Some(record) = try await self.record(code) else {
@@ -111,7 +111,52 @@ fn Readmission.readmit(self, code: ident::HashValue, trust: policy::Trust) fails
     var writes = mem::List[store::Write].empty(alloc)
     mut writes.push(store::Write.Put(path: code_path(code, name: "admission", alloc), value: store::Value.Record(type: store::TypeRef.of(code::ADMISSION_TYPE, schema: mem::wire::Codec[code::Admission].schema_hash(), alloc), bytes: take bytes, secret: false)))
     discard try await self.users.commit(take writes)
+    try await self.replace(code, record: rewritten)
 } Readmission.readmit
+
+/// Restarts each running instance of the bundle of code hash `code` that `record`, its admission record, places in another space than the one it runs in.
+fn Readmission.replace(self, code: ident::HashValue, record: code::Admission) fails task::Cancelled uses wait {
+    let alloc = self.judge.alloc
+    var monikers = mem::List[text::String].empty(alloc)
+    try await self.users.gather(self.users.running, bundle: code, live: true, mut monikers)
+    for moniker in monikers {
+        let Some(live) = try await value_at(self.users.running, name: moniker.as_str(), alloc) else {
+            continue
+        }
+        let Ok(running) = attempt mem::wire::Codec[os::LiveInstance].decode(live.view(), alloc) else {
+            continue
+        }
+        let Some(specified) = try await value_at(self.users.specs, name: moniker.as_str(), alloc) else {
+            continue
+        }
+        let Ok(spec) = attempt mem::wire::Codec[os::InstanceSpec].decode(specified.view(), alloc) else {
+            continue
+        }
+        let placed = os::Space.of(ident::Principal(text: spec.principal.text), placement: spec.placement, shared: record.shared, provenance: record.provenance)
+        if placed.name(alloc).as_str() == running.space.as_str() {
+            continue
+        }
+        var name = text::Fixed[59].empty()
+        mut name.append(moniker.as_str())
+        match attempt await self.control.restart(ident::Moniker(text: name), alloc) {
+            Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+            else => {
+            }
+        }
+    }
+} Readmission.replace
+
+/// The value of the node `/<name>` of `view`, `None` when it holds none.
+fn value_at(view: store::service::View, name: Str, alloc: mem::Alloc) -> Option[Untrusted[mem::Bytes]] fails task::Cancelled uses wait {
+    var path = text::String.of("/", alloc)
+    mut path.append(name)
+    let node = match first attempt await view.get(ident::Path(text: take path), at: None, alloc) {
+        Ok(got) => got
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    return node.value
+} value_at
 
 /// The admission record of the bundle of code hash `code`, `None` when none decodes.
 fn Readmission.record(self, code: ident::HashValue) -> Option[code::Admission] fails task::Cancelled uses wait {

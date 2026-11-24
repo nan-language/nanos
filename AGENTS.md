@@ -24,7 +24,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `runner/` | The `runner` package: instances in their own domains, their intakes, lifecycles, restarts, Envs, checkpoints, dead letters, flight recorders, forks, pauses, replays, hibernations, updates and their probations, jobs with their streams and file views, and the accounts of sessions |
 | `supervisor/` | The `supervisor` package: the base instance that starts the others in their order |
 | `devices/` | The `devices` package: the device protocols and `fat`'s, the `drivers` registry and the capability through which the core previews and holds bundles' contributions, the AML evaluator, partition tables, volume views and the device manager |
-| `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries |
+| `drivers/` | The `drivers` package: one module per driver family, each contributing its `drivers` entries, and `dma`, the buffers drivers hand their devices |
 | `fat/` | The `fat` package: the boot volume's file system |
 | `store/` | The `store` package: the store's engine, its log, index trees, item table, blob cache and keyring, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol, Views and mappings |
 | `journal/` | The `journal` package: events and the kernel image's kind table, causes and traces, metrics, the streams of `/journal`, sources, log capabilities, and the `journal` instance |
