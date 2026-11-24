@@ -277,7 +277,7 @@ Placement is computed when an instance starts, from its bundle's [admission reco
 4. it acts for `system` or `owner`;
 5. its spec's `placement` is not `isolated`.
 
-Admission records conditions 1 and 2 as the bundle's `shared` field. Every other instance runs in the **isolated space** of its principal and provenance class, one space per pair, named `<principal>/<class>` in `/live`. `keys` runs alone in the isolated space `keys`; the other base instances run in the shared space. The mechanics of spaces are [placement mechanics](04-kernel.md#placement-mechanics); isolated spaces require [N23](22-nan.md#n23).
+Admission records conditions 1 and 2 as the bundle's `shared` field. Every other instance runs in the **isolated space** of its principal and provenance class, one space per pair (requires [N55](22-nan.md#n55)), named `<principal>/<class>` in `/live`. `keys` runs alone in the isolated space `keys` (requires [N54](22-nan.md#n54)); the other base instances run in the shared space. The mechanics of spaces are [placement mechanics](04-kernel.md#placement-mechanics); isolated spaces require [N23](22-nan.md#n23).
 
 ### Machine conditions
 
@@ -299,9 +299,9 @@ The shared space is one confidentiality domain: an instance in it may read anyth
 | Cost | Paid when | Size |
 | --- | --- | --- |
 | encoding and validating decode | each message between spaces, as between bundles ([isolated transport](07-communication.md#isolated-transport)) | the cost of a [transfer](07-communication.md#transfer) between bundles |
-| split tables | each crossing between an isolated space and the core, on a machine without `meltdown-immune` | two root loads per crossing ([split tables](04-kernel.md#split-tables)) |
+| split tables | each crossing between an isolated space and the core, on a machine without `meltdown-immune` (requires [N61](22-nan.md#n61)) | two root loads per crossing ([split tables](04-kernel.md#split-tables)) |
 | TLB flush | each switch between spaces, on a machine without `pcid` | the CPU's non-global translations |
-| IBPB | each switch between isolated spaces of different principals (requires [N11](22-nan.md#n11)) | one barrier |
+| IBPB | each switch between isolated spaces of different principals (requires [N11](22-nan.md#n11), [N56](22-nan.md#n56)) | one barrier |
 | core scheduling | on a machine whose measured fact `smt` holds, the core scheduling of [wake placement](08-scheduling.md#wake-placement) | the siblings' idle time |
 | memory | each isolated space | its page tables, its user-mode runtime and its copy of each loaded bundle's writable data |
 

@@ -82,7 +82,7 @@ NaN's runtime owns each CPU's interface to its interrupt controller: the local A
 
 - `irq` allocates each device vector that `devices` requests ([interrupts and polling](15-devices.md#interrupts-and-polling)) on one CPU (requires [N21](22-nan.md#n21)): the CPU named for a per-CPU queue, or else the CPU of the device's NUMA node holding the fewest device vectors.
 - It programs the source: an I/O APIC redirection entry, an MSI or MSI-X message, a GICv3 route or an ITS mapping.
-- A driver in an isolated space receives only message-signalled interrupts: the core's interrupt fn rings the driver's doorbell from `routes` and completes the interrupt (requires [N23](22-nan.md#n23)).
+- A driver in an isolated space receives only message-signalled interrupts: the core's interrupt fn rings the driver's doorbell from `routes` and completes the interrupt (requires [N23](22-nan.md#n23), [N54](22-nan.md#n54)).
 
 An interrupt costs one seam entry; an idle device costs nothing.
 
@@ -106,10 +106,10 @@ A **space** is an address space: the **shared space**, whose code runs in ring 0
 
 ### Isolated spaces
 
-- An isolated space has a root of its own. Below its user window it shares the shared space's tables, so the core's mappings are present and supervisor-only (requires [N23](22-nan.md#n23)).
+- An isolated space has a root of its own. Below its user window it shares the shared space's tables, so the core's mappings are present and supervisor-only (requires [N23](22-nan.md#n23), [N61](22-nan.md#n61)).
 - The **user window** starts at B, the first 512 GiB boundary above the highest physical address the shared space maps, and ends at 2^47 on x86_64 and at 2^48 on AArch64. A machine whose B lies above 2^46 lacks `user-mode`.
 - The window holds the code areas of the space's bundles (user, read-execute or read-only), its domains' chunks ([mappings](05-memory.md#mappings)), mapped blobs (read-only), its doorbell frame, the frames of its [channels](07-communication.md#isolated-transport) and the MMIO windows of its drivers (uncached). Nothing in it is both writable and executable.
-- The shared space uses PCID 0, ASID 0 on AArch64. Each CPU gives tags 1 to 63 to the isolated spaces it ran most recently, and reassigns the least recently used tag after invalidating its translations. On a machine without `pcid`, every switch between spaces flushes the CPU's non-global translations.
+- The shared space uses PCID 0, ASID 0 on AArch64. Each CPU gives tags 1 to 63 to the isolated spaces it ran most recently, and reassigns the least recently used tag after invalidating its translations (requires [N61](22-nan.md#n61)). On a machine without `pcid`, every switch between spaces flushes the CPU's non-global translations.
 
 ### Split tables
 
@@ -117,7 +117,7 @@ On a machine without `meltdown-immune`, each isolated space has a second root, i
 
 ### Switches and shootdowns
 
-- Switching a CPU to a space loads its root with the CPU's tag for it. Before running an isolated space of a principal other than the last principal whose isolated code ran on that CPU, the core issues an indirect branch prediction barrier; on CPUs affected by data-sampling flaws, it clears the CPU buffers before every return to user mode (requires [N11](22-nan.md#n11)).
+- Switching a CPU to a space loads its root with the CPU's tag for it. Before running an isolated space of a principal other than the last principal whose isolated code ran on that CPU, the core issues an indirect branch prediction barrier; on CPUs affected by data-sampling flaws, it clears the CPU buffers before every return to user mode (requires [N11](22-nan.md#n11), [N56](22-nan.md#n56)).
 - Removing a mapping completes only when no CPU can use it: CPUs running the space take a shootdown IPI and invalidate the range, and CPUs holding a tag for the space without running it invalidate that tag before they run the space again (requires [N11](22-nan.md#n11)). A frame whose mapping is removed returns to the frame allocator only after the removal completes. A change to the shared space shoots down every CPU.
 - A switch costs one root load; a shootdown costs one IPI round to the CPUs running the space; an idle space costs nothing.
 
@@ -137,8 +137,8 @@ Code of an isolated space runs on **space threads**: kernel threads that `sched`
 
 - A space thread leaves user mode by the system call seam, an exception or an interrupt, whose landing fns are those of `entry` ([NaN 24 §User exceptions and syscalls](https://github.com/nan-language/nan/blob/main/docs/spec/24-kernel.md#user-exceptions-and-syscalls)). A timer interrupt preempts a space thread as it preempts a task.
 - While a space thread runs user code, the core denies user mode the time-stamp counter (CR4.TSD) or the generic counter (CNTKCTL_EL1) (requires [N11](22-nan.md#n11)), so user code reads time only through `now`, at its clock's [resolution](08-scheduling.md#resolution).
-- Each space has a **doorbell frame**, shared with the core, holding one bit per doorbell of the space, at most 32,768: the core sets a bit when its doorbell rings, and the runtime clears it. The core gives a doorbell to each side of a channel the space holds and to each vector of the space's drivers.
-- A **handle** is a capability of an instance of the space, named by its slot in the space's handle table, which the core keeps (requires [N27](22-nan.md#n27)).
+- Each space has a **doorbell frame**, shared with the core, holding one bit per doorbell of the space, at most 32,768: the core sets a bit when its doorbell rings, and the runtime clears it. The core gives a doorbell to each side of a channel the space holds and to each vector of the space's drivers (requires [N59](22-nan.md#n59)).
+- A **handle** is a capability of an instance of the space, named by its slot in the space's handle table, which the core keeps (requires [N27](22-nan.md#n27), [N54](22-nan.md#n54)).
 - Every exception raised in user mode is an [integrity fault](#integrity-faults).
 
 ### System calls
@@ -159,11 +159,11 @@ A system call passes its number and up to six arguments in the registers NaN 24 
 | 9 | `pass` | channel, handle | a capability id pending for the channel | `stale`, `invalid` |
 | 10 | `claim` | channel, pending capability id, domain slot | a handle | `invalid` |
 
-- `run` names the domain whose code the thread runs next: its account is charged for the thread ([accounting](08-scheduling.md#accounting)), and its domain answers for an exception. A space thread runs the domain of the instance the core started it for as long as it has not called `run`.
+- `run` names the domain whose code the thread runs next: its account is charged for the thread ([accounting](08-scheduling.md#accounting)), and its domain answers for an exception. A space thread runs the domain of the instance the core started it for as long as it has not called `run` (requires [N55](22-nan.md#n55)).
 - `wait` blocks the thread while no bit of the doorbell frame is set, at most to the deadline; a waiting space thread costs nothing.
 - `draw` draws chunks through the domain's cell and maps them; `release` unmaps and returns them ([mappings](05-memory.md#mappings)).
-- `invoke` performs an operation that never waits of a kernel-implemented [capability kind](09-authority.md#capability-kinds) (requires [N27](22-nan.md#n27)); its arguments and result are `mem::wire` encodings, read and written by bounded copies (requires [N23](22-nan.md#n23)). An operation that waits reaches the instance serving it through a channel.
-- `transfer`, `accept`, `pass` and `claim` are the core operations of the [isolated transport](07-communication.md#isolated-transport): `transfer` hands the core a payload for a channel; `accept` gives it to the receiving domain, copied into chunks drawn through the domain's cell or with its frames moved into the receiver's window; `pass` and `claim` move a capability.
+- `invoke` performs an operation that never waits of a kernel-implemented [capability kind](09-authority.md#capability-kinds) (requires [N27](22-nan.md#n27), [N54](22-nan.md#n54)); its arguments and result are `mem::wire` encodings, read and written by bounded copies (requires [N23](22-nan.md#n23)). An operation that waits reaches the instance serving it through a channel.
+- `transfer`, `accept`, `pass` and `claim` are the core operations of the [isolated transport](07-communication.md#isolated-transport) (requires [N59](22-nan.md#n59)): `transfer` hands the core a payload for a channel; `accept` gives it to the receiving domain, copied into chunks drawn through the domain's cell or with its frames moved into the receiver's window; `pass` and `claim` move a capability.
 
 ## Kernel policies
 
@@ -232,7 +232,7 @@ An **integrity fault** is a CPU exception raised by an instance's code, or a bre
 
 A CPU exception during these steps halts the kernel.
 
-The fault report has the form of a [NaN trap report](https://github.com/nan-language/nan/blob/main/docs/spec/11-errors-domains.md#trap-reports), with `fault.integrity` in place of the trap kind and the operand line `vector = v, code = c, address = a`, located through the bundle's line tables. An instruction outside every line table makes the first line `fault.integrity at 0x<address> in <bundle short hash>`; a breach makes it `fault.integrity at channel <n> in <moniker>`, with the operand line `field = f, value = v`.
+The fault report has the form of a [NaN trap report](https://github.com/nan-language/nan/blob/main/docs/spec/11-errors-domains.md#trap-reports), with `fault.integrity` in place of the trap kind and the operand line `vector = v, code = c, address = a`, located through the bundle's line tables (in user mode, requires [N57](22-nan.md#n57)). An instruction outside every line table makes the first line `fault.integrity at 0x<address> in <bundle short hash>`; a breach makes it `fault.integrity at channel <n> in <moniker>`, with the operand line `field = f, value = v`.
 
 ```text
 fault.integrity at ring/ring.nan:57 in ring::Ring.push

@@ -124,13 +124,13 @@ The base instances form one bundle, so their messages move. A transfer between b
 
 ## Capability transfer
 
-A capability argument travels with its message: sending copies it, and delivery adds an entry naming the same capability to the receiver's received-capability table, whose `CapId[C]` the variant holds ([runner tables](06-execution.md#runner-tables)) (requires [N4](22-nan.md#n4), [N27](22-nan.md#n27)). Revoking the capability revokes the received copy. A capability in a reply reaches the calling instance's table the same way. Between bundles the capability travels beside the encoding; between spaces the core adds the entry, as the [isolated transport](#isolated-transport) states.
+A capability argument travels with its message: sending copies it, and delivery adds an entry naming the same capability to the receiver's received-capability table, whose `CapId[C]` the variant holds ([runner tables](06-execution.md#runner-tables)) (requires [N4](22-nan.md#n4), [N27](22-nan.md#n27)). Revoking the capability revokes the received copy. A capability in a reply reaches the calling instance's table the same way. Between bundles the capability travels beside the encoding; between spaces the core adds the entry, as the [isolated transport](#isolated-transport) states (requires [N54](22-nan.md#n54)).
 
 Only `Port`, `View`, `Control`, `Egress`, `Listen`, `WallClock` and `sys::Clock` capabilities travel ([capability kinds](09-authority.md#capability-kinds)). Admission refuses a protocol with an argument of any other capability type (`port.capability-kind`). No received capability persists: a checkpoint or a dead letter holds only its id, stale after a restart.
 
 ## Isolated transport
 
-Messages between instances in different spaces travel through **channels** (requires [N23](22-nan.md#n23)). The core creates a channel for each pair of a sending instance and a minted port whose target lies in another space, at its first message, and frees it when the minted port is revoked and its outstanding calls have ended. A channel is 10 frames, mapped into both spaces and charged as [transfers](05-memory.md#transfers) states, a failed draw trapping the sender:
+Messages between instances in different spaces travel through **channels** (requires [N23](22-nan.md#n23), [N59](22-nan.md#n59)). The core creates a channel for each pair of a sending instance and a minted port whose target lies in another space, at its first message, and frees it when the minted port is revoked and its outstanding calls have ended. A channel is 10 frames, mapped into both spaces and charged as [transfers](05-memory.md#transfers) states, a failed draw trapping the sender:
 
 | Frames | Written by | Holds |
 | --- | --- | --- |

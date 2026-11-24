@@ -541,3 +541,75 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** the toolchain the `nan` job runs building bundles against the interface file of the kernel image a generation ships, which a toolchain built for a host target built.
 - **Chapters:** [10](10-code.md), [20](20-base.md).
 - **Issue:** [nan-language/nan#280](https://github.com/nan-language/nan/issues/280).
+
+## N54
+
+**Kernel capabilities in isolated spaces.**
+
+- **Language 1:** an instance held in an isolated space builds its Env from a world whose capability table holds the link's channels alone, and only `sys::Log`, `sys::Stdio` and `sys::Random` cross into a space with a call, a reply or `Cx.capability` (NaN 14 §Component instances).
+- **NaN OS requires:** the capability kinds its kernel implements held by an instance in an isolated space, in the world it starts with and in calls and replies, their operations reaching the kernel's capability and their revocation reaching the space.
+- **Chapters:** [04](04-kernel.md), [07](07-communication.md), [09](09-authority.md).
+- **Issue:** [nan-language/nan#284](https://github.com/nan-language/nan/issues/284).
+
+## N55
+
+**Several instances in one isolated space.**
+
+- **Language 1:** `sys::load::Isolated.space` maps the runtime and one bundle, and `nanos::run_isolated` and `nanos::hold_isolated` each run one job or instance in a space of its own (NaN 24 §Isolated spaces, NaN 14 §Jobs).
+- **NaN OS requires:** a space holding several bundles and running several jobs and instances, each in a domain of its own.
+- **Chapters:** [04](04-kernel.md), [09](09-authority.md).
+- **Issue:** [nan-language/nan#285](https://github.com/nan-language/nan/issues/285).
+
+## N56
+
+**Speculation barriers between spaces.**
+
+- **Language 1:** a space's thread enters user mode inside `nanos::run_isolated` and `nanos::hold_isolated`, and `hw::Ring0.run_user` issues neither an indirect branch prediction barrier nor `verw` (NaN 24 §User mode).
+- **NaN OS requires:** an indirect branch prediction barrier before a CPU runs a space of another principal than the last, and the CPU buffers cleared before every return to user mode on CPUs affected by data sampling.
+- **Chapters:** [04](04-kernel.md), [09](09-authority.md).
+- **Issue:** [nan-language/nan#286](https://github.com/nan-language/nan/issues/286).
+
+## N57
+
+**Faults of user threads.**
+
+- **Language 1:** a job or an instance whose thread takes an exception ends `Trapped` with a trap of kind `trap.exception` alone (NaN 14 §Jobs).
+- **NaN OS requires:** the vector, the error code, the faulting and instruction addresses of the exception, and a report located through the bundle's line tables.
+- **Chapters:** [04](04-kernel.md).
+- **Issue:** [nan-language/nan#287](https://github.com/nan-language/nan/issues/287).
+
+## N58
+
+**DMA faults.**
+
+- **Language 1:** a PCI function's DMA outside its I/O domain reaches no memory, and nothing reports it (NaN 23 §I/O domains).
+- **NaN OS requires:** each fault the IOMMU records, with the function, the address and its direction.
+- **Chapters:** [15](15-devices.md).
+- **Issue:** [nan-language/nan#288](https://github.com/nan-language/nan/issues/288).
+
+## N59
+
+**Channels between spaces.**
+
+- **Language 1:** an instance in an isolated space exchanges messages through its kernel's relay tasks over the first channel of its link, encodings past 1 MiB unsupported, and a space that sends what it cannot decode is no longer heard (NaN 14 §Component instances).
+- **NaN OS requires:** channels mapped into two spaces, their doorbells, payloads of any size moved by frames when large, and a breach reported as a fault of the side that wrote it.
+- **Chapters:** [04](04-kernel.md), [07](07-communication.md).
+- **Issue:** [nan-language/nan#289](https://github.com/nan-language/nan/issues/289).
+
+## N60
+
+**IOMMU groups.**
+
+- **Language 1:** `hw::PciFunction.attach` fails with `Unsupported` for a function that is not isolated, and `attach_physical` for one whose DMA reaches the IOMMU under another requester id (NaN 24 §PCI functions).
+- **NaN OS requires:** every function of an IOMMU group attached to the group's one domain.
+- **Chapters:** [15](15-devices.md).
+- **Issue:** [nan-language/nan#290](https://github.com/nan-language/nan/issues/290).
+
+## N61
+
+**Roots and tags of isolated spaces.**
+
+- **Language 1:** a space's thread always runs under a root mapping the window and the entry area alone, its translations tagged as every space's are (NaN 24 §Isolated spaces, §Split tables).
+- **NaN OS requires:** on CPUs Meltdown does not affect, a space's root sharing the kernel's tables below its window, and a tag per space.
+- **Chapters:** [04](04-kernel.md), [09](09-authority.md).
+- **Issue:** [nan-language/nan#291](https://github.com/nan-language/nan/issues/291).
