@@ -109,6 +109,7 @@ struct Base derives Copy {
     accounts: os::Accounts
     meter: os::Meter
     loading: loading::Loading
+    spaces: Option[isolation::Spaces]
     registries: devices::Registries
     jobs: BaseJobs
     toolchain: Option[code::Toolchain]
@@ -375,14 +376,21 @@ fn Base.run_job(
     code: ident::HashValue,
     take input: mem::Bytes,
     take world: nanos::World,
+    space: Option[u64],
     domain: sys::Abandoner,
     exec: task::Executor,
     alloc: mem::Alloc,
     ) -> os::JobOutcome fails task::Cancelled uses wait {
-    return match image {
-        Some(loaded) => try await self.loading.run_job(take loaded, code, take input, take world, domain, exec, alloc)
-        None => try await self.run_base_job(code, take input, take world, domain, exec, alloc)
+    let Some(loaded) = image else {
+        return try await self.run_base_job(code, take input, take world, domain, exec, alloc)
     }
+    let Some(bytes) = space else {
+        return try await self.loading.run_job(take loaded, code, take input, take world, domain, exec, alloc)
+    }
+    let Some(spaces) = self.spaces else {
+        return os::JobOutcome.Failed(text: text::String.of("place.unavailable", alloc))
+    }
+    return try await spaces.run(take loaded, take input, bytes, take world, domain)
 } Base.run_job
 
 fn Base.host(
@@ -393,7 +401,14 @@ fn Base.host(
     take world: nanos::World,
     take hosting: runner::Hosting,
     ) -> Result[runner::Ended, sys::Trap] fails task::Cancelled uses wait {
-    return try await self.loading.host(take image, code, component, take world, take hosting)
+    let Some(bytes) = hosting.isolation() else {
+        return try await self.loading.host(take image, code, component, take world, take hosting)
+    }
+    let Some(spaces) = self.spaces else {
+        take hosting.close()
+        return Ok(runner::Ended.Unloadable(code: text::Fixed[32].of("place.unavailable")))
+    }
+    return try await spaces.host(take image, component, bytes, take world, take hosting)
 } Base.host
 
 /// Serves the base driver `component`.
@@ -1198,6 +1213,7 @@ fn run_base(
     take cells: frames::PoolCells,
     fixed: frames::Fixed,
     take loader: sys::load::Loader,
+    spacing: sys::load::Loader,
     shipped: Option[toolchain::Shipped],
     heap: mem::Alloc,
     ) fails task::Cancelled uses wait
@@ -1209,6 +1225,12 @@ fn run_base(
     defer close_toolchains(take toolchains)
     var spaces = spaces_of(shipped, mut frames, alloc: config.alloc)
     defer mut frames.take_back(take spaces)
+    var isolated = mem::List[hw::PhysFrame[4_096]].empty(config.alloc)
+    defer mut frames.take_back(take isolated)
+    let task::Channel(sender: placing, receiver: placed) = task::Channel[isolation::Input].bounded(16, alloc: config.alloc)
+    let placings = isolation::MintedSpaces.of(placing, alloc: config.alloc)
+    defer take placings.close()
+    var unplaced = Some(take placed)
     var pool = cells
     defer take pool.close()
     let task::Channel(sender: orders, receiver: ordered) = task::Channel[devices::RootOrder].bounded(16, alloc: config.alloc)
@@ -1225,12 +1247,13 @@ fn run_base(
     let lives = Roots.of(orders, reported, posted, switched, accounted, take transferred, loads, registered, backlog, monikers: rings.monikers(), alloc: config.alloc)
     defer take lives.close()
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
-    let base = Base(root: lives.root.mint(claim: false), claims: lives.root.mint(claim: true), bundle: bundle, support: support, image_bytes: fixed.image, boot: boot, isa: isa, reporter: lives.reporter.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: lives.feed.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint(), loading: lives.loading.mint(), registries: lives.registries.mint(), jobs: BaseJobs.of(bundle, tree: toolchain_tree(shipped), alloc: config.alloc), toolchain: mint_toolchain(toolchains))
+    let base = Base(root: lives.root.mint(claim: false), claims: lives.root.mint(claim: true), bundle: bundle, support: support, image_bytes: fixed.image, boot: boot, isa: isa, reporter: lives.reporter.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: lives.feed.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint(), loading: lives.loading.mint(), spaces: Some(placings.mint()), registries: lives.registries.mint(), jobs: BaseJobs.of(bundle, tree: toolchain_tree(shipped), alloc: config.alloc), toolchain: mint_toolchain(toolchains))
     var requested = incoming
     let counters = Counters.of(requests.split(), alloc: config.alloc)
+    let lending = requests.split()
     var given = Some(Given(known: take known, machine: Resources(requests: take requests, cpus: cpus.share(), alloc: config.alloc), keeper: take keeper, orders: take ordered, store_events: take reports, granted: take granted, granting: take granting, postings: take postings, switches: take switches, logged: take logged, traced: take traced, arming: take arming, accounting: take accounting, transfers: take transfers, loads: take load_orders, registry_orders: take registry_orders, loader: take loader, runs: take run_orders))
     defer abandon_given(take given)
-    try await task::scope(config.exec, body: fn[mut frames, mut given, mut requested, mut pool, mut spaces](s: task::Scope) fails task::Cancelled uses wait {
+    let scoped = attempt await task::scope(config.exec, body: fn[mut frames, mut given, mut requested, mut pool, mut spaces, mut isolated, mut unplaced](s: task::Scope) fails task::Cancelled uses wait {
         let Some(Given(known: genesis, machine: resources, keeper: held, orders: root_orders, store_events: store_events, granted: grants_out, granting: grants_in, postings: board, switches: switch_orders, logged: log_records, traced: tracing, arming: arming_orders, accounting: account_orders, transfers: transfer_records, loads: bundle_orders, registry_orders: registering, loader: bundles, runs: toolchain_runs)) = mut given.extract() else {
             return
         }
@@ -1289,8 +1312,40 @@ fn run_base(
                 }
             })
         })
+        match mut unplaced.extract() {
+            Some(placements) => {
+                let returning = placing.split()
+                discard s.spawn(fn[take placements, take returning, mut isolated]() fails task::Cancelled uses wait limits stack 32_768 {
+                    try await serve_spaces(cpu, loader: spacing, inputs: take placements, returning, requests: lending, pool: mut isolated, exec: config.exec, alloc: config.alloc)
+                })
+            }
+            None => {
+            }
+        }
         try await keep_memory(mut frames, node: mut pool, fixed, requests: mut requested, keeper: counters, exec: config.exec, alloc: config.alloc)
     })
+    match unplaced {
+        Some(placements) => {
+            discard attempt await take placements.drain(visit: fn[mut isolated](take left: isolation::Input) {
+                match left {
+                    isolation::Input.Returned(lent) => {
+                        for frame in take lent {
+                            mut isolated.push(take frame)
+                        }
+                    }
+                    isolation::Input.Order(_) or isolation::Input.Job(_) => {
+                    }
+                }
+            })
+        }
+        None => {
+        }
+    }
+    match scoped {
+        Ok(_) => {
+        }
+        Err(cancelled) => fail cancelled
+    }
 } run_base
 
 /// The root entries of what base instances reach of the core: the device root, where the store reports its events, the feed of the core rings, the `/live` records they publish, the store's, the devices', the part of `/live/security` `keys` tells, `/live/boot` and `/live/sessions`; the monikers of the instances calling them; the power switch; the accounts of sessions; the drivers' meter; and the loading of jobs' bundles.
@@ -1506,7 +1561,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     let alloc = world.alloc
     var bundle = Array[u8, 33].filled(0)
     bundle[0] = 0x01
-    let config = runner::Config(base: ident::HashValue(bytes: bundle), exec: world.exec, hibernation: alloc, alloc: alloc, cpus: 1, clock: world.clock, wall: ident::Wall(at: ident::WallTime.unknown(), since_ns: 0), random: world.random, classes: sched::classes(), system: ident::Cause.of(1, number: 1))
+    let config = runner::Config(base: ident::HashValue(bytes: bundle), exec: world.exec, hibernation: alloc, alloc: alloc, cpus: 1, clock: world.clock, wall: ident::Wall(at: ident::WallTime.unknown(), since_ns: 0), random: world.random, classes: sched::classes(), system: ident::Cause.of(1, number: 1), user_mode: false)
     let rings = rings::Rings.of(cpus: hw::cpu_count(), clock: world.clock, boot: 1, alloc)
     let task::Channel(sender: orders, receiver: unserved) = task::Channel[devices::RootOrder].bounded(1, alloc)
     discard unserved
@@ -1545,7 +1600,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unregistered
     let registries = devices::MintedRegistries.of(registering, alloc)
     defer take registries.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), support: ident::HashValue(bytes: bundle), image_bytes: 0, boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint(), loading: loads.mint(), registries: registries.mint(), jobs: BaseJobs.of(ident::HashValue(bytes: bundle), tree: None, alloc), toolchain: None)
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), support: ident::HashValue(bytes: bundle), image_bytes: 0, boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint(), loading: loads.mint(), spaces: None, registries: registries.mint(), jobs: BaseJobs.of(ident::HashValue(bytes: bundle), tree: None, alloc), toolchain: None)
     let task::Channel(sender: logs, receiver: unlogged) = task::Channel[journal::Logged].bounded(1, alloc)
     discard unlogged
     let task::Channel(sender: ungranted, receiver: granting) = task::Channel[os::Granted].bounded(1, alloc)

@@ -25,10 +25,12 @@ struct Job {
     seed: Option[u64]
 } Job
 
-/// What a job's admitted bundle tells of how it runs: whether its `main` is a host-compatible entry, and whether the bundle has provenance `agent`.
+/// What a job's admitted bundle tells of how it runs: whether its `main` is a host-compatible entry, the bundle's provenance class, whether admission placed it in the shared space, and whether it is a base job, which the kernel image runs in the shared space.
 struct JobEntry derives Copy {
     host: bool
-    agent: bool
+    provenance: os::Provenance
+    shared: bool
+    base: bool
 } JobEntry
 
 /// The next run of a job, once prepared: the View of `job/<moniker>` it writes through, and its entry.
@@ -44,8 +46,9 @@ struct JobCreation {
     order: mem::Box[os::JobOrder]
 } JobCreation
 
-/// What the task of a job's run takes: a View of `/sys/code` reading the image of the bundle of code hash `bundle`, `None` while `store` has no endpoint, the encoding of its input and its world.
+/// What the task of a job's run takes: the bytes its isolated space may draw, none when it runs in the shared space, a View of `/sys/code` reading the image of the bundle of code hash `bundle`, `None` while `store` has no endpoint, the encoding of its input and its world.
 struct JobLaunch {
+    space: Option[u64]
     code: Option[store::service::View]
     bundle: ident::HashValue
     input: mem::Bytes
@@ -75,7 +78,7 @@ fn Directory.create_job(mut self, mut creation: Option[JobCreation], slot: u32, 
     if self.endpoints.get(moniker).is_some() or self.jobs.contains(moniker) {
         return Err(os::ControlError.Exists)
     }
-    let job = Job(order: take order.into_contents(), started: ident::WallTime(utc_ns: 0, uncertainty_ns: 0), prepared: false, writing: None, code: None, cancelled: None, over: false, entry: JobEntry(host: false, agent: false), seed: None)
+    let job = Job(order: take order.into_contents(), started: ident::WallTime(utc_ns: 0, uncertainty_ns: 0), prepared: false, writing: None, code: None, cancelled: None, over: false, entry: JobEntry(host: false, provenance: os::Provenance.Vendor, shared: true, base: false), seed: None)
     discard mut self.jobs.insert(ident::Moniker(text: moniker.text))
     discard mut self.slots.insert(slot, value: ident::Moniker(text: moniker.text))
     let task::Channel(sender: _, receiver: calls) = task::Channel[os::Call].bounded(1, alloc)
@@ -141,6 +144,7 @@ fn Shared.prepare_job(self, mut driver: Driver, sender: task::Sender[Input], s: 
         None => return
     }
     let bundle = driver.spec.bundle
+    let base = self.components.base_job(bundle)
     let moniker = ident::Moniker(text: driver.moniker.text)
     let principal = ident::Principal(text: driver.spec.principal.text)
     let directory = self.directory.share()
@@ -151,7 +155,7 @@ fn Shared.prepare_job(self, mut driver: Driver, sender: task::Sender[Input], s: 
         let prepared = match states {
             Some(state) => match roots {
                 Some(root) => match codes {
-                    Some(code) => try await prepared_entry(code, bundle, state, root, moniker, take record, renamed: not spec_names, alloc)
+                    Some(code) => try await prepared_entry(code, bundle, base, state, root, moniker, take record, renamed: not spec_names, alloc)
                     None => Err(text::Fixed[32].of("port.server-stopped"))
                 }
                 None => Err(text::Fixed[32].of("port.server-stopped"))
@@ -162,10 +166,11 @@ fn Shared.prepare_job(self, mut driver: Driver, sender: task::Sender[Input], s: 
     })
 } Shared.prepare_job
 
-/// The next run of the job `moniker` of the bundle of code hash `bundle`, prepared as `prepared_run` prepares it, with the entry the bundle's admission record, read through `code`, a View of `/sys/code`, gives; the code of what failed otherwise.
+/// The next run of the job `moniker` of the bundle of code hash `bundle`, a base job when `base`, prepared as `prepared_run` prepares it, with the entry the bundle's admission record, read through `code`, a View of `/sys/code`, gives; the code of what failed otherwise.
 fn prepared_entry(
     code: store::service::View,
     bundle: ident::HashValue,
+    base: bool,
     state: store::service::View,
     root: store::service::View,
     moniker: ident::Moniker,
@@ -173,7 +178,7 @@ fn prepared_entry(
     renamed: bool,
     alloc: mem::Alloc,
     ) -> Result[Prepared, text::Fixed[32]] fails task::Cancelled uses wait {
-    let entry = match try await admitted_entry(code, bundle, alloc) {
+    let entry = match try await admitted_entry(code, bundle, base, alloc) {
         Ok(read) => read
         Err(failed) => return Err(failed)
     }
@@ -183,8 +188,8 @@ fn prepared_entry(
     }
 } prepared_entry
 
-/// The entry of the admitted bundle of code hash `bundle`, as its admission record, read through `code`, a View of `/sys/code`, gives it; `store.corrupt` for a record that does not decode.
-fn admitted_entry(code: store::service::View, bundle: ident::HashValue, alloc: mem::Alloc) -> Result[JobEntry, text::Fixed[32]] fails task::Cancelled uses wait {
+/// The entry of the admitted bundle of code hash `bundle`, a base job when `base`, as its admission record, read through `code`, a View of `/sys/code`, gives it; `store.corrupt` for a record that does not decode.
+fn admitted_entry(code: store::service::View, bundle: ident::HashValue, base: bool, alloc: mem::Alloc) -> Result[JobEntry, text::Fixed[32]] fails task::Cancelled uses wait {
     var text = text::String.of("/", alloc)
     mut text.append(bundle.full_form().as_str())
     mut text.append("/admission")
@@ -203,7 +208,7 @@ fn admitted_entry(code: store::service::View, bundle: ident::HashValue, alloc: m
         Some(program) => program.host
         None => false
     }
-    return Ok(JobEntry(host: host, agent: admission.provenance == os::Provenance.Agent))
+    return Ok(JobEntry(host: host, provenance: admission.provenance, shared: admission.shared, base: base))
 } admitted_entry
 
 /// The rights of a job's View of the root of its branch: reading, writing, branching and merging, and owning the nodes its owning operations write.
@@ -286,6 +291,7 @@ fn Driver.job_ready(mut self, take prepared: Prepared) -> bool {
 
 /// The run of the job of the driver its preparation made ready, `None` for an instance of a component: the View reading the image of its bundle, the encoding of its typed entry's input or of its host-compatible entry's arguments and environment, and its deadline, the run starting at `started`.
 fn Driver.take_run(mut self, started: ident::WallTime) -> Option[mem::Box[JobRun]] {
+    let space = self.isolation()
     let Some(job) = mut self.job.extract() else {
         return None
     }
@@ -297,7 +303,7 @@ fn Driver.take_run(mut self, started: ident::WallTime) -> Option[mem::Box[JobRun
             true => mut input.append(running.order.host_input.view())
             false => mut input.append(running.order.input.view())
         }
-        launching = Some(mem::Heap.of(self.alloc).boxed(JobRun(code: running.code, bundle: self.spec.bundle, input: take input, deadline_s: running.order.deadline_s)))
+        launching = Some(mem::Heap.of(self.alloc).boxed(JobRun(code: running.code, bundle: self.spec.bundle, input: take input, deadline_s: running.order.deadline_s, space: space)))
         running.started = started
         running.prepared = false
     }
@@ -305,12 +311,13 @@ fn Driver.take_run(mut self, started: ident::WallTime) -> Option[mem::Box[JobRun
     return launching
 } Driver.take_run
 
-/// A run of a job ready to launch: the View reading the image of the bundle of code hash `bundle`, the encoding of its input, and its deadline.
+/// A run of a job ready to launch: the View reading the image of the bundle of code hash `bundle`, the encoding of its input, its deadline, and the bytes its isolated space may draw, none when it runs in the shared space.
 struct JobRun {
     code: Option[store::service::View]
     bundle: ident::HashValue
     input: mem::Bytes
     deadline_s: Option[u32]
+    space: Option[u64]
 } JobRun
 
 /// Handles the end of the run `incarnation` of the job of `driver`, with `outcome` and `cpu_ns` charged, unless a later run started.
@@ -360,7 +367,7 @@ struct Pacing derives Copy {
 /// How the incarnation the driver starts runs: a job of provenance `agent` on a serial executor seeded now, the job keeping the seed, unless a grant confers `exec.parallel`, and on a clock at 1 ms resolution unless a grant confers `clock.fine`; any other incarnation on its account's executor and the runner's clock.
 fn Shared.pacing(self, mut driver: Driver) -> Pacing fails task::Cancelled uses wait {
     let agent = match driver.job {
-        Some(job) => job.contents().entry.agent
+        Some(job) => job.contents().entry.provenance == os::Provenance.Agent
         None => false
     }
     if not agent {
@@ -508,8 +515,8 @@ fn Shared.launch_job(
     incarnation: u64,
     header: os::Header,
     ) {
-    let JobRun(code: reading, bundle: hash, input: input, deadline_s: deadline_s) = take ready.into_contents()
-    let launch = JobLaunch(code: reading, bundle: hash, input: take input, world: take world)
+    let JobRun(code: reading, bundle: hash, input: input, deadline_s: deadline_s, space: space) = take ready.into_contents()
+    let launch = JobLaunch(space: space, code: reading, bundle: hash, input: take input, world: take world)
     let components = self.components
     let own = self.config.alloc
     match deadline_s {
@@ -527,7 +534,7 @@ fn Shared.launch_job(
     discard s.spawn(fn[take launch, take abandoner, take marks, take ended]() fails task::Cancelled uses wait limits stack 32_768 {
         var given = Some(take launch)
         let outcome = try await sys::run_headed(header.carried(), body: fn[mut given]() -> os::JobOutcome fails task::Cancelled uses wait {
-            let Some(JobLaunch(code: code, bundle: bundle, input: encoded, world: granted)) = mut given.extract() else {
+            let Some(JobLaunch(space: isolating, code: code, bundle: bundle, input: encoded, world: granted)) = mut given.extract() else {
                 return os::JobOutcome.Interrupted
             }
             var image: Option[mem::Bytes] = None
@@ -540,7 +547,7 @@ fn Shared.launch_job(
                     Err(failure) => return os::JobOutcome.Failed(text: text::String.of(failure.as_str(), alloc))
                 })
             }
-            return try await components.run_job(take image, code: bundle, input: take encoded, world: take granted, domain: abandoner.contents(), exec, alloc)
+            return try await components.run_job(take image, code: bundle, input: take encoded, world: take granted, space: isolating, domain: abandoner.contents(), exec, alloc)
         })
         var cpu_ns: u64 = 0
         let task::Channel(sender: reply, receiver: read) = task::Channel[os::Gauge].bounded(1, alloc: own)

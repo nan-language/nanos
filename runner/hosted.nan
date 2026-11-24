@@ -1,6 +1,6 @@
 //! Instances of a bundle's components: the admission record describing each one's component, and the task of its domain, which reads the image of its bundle at each start and drives the instance the kernel holds for it as `Driven.run` drives a component of the kernel image.
 
-/// A bundle's component as the runner runs it: the name of the entry its bundle exports it under, the protocol it serves, its state schema, the earlier schemas its state's forward migrations convert from, those an inverse converts it back to and every earlier schema it reads, whether its state type is a flexible struct, the names of its operations by number, whether its Env takes a configuration record, the View of `/sys/code` its starts read its bundle's image through, `None` while `store` has no endpoint, and the encoding of the protocol schema its bundle gives for it once an incarnation told it.
+/// A bundle's component as the runner runs it: the name of the entry its bundle exports it under, the protocol it serves, its state schema, the earlier schemas its state's forward migrations convert from, those an inverse converts it back to and every earlier schema it reads, whether its state type is a flexible struct, the names of its operations by number, whether its Env takes a configuration record, whether admission placed its bundle in the shared space and the bundle's provenance class, the View of `/sys/code` its starts read its bundle's image through, `None` while `store` has no endpoint, and the encoding of the protocol schema its bundle gives for it once an incarnation told it.
 struct Hosted {
     entry: text::String
     protocol: sys::ProtocolHash
@@ -11,6 +11,8 @@ struct Hosted {
     flexible: bool
     operations: mem::List[text::String]
     configured: bool
+    shared: bool
+    provenance: os::Provenance
     code: Option[store::service::View]
     served: Option[mem::Bytes]
 } Hosted
@@ -18,12 +20,13 @@ struct Hosted {
 /// The longest an instance started by an update waits for a message before its holder looks for a health probe to run, in nanoseconds; such an instance is never suspended.
 const PROBED_WAIT_NS: u64 = 1_000_000_000
 
-/// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, the protocol its component serves and the names of its operations by number, the encoding of the protocol schema its bundle gives for it, the executor and allocator of its domain, the cell it draws what it hands the driver through, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
+/// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, the protocol its component serves and the names of its operations by number, the encoding of the protocol schema its bundle gives for it, the bytes its isolated space may draw, none when it runs in the shared space, the executor and allocator of its domain, the cell it draws what it hands the driver through, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
 pub open linear struct Hosting {
     serving: Serving
     protocol: sys::ProtocolHash
     operations: mem::List[text::String]
     served: Option[mem::Bytes]
+    space: Option[u64]
     exec: task::Executor
     alloc: mem::Alloc
     handing: mem::Budget
@@ -66,7 +69,7 @@ validator fn hosted_in(record: Untrusted[Slice[u8]], component: Str, alloc: mem:
                 mut inverses.push(earlier.schema)
             }
         }
-        return Some(Hosted(entry: text::String.of(entry, alloc), protocol: sys::ProtocolHash(bytes: described.protocol.bytes), schema: described.schema, migrations: take migrations, inverses: take inverses, reads: take reads, flexible: described.flexible, operations: take operations, configured: described.config.is_some(), code: None, served: None))
+        return Some(Hosted(entry: text::String.of(entry, alloc), protocol: sys::ProtocolHash(bytes: described.protocol.bytes), schema: described.schema, migrations: take migrations, inverses: take inverses, reads: take reads, flexible: described.flexible, operations: take operations, configured: described.config.is_some(), shared: admission.shared, provenance: admission.provenance, code: None, served: None))
     }
     return None
 } hosted_in
@@ -231,16 +234,46 @@ fn Driver.bundled(self) -> Option[mem::Box[Bundled]] {
         return None
     }
     let hosted = described.contents()
-    return Some(mem::Heap.of(self.alloc).boxed(Bundled(code: hosted.code, bundle: self.spec.bundle, entry: text::String.of(hosted.entry.as_str(), alloc: self.alloc), protocol: hosted.protocol, operations: names_in(hosted.operations, alloc: self.alloc))))
+    return Some(mem::Heap.of(self.alloc).boxed(Bundled(code: hosted.code, bundle: self.spec.bundle, entry: text::String.of(hosted.entry.as_str(), alloc: self.alloc), protocol: hosted.protocol, operations: names_in(hosted.operations, alloc: self.alloc), space: self.isolation())))
 } Driver.bundled
 
-/// What the first task of the domain of an instance of a bundle's component runs it from: a View of `/sys/code` reading the image of the bundle of code hash `bundle`, `None` while `store` has no endpoint, the name of the entry it exports the component under, the protocol it serves and the names of its operations by number.
+/// The bytes the instance's isolated space may draw, its memory limit, none when it runs in the shared space.
+fn Driver.isolation(self) -> Option[u64] {
+    if self.space() == os::Space.Shared {
+        return None
+    }
+    return Some(self.spec.budget.limit)
+} Driver.isolation
+
+/// The space the instance runs in: the one its spec and its bundle's admission give a bundle's component or a prepared job other than a base job, else the shared space, where the kernel image runs.
+fn Driver.space(self) -> os::Space {
+    let principal = ident::Principal(text: self.spec.principal.text)
+    match self.hosted {
+        Some(described) => {
+            let hosted = described.contents()
+            return os::Space.of(take principal, placement: self.spec.placement, shared: hosted.shared, provenance: hosted.provenance)
+        }
+        None => {
+        }
+    }
+    let Some(job) = self.job else {
+        return os::Space.Shared
+    }
+    let entry = job.contents().entry
+    if entry.base {
+        return os::Space.Shared
+    }
+    return os::Space.of(take principal, placement: self.spec.placement, shared: entry.shared, provenance: entry.provenance)
+} Driver.space
+
+/// What the first task of the domain of an instance of a bundle's component runs it from: a View of `/sys/code` reading the image of the bundle of code hash `bundle`, `None` while `store` has no endpoint, the name of the entry it exports the component under, the protocol it serves, the names of its operations by number, and the bytes its isolated space may draw, none when it runs in the shared space.
 struct Bundled {
     code: Option[store::service::View]
     bundle: ident::HashValue
     entry: text::String
     protocol: sys::ProtocolHash
     operations: mem::List[text::String]
+    space: Option[u64]
 } Bundled
 
 /// What an instance of a bundle's component takes from its driver, `serving`, with the protocol its component serves, the names of its operations by number, and the executor and allocator of its domain.
@@ -248,6 +281,7 @@ pub fn Hosting.of(
     take serving: Serving,
     protocol: sys::ProtocolHash,
     take operations: mem::List[text::String],
+    space: Option[u64],
     exec: task::Executor,
     alloc: mem::Alloc,
     ) -> Hosting {
@@ -256,7 +290,7 @@ pub fn Hosting.of(
     let pending = Pending(replies: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Handed, QUEUED_REPLIES].empty()), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), keeps: serving.keeping.is_some(), syncing: syncing.share(), alloc: handing.alloc())
     let replies = pending.replies.share()
     let signal = pending.signal.share()
-    return Hosting(serving: take serving, protocol: protocol, operations: take operations, served: None, exec: exec, alloc: alloc, handing: take handing, replier: sys::Minter[Replier, Pending, u8].of(take pending, alloc), replies: take replies, signal: take signal, syncing: take syncing)
+    return Hosting(serving: take serving, protocol: protocol, operations: take operations, served: None, space: space, exec: exec, alloc: alloc, handing: take handing, replier: sys::Minter[Replier, Pending, u8].of(take pending, alloc), replies: take replies, signal: take signal, syncing: take syncing)
 } Hosting.of
 
 /// Keeps `served`, the protocol schema the bundle gives for the component, for the driver.
@@ -286,16 +320,19 @@ pub fn Hosting.take_checkpoint(mut self) -> Option[nanos::Checkpoint] {
     return Some(nanos::Checkpoint(schema: mem::wire::SchemaHash(bytes: schema.bytes), bytes: take state))
 } Hosting.take_checkpoint
 
+/// The bytes the instance's isolated space may draw, none when it runs in the shared space.
+pub fn Hosting.isolation(self) -> Option[u64] = self.space
+
 /// Revokes the runner capability of an instance the kernel never held.
 pub fn Hosting.close(take self) {
-    let Hosting(serving: _, protocol: _, operations: _, served: _, exec: _, alloc: _, handing: handing, replier: replier, replies: _, signal: _, syncing: _) = self
+    let Hosting(serving: _, protocol: _, operations: _, served: _, space: _, exec: _, alloc: _, handing: handing, replier: replier, replies: _, signal: _, syncing: _) = self
     take replier.close()
     take handing.close()
 } Hosting.close
 
 /// Runs the instance `instance` of the bundle's component as `Driven.run` runs one of the kernel image: resumes it, ends it at once when its health is not `Healthy`, then serves what its driver delivers, one call at a time, suspending it after the time without a message the driver sets and keeping its checkpoints. Told to stop, it handles every message that waits, keeps a checkpoint when the state is dirty, and ends the instance. Orders for its holder are refused. How the instance ended, or the trap that abandoned its domain.
 pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
-    let Hosting(serving: serving, protocol: protocol, operations: operations, served: served, exec: exec, alloc: alloc, handing: handing, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
+    let Hosting(serving: serving, protocol: protocol, operations: operations, served: served, space: _, exec: exec, alloc: alloc, handing: handing, replier: replier, replies: replies, signal: signal, syncing: syncing) = self
     defer take handing.close()
     defer take replier.close()
     let handed = handing.alloc()
