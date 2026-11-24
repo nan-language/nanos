@@ -139,15 +139,27 @@ pkg fn Rings.span(self, slot: u32, span: runner::Span) {
 
 /// Writes the record of a device event as the core's, its continuation holding the device's bus path.
 pkg fn Rings.record_device(self, event: devices::Event) {
+    self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: 0, kind: device_kind(event.kind), severity: device_severity(event.kind), flags: 0, argument: event.argument), continuation: Some(text_record(event.path.text().as_str())))
+} Rings.record_device
+
+/// Writes `fault.iommu-failed` as the core's: the register base `unit` of the IOMMU unit the core could not enable, and why.
+pkg fn Rings.record_iommu_failed(self, unit: u64, reason: Str) {
+    self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: 0, kind: journal::IOMMU_FAILED, severity: 4, flags: 0, argument: unit), continuation: Some(text_record(reason)))
+} Rings.record_iommu_failed
+
+/// A continuation holding the first 32 bytes of `text`.
+fn text_record(text: Str) -> journal::RingRecord {
     var payload = Array[u8, 32].filled(0)
-    let path = event.path.text()
     var at: usize = 0
-    for byte in path.as_bytes() {
+    for byte in text.as_bytes() {
+        if at == payload.len() {
+            break
+        }
         payload[at] = byte
         at += 1
     }
-    self.write(journal::RingRecord(time: elapsed(self.clock), cause: 0, source: 0, kind: device_kind(event.kind), severity: device_severity(event.kind), flags: 0, argument: event.argument), continuation: Some(journal::RingRecord.from_bits(payload)))
-} Rings.record_device
+    return journal::RingRecord.from_bits(payload)
+} text_record
 
 /// Writes the record of an event of the store as the core's: its argument is the log bytes a mount replayed, the address of a corrupt structure, the commits thinned, or the free bytes when writes are refused.
 pkg fn Rings.record_store(self, event: store::Event) {
@@ -487,34 +499,16 @@ pkg fn detail(kind: u16, continuation: journal::RingRecord) -> text::Fixed[40] {
         return counted
     }
     if kind == journal::JOB_ENDED {
-        var outcome = text::Fixed[40].of("outcome ")
-        for byte in continuation.to_bits() {
-            if byte == 0 {
-                break
-            }
-            mut outcome.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
-        }
-        return outcome
+        return texted("outcome ", continuation)
     }
     if kind == journal::CHECKPOINT_FAILED or kind == journal::TRAPPED or kind == journal::BOOT_CANDIDATE_FAILED {
-        var code = text::Fixed[40].of("code ")
-        for byte in continuation.to_bits() {
-            if byte == 0 {
-                break
-            }
-            mut code.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
-        }
-        return code
+        return texted("code ", continuation)
     }
     if kind >= journal::DEVICE_ADDED and kind <= journal::DEVICE_INTERRUPT_STORM {
-        var path = text::Fixed[40].of("path ")
-        for byte in continuation.to_bits() {
-            if byte == 0 {
-                break
-            }
-            mut path.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
-        }
-        return path
+        return texted("path ", continuation)
+    }
+    if kind == journal::IOMMU_FAILED {
+        return texted("reason ", continuation)
     }
     if kind != journal::REVOKED {
         return text::Fixed[40].empty()
@@ -525,6 +519,18 @@ pkg fn detail(kind: u16, continuation: journal::RingRecord) -> text::Fixed[40] {
         else => "reason unknown"
     })
 } detail
+
+/// `prefix` followed by the text a continuation holds, up to its first NUL.
+fn texted(prefix: Str, continuation: journal::RingRecord) -> text::Fixed[40] {
+    var text = text::Fixed[40].of(prefix)
+    for byte in continuation.to_bits() {
+        if byte == 0 {
+            break
+        }
+        mut text.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+    }
+    return text
+} texted
 
 fn device_kind(kind: devices::EventKind) -> u16 {
     return match kind {
@@ -750,6 +756,22 @@ test boots_give_their_start_and_each_failed_candidate for Rings.record_boot {
     expect detail(kind: journal::BOOT_STARTED, continuation: records[1]).as_str() == "counter 66051"
     expect detail(kind: journal::BOOT_CANDIDATE_FAILED, continuation: records[3]).as_str() == "code boot.hash-mismatch"
 } boots_give_their_start_and_each_failed_candidate
+
+test iommu_failures_give_their_unit_and_reason for Rings.record_iommu_failed {
+    let world = testing::world()
+    let alloc = world.alloc
+    let cpus = hw::cpu_count()
+    let rings = Rings.of(cpus, clock: world.clock, boot: 1, alloc)
+    rings.record_iommu_failed(unit: 0xFED9_0000, reason: "reserved-memory")
+    var records = mem::List[journal::RingRecord].empty(alloc)
+    for cpu in 0..<cpus {
+        discard rings.drain(cpu, into: mut records)
+    }
+    expect records.len() == 2
+    let failed = journal::CoreRecord(record: records[0], more: single(records[1], alloc), source: ident::Moniker(text: text::Fixed[59].of("supervisor")), sender: None).event(ident::Cause.of(boot: 1, number: 1), alloc)
+    expect failed.kind.as_str() == "fault.iommu-failed" and failed.severity == journal::Severity.Error and records[0].argument == 0xFED9_0000
+    expect detail(kind: journal::IOMMU_FAILED, continuation: records[1]).as_str() == "reason reserved-memory"
+} iommu_failures_give_their_unit_and_reason
 
 test start_causes_open_under_their_parent_and_spans_name_their_call for Rings.open {
     let world = testing::world()

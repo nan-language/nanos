@@ -12,7 +12,7 @@ const MSI: u32 = 0x05
 
 const MSIX: u32 = 0x11
 
-/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports with the interrupts of their hot-plug slots and the signal those post, the devices it lists, the firmware tables, the topology's generation and where to send it once it changes, and the random source entropy devices reseed.
+/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports with the interrupts of their hot-plug slots and the signal those post, the devices it lists, the firmware tables, the topology's generation and where to send it once it changes, the random source entropy devices reseed, whether the IOMMU confines DMA, and where the DMA of each function a claim attached reaches.
 pkg linear struct Keeper {
     idle: mem::List[hw::PciFunction]
     keepers: mem::List[hw::PciKeeper]
@@ -24,7 +24,15 @@ pkg linear struct Keeper {
     generation: u64
     watchers: mem::List[task::Sender[u64]]
     source: random::Source
+    confining: bool
+    reaches: mem::List[Reach]
 } Keeper
+
+/// Where the DMA of the function at `address` reaches since a claim attached it.
+struct Reach derives Copy {
+    address: devices::PciAddress
+    dma: devices::Dma
+} Reach
 
 /// What the keeper serves: an order of the device root, or the interrupt of a hot-plug slot.
 pkg enum Input {
@@ -52,15 +60,16 @@ pkg struct Table {
 
 pkg fn Table.of(signature: Array[u8, 4], take bytes: Untrusted[mem::Bytes]) -> Table = Table(signature: signature, bytes: take bytes)
 
-/// The keeper of `functions` and `ports`, giving each function a keeper and listing it, of `tables`, and of the random source `source`.
+/// The keeper of `functions` and `ports`, giving each function a keeper and listing it, of `tables`, and of the random source `source`; with `confining`, the IOMMU confines DMA, so it lists each function's IOMMU group.
 pkg fn Keeper.of(
     take functions: mem::List[hw::PciFunction],
     take ports: mem::List[hw::PciPort],
     take tables: mem::List[Table],
     take source: random::Source,
+    confining: bool,
     alloc: mem::Alloc,
     ) -> Keeper {
-    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, slots: mem::List.empty(alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), found: mem::List.empty(alloc), tables: take tables, generation: 0, watchers: mem::List.empty(alloc), source: take source)
+    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, slots: mem::List.empty(alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), found: mem::List.empty(alloc), tables: take tables, generation: 0, watchers: mem::List.empty(alloc), source: take source, confining: confining, reaches: mem::List.empty(alloc))
     for function in take functions {
         mut kept.adopt(take function, alloc)
     }
@@ -75,9 +84,22 @@ fn Keeper.adopt(mut self, take function: hw::PciFunction, alloc: mem::Alloc) {
         None => {
         }
     }
-    mut self.found.push(found_of(held, alloc))
+    mut self.found.push(found_of(held, group: self.group_of(held.address(), alloc), alloc))
     mut self.idle.push(take held)
 } Keeper.adopt
+
+/// The IOMMU group of the function at `address`, `None` while the IOMMU confines no DMA.
+fn Keeper.group_of(self, address: hw::PciAddress, alloc: mem::Alloc) -> Option[u32] {
+    if not self.confining {
+        return None
+    }
+    var bridges = mem::List[devices::Bridge].empty(alloc)
+    for port in self.ports {
+        let below = port.buses()
+        mut bridges.push(devices::Bridge(segment: port.address().segment, secondary: below.secondary, subordinate: below.subordinate, conventional: port.kind() == hw::PortKind.Bridge))
+    }
+    return Some(devices::iommu_group(devices::PciAddress.of(address), bridges: bridges.view()))
+} Keeper.group_of
 
 /// The signal the interrupts of the hot-plug slots post.
 pkg fn Keeper.slot_signal(self) -> mem::Shared[hw::Signal[Unit]] {
@@ -104,7 +126,7 @@ fn Keeper.watch_slots(mut self) {
 
 /// Releases what the keeper holds.
 pkg fn Keeper.release(take self) {
-    let Keeper(idle: idle, keepers: keepers, ports: ports, slots: slots, signal: _, found: _, tables: _, generation: _, watchers: _, source: _) = self
+    let Keeper(idle: idle, keepers: keepers, ports: ports, slots: slots, signal: _, found: _, tables: _, generation: _, watchers: _, source: _, confining: _, reaches: _) = self
     for slot in take slots {
         discard take slot.uninstall()
     }
@@ -119,8 +141,14 @@ pkg fn Keeper.release(take self) {
     }
 } Keeper.release
 
-/// Carries out the device root's orders and takes the hot-plug slots' events as `inputs` bring them, recording device events in `rings`, until they end.
-pkg fn Keeper.serve(mut self, take inputs: task::Receiver[Input], rings: rings::Rings, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Carries out the device root's orders and takes the hot-plug slots' events as `inputs` bring them, recording device events in `rings` and confining claimed functions with `iommu`, until they end.
+pkg fn Keeper.serve(
+    mut self,
+    take inputs: task::Receiver[Input],
+    rings: rings::Rings,
+    iommu: Option[hw::Iommu],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
     mut self.watch_slots()
     var receiver = inputs
     loop {
@@ -133,13 +161,19 @@ pkg fn Keeper.serve(mut self, take inputs: task::Receiver[Input], rings: rings::
                     try await mut self.changed()
                 }
             }
-            Input.Order(order) => try await mut self.carry_out(take order, rings, alloc)
+            Input.Order(order) => try await mut self.carry_out(take order, rings, iommu, alloc)
         }
     }
 } Keeper.serve
 
 /// Carries out `order`.
-fn Keeper.carry_out(mut self, take order: devices::RootOrder, rings: rings::Rings, alloc: mem::Alloc) fails task::Cancelled uses wait {
+fn Keeper.carry_out(
+    mut self,
+    take order: devices::RootOrder,
+    rings: rings::Rings,
+    iommu: Option[hw::Iommu],
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
     match order {
         devices::RootOrder.Devices(done: done) => {
             discard attempt await done.send(self.listed(alloc))
@@ -152,12 +186,15 @@ fn Keeper.carry_out(mut self, take order: devices::RootOrder, rings: rings::Ring
             discard attempt await done.send(declared)
         }
         devices::RootOrder.Claim(path: path, done: done) => {
-            let claimed = mut self.claim(path, rings, alloc)
+            let claimed = mut self.claim(path, rings, iommu, alloc)
             discard attempt await done.send(take claimed)
         }
         devices::RootOrder.Cut(path: path, reset: reset, done: done) => {
             let cut = mut self.cut(path, reset)
             discard attempt await done.send(cut)
+        }
+        devices::RootOrder.Dma(path: path, done: done) => {
+            discard attempt await done.send(self.dma_of(path))
         }
         devices::RootOrder.Changes(seen: seen, done: done) => {
             if self.generation > seen {
@@ -246,7 +283,7 @@ fn Keeper.slots_changed(mut self, alloc: mem::Alloc) -> bool {
     return changed
 } Keeper.slots_changed
 
-/// Drops the devices on `buses`, whose card left: their listings, the functions the keeper holds and the keepers of those it reclaims; whether any was listed.
+/// Drops the devices on `buses`, whose card left: their listings, where their DMA reached, the functions the keeper holds and the keepers of those it reclaims; whether any was listed.
 fn Keeper.drop_below(mut self, buses: hw::PciBuses) -> bool {
     var dropped = false
     var at: usize = 0
@@ -258,6 +295,15 @@ fn Keeper.drop_below(mut self, buses: hw::PciBuses) -> bool {
         if gone {
             discard mut self.found.remove(at)
             dropped = true
+        } else {
+            at += 1
+        }
+    }
+    at = 0
+    while at < self.reaches.len() {
+        let bus = self.reaches[at].address.bus
+        if bus >= buses.secondary and bus <= buses.subordinate {
+            discard mut self.reaches.remove(at)
         } else {
             at += 1
         }
@@ -300,6 +346,7 @@ fn Keeper.cut(mut self, path: devices::BusPath, reset: bool) -> bool {
     let Some(function) = mut self.take_function(address) else {
         return false
     }
+    mut self.unreached(address)
     if not function.removed() {
         var held = function
         var answered = true
@@ -334,7 +381,7 @@ fn copy_found(found: devices::Found, alloc: mem::Alloc) -> devices::Found {
     for resource in found.resources {
         mut resources.push(resource)
     }
-    return devices::Found(path: found.path, ids: found.ids, resources: take resources, core: found.core)
+    return devices::Found(path: found.path, ids: found.ids, resources: take resources, core: found.core, group: found.group)
 } copy_found
 
 /// A copy of the `index`th table of `signature`.
@@ -360,22 +407,28 @@ fn Keeper.declare(mut self, path: devices::BusPath, ids: devices::DeviceIds, tak
         }
     }
     let core = overlaps_ports(resources, base: LOG_UART, count: LOG_UART_PORTS)
-    mut self.found.push(devices::Found(path: path, ids: ids, resources: take resources, core: core))
+    mut self.found.push(devices::Found(path: path, ids: ids, resources: take resources, core: core, group: None))
     return true
 } Keeper.declare
 
-/// The hardware of the device at `path`: a PCI function the keeper holds, or one its keeper reclaims; a platform device's windows unless the core keeps it.
-fn Keeper.claim(mut self, path: devices::BusPath, rings: rings::Rings, alloc: mem::Alloc) -> Option[devices::Claimed] {
+/// The hardware of the device at `path`: a PCI function the keeper holds, or one its keeper reclaims, attached for DMA through `iommu`; a platform device's windows unless the core keeps it.
+fn Keeper.claim(
+    mut self,
+    path: devices::BusPath,
+    rings: rings::Rings,
+    iommu: Option[hw::Iommu],
+    alloc: mem::Alloc,
+    ) -> Option[devices::Claimed] {
     match path {
         devices::BusPath.Pci(address) => {
             let Some(function) = mut self.take_idle(address) else {
-                return mut self.claim_reclaimed(path, address, rings)
+                return mut self.claim_reclaimed(path, address, rings, iommu)
             }
             if function.removed() {
                 mut self.idle.push(take function)
                 return None
             }
-            return Some(devices::Claimed.Pci(take function))
+            return mut self.attached(take function, iommu)
         }
         devices::BusPath.Acpi(hid: _, uid: _) => {
             for each in self.found {
@@ -388,19 +441,91 @@ fn Keeper.claim(mut self, path: devices::BusPath, rings: rings::Rings, alloc: me
     }
 } Keeper.claim
 
-/// The function at `address` that its last holder handed back, reset for its next driver: `None` while a driver holds it, or once it does not answer its reset, recorded as `device.failed` with `device.reset-failed`.
-fn Keeper.claim_reclaimed(mut self, path: devices::BusPath, address: devices::PciAddress, rings: rings::Rings) -> Option[devices::Claimed] {
+/// The function at `address` that its last holder handed back, reset and attached through `iommu` for its next driver: `None` while a driver holds it, or once it does not answer its reset, recorded as `device.failed` with `device.reset-failed`.
+fn Keeper.claim_reclaimed(
+    mut self,
+    path: devices::BusPath,
+    address: devices::PciAddress,
+    rings: rings::Rings,
+    iommu: Option[hw::Iommu],
+    ) -> Option[devices::Claimed] {
     let Some(function) = mut self.reclaim(address) else {
         return None
     }
     var held = function
     if is_reset(attempt mut held.reset()) {
-        return Some(devices::Claimed.Pci(take held))
+        return mut self.attached(take held, iommu)
     }
     mut self.idle.push(take held)
     rings.record_device(devices::Event(kind: devices::EventKind.Failed, path: path, argument: devices::Code.ResetFailed.number()))
     return None
 } Keeper.claim_reclaimed
+
+/// `function` attached for its driver's DMA: to a new I/O domain of `iommu`, or to physical memory without an IOMMU or when the IOMMU cannot tell the function's DMA from its peers'; `None`, the keeper holding the function again, when neither attaches it.
+fn Keeper.attached(mut self, take function: hw::PciFunction, iommu: Option[hw::Iommu]) -> Option[devices::Claimed] {
+    var held = function
+    let address = devices::PciAddress.of(held.address())
+    match iommu {
+        Some(unit) => {
+            let Ok(domain) = attempt unit.domain() else {
+                mut self.idle.push(take held)
+                return None
+            }
+            match first attempt mut held.attach(domain.space()) {
+                Ok(_) => {
+                    mut self.reached(address, dma: devices::Dma.Confined)
+                    let space = domain.space()
+                    return Some(devices::Claimed.Pci(devices::Attached(function: take held, domain: Some(take domain), space: space)))
+                }
+                Err(hw::IommuError.Unsupported) => take domain.close()
+                Err(_) => {
+                    take domain.close()
+                    mut self.idle.push(take held)
+                    return None
+                }
+            }
+        }
+        None => {
+        }
+    }
+    if (attempt mut held.attach_physical()).is_err() {
+        mut self.idle.push(take held)
+        return None
+    }
+    mut self.reached(address, dma: devices::Dma.Unconfined)
+    return Some(devices::Claimed.Pci(devices::Attached(function: take held, domain: None, space: hw::IoSpace.physical())))
+} Keeper.attached
+
+/// Records that the DMA of the function at `address` reaches as `dma` says.
+fn Keeper.reached(mut self, address: devices::PciAddress, dma: devices::Dma) {
+    mut self.unreached(address)
+    mut self.reaches.push(Reach(address: address, dma: dma))
+} Keeper.reached
+
+/// Forgets where the DMA of the function at `address` reached.
+fn Keeper.unreached(mut self, address: devices::PciAddress) {
+    var at: usize = 0
+    while at < self.reaches.len() {
+        if self.reaches[at].address == address {
+            discard mut self.reaches.remove(at)
+        } else {
+            at += 1
+        }
+    }
+} Keeper.unreached
+
+/// Where the DMA of the driver of the device at `path` reaches: as the claim that attached its function recorded, nowhere for a platform device or a function no claim attached.
+fn Keeper.dma_of(self, path: devices::BusPath) -> devices::Dma {
+    let devices::BusPath.Pci(address) = path else {
+        return devices::Dma.None
+    }
+    for reach in self.reaches {
+        if reach.address == address {
+            return reach.dma
+        }
+    }
+    return devices::Dma.None
+} Keeper.dma_of
 
 /// Whether a function's reset leaves it answering: reset, or without a way to reset.
 fn is_reset(outcome: Result[Unit, hw::PciError]) -> bool {
@@ -438,8 +563,8 @@ fn Keeper.take_function(mut self, address: devices::PciAddress) -> Option[hw::Pc
     return Some(take function)
 } Keeper.take_function
 
-/// The listing of a PCI function: its identifiers from its configuration space, its memory BARs, its MSI and MSI-X capabilities and its INTx pin.
-fn found_of(function: hw::PciFunction, alloc: mem::Alloc) -> devices::Found {
+/// The listing of a PCI function in the IOMMU group `group`: its identifiers from its configuration space, its memory BARs, its MSI and MSI-X capabilities and its INTx pin.
+fn found_of(function: hw::PciFunction, group: Option[u32], alloc: mem::Alloc) -> devices::Found {
     let identifiers = function.config_read(0)
     let class = function.config_read(0x08)
     let subsystem = function.config_read(0x2C)
@@ -458,7 +583,7 @@ fn found_of(function: hw::PciFunction, alloc: mem::Alloc) -> devices::Found {
     if pin != 0 {
         mut resources.push(devices::Resource.Intx(pin: pin))
     }
-    return devices::Found(path: devices::BusPath.Pci(devices::PciAddress.of(function.address())), ids: ids, resources: take resources, core: false)
+    return devices::Found(path: devices::BusPath.Pci(devices::PciAddress.of(function.address())), ids: ids, resources: take resources, core: false, group: group)
 } found_of
 
 /// Appends the function's MSI and MSI-X capabilities to `resources`.

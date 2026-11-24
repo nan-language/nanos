@@ -5,15 +5,25 @@ const USABLE: u32 = 1
 
 const PAGE: u64 = 4_096
 
+/// The highest address at which the user window may start for the machine to have `user-mode`.
+const USER_WINDOW_LIMIT: u64 = 0x4000_0000_0000
+
 /// Copies of the firmware tables the start reads and of those `devices` reads, taken before the shared space replaces the entry root that maps them.
 struct Tables {
     madt: Option[Untrusted[mem::Bytes]]
     fadt: Option[Untrusted[mem::Bytes]]
     srat: Option[Untrusted[mem::Bytes]]
+    dmar: Option[Untrusted[mem::Bytes]]
     copies: mem::List[keeper::Table]
 } Tables
 
-/// The start sequence: each step that fails halts the kernel with its code. The first task starts every other CPU, prints the start line, then runs the base instances of the image's genesis record.
+/// An IOMMU the start did not enable: the register base of its first remapping unit, and why.
+struct IommuFailure derives Copy {
+    unit: u64
+    reason: text::Fixed[32]
+} IommuFailure
+
+/// The start sequence: each step that fails halts the kernel with its code. The first task, which holds the IOMMU for the boot, starts every other CPU, prints the start line, then runs the base instances of the image's genesis record.
 fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     let Some(cpu) = mut k.ring0() else {
         expect false
@@ -29,7 +39,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
         halt(code: "fault.handoff-invalid", subject: "handoff")
     }
     let features = cpu::Features.read(cpu)
-    let tables = Tables(madt: k.acpi_table(acpi::Signature.Madt.bytes(), alloc), fadt: k.acpi_table(acpi::Signature.Fadt.bytes(), alloc), srat: k.acpi_table(acpi::Signature.Srat.bytes(), alloc), copies: device_tables(k, alloc))
+    let tables = Tables(madt: k.acpi_table(acpi::Signature.Madt.bytes(), alloc), fadt: k.acpi_table(acpi::Signature.Fadt.bytes(), alloc), srat: k.acpi_table(acpi::Signature.Srat.bytes(), alloc), dmar: k.acpi_table(acpi::Signature.Dmar.bytes(), alloc), copies: device_tables(k, alloc))
     var regions = mut k.regions()
     let shipping = Shipping.of(take modules, mut regions, alloc)
     let extents = extents_of(regions, alloc)
@@ -60,21 +70,22 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
     }
     let clock = k.clock()
     let wall = start_wall(tables.fadt, clock)
+    let rings = rings::Rings.of(cpus, clock, boot: handoff.boot_counter, alloc: core)
+    rings.record_boot(handoff)
+    let iommu = enabled_iommu(mut k, dmar: tables.dmar, rings, alloc)
     let state = mem::Shared.of(sched::State.of(places_of(features, nodes, cpus, alloc: core), clock, mwait: features.mwait, hwp: features.hwp, rapl: features.rapl.is_some(), alloc: core), alloc: core)
     mut k.policy(sched::Scheduler.of(state.share()))
-    let facts = Facts(cpus: cpus, nodes: nodes.count(), ram_bytes: ram, features: features, conditions: handoff.conditions)
+    let facts = Facts(cpus: cpus, nodes: nodes.count(), ram_bytes: ram, features: features, conditions: handoff.conditions, iommu: iommu.is_some(), user_mode: spaces::user_window(extents.view()) <= USER_WINDOW_LIMIT)
     let bundle = ident::HashValue(bytes: handoff.kernel_hash)
     let known = image_genesis(bundle, handoff, alloc: core)
-    let keeper = keeper_of(mut k, take tables, source, alloc: core)
+    let keeper = keeper_of(mut k, take tables, source, confining: facts.iommu, alloc: core)
     let drawing = random::Drawing.of(take source, alloc: core)
     let Ok(drawn) = attempt drawing.random() else {
         expect false
         loop {
         }
     }
-    let rings = rings::Rings.of(cpus, clock, boot: handoff.boot_counter, alloc: core)
-    rings.record_boot(handoff)
-    take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state, take known, take keeper, take rings, take loader, take shipped](exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
+    take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state, take known, take keeper, take iommu, take rings, take loader, take shipped](exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
         discard attempt await start_cpus(cpu, take roots, features, state, frames: mut memory.frames, exec)
         state.contents().all_started()
         discard attempt await low.release(cpu)
@@ -87,7 +98,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536 {
             halt(code: "fault.memory-insufficient", subject: "hibernation")
         }
         let config = runner::Config(base: bundle, exec: exec, hibernation: images, alloc: core, cpus: cpus, clock: clock, wall: wall, random: drawn, classes: sched::classes(), system: ident::Cause.of(handoff.boot_counter, number: 1))
-        discard attempt await run_base(cpu, rapl: features.rapl, take known, take keeper, bundle, support, boot: devices::BootVolume(scheme: handoff.volume_scheme, partition: handoff.volume_partition, signature: handoff.volume_signature), isa, handoff, machine: machine_of(facts), config, rings, cpus: state.share(), frames: mut memory.frames, take cells, fixed: memory.fixed, take loader, shipped, heap: alloc)
+        discard attempt await run_base(cpu, rapl: features.rapl, take known, take keeper, iommu, bundle, support, boot: devices::BootVolume(scheme: handoff.volume_scheme, partition: handoff.volume_partition, signature: handoff.volume_signature), isa, handoff, machine: machine_of(facts), config, rings, cpus: state.share(), frames: mut memory.frames, take cells, fixed: memory.fixed, take loader, shipped, heap: alloc)
         let parked = hw::Signal[Unit].empty()
         loop {
             discard attempt await parked.wait()
@@ -105,13 +116,52 @@ fn grow_heap(k: boot::Kernel, mut memory: frames::Memory) {
     }
 } grow_heap
 
-/// The keeper of the PCI functions and ports `k` gives and of the copies `tables` holds, drawing on `source`.
-fn keeper_of(mut k: boot::Kernel, take tables: Tables, source: random::Source, alloc: mem::Alloc) -> keeper::Keeper {
+/// The keeper of the PCI functions and ports `k` gives and of the copies `tables` holds, drawing on `source`, the IOMMU confining DMA when `confining`.
+fn keeper_of(
+    mut k: boot::Kernel,
+    take tables: Tables,
+    source: random::Source,
+    confining: bool,
+    alloc: mem::Alloc,
+    ) -> keeper::Keeper {
     let functions = mut k.pci_functions()
     let ports = mut k.pci_ports()
-    let Tables(madt: _, fadt: _, srat: _, copies: copies) = tables
-    return keeper::Keeper.of(take functions, take ports, tables: take copies, source: source.share(), alloc)
+    let Tables(madt: _, fadt: _, srat: _, dmar: _, copies: copies) = tables
+    return keeper::Keeper.of(take functions, take ports, tables: take copies, source: source.share(), confining, alloc)
 } keeper_of
+
+/// Start step 8: the IOMMU `k` enables, `None` when it enables none, an IOMMU the DMAR `dmar` describes then recorded in `rings` as `fault.iommu-failed`.
+fn enabled_iommu(mut k: boot::Kernel, dmar: Option[Untrusted[mem::Bytes]], rings: rings::Rings, alloc: mem::Alloc) -> Option[hw::Iommu] {
+    let iommu = mut k.iommu()
+    if iommu.is_none() {
+        match iommu_failure(dmar, alloc) {
+            Some(failed) => rings.record_iommu_failed(unit: failed.unit, reason: failed.reason.as_str())
+            None => {
+            }
+        }
+    }
+    return iommu
+} enabled_iommu
+
+/// Why the IOMMU the DMAR `dmar` describes was not enabled, with the register base of its first unit: the DMAR lists several units or reserves memory for devices, the platform does not remap interrupts, or the unit lacks a feature the runtime needs; `None` when no DMAR passing its validator lists a unit.
+fn iommu_failure(dmar: Option[Untrusted[mem::Bytes]], alloc: mem::Alloc) -> Option[IommuFailure] {
+    let Some(bytes) = dmar else {
+        return None
+    }
+    let Ok(read) = attempt acpi::Dmar.read(bytes.view(), alloc) else {
+        return None
+    }
+    let Some(unit) = read.units.get(0) else {
+        return None
+    }
+    let reason = match first read {
+        acpi::Dmar(units: units, reserved: _, interrupt_remapping: _) if units.len() > 1 => "several-units"
+        acpi::Dmar(units: _, reserved: true, interrupt_remapping: _) => "reserved-memory"
+        acpi::Dmar(units: _, reserved: _, interrupt_remapping: false) => "no-interrupt-remapping"
+        else => "unit-unsupported"
+    }
+    return Some(IommuFailure(unit: unit, reason: text::Fixed[32].of(reason)))
+} iommu_failure
 
 /// The loader of the kernel image, which exports its load ABI.
 fn loader_of(k: boot::Kernel) -> sys::load::Loader {

@@ -420,8 +420,8 @@ fn Base.serve_rng(self, take world: nanos::World, take serving: runner::Serving)
         return runner::Ended.EnvIncomplete
     }
     match try await self.claimed(path, alloc) {
-        Some(devices::Claimed.Pci(function)) => {
-            let Some(env) = drivers::virtio::RngEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), alloc) else {
+        Some(devices::Claimed.Pci(attached)) => {
+            let Some(env) = drivers::virtio::RngEnv.of(take attached, clock: world.clock, alarm: self.alarm(path, serving), alloc) else {
                 return runner::Ended.EnvIncomplete
             }
             var peers = mem::List[sys::ProtocolSchema].empty(alloc)
@@ -439,8 +439,8 @@ fn Base.serve_blk(self, take world: nanos::World, take serving: runner::Serving)
         return runner::Ended.EnvIncomplete
     }
     match try await self.claimed(path, alloc) {
-        Some(devices::Claimed.Pci(function)) => {
-            let Some(env) = drivers::virtio::BlkEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
+        Some(devices::Claimed.Pci(attached)) => {
+            let Some(env) = drivers::virtio::BlkEnv.of(take attached, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
             }
             return try await runner::Driven[drivers::virtio::Blk, drivers::virtio::BlkEnv, drivers::virtio::BlkDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::virtio::BlkEnv.abandon)
@@ -456,8 +456,8 @@ fn Base.serve_nvme(self, take world: nanos::World, take serving: runner::Serving
         return runner::Ended.EnvIncomplete
     }
     match try await self.claimed(path, alloc) {
-        Some(devices::Claimed.Pci(function)) => {
-            let Some(env) = drivers::nvme::NvmeEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
+        Some(devices::Claimed.Pci(attached)) => {
+            let Some(env) = drivers::nvme::NvmeEnv.of(take attached, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
             }
             return try await runner::Driven[drivers::nvme::Nvme, drivers::nvme::NvmeEnv, drivers::nvme::NvmeDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::nvme::NvmeEnv.abandon)
@@ -478,7 +478,7 @@ fn Base.serve_platform(self, component: Str, take world: nanos::World, take serv
         Some(devices::Claimed.Platform(claimed)) => {
             resources = claimed
         }
-        Some(devices::Claimed.Pci(function)) => take function.release()
+        Some(devices::Claimed.Pci(attached)) => release_attached(take attached)
         None => {
         }
     }
@@ -546,8 +546,8 @@ fn Base.serve_ahci(self, take world: nanos::World, take serving: runner::Serving
         return runner::Ended.EnvIncomplete
     }
     match try await self.claimed(path, alloc) {
-        Some(devices::Claimed.Pci(function)) => {
-            let Some(env) = drivers::ahci::AhciEnv.of(take function, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
+        Some(devices::Claimed.Pci(attached)) => {
+            let Some(env) = drivers::ahci::AhciEnv.of(take attached, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
             }
             return try await runner::Driven[drivers::ahci::Ahci, drivers::ahci::AhciEnv, drivers::ahci::AhciDevice].run(take env, exec: world.exec, alloc, take serving, peers: schema_of_block(alloc), release: drivers::ahci::AhciEnv.abandon)
@@ -891,11 +891,22 @@ fn Base.claimed(self, path: devices::BusPath, alloc: mem::Alloc) -> Option[devic
 /// Hands claimed hardware no Env took back to the keeper: a function returns, cut off.
 fn release_claimed(take claimed: Option[devices::Claimed]) {
     match claimed {
-        Some(devices::Claimed.Pci(function)) => take function.release()
+        Some(devices::Claimed.Pci(attached)) => release_attached(take attached)
         Some(devices::Claimed.Platform(_)) or None => {
         }
     }
 } release_claimed
+
+/// Hands an attached function back to the keeper, cut off, then ends the I/O domain it was attached to.
+fn release_attached(take attached: devices::Attached) {
+    let devices::Attached(function: function, domain: domain, space: _) = attached
+    take function.release()
+    match domain {
+        Some(confining) => take confining.close()
+        None => {
+        }
+    }
+} release_attached
 
 /// The genesis record the kernel image holds: the specification of each base instance, acting for `system` and running the image's bundle `bundle`, the root grant `g0`, the base instances' grants, and on a claimed machine or in `dev` mode the owner's grant.
 fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem::Alloc) -> runner::Known {
@@ -1167,12 +1178,13 @@ fn boot_record(handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::
     return store::service::TypedValue(type: store::TypeRef.of(BOOT_STATE_TYPE, schema: mem::wire::Codec[bootfmt::BootState].schema_hash(), alloc), bytes: take bytes)
 } boot_record
 
-/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames`, prints each event `rings` record, holds the board of `/live`, `machine` its first record, writes each CPU's energy-performance preference through `cpu` on a machine with HWP, loads jobs' bundles through `loader`, and runs the toolchain `shipped`, when the start isolated one, drawing through NaN's boot heap `heap`; it never ends unless cancelled.
+/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, attaching claimed functions through `iommu`, the core carves the regions of reserved instances from `frames`, prints each event `rings` record, holds the board of `/live`, `machine` its first record, writes each CPU's energy-performance preference through `cpu` on a machine with HWP, loads jobs' bundles through `loader`, and runs the toolchain `shipped`, when the start isolated one, drawing through NaN's boot heap `heap`; it never ends unless cancelled.
 fn run_base(
     cpu: hw::Ring0,
     rapl: Option[cpu::Rapl],
     take known: runner::Known,
     take keeper: keeper::Keeper,
+    iommu: Option[hw::Iommu],
     bundle: ident::HashValue,
     support: ident::HashValue,
     boot: devices::BootVolume,
@@ -1259,7 +1271,7 @@ fn run_base(
         discard s.spawn(fn[take held, take received]() fails task::Cancelled uses wait limits stack 32_768 {
             var keeping = held
             defer take keeping.release()
-            try await mut keeping.serve(take received, rings, alloc: config.alloc)
+            try await mut keeping.serve(take received, rings, iommu, alloc: config.alloc)
         })
         discard s.spawn(fn[take root_orders, take forwarding]() fails task::Cancelled uses wait limits stack 8_192 {
             try await keeper::forward(take root_orders, inputs: take forwarding)
