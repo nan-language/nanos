@@ -19,7 +19,7 @@ pub layout Pool: bytes 4_096 le {
     data: Array[u8, 4_096] at 0
 } Pool
 
-/// The driver's Env: its queue's ring, its function and the I/O domain it is attached to, the windows over its common and notification structures, its queue and buffer, its interrupt, the signal that interrupt posts, its clock, its alarm and its cell.
+/// The driver's Env: its queue's ring, its function and the I/O domain it is attached to, the windows over its common and notification structures, its queue and the buffer it fills, its interrupt, the signal that interrupt posts, its clock, its alarm and its cell.
 pub open linear struct RngEnv derives Send {
     ring: Ring
     function: hw::PciFunction
@@ -27,7 +27,7 @@ pub open linear struct RngEnv derives Send {
     common: hw::Mmio[Common]
     notify: hw::Mmio[Notify]
     queue: hw::DmaShared[Queue]
-    pool: hw::DmaShared[Pool]
+    pool: dma::Buffers[Pool]
     irq: hw::IrqShared[Interrupt]
     signal: mem::Shared[hw::Signal[Unit]]
     clock: sys::Clock
@@ -60,9 +60,9 @@ impl Rng: sys::Health[RngEnv, RngDevice]
 
 impl Rng: sys::Suspend[RngEnv, RngDevice]
 
-/// The Env over the attached function `attached`: its structures mapped, its features negotiated, its queue and buffer drawn from `alloc` in the function's DMA space, and its queue's interrupt on MSI-X entry 0 of CPU 0 under the storm limit; `None` when the device does not allow it, the function then handed back.
+/// The Env over the attached function `attached`: its structures mapped, its features negotiated, its queue and buffer drawn from `alloc` in the function's DMA space, the buffer mapped only while the device fills it when the function is external, and its queue's interrupt on MSI-X entry 0 of CPU 0 under the storm limit; `None` when the device does not allow it, the function then handed back.
 pub fn RngEnv.of(take attached: devices::Attached, clock: sys::Clock, take alarm: devices::Alarm, alloc: mem::Alloc) -> Option[RngEnv] {
-    let devices::Attached(function: function, domain: domain, space: space) = attached
+    let devices::Attached(function: function, domain: domain, space: space, external: external) = attached
     var held = function
     let Some(found) = located(held, kind: ENTROPY) else {
         release(take held, take domain, common: None, notify: None, queue: None)
@@ -97,7 +97,9 @@ pub fn RngEnv.of(take attached: devices::Attached, clock: sys::Clock, take alarm
     }
     mut irq.limit(per_second: devices::STORM_LIMIT)
     ready(mut regs)
-    let pool = hw::DmaShared.of(heap.boxed(Pool.from_bits(Array[u8, 4_096].filled(0))), space)
+    var filled = mem::List[mem::Box[Pool]].empty(alloc)
+    mut filled.push(heap.boxed(Pool.from_bits(Array[u8, 4_096].filled(0))))
+    let pool = dma::Buffers.of(take filled, space, external, alloc)
     return Some(RngEnv(ring: ring, function: take held, domain: take domain, common: take regs, notify: take notify, queue: take queue, pool: take pool, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, alloc: alloc))
 } RngEnv.of
 
@@ -105,7 +107,7 @@ pub fn RngEnv.of(take attached: devices::Attached, clock: sys::Clock, take alarm
 pub fn RngEnv.abandon(take self) {
     let RngEnv(ring: _, function: function, domain: domain, common: common, notify: notify, queue: queue, pool: pool, irq: irq, signal: _, clock: _, alarm: _, alloc: _) = self
     discard take irq.uninstall()
-    discard take pool.into_box()
+    take pool.release()
     release(take function, take domain, common: Some(take common), notify: Some(take notify), queue: Some(take queue))
 } RngEnv.abandon
 
@@ -151,6 +153,7 @@ pub fn Rng.fill(mut self, take count: u32, mut env: RngEnv, mut cx: sys::Cx[RngD
 /// Resets the device, failing the requests waiting with `device.reset`, then puts its function in D3hot.
 pub fn Rng.suspend(mut self, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
     reset(mut env.common)
+    mut env.pool.complete()
     while self.asked.len() > 0 {
         let asked = mut self.asked.remove(0)
         var reply = sys::Encoded.empty(env.alloc)
@@ -196,10 +199,12 @@ fn Rng.completed(mut self, mut env: RngEnv, mut cx: sys::Cx[RngDevice]) {
     self.used = self.used.wrapping_add(1)
     self.busy = false
     if self.asked.len() == 0 {
+        mut env.pool.complete()
         return
     }
     let asked = mut self.asked.remove(0)
     let filled = mut self.taken(mut env, count: asked.count, written: entry.len)
+    mut env.pool.complete()
     var reply = sys::Encoded.empty(env.alloc)
     mem::wire::Codec[Result[Untrusted[mem::Bytes], devices::DeviceError]].encode(filled, out: mut reply.bytes)
     discard attempt mut cx.reply(asked.request, reply)
@@ -213,7 +218,7 @@ fn Rng.taken(mut self, mut env: RngEnv, count: u32, written: u32) -> Result[Untr
     }
     var bytes = mem::Bytes.empty(env.alloc)
     for at in 0..<usize.widen(count) {
-        let byte = mut env.pool.read_acquire_at(Pool.data, index: at)
+        let byte = mut env.pool.at_mut(0).read_acquire_at(Pool.data, index: at)
         if not mut self.tests.sample(byte) {
             self.failed = true
         }
@@ -230,7 +235,8 @@ fn Rng.submit(mut self, mut env: RngEnv) {
     if self.busy or self.asked.len() == 0 {
         return
     }
-    mut env.queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(addr: env.pool.bus_addr().value, len: self.asked[0].count, flags: WRITE, next: 0))
+    mut env.pool.submit()
+    mut env.queue.write_release_at(Queue.descriptors, index: 0, value: Descriptor(addr: env.pool.at(0).bus_addr().value, len: self.asked[0].count, flags: WRITE, next: 0))
     self.available = offer(mut env.queue, head: 0, index: self.available, size: env.ring.size)
     mut env.notify.write(Notify.queue, value: 0)
     self.busy = true

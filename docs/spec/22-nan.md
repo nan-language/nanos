@@ -613,3 +613,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** on CPUs Meltdown does not affect, a space's root sharing the kernel's tables below its window, and a tag per space.
 - **Chapters:** [04](04-kernel.md), [09](09-authority.md).
 - **Issue:** [nan-language/nan#291](https://github.com/nan-language/nan/issues/291).
+
+## N62
+
+**Large IOMMU pages.**
+
+- **Language 1:** a DMA buffer made in an I/O domain's space is mapped in whole pages of its own, of a size the runtime chooses (NaN 23 §DMA).
+- **NaN OS requires:** the aligned 2 MiB ranges of a buffer mapped with 2 MiB IOMMU pages where the IOMMU has them.
+- **Chapters:** [15](15-devices.md).
+- **Issue:** [nan-language/nan#292](https://github.com/nan-language/nan/issues/292).

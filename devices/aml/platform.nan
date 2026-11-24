@@ -1,4 +1,10 @@
-//! What the namespace describes: its devices with their identifiers and the windows and lines their `_CRS` gives, the PCI interrupt routes `_PRT` gives, and the sleep values `\_Sx_` gives.
+//! What the namespace describes: its devices with their identifiers and the windows and lines their `_CRS` gives, the PCI interrupt routes `_PRT` gives, the PCI ports its `_DSD`s mark external-facing, and the sleep values `\_Sx_` gives.
+
+/// The UUID of the `_DSD` properties that mark a PCI port external-facing, in the byte order of `ToUUID`.
+const FACING_PROPERTIES: Slice[u8] = b"\xCC\x06\xCC\xEF\xAC\x73\xC3\x4B\xBF\xF0\x76\x14\x38\x07\xC3\x89"
+
+/// The property of those that marks the port.
+const FACING_PROPERTY: Slice[u8] = b"ExternalFacingPort"
 
 /// A window or line a `_CRS` resource template gives: an interrupt line by its number, an ISA interrupt for an IRQ descriptor and a global system interrupt for an extended one, with its trigger and polarity.
 pub closed enum Window derives Copy, Eq, Render, Encode {
@@ -25,6 +31,14 @@ pub closed struct Route derives Copy, Eq, Render, Encode {
     pub source: Option[Path]
     pub index: u32
 } Route
+
+/// A root port of a PCI root bridge that the firmware marks external-facing: its segment, bus, device and function.
+pub closed struct Facing derives Copy, Eq, Render, Encode {
+    pub segment: u16
+    pub bus: u8
+    pub device: u8
+    pub function: u8
+} Facing
 
 /// The values of a sleep state's `\_Sx_` object for the PM1a and PM1b control registers.
 pub closed struct Sleep derives Copy, Eq, Render, Encode {
@@ -143,6 +157,135 @@ pub fn routes(code: Code, alloc: mem::Alloc) -> mem::List[Route] fails AmlError 
     }
     return found
 } routes
+
+/// The root ports of the namespace's PCI root bridges whose `_DSD` sets `ExternalFacingPort` to 1, each on its bridge's `_SEG` and `_BBN`, 0 when it has none; a port whose objects fail to evaluate is left out.
+pub fn facing(code: Code, alloc: mem::Alloc) -> mem::List[Facing] fails AmlError {
+    let objects = try namespace(code, alloc)
+    let bytes = code.bytes.view()
+    var found = mem::List[Facing].empty(alloc)
+    for object in objects {
+        if object.path.last() != segment(b"_DSD") or (object.kind != Kind.Name and object.kind != Kind.Method) {
+            continue
+        }
+        match attempt port_facing(bytes, objects, properties: object, alloc) {
+            Ok(Some(port)) => mut found.push(port)
+            else => {
+            }
+        }
+    }
+    return found
+} facing
+
+/// The port whose `_DSD` is `properties` when it is a root port of a PCI root bridge that `_DSD` marks external-facing.
+fn port_facing(code: Slice[u8], objects: mem::List[Object], properties: Object, alloc: mem::Alloc) -> Option[Facing] fails AmlError {
+    let port = properties.path.parent()
+    let bridge = port.parent()
+    let Some(address) = child(objects, path: port, name: b"_ADR") else {
+        return None
+    }
+    if not try root_bridge(code, objects, path: bridge, alloc) {
+        return None
+    }
+    let evaluated = try evaluate(code, objects, object: properties, alloc)
+    if not marked(code, properties: evaluated) {
+        return None
+    }
+    let located = try evaluate(code, objects, object: address, alloc)
+    let adr = try integer(located.value)
+    let segment_number = try number_of(code, objects, path: bridge, name: b"_SEG", alloc)
+    let bus = try number_of(code, objects, path: bridge, name: b"_BBN", alloc)
+    return Some(Facing(segment: u16.truncate(segment_number), bus: u8.truncate(bus), device: u8.truncate(adr >> 16), function: u8.truncate(adr)))
+} port_facing
+
+/// Whether the device at `path` is a PCI root bridge: its `_HID` or one of its `_CID`s is `PNP0A08` or `PNP0A03`.
+fn root_bridge(code: Slice[u8], objects: mem::List[Object], path: Path, alloc: mem::Alloc) -> bool fails AmlError {
+    match child(objects, path, name: b"_HID") {
+        Some(hid) => {
+            let named = try evaluate(code, objects, object: hid, alloc)
+            if bridging(try identifier(code, value: named.value)) {
+                return true
+            }
+        }
+        None => {
+        }
+    }
+    let Some(cid) = child(objects, path, name: b"_CID") else {
+        return false
+    }
+    let evaluated = try evaluate(code, objects, object: cid, alloc)
+    for each in try identifiers(code, evaluated) {
+        if bridging(each) {
+            return true
+        }
+    }
+    return false
+} root_bridge
+
+fn bridging(id: text::Fixed[8]) -> bool {
+    return id.as_str() == "PNP0A08" or id.as_str() == "PNP0A03"
+} bridging
+
+/// The integer the object `name` of the device at `path` gives, 0 when it has none.
+fn number_of(
+    code: Slice[u8],
+    objects: mem::List[Object],
+    path: Path,
+    name: Slice[u8],
+    alloc: mem::Alloc,
+    ) -> u64 fails AmlError {
+    let Some(found) = child(objects, path, name) else {
+        return 0
+    }
+    let evaluated = try evaluate(code, objects, object: found, alloc)
+    return try integer(evaluated.value)
+} number_of
+
+/// Whether the `_DSD` package `properties` sets `ExternalFacingPort` to 1 among the properties of `FACING_PROPERTIES`.
+fn marked(code: Slice[u8], properties: Evaluated) -> bool {
+    let Value.Package(head: head, count: count) = properties.value else {
+        return false
+    }
+    var at: u32 = 0
+    while at + 1 < count {
+        let uuid = properties.elements[usize.widen(head + at)]
+        let set = properties.elements[usize.widen(head + at + 1)]
+        at += 2
+        let Value.Buffer(start: start, length: length) = uuid else {
+            continue
+        }
+        let Value.Package(head: entries, count: listed) = set else {
+            continue
+        }
+        if not spans(code, start, length, wanted: FACING_PROPERTIES) {
+            continue
+        }
+        for index in 0..<listed {
+            let Value.Package(head: pair, count: fields) = properties.elements[usize.widen(entries + index)] else {
+                continue
+            }
+            let Value.Text(start: key, length: key_length) = properties.elements[usize.widen(pair)] else {
+                continue
+            }
+            if fields == 2 and spans(code, start: key, length: key_length, wanted: FACING_PROPERTY) and properties.elements[usize.widen(pair) + 1] == Value.Integer(1) {
+                return true
+            }
+        }
+    }
+    return false
+} marked
+
+/// Whether the `length` bytes of `code` from `start` are `wanted`.
+fn spans(code: Slice[u8], start: u32, length: u32, wanted: Slice[u8]) -> bool {
+    if usize.widen(length) != wanted.len() {
+        return false
+    }
+    for index in 0..<wanted.len() {
+        if code[usize.widen(start) + index] != wanted[index] {
+            return false
+        }
+    }
+    return true
+} spans
 
 /// The values of the sleep state `state`'s `\_Sx_` object.
 pub fn sleep_state(code: Code, state: u8, alloc: mem::Alloc) -> Sleep fails AmlError {

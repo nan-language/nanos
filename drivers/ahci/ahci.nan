@@ -137,14 +137,14 @@ pub layout Segment: bytes 8_192 le {
     data: Array[u8, 8_192] at 0
 } Segment
 
-/// A port holding a disk: its registers, the disk's geometry, its memory with the offsets of its structures in it, and the segments of its buffer.
+/// A port holding a disk: its registers, the disk's geometry, its memory with the offsets of its structures in it, and the segments of its buffer, mapped only while a command is on the disk when the function is external.
 pub open linear struct Disk derives Send {
     regs: hw::Mmio[Port]
     info: devices::BlockInfo
     area: hw::DmaShared[Area]
     list: u64
     table: u64
-    segments: mem::List[hw::DmaShared[Segment]]
+    segments: dma::Buffers[Segment]
 } Disk
 
 /// The driver's Env: its function and the I/O domain it is attached to, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, its clock, its alarm, the meter its transfers are charged through and its cell.
@@ -209,7 +209,7 @@ pub fn AhciEnv.of(
     meter: os::Meter,
     alloc: mem::Alloc,
     ) -> Option[AhciEnv] {
-    let devices::Attached(function: function, domain: domain, space: space) = attached
+    let devices::Attached(function: function, domain: domain, space: space, external: external) = attached
     var held = function
     let Ok(window) = attempt hw::Mmio[Hba].of_bar(mut held, index: 5, offset: 0) else {
         hand_back(take held, take domain)
@@ -224,7 +224,7 @@ pub fn AhciEnv.of(
         if ((implemented >> port) & 1) == 0 {
             continue
         }
-        match set_up_port(mut held, port, space, heap, clock, alloc) {
+        match set_up_port(mut held, port, space, external, heap, clock, alloc) {
             Some(disk) => mut disks.push(take disk)
             None => {
             }
@@ -288,9 +288,7 @@ fn free_disk(take disk: Disk, clock: sys::Clock) {
     stop(mut held, clock)
     take held.unmap()
     discard take area.into_box()
-    for segment in take segments {
-        discard take segment.into_box()
-    }
+    take segments.release()
 } free_disk
 
 /// Clears the port's start and FIS receive bits and waits until its command list and FIS receive stop running.
@@ -328,6 +326,7 @@ fn receive(mut regs: hw::Mmio[Port], at: u64, clock: sys::Clock) -> bool {
 /// Resets the disk's port with a COMRESET, which aborts its command, then starts it again once its device answers: whether it did.
 fn Disk.restart(mut self, clock: sys::Clock) -> bool {
     stop(mut self.regs, clock)
+    mut self.segments.complete()
     let control = mut self.regs.read(Port.sctl) & ~DETECTION
     mut self.regs.write(Port.sctl, value: control | COMRESET)
     let held = deadline(clock, ms: HOLD_MS)
@@ -384,11 +383,12 @@ fn passed(clock: sys::Clock, until: u64) -> bool {
     }
 } passed
 
-/// The disk on `port` of `function` when it holds an ATA disk: its registers mapped, its memory drawn from `heap` in `space`, its port started, and the disk identified; `None` otherwise, what it took released.
+/// The disk on `port` of `function` when it holds an ATA disk: its registers mapped, its memory drawn from `heap` in `space`, its buffer mapped only while a command is on the disk when it is `external`, its port started, and the disk identified; `None` otherwise, what it took released.
 fn set_up_port(
     mut function: hw::PciFunction,
     port: u32,
     space: hw::IoSpace,
+    external: bool,
     heap: mem::Heap,
     clock: sys::Clock,
     alloc: mem::Alloc,
@@ -403,10 +403,11 @@ fn set_up_port(
     }
     stop(mut regs, clock)
     let area = hw::DmaShared.of(heap.boxed(Area.from_bits(Array[u8, 8_192].filled(0))), space)
-    var segments = mem::List[hw::DmaShared[Segment]].empty(alloc)
+    var boxes = mem::List[mem::Box[Segment]].empty(alloc)
     for _ in 0..<SEGMENT_COUNT {
-        mut segments.push(hw::DmaShared.of(heap.boxed(Segment.from_bits(Array[u8, 8_192].filled(0))), space))
+        mut boxes.push(heap.boxed(Segment.from_bits(Array[u8, 8_192].filled(0))))
     }
+    let segments = dma::Buffers.of(take boxes, space, external, alloc)
     let base = area.bus_addr().value
     let list = align_up(base, to: LIST_BYTES) - base
     let table = align_up(base + list + LIST_BYTES + FIS_BYTES, to: TABLE_ALIGN) - base
@@ -416,13 +417,12 @@ fn set_up_port(
         stop(mut regs, clock)
         take regs.unmap()
         discard take area.into_box()
-        for segment in take segments {
-            discard take segment.into_box()
-        }
+        take segments.release()
         return None
     }
     mut regs.write(Port.cmd, value: mut regs.read(Port.cmd) | RUN)
     var disk = Disk(regs: take regs, info: devices::BlockInfo(units: 1, block_bytes: 512, blocks: 0, max_transfer_bytes: TRANSFER_BYTES, zone_blocks: 0, cache: false, fua: false, discards: false, read_only: false), area: take area, list: list, table: table, segments: take segments)
+    mut disk.segments.submit()
     issue(mut disk, command: IDENTIFY, lba: 0, sectors: 1, bytes: 512, write: false)
     let until = deadline(clock, ms: ANSWER_MS)
     var late = false
@@ -439,6 +439,7 @@ fn set_up_port(
         free_disk(take disk, clock)
         return None
     }
+    mut disk.segments.complete()
     disk.info = info
     return Some(take disk)
 } set_up_port
@@ -496,7 +497,7 @@ fn issue(
             true => SEGMENT_BYTES
             false => left
         }
-        let address = disk.segments[usize.widen(entries)].bus_addr().value
+        let address = disk.segments.at(usize.widen(entries)).bus_addr().value
         let entry = table + 32 + 4 * usize.widen(entries)
         put(mut disk, at: entry, bits: u32.truncate(address))
         put(mut disk, at: entry + 1, bits: u32.truncate(address >> 32))
@@ -660,6 +661,7 @@ fn Ahci.completed(mut self, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
             Operation.Read(block: _, count: blocks) => answer(request, result: read_outcome(failed, mut env, unit, count: blocks), alloc: env.alloc, mut cx)
             else => answer(request, result: outcome(failed), alloc: env.alloc, mut cx)
         }
+        mut env.disks.at_mut(unit).segments.complete()
         mut cx.cancel(key: TIMING + u64.widen(unit))
     }
     mut self.submit(mut env, mut cx)
@@ -743,6 +745,7 @@ fn Ahci.submit(mut self, mut env: AhciEnv, mut cx: sys::Cx[AhciDevice]) {
         }
         let block_bytes = env.disks[unit].info.block_bytes
         let operation = self.waiting[chosen].operation
+        mut env.disks.at_mut(unit).segments.submit()
         match self.waiting[chosen].data {
             Some(bytes) => {
                 var at: usize = 0

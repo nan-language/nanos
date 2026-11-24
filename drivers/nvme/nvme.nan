@@ -39,12 +39,12 @@ pub open linear struct Admin derives Send {
     pair: Pair
 } Admin
 
-/// An I/O queue pair: its submissions and completions, the PRP list and the pages of the transfer on it, its interrupt, and the signal that interrupt posts.
+/// An I/O queue pair: its submissions and completions, the PRP list and the pages of the transfer on it, mapped only while the transfer is on the controller when the function is external, its interrupt, and the signal that interrupt posts.
 pub open linear struct Lane derives Send {
     submissions: Page
     completions: Page
-    list: Page
-    pages: mem::List[Page]
+    list: dma::Buffers[Span]
+    pages: dma::Buffers[Span]
     irq: hw::IrqShared[virtio::Interrupt]
     signal: mem::Shared[hw::Signal[Unit]]
 } Lane
@@ -107,7 +107,7 @@ pub fn NvmeEnv.of(
     meter: os::Meter,
     alloc: mem::Alloc,
     ) -> Option[NvmeEnv] {
-    let devices::Attached(function: function, domain: domain, space: space) = attached
+    let devices::Attached(function: function, domain: domain, space: space, external: external) = attached
     var held = function
     let Ok(mapped) = attempt hw::Mmio[Controller].of_bar(mut held, index: 0, offset: 0) else {
         hand_back(take held, take domain)
@@ -133,7 +133,7 @@ pub fn NvmeEnv.of(
     }
     let granted = granted_pairs(mut regs, pair: mut control.pair, submissions: mut control.submissions, completions: mut control.completions, wanted)
     for index in 0..<granted {
-        let Some(lane) = lane_of(mut held, mut regs, mut control, index: u16.fit(index), space, heap, alloc) else {
+        let Some(lane) = lane_of(mut held, mut regs, mut control, index: u16.fit(index), space, external, heap, alloc) else {
             break
         }
         mut lanes.push(take lane)
@@ -146,13 +146,14 @@ pub fn NvmeEnv.of(
     return Some(NvmeEnv(identified: identified, function: take held, domain: take domain, regs: take regs, admin: take control, lanes: take lanes, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, alarm: take alarm, meter: meter, alloc: alloc))
 } NvmeEnv.of
 
-/// I/O pair `index` created with its pages in `space` and an interrupt on CPU `index`; `None`, nothing created, when there is no MSI-X entry for it or the controller refuses it.
+/// I/O pair `index` created with its pages in `space`, those of its transfers mapped only while each is on the controller when it is `external`, and an interrupt on CPU `index`; `None`, nothing created, when there is no MSI-X entry for it or the controller refuses it.
 fn lane_of(
     mut function: hw::PciFunction,
     mut regs: hw::Mmio[Controller],
     mut control: Admin,
     index: u16,
     space: hw::IoSpace,
+    external: bool,
     heap: mem::Heap,
     alloc: mem::Alloc,
     ) -> Option[Lane] {
@@ -162,22 +163,23 @@ fn lane_of(
         Err(_) => return None
     }
     mut irq.limit(per_second: devices::STORM_LIMIT)
-    var pages = mem::List[Page].empty(alloc)
+    var spans = mem::List[mem::Box[Span]].empty(alloc)
     for _ in 0..<DATA_PAGES {
-        mut pages.push(Page.of(heap, space))
+        mut spans.push(blank(heap))
     }
+    let pages = dma::Buffers.of(take spans, space, external, alloc)
     let submissions = Page.of(heap, space)
     let completions = Page.of(heap, space)
     if not create_io_pair(mut regs, pair: mut control.pair, submissions: mut control.submissions, completions: mut control.completions, id: index + 1, vector: index, io_submissions: submissions, io_completions: completions) {
         discard take irq.uninstall()
         take submissions.release()
         take completions.release()
-        for page in take pages {
-            take page.release()
-        }
+        take pages.release()
         return None
     }
-    return Some(Lane(submissions: take submissions, completions: take completions, list: Page.of(heap, space), pages: take pages, irq: take irq, signal: take signal))
+    var listing = mem::List[mem::Box[Span]].empty(alloc)
+    mut listing.push(blank(heap))
+    return Some(Lane(submissions: take submissions, completions: take completions, list: dma::Buffers.of(take listing, space, external, alloc), pages: take pages, irq: take irq, signal: take signal))
 } lane_of
 
 /// Disables the controller, then releases the interrupts, the registers and the pages, and hands the function back.
@@ -202,20 +204,17 @@ fn release_queues(take regs: hw::Mmio[Controller], take control: Admin, take lan
     var held = regs
     discard disable(mut held)
     take held.unmap()
-    let Admin(submissions: Page(span: submitted, at: _), completions: Page(span: completed, at: _), scratch: Page(span: scratched, at: _), pair: _) = control
+    let Admin(submissions: Page(span: submitted), completions: Page(span: completed), scratch: Page(span: scratched), pair: _) = control
     discard take submitted.into_box()
     discard take completed.into_box()
     discard take scratched.into_box()
     for lane in take lanes {
-        let Lane(submissions: Page(span: queued, at: _), completions: Page(span: posted, at: _), list: Page(span: listed, at: _), pages: pages, irq: irq, signal: _) = lane
+        let Lane(submissions: Page(span: queued), completions: Page(span: posted), list: listed, pages: pages, irq: irq, signal: _) = lane
         discard take irq.uninstall()
         discard take queued.into_box()
         discard take posted.into_box()
-        discard take listed.into_box()
-        for page in take pages {
-            let Page(span: span, at: _) = page
-            discard take span.into_box()
-        }
+        take listed.release()
+        take pages.release()
     }
 } release_queues
 
@@ -228,6 +227,7 @@ fn NvmeEnv.restart(mut self) -> bool {
     }
     discard granted_pairs(mut self.regs, pair: mut self.admin.pair, submissions: mut self.admin.submissions, completions: mut self.admin.completions, wanted: u32.fit(self.lanes.len()))
     for index in 0..<self.lanes.len() {
+        mut self.lanes.at_mut(index).complete()
         mut self.lanes.at_mut(index).completions.clear()
         if not create_io_pair(mut self.regs, pair: mut self.admin.pair, submissions: mut self.admin.submissions, completions: mut self.admin.completions, id: u16.fit(index) + 1, vector: u16.fit(index), io_submissions: self.lanes[index].submissions, io_completions: self.lanes[index].completions) {
             return false
@@ -396,6 +396,7 @@ fn Nvme.completed(mut self, take pair: u16, mut env: NvmeEnv, mut cx: sys::Cx[Nv
             else => answer(request, result: outcome(done.status), alloc: env.alloc, mut cx)
         }
     }
+    mut env.lanes.at_mut(lane).complete()
     if self.tracks[lane].waiting.len() == 0 {
         mut cx.cancel(key: TIMING + u64.widen(lane))
     }
@@ -490,13 +491,21 @@ fn Nvme.submit(mut self, lane: usize, mut env: NvmeEnv, mut cx: sys::Cx[NvmeDevi
     })
 } Nvme.submit
 
+/// Unmaps the pages of the transfer that was on the pair when the function is external.
+fn Lane.complete(mut self) {
+    mut self.pages.complete()
+    mut self.list.complete()
+} Lane.complete
+
 /// The command of `operation` on this pair, the data a write carries copied into its pages.
 fn Lane.load(mut self, operation: Operation, take data: Option[mem::Bytes], identified: Identified) -> Command {
+    mut self.pages.submit()
+    mut self.list.submit()
     match data {
         Some(bytes) => {
             var at: usize = 0
             for byte in bytes.view() {
-                mut self.pages.at_mut(at / usize.widen(PAGE_BYTES)).put8(at % usize.widen(PAGE_BYTES), byte)
+                put_byte(mut self.pages.at_mut(at / usize.widen(PAGE_BYTES)), offset: at % usize.widen(PAGE_BYTES), byte)
                 at += 1
             }
         }
@@ -522,14 +531,15 @@ fn Lane.transfer(
     let used = usize.widen((bytes + PAGE_BYTES - 1) / PAGE_BYTES)
     var prp2: u64 = 0
     if used == 2 {
-        prp2 = self.pages[1].bus()
+        prp2 = page_bus(self.pages.at(1))
     } else if used > 2 {
         for page in 1..<used {
-            mut self.list.put64(8 * (page - 1), value: self.pages[page].bus())
+            let listed = page_bus(self.pages.at(page))
+            put_word(mut self.list.at_mut(0), offset: 8 * (page - 1), value: listed)
         }
-        prp2 = self.list.bus()
+        prp2 = page_bus(self.list.at(0))
     }
-    return Command(opcode: opcode, namespace: namespace.id, prp1: self.pages[0].bus(), prp2: prp2, cdw10: u32.truncate(start), cdw11: u32.truncate(start >> 32), cdw12: blocks - 1)
+    return Command(opcode: opcode, namespace: namespace.id, prp1: page_bus(self.pages.at(0)), prp2: prp2, cdw10: u32.truncate(start), cdw11: u32.truncate(start >> 32), cdw12: blocks - 1)
 } Lane.transfer
 
 /// The namespace unit `unit` serves.
@@ -573,7 +583,7 @@ fn read_outcome(
     let length = usize.widen(count * env.identified.units[usize.widen(unit)].block_bytes)
     var bytes = mem::Bytes.empty(env.alloc)
     for at in 0..<length {
-        mut bytes.push(mut env.lanes.at_mut(lane).pages.at_mut(at / usize.widen(PAGE_BYTES)).get8(at % usize.widen(PAGE_BYTES)))
+        mut bytes.push(get_byte(mut env.lanes.at_mut(lane).pages.at_mut(at / usize.widen(PAGE_BYTES)), offset: at % usize.widen(PAGE_BYTES)))
     }
     return Ok(Untrusted.of(take bytes))
 } read_outcome

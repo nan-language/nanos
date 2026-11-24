@@ -211,7 +211,7 @@ On a machine with `iommu`, the core enables DMA and interrupt remapping before `
 
 - Functions the IOMMU cannot tell apart, sharing a requester id or behind a PCIe-to-PCI bridge, form one **IOMMU group** with one IOMMU domain (requires [N60](22-nan.md#n60)). A group's functions bind only to drivers of one principal and one [provenance class](09-authority.md#provenance); another binding gives `failed(device.group-conflict)`.
 - A driver's DMA allocator draws buffers within the driver's memory limit and maps them into its group's domain; the bus address of an `hw::Dma` or `hw::DmaShared` buffer is its I/O virtual address (requires [N13](22-nan.md#n13)).
-- Buffers of internal devices are mapped once, when allocated, with 2 MiB IOMMU pages where available. Buffers of external devices (below a port the firmware marks external-facing or hot-pluggable) are mapped at submission and unmapped at completion, whose IOTLB invalidation ends before the buffer returns.
+- Buffers of internal devices are mapped once, when allocated, with 2 MiB IOMMU pages where available (requires [N62](22-nan.md#n62)). Buffers of external devices (below a port the firmware marks external-facing or hot-pluggable) are mapped at submission and unmapped at completion, whose IOTLB invalidation ends before the buffer returns.
 - Interrupt remapping limits a device's MSI writes to its own vectors. PCIe address translation services are disabled on every function.
 - A DMA access outside its domain is an IOMMU fault: the core emits `device.dma-fault` and abandons the driver's domain from outside (requires [N2](22-nan.md#n2), [N58](22-nan.md#n58)).
 

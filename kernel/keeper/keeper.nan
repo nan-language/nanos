@@ -12,13 +12,14 @@ const MSI: u32 = 0x05
 
 const MSIX: u32 = 0x11
 
-/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports with the interrupts of their hot-plug slots and the signal those post, the devices it lists, the firmware tables, the topology's generation and where to send it once it changes, the random source entropy devices reseed, whether the IOMMU confines DMA, and where the DMA of each function a claim attached reaches.
+/// What the keeper holds: the PCI functions no driver holds, each function's keeper, the ports with the interrupts of their hot-plug slots and the signal those post, the ports the firmware marks external-facing, the devices it lists, the firmware tables, the topology's generation and where to send it once it changes, the random source entropy devices reseed, whether the IOMMU confines DMA, and where the DMA of each function a claim attached reaches.
 pkg linear struct Keeper {
     idle: mem::List[hw::PciFunction]
     keepers: mem::List[hw::PciKeeper]
     ports: mem::List[hw::PciPort]
     slots: mem::List[hw::IrqShared[SlotInterrupt]]
     signal: mem::Shared[hw::Signal[Unit]]
+    facing: mem::List[devices::PciAddress]
     found: mem::List[devices::Found]
     tables: mem::List[Table]
     generation: u64
@@ -69,7 +70,7 @@ pkg fn Keeper.of(
     confining: bool,
     alloc: mem::Alloc,
     ) -> Keeper {
-    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, slots: mem::List.empty(alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), found: mem::List.empty(alloc), tables: take tables, generation: 0, watchers: mem::List.empty(alloc), source: take source, confining: confining, reaches: mem::List.empty(alloc))
+    var kept = Keeper(idle: mem::List.empty(alloc), keepers: mem::List.empty(alloc), ports: take ports, slots: mem::List.empty(alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc), facing: mem::List.empty(alloc), found: mem::List.empty(alloc), tables: take tables, generation: 0, watchers: mem::List.empty(alloc), source: take source, confining: confining, reaches: mem::List.empty(alloc))
     for function in take functions {
         mut kept.adopt(take function, alloc)
     }
@@ -93,13 +94,27 @@ fn Keeper.group_of(self, address: hw::PciAddress, alloc: mem::Alloc) -> Option[u
     if not self.confining {
         return None
     }
+    return Some(devices::iommu_group(devices::PciAddress.of(address), bridges: self.bridges(alloc).view()))
+} Keeper.group_of
+
+/// The bridges the keeper's ports are, external below a hot-plug slot or a port the firmware marks external-facing.
+fn Keeper.bridges(self, alloc: mem::Alloc) -> mem::List[devices::Bridge] {
     var bridges = mem::List[devices::Bridge].empty(alloc)
     for port in self.ports {
         let below = port.buses()
-        mut bridges.push(devices::Bridge(segment: port.address().segment, secondary: below.secondary, subordinate: below.subordinate, conventional: port.kind() == hw::PortKind.Bridge))
+        var external = match port.slot() {
+            Some(slot) => slot.hot_plug
+            None => false
+        }
+        for facing in self.facing {
+            if facing == devices::PciAddress.of(port.address()) {
+                external = true
+            }
+        }
+        mut bridges.push(devices::Bridge(segment: port.address().segment, secondary: below.secondary, subordinate: below.subordinate, conventional: port.kind() == hw::PortKind.Bridge, external: external))
     }
-    return Some(devices::iommu_group(devices::PciAddress.of(address), bridges: bridges.view()))
-} Keeper.group_of
+    return bridges
+} Keeper.bridges
 
 /// The signal the interrupts of the hot-plug slots post.
 pkg fn Keeper.slot_signal(self) -> mem::Shared[hw::Signal[Unit]] {
@@ -126,7 +141,7 @@ fn Keeper.watch_slots(mut self) {
 
 /// Releases what the keeper holds.
 pkg fn Keeper.release(take self) {
-    let Keeper(idle: idle, keepers: keepers, ports: ports, slots: slots, signal: _, found: _, tables: _, generation: _, watchers: _, source: _, confining: _, reaches: _) = self
+    let Keeper(idle: idle, keepers: keepers, ports: ports, slots: slots, signal: _, facing: _, found: _, tables: _, generation: _, watchers: _, source: _, confining: _, reaches: _) = self
     for slot in take slots {
         discard take slot.uninstall()
     }
@@ -177,6 +192,9 @@ fn Keeper.carry_out(
     match order {
         devices::RootOrder.Devices(done: done) => {
             discard attempt await done.send(self.listed(alloc))
+        }
+        devices::RootOrder.Facing(ports: ports) => {
+            self.facing = ports
         }
         devices::RootOrder.Table(signature: signature, index: index, done: done) => {
             discard attempt await done.send(self.table(signature, index, alloc))
@@ -422,13 +440,13 @@ fn Keeper.claim(
     match path {
         devices::BusPath.Pci(address) => {
             let Some(function) = mut self.take_idle(address) else {
-                return mut self.claim_reclaimed(path, address, rings, iommu)
+                return mut self.claim_reclaimed(path, address, rings, iommu, alloc)
             }
             if function.removed() {
                 mut self.idle.push(take function)
                 return None
             }
-            return mut self.attached(take function, iommu)
+            return mut self.attached(take function, iommu, alloc)
         }
         devices::BusPath.Acpi(hid: _, uid: _) => {
             for each in self.found {
@@ -448,13 +466,14 @@ fn Keeper.claim_reclaimed(
     address: devices::PciAddress,
     rings: rings::Rings,
     iommu: Option[hw::Iommu],
+    alloc: mem::Alloc,
     ) -> Option[devices::Claimed] {
     let Some(function) = mut self.reclaim(address) else {
         return None
     }
     var held = function
     if is_reset(attempt mut held.reset()) {
-        return mut self.attached(take held, iommu)
+        return mut self.attached(take held, iommu, alloc)
     }
     mut self.idle.push(take held)
     rings.record_device(devices::Event(kind: devices::EventKind.Failed, path: path, argument: devices::Code.ResetFailed.number()))
@@ -462,9 +481,10 @@ fn Keeper.claim_reclaimed(
 } Keeper.claim_reclaimed
 
 /// `function` attached for its driver's DMA: to a new I/O domain of `iommu`, or to physical memory without an IOMMU or when the IOMMU cannot tell the function's DMA from its peers'; `None`, the keeper holding the function again, when neither attaches it.
-fn Keeper.attached(mut self, take function: hw::PciFunction, iommu: Option[hw::Iommu]) -> Option[devices::Claimed] {
+fn Keeper.attached(mut self, take function: hw::PciFunction, iommu: Option[hw::Iommu], alloc: mem::Alloc) -> Option[devices::Claimed] {
     var held = function
     let address = devices::PciAddress.of(held.address())
+    let external = devices::external(address, bridges: self.bridges(alloc).view())
     match iommu {
         Some(unit) => {
             let Ok(domain) = attempt unit.domain() else {
@@ -475,7 +495,7 @@ fn Keeper.attached(mut self, take function: hw::PciFunction, iommu: Option[hw::I
                 Ok(_) => {
                     mut self.reached(address, dma: devices::Dma.Confined)
                     let space = domain.space()
-                    return Some(devices::Claimed.Pci(devices::Attached(function: take held, domain: Some(take domain), space: space)))
+                    return Some(devices::Claimed.Pci(devices::Attached(function: take held, domain: Some(take domain), space: space, external: external)))
                 }
                 Err(hw::IommuError.Unsupported) => take domain.close()
                 Err(_) => {
@@ -493,7 +513,7 @@ fn Keeper.attached(mut self, take function: hw::PciFunction, iommu: Option[hw::I
         return None
     }
     mut self.reached(address, dma: devices::Dma.Unconfined)
-    return Some(devices::Claimed.Pci(devices::Attached(function: take held, domain: None, space: hw::IoSpace.physical())))
+    return Some(devices::Claimed.Pci(devices::Attached(function: take held, domain: None, space: hw::IoSpace.physical(), external: external)))
 } Keeper.attached
 
 /// Records that the DMA of the function at `address` reaches as `dma` says.
