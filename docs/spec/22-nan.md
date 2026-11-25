@@ -622,3 +622,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** the aligned 2 MiB ranges of a buffer mapped with 2 MiB IOMMU pages where the IOMMU has them.
 - **Chapters:** [15](15-devices.md).
 - **Issue:** [nan-language/nan#292](https://github.com/nan-language/nan/issues/292).
+
+## N63
+
+**Services of each job and instance of a space.**
+
+- **Language 1:** a job's world holds the log, standard streams, random source and file system its kernel gives it (NaN 14 §Jobs), and a space holds one job or instance (N55).
+- **NaN OS requires:** each job and instance of a space reaching the log, standard streams, random source and file system its kernel gives it, and a job of a space holding the capabilities its kernel gives it.
+- **Chapters:** [06](06-execution.md), [09](09-authority.md).
+- **Issue:** [nan-language/nan#297](https://github.com/nan-language/nan/issues/297).

@@ -147,10 +147,9 @@ pub open linear struct Disk derives Send {
     segments: dma::Buffers[Segment]
 } Disk
 
-/// The driver's Env: its function and the I/O domain it is attached to, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, its clock, its alarm, the meter its transfers are charged through and its cell.
+/// The driver's Env: its function, its window over the HBA's generic host control, its disks in port order, its interrupt, the signal that interrupt posts, its clock, its alarm, the meter its transfers are charged through and its cell.
 pub open linear struct AhciEnv derives Send {
     function: hw::PciFunction
-    domain: Option[hw::IoDomain]
     abar: hw::Mmio[Hba]
     disks: mem::List[Disk]
     irq: hw::IrqShared[Interrupt]
@@ -209,10 +208,10 @@ pub fn AhciEnv.of(
     meter: os::Meter,
     alloc: mem::Alloc,
     ) -> Option[AhciEnv] {
-    let devices::Attached(function: function, domain: domain, space: space, external: external) = attached
+    let devices::Attached(function: function, space: space, external: external) = attached
     var held = function
     let Ok(window) = attempt hw::Mmio[Hba].of_bar(mut held, index: 5, offset: 0) else {
-        hand_back(take held, take domain)
+        take held.release()
         return None
     }
     var abar = window
@@ -231,56 +230,40 @@ pub fn AhciEnv.of(
         }
     }
     if disks.len() == 0 {
-        release(take held, take domain, take abar, take disks, clock)
+        release(take held, take abar, take disks, clock)
         return None
     }
     let signal = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
     var irq = match mut held.msi(cpu: 0, dev: Interrupt(signal: signal.share()), on_irq: Interrupt.on_irq) {
         Ok(shared) => shared
         Err(_) => {
-            release(take held, take domain, take abar, take disks, clock)
+            release(take held, take abar, take disks, clock)
             return None
         }
     }
     mut irq.limit(per_second: devices::STORM_LIMIT)
     mut abar.write(Hba.is, value: 0xFFFF_FFFF)
     mut abar.write(Hba.ghc, value: mut abar.read(Hba.ghc) | INTERRUPT_ENABLE)
-    return Some(AhciEnv(function: take held, domain: take domain, abar: take abar, disks: take disks, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, meter: meter, alloc: alloc))
+    return Some(AhciEnv(function: take held, abar: take abar, disks: take disks, irq: take irq, signal: take signal, clock: clock, alarm: take alarm, meter: meter, alloc: alloc))
 } AhciEnv.of
 
 /// Stops the ports, then releases the interrupt, the window and the buffers, and hands the function back.
 pub fn AhciEnv.abandon(take self) {
-    let AhciEnv(function: function, domain: domain, abar: abar, disks: disks, irq: irq, signal: _, clock: clock, alarm: _, meter: _, alloc: _) = self
+    let AhciEnv(function: function, abar: abar, disks: disks, irq: irq, signal: _, clock: clock, alarm: _, meter: _, alloc: _) = self
     discard take irq.uninstall()
-    release(take function, take domain, take abar, take disks, clock)
+    release(take function, take abar, take disks, clock)
 } AhciEnv.abandon
 
-/// Stops each disk's port and frees its memory, then unmaps the window, hands the function back, cut off, and ends the I/O domain it was attached to.
-fn release(
-    take function: hw::PciFunction,
-    take domain: Option[hw::IoDomain],
-    take abar: hw::Mmio[Hba],
-    take disks: mem::List[Disk],
-    clock: sys::Clock,
-    ) {
+/// Stops each disk's port and frees its memory, then unmaps the window and hands the function back, cut off.
+fn release(take function: hw::PciFunction, take abar: hw::Mmio[Hba], take disks: mem::List[Disk], clock: sys::Clock) {
     var window = abar
     for disk in take disks {
         free_disk(take disk, clock)
     }
     mut window.write(Hba.ghc, value: mut window.read(Hba.ghc) & ~INTERRUPT_ENABLE)
     take window.unmap()
-    hand_back(take function, take domain)
-} release
-
-/// Hands `function` back, cut off, then ends the I/O domain it was attached to.
-fn hand_back(take function: hw::PciFunction, take domain: Option[hw::IoDomain]) {
     take function.release()
-    match domain {
-        Some(confining) => take confining.close()
-        None => {
-        }
-    }
-} hand_back
+} release
 
 fn free_disk(take disk: Disk, clock: sys::Clock) {
     let Disk(regs: regs, info: _, area: area, list: _, table: _, segments: segments) = disk

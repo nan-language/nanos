@@ -56,10 +56,11 @@ validator fn copied(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes 
     return bytes
 } copied
 
-/// Runs `run` in an isolated space of the toolchain on `cpu`, its pages taken from `frames` and given back to them, until it ends or its stop closes, and tells its end and what it wrote; the capabilities of its file system and standard streams draw through `alloc`.
+/// Runs `run` in an isolated space of the toolchain for `tenant` on `cpu`, its pages taken from `frames` and given back to them, until it ends or its stop closes, and tells its end and what it wrote; the capabilities of its file system and standard streams draw through `alloc`.
 pkg fn Shipped.run(
     self,
     cpu: hw::Ring0,
+    tenant: u64,
     take run: code::Run,
     mut frames: mem::List[hw::PhysFrame[4_096]],
     exec: task::Executor,
@@ -92,38 +93,20 @@ pkg fn Shipped.run(
     var ended: Result[nanos::Ended, text::Fixed[32]] = Ok(nanos::Ended.Cancelled)
     var inputs = Some(take input)
     var stops = Some(take stop)
-    let scoped = attempt await task::scope(exec, body: fn[mut frames, mut extended, mut ended, mut inputs, mut stops](s: task::Scope) fails task::Cancelled uses wait {
+    let scoped = attempt await nanos::isolate(cpu, tenant, services, mut frames, mut extended, exec, alloc, body: fn[mut ended, mut inputs, mut stops](space: nanos::Isolation) fails task::Cancelled uses wait limits stack 131_072 {
         let Some(given) = mut inputs.extract() else {
             return
         }
         let Some(watched) = mut stops.extract() else {
             return
         }
-        let task::Channel(sender: finishing, receiver: finished) = task::Channel[Result[nanos::Ended, text::Fixed[32]]].bounded(1, alloc)
-        discard s.spawn(fn[take given, take finishing, mut frames, mut extended]() fails task::Cancelled uses wait limits stack 65_536 {
-            let outcome: Result[nanos::Ended, text::Fixed[32]] = match attempt await nanos::run_isolated(cpu, job, services, link, input: take given, mut frames, mut extended, alloc) {
-                Ok(given_end) => Ok(take given_end)
-                Err(nanos::IsolatedError.Cancelled(cancelled)) => fail cancelled
-                Err(nanos::IsolatedError.NoJob) or Err(nanos::IsolatedError.NoChannel) or Err(nanos::IsolatedError.Unplaced(_)) => Err(text::Fixed[32].of("place.unavailable"))
-            }
-            discard attempt await finishing.send(take outcome)
-        })
-        let winner = try await task::race(exec, left: fn[take finished]() -> Option[Result[nanos::Ended, text::Fixed[32]]] fails task::Cancelled uses wait limits stack 4_096 {
-            var receiver = finished
-            return try await mut receiver.receive()
-        }, right: fn[take watched]() -> Option[Result[nanos::Ended, text::Fixed[32]]] fails task::Cancelled uses wait limits stack 4_096 {
-            var waiting = watched
-            discard try await mut waiting.receive()
-            return None
-        })
-        match winner {
+        match try await isolation::ended_job(space, job, link, input: take given, stop: take watched, exec, alloc) {
             Some(outcome) => {
                 ended = outcome
             }
             None => {
             }
         }
-        s.cancel()
     })
     take link.release(mut frames)
     match extended {

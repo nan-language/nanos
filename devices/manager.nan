@@ -82,6 +82,7 @@ pub closed enum Code derives Copy, Eq, Render, Encode {
     ResetFailed
     Aml
     BarUnassigned
+    GroupConflict
 } Code
 
 /// The code's number, which a `device.failed` event carries as its argument.
@@ -95,6 +96,7 @@ pub fn Code.number(self) -> u64 {
         Code.ResetFailed => 6
         Code.Aml => 7
         Code.BarUnassigned => 8
+        Code.GroupConflict => 9
     }
 } Code.number
 
@@ -418,7 +420,7 @@ fn wind_down(
     }
 } wind_down
 
-/// Brings the device at `at` to its binding: the driver the binding chooses, none under `unbound` or the policy `off`, a driver it no longer chooses retired and its device cut off first.
+/// Brings the device at `at` to its binding: the driver the binding chooses, none under `unbound` or the policy `off`, a driver it no longer chooses retired and its device cut off first. A driver whose code would mix provenance classes in the device's IOMMU group binds not: the device is `failed(device.group-conflict)`.
 fn Manager.reconcile(
     mut self,
     at: usize,
@@ -428,9 +430,10 @@ fn Manager.reconcile(
     ) {
     let path = self.records[at].path
     let wanted_by = self.binding_of(path)
+    let entries = loaded_entries(self.sources.view(), alloc: env.alloc)
     let wanted = match wanted_by.power {
         PowerPolicy.Off => Choice.Unbound
-        else => choose(self.records[at].ids, choice: wanted_by.driver, entries: loaded_entries(self.sources.view(), alloc: env.alloc).view())
+        else => choose(self.records[at].ids, choice: wanted_by.driver, entries: entries.view())
     }
     let current = self.records[at].entry
     let held = self.records[at].driver.is_some()
@@ -439,31 +442,56 @@ fn Manager.reconcile(
             if held and current == Some(name) {
                 return
             }
-            let leaving = mut self.detach(at, mut env, mut cx)
-            if held {
-                mut self.emit(env.root, kind: EventKind.Unbound, path, argument: 0, mut cx)
-                mut self.emit(env.root, kind: EventKind.CutOff, path, argument: CUT_STOPPED, mut cx)
-            }
-            mut self.attach(at, name, take leaving, reached, mut env, mut cx)
-        }
-        Choice.Unbound or Choice.Mismatch => {
-            match wanted {
-                Choice.Mismatch => mut self.mark_failed(at, code: Code.DriverMismatch, mut env, mut cx)
-                else => {
-                    self.records[at].status = Status.Converged
-                    mut self.show(at, mut env, mut cx)
+            if not conflicts(self.records.view(), at, name, entries: entries.view()) {
+                let leaving = mut self.detach(at, mut env, mut cx)
+                if held {
+                    mut self.emit(env.root, kind: EventKind.Unbound, path, argument: 0, mut cx)
+                    mut self.emit(env.root, kind: EventKind.CutOff, path, argument: CUT_STOPPED, mut cx)
                 }
-            }
-            if not held {
+                mut self.attach(at, name, take leaving, reached, mut env, mut cx)
                 return
             }
-            let leaving = mut self.detach(at, mut env, mut cx)
-            mut self.emit(env.root, kind: EventKind.Unbound, path, argument: 0, mut cx)
-            mut self.emit(env.root, kind: EventKind.CutOff, path, argument: CUT_STOPPED, mut cx)
-            mut self.retire(path, monikers: take leaving, reset: true, unplugged: false, mut env, mut cx)
+            mut self.mark_failed(at, code: Code.GroupConflict, mut env, mut cx)
+        }
+        Choice.Unbound => {
+            self.records[at].status = Status.Converged
+            mut self.show(at, mut env, mut cx)
+        }
+        Choice.Mismatch => mut self.mark_failed(at, code: Code.DriverMismatch, mut env, mut cx)
+    }
+    if not held {
+        return
+    }
+    let leaving = mut self.detach(at, mut env, mut cx)
+    mut self.emit(env.root, kind: EventKind.Unbound, path, argument: 0, mut cx)
+    mut self.emit(env.root, kind: EventKind.CutOff, path, argument: CUT_STOPPED, mut cx)
+    mut self.retire(path, monikers: take leaving, reset: true, unplugged: false, mut env, mut cx)
+} Manager.reconcile
+
+/// Whether the entry `name` is of another provenance class than the entry of the driver of another device of the IOMMU group of the device at `at` among `records`.
+fn conflicts(records: Slice[LiveDevice], at: usize, name: text::Fixed[20], entries: Slice[DriverEntry]) -> bool {
+    let Some(group) = records[at].iommu_group else {
+        return false
+    }
+    let Some(wanted) = entry_named(name, entries) else {
+        return false
+    }
+    for other in 0..<records.len() {
+        if other == at or records[other].iommu_group != Some(group) or records[other].driver.is_none() {
+            continue
+        }
+        let Some(held) = records[other].entry else {
+            continue
+        }
+        let Some(entry) = entry_named(held, entries) else {
+            continue
+        }
+        if entry.source.provenance() != wanted.source.provenance() {
+            return true
         }
     }
-} Manager.reconcile
+    return false
+} conflicts
 
 /// The binding of the device at `path`: the one set, else the defaults.
 fn Manager.binding_of(self, path: BusPath) -> Binding {
@@ -770,7 +798,7 @@ fn Manager.attach(
     let alloc = env.alloc
     let bundle = match entry.source {
         Source.Image => env.bundle
-        Source.Bundle(code: code, automatic: _) => code
+        Source.Bundle(code: code, provenance: _) => code
     }
     let spec = os::InstanceSpec.of(principal: ident::Principal(text: text::Fixed[64].of("system")), bundle, component: entry.component.as_str(), alloc)
     let key = mut self.key_of(path)
@@ -1192,9 +1220,9 @@ test rematches_rerun_matchable_unbound_devices_and_those_of_changed_entries for 
     let alloc = testing::world().alloc
     let code = ident::HashValue.of_content(b"bundle")
     var previous = mem::List[Sourced].empty(alloc)
-    mut previous.push(Sourced(key: text::Fixed[20].of("gone"), source: Source.Bundle(code: code, automatic: true)))
+    mut previous.push(Sourced(key: text::Fixed[20].of("gone"), source: Source.Bundle(code: code, provenance: os::Provenance.Vendor)))
     var current = mem::List[Sourced].empty(alloc)
-    mut current.push(Sourced(key: text::Fixed[20].of("probe"), source: Source.Bundle(code: code, automatic: true)))
+    mut current.push(Sourced(key: text::Fixed[20].of("probe"), source: Source.Bundle(code: code, provenance: os::Provenance.Vendor)))
     var records = mem::List[LiveDevice].empty(alloc)
     mut records.push(device_at(1, entry: None, status: Status.Converged, alloc))
     mut records.push(device_at(2, entry: None, status: Status.Converged, alloc))
@@ -1207,6 +1235,30 @@ test rematches_rerun_matchable_unbound_devices_and_those_of_changed_entries for 
     let rerun = rematched(records.view(), core: core.view(), previous: previous.view(), current: current.view(), alloc)
     expect rerun.len() == 3 and rerun[0] == 0 and rerun[1] == 4 and rerun[2] == 5
 } rematches_rerun_matchable_unbound_devices_and_those_of_changed_entries
+
+test drivers_of_one_iommu_group_share_one_provenance_class for conflicts {
+    let alloc = testing::world().alloc
+    let code = ident::HashValue.of_content(b"bundle")
+    var entries = mem::List[DriverEntry].empty(alloc)
+    mut entries.push(entry_from("image-blk", source: Source.Image))
+    mut entries.push(entry_from("agent-blk", source: Source.Bundle(code: code, provenance: os::Provenance.Agent)))
+    mut entries.push(entry_from("vendor-blk", source: Source.Bundle(code: code, provenance: os::Provenance.Vendor)))
+    var records = mem::List[LiveDevice].empty(alloc)
+    mut records.push(device_at(1, entry: Some("image-blk"), status: Status.Converged, alloc))
+    mut records.push(device_at(2, entry: None, status: Status.Pending, alloc))
+    mut records.push(device_at(3, entry: None, status: Status.Pending, alloc))
+    records[0].driver = Some(ident::Moniker(text: text::Fixed[59].of("image-blk")))
+    records[0].iommu_group = Some(8)
+    records[1].iommu_group = Some(8)
+    records[2].iommu_group = Some(16)
+    expect conflicts(records.view(), at: 1, name: text::Fixed[20].of("agent-blk"), entries: entries.view())
+    expect not conflicts(records.view(), at: 1, name: text::Fixed[20].of("vendor-blk"), entries: entries.view())
+    expect not conflicts(records.view(), at: 2, name: text::Fixed[20].of("agent-blk"), entries: entries.view())
+} drivers_of_one_iommu_group_share_one_provenance_class
+
+fn entry_from(name: Str, source: Source) -> DriverEntry {
+    return DriverEntry(name: text::Fixed[20].of(name), matches: Array[DeviceMatch, 4].filled(DeviceMatch.None), class: Class.Block, component: text::Fixed[48].of(name), priority: 0, source: source)
+} entry_from
 
 fn device_at(slot: u8, entry: Option[Str], status: Status, alloc: mem::Alloc) -> LiveDevice {
     let named = match entry {

@@ -277,7 +277,7 @@ Placement is computed when an instance starts, from its bundle's [admission reco
 4. it acts for `system` or `owner`;
 5. its spec's `placement` is not `isolated`.
 
-Admission records conditions 1 and 2 as the bundle's `shared` field. Every other instance runs in the **isolated space** of its principal and provenance class, one space per pair (requires [N55](22-nan.md#n55)), named `<principal>/<class>` in `/live`. `keys` runs alone in the isolated space `keys` (requires [N54](22-nan.md#n54)); the other base instances run in the shared space. The mechanics of spaces are [placement mechanics](04-kernel.md#placement-mechanics); isolated spaces require [N23](22-nan.md#n23).
+Admission records conditions 1 and 2 as the bundle's `shared` field. Every other instance runs in the **isolated space** of its principal and provenance class, one space per pair (requires [N55](22-nan.md#n55), [N63](22-nan.md#n63)), named `<principal>/<class>` in `/live`. `keys` runs alone in the isolated space `keys` (requires [N54](22-nan.md#n54)); the other base instances run in the shared space. The mechanics of spaces are [placement mechanics](04-kernel.md#placement-mechanics); isolated spaces require [N23](22-nan.md#n23).
 
 ### Machine conditions
 

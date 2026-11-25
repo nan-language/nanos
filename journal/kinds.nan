@@ -100,6 +100,9 @@ pub const IOMMU_FAILED: u16 = 32
 /// `place.moved`, whose payload `Wide` lays out: the label of the space the instance left, then of the one it moved to.
 pub const PLACE_MOVED: u16 = 33
 
+/// `device.dma-fault`, whose payload `Wide` lays out: the address of the page the access reached, the device's bus path and whether it wrote.
+pub const DEVICE_DMA_FAULT: u16 = 34
+
 /// The payload bytes of a record of a kind of two continuations: its argument's 8 bytes, least significant first, then the bytes of each continuation.
 pub closed struct Wide derives Copy {
     pub bytes: Array[u8, 72]
@@ -144,6 +147,13 @@ pub closed struct CodeLoaded derives Render, Encode {
     pub space: text::String
     pub code_bytes: u64
 } CodeLoaded
+
+/// The payload of `device.dma-fault`: the bus path of the function whose DMA requester id made the access, the address of the page it reached, and `read` or `write`.
+pub closed struct DmaFaulted derives Render, Encode {
+    pub path: text::String
+    pub address: u64
+    pub access: text::String
+} DmaFaulted
 
 /// The payload of `place.moved`: the instance that restarted in another space, the label of the space it left and of the one it runs in.
 pub closed struct PlaceMoved derives Render, Encode {
@@ -351,6 +361,7 @@ pub fn kind_name(kind: u16) -> text::Fixed[32] {
         UPDATE_REVERTED => "update.reverted"
         IOMMU_FAILED => "fault.iommu-failed"
         PLACE_MOVED => "place.moved"
+        DEVICE_DMA_FAULT => "device.dma-fault"
         else => "unknown"
     })
 } kind_name
@@ -384,7 +395,7 @@ pub fn RingRecord.continued(self) -> bool = (self.flags & CONTINUED) != 0
 
 /// The continuations a continued record of kind `kind` has: two for the kinds `Wide` lays out, one otherwise.
 pub fn continuations(kind: u16) -> usize {
-    if (kind >= CODE_LOADED and kind <= UPDATE_REVERTED) or kind == PLACE_MOVED {
+    if (kind >= CODE_LOADED and kind <= UPDATE_REVERTED) or kind == PLACE_MOVED or kind == DEVICE_DMA_FAULT {
         return 2
     }
     return 1
@@ -418,6 +429,17 @@ pub fn Wide.of_code(code: ident::HashValue, code_bytes: u64, space: Str) -> Wide
     mut wide.put_text(from: 41, to: 72, text: space)
     return wide
 } Wide.of_code
+
+/// The payload of `device.dma-fault` of an access of the device at `path` to the page at `address`, a write when `write`: the address, the path cut to 32 bytes, then 1 for a write.
+pub fn Wide.of_dma_fault(path: Str, address: u64, write: bool) -> Wide {
+    var wide = Wide(bytes: Array[u8, 72].filled(0))
+    mut wide.put_number(at: 0, value: address)
+    mut wide.put_text(from: 8, to: 40, text: path)
+    if write {
+        wide.bytes[40] = 1
+    }
+    return wide
+} Wide.of_dma_fault
 
 /// The payload of `place.moved` from the space labelled `old` to the one labelled `new`: each label in 36 bytes.
 pub fn Wide.of_move(old: Str, new: Str) -> Wide {
@@ -637,6 +659,10 @@ fn CoreRecord.payload(self, alloc: mem::Alloc) -> Payload {
         BOOT_CANDIDATE_FAILED => payload_of(CandidateFailed(generation: argument, code: text_of(more, alloc)), alloc)
         CODE_LOADED => payload_of(CodeLoaded(code: self.wide().hash(at: 8), space: self.wide().text(from: 41, to: 72, alloc), code_bytes: argument), alloc)
         CODE_UNLOADED => payload_of(CodeUnloaded(code: self.wide().hash(at: 8), space: self.wide().text(from: 41, to: 72, alloc)), alloc)
+        DEVICE_DMA_FAULT => payload_of(DmaFaulted(path: self.wide().text(from: 8, to: 40, alloc), address: argument, access: text::String.of(match self.wide().bytes[40] {
+            1 => "write"
+            else => "read"
+        }, alloc)), alloc)
         PLACE_MOVED => payload_of(PlaceMoved(moniker: ident::Moniker(text: self.source.text), old: self.wide().text(from: 0, to: 36, alloc), new: self.wide().text(from: 36, to: 72, alloc)), alloc)
         UPDATE_STARTED => payload_of(UpdateStarted(moniker: ident::Moniker(text: self.source.text), old: self.wide().hash(at: 1), new: self.wide().hash(at: 34), class: match self.wide().bytes[0] {
             1 => MigrationClass.Additive
@@ -820,6 +846,21 @@ test events_carry_the_labels_of_their_spaces for Wide.of_move {
     }
     expect into.space.as_str() == "agent.ops/reviewed" and into.code_bytes == 9 and into.code == ident::HashValue(bytes: code)
 } events_carry_the_labels_of_their_spaces
+
+test dma_faults_carry_the_device_page_and_access for Wide.of_dma_fault {
+    let alloc = testing::world().alloc
+    let wide = Wide.of_dma_fault(path: "pci/0000.00.1f.2", address: 0x7000, write: true)
+    var more = mem::List[RingRecord].empty(alloc)
+    mut more.push(wide.continuation(0))
+    mut more.push(wide.continuation(1))
+    let faulted = CoreRecord(record: RingRecord(time: 5, cause: 0, source: 0, kind: DEVICE_DMA_FAULT, severity: 4, flags: CONTINUED, argument: wide.argument()), more: take more, source: ident::Moniker(text: text::Fixed[59].of("kernel")), sender: None).event(ident::Cause.of(boot: 2, number: 1), alloc)
+    let Ok(payload) = attempt mem::wire::Codec[DmaFaulted].decode(Untrusted.of(faulted.payload.bytes.view()), alloc) else {
+        expect false
+        return
+    }
+    expect faulted.kind.as_str() == "device.dma-fault" and continuations(DEVICE_DMA_FAULT) == 2
+    expect payload.path.as_str() == "pci/0000.00.1f.2" and payload.address == 0x7000 and payload.access.as_str() == "write"
+} dma_faults_carry_the_device_page_and_access
 
 test traps_give_fault_records_and_boots_their_system_cause for CoreRecord.fault {
     let alloc = testing::world().alloc

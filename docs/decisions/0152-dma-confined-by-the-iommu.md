@@ -1,6 +1,6 @@
 # 0152. DMA confined by the IOMMU
 
-Status: accepted
+Status: superseded by 0155
 
 ## Context
 

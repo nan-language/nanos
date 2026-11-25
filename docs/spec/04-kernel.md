@@ -126,7 +126,7 @@ On a machine without `meltdown-immune`, each isolated space has a second root, i
 [Placement](09-authority.md#placement) decides, when an instance starts, whether it runs in the shared space or in an isolated space; the core carries the decision out.
 
 - An instance placed shared runs its tasks in ring 0.
-- An instance placed isolated runs in the isolated space that placement names. The core creates an isolated space when an instance first starts in it, and destroys it, freeing its tables, when its last instance has stopped.
+- An instance placed isolated runs in the isolated space that placement names. The core creates an isolated space when an instance first starts in it, and destroys it, freeing its tables, when its last instance has stopped (requires [N55](22-nan.md#n55), [N63](22-nan.md#n63)).
 - The runner loads a bundle into each space where an instance of it starts ([loading](10-code.md#loading)).
 - An instance moves to another space only by a restart there ([provenance](09-authority.md#provenance)).
 - On a machine without `user-mode`, the core creates no isolated space ([machine conditions](09-authority.md#machine-conditions)).

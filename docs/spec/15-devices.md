@@ -96,7 +96,7 @@ The windows, interrupt bindings (`hw::IrqShared`) and DMA rings (`hw::DmaShared`
 
 `devices` binds a driver by these steps:
 
-1. It allocates the device's vectors and, on a machine with `iommu`, a new IOMMU domain for its group, and enables memory and I/O decoding; with no vector left the device gets `failed(device.no-vectors)`.
+1. It allocates the device's vectors and, on a machine with `iommu`, attaches it to the IOMMU domain of its group, and enables memory and I/O decoding; with no vector left the device gets `failed(device.no-vectors)`.
 2. It writes the driver's spec at `/sys/instances/<moniker>` and its `Device` grant, held by `inst.<moniker>`, in one commit. Before the store is mounted, it starts the driver from these records and commits them once the store is mounted.
 3. The runner [starts](06-execution.md#starting) the driver, and `devices` enables bus mastering once the Env holds the DMA allocator. A [placement](09-authority.md#placement) refusal gives the device `failed` with the placement code.
 4. It has the runner call the driver's `health()` ([system interfaces](06-execution.md#system-interfaces)). No return within 5 s gives `failed(device.start-timeout)`, a trap or `Unhealthy` gives `failed(device.unhealthy)`, and either cuts the device off.
@@ -242,7 +242,7 @@ Power off and reboot use `\_S5`, which `devices.aml` evaluates, and the FADT res
 
 **Cut-off** ends a device's access to memory and interrupts. When a driver's domain is abandoned (a trap, a CPU exception, the handler time limit, a DMA fault or an interrupt storm), these steps run before [settlement](https://github.com/nan-language/nan/blob/main/docs/spec/11-errors-domains.md#settlement) frees its memory (requires [N13](22-nan.md#n13)):
 
-1. The core detaches the group's IOMMU domain on a machine with `iommu`, or clears the function's bus master bit; the device's DMA then faults or stops. `device.cut-off` is emitted with the reason.
+1. The core detaches the function from its group's IOMMU domain on a machine with `iommu`, or clears its bus master bit; the device's DMA then faults or stops. `device.cut-off` is emitted with the reason.
 2. It masks the device's vectors and uninstalls the driver's interrupt bindings.
 3. It resets the function by function level reset when supported. A function unresponsive 1 s after its reset gets `failed(device.reset-failed)` and stays cut off.
 4. It acknowledges every device operation the driver had in flight ([NaN 17 §Acknowledged cancellation](https://github.com/nan-language/nan/blob/main/docs/spec/17-suspension-io.md#acknowledged-cancellation)), and settlement frees the driver's DMA memory.

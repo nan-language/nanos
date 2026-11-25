@@ -434,7 +434,7 @@ fn Base.serve_rng(self, take world: nanos::World, take serving: runner::Serving)
     let Some(path) = claimed_path(world) else {
         return runner::Ended.EnvIncomplete
     }
-    match try await self.claimed(path, alloc) {
+    match try await self.claimed(path, serving, alloc) {
         Some(devices::Claimed.Pci(attached)) => {
             let Some(env) = drivers::virtio::RngEnv.of(take attached, clock: world.clock, alarm: self.alarm(path, serving), alloc) else {
                 return runner::Ended.EnvIncomplete
@@ -453,7 +453,7 @@ fn Base.serve_blk(self, take world: nanos::World, take serving: runner::Serving)
     let Some(path) = claimed_path(world) else {
         return runner::Ended.EnvIncomplete
     }
-    match try await self.claimed(path, alloc) {
+    match try await self.claimed(path, serving, alloc) {
         Some(devices::Claimed.Pci(attached)) => {
             let Some(env) = drivers::virtio::BlkEnv.of(take attached, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
@@ -470,7 +470,7 @@ fn Base.serve_nvme(self, take world: nanos::World, take serving: runner::Serving
     let Some(path) = claimed_path(world) else {
         return runner::Ended.EnvIncomplete
     }
-    match try await self.claimed(path, alloc) {
+    match try await self.claimed(path, serving, alloc) {
         Some(devices::Claimed.Pci(attached)) => {
             let Some(env) = drivers::nvme::NvmeEnv.of(take attached, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
@@ -489,7 +489,7 @@ fn Base.serve_platform(self, component: Str, take world: nanos::World, take serv
         return runner::Ended.EnvIncomplete
     }
     var resources = mem::List[devices::Resource].empty(alloc)
-    match try await self.claimed(path, alloc) {
+    match try await self.claimed(path, serving, alloc) {
         Some(devices::Claimed.Platform(claimed)) => {
             resources = claimed
         }
@@ -560,7 +560,7 @@ fn Base.serve_ahci(self, take world: nanos::World, take serving: runner::Serving
     let Some(path) = claimed_path(world) else {
         return runner::Ended.EnvIncomplete
     }
-    match try await self.claimed(path, alloc) {
+    match try await self.claimed(path, serving, alloc) {
         Some(devices::Claimed.Pci(attached)) => {
             let Some(env) = drivers::ahci::AhciEnv.of(take attached, clock: world.clock, alarm: self.alarm(path, serving), meter: self.meter, alloc) else {
                 return runner::Ended.EnvIncomplete
@@ -879,9 +879,9 @@ fn Base.alarm(self, path: devices::BusPath, serving: runner::Serving) -> devices
     return devices::Alarm.of(root: self.root, path, abandoner: serving.abandoner.share())
 } Base.alarm
 
-/// The hardware of the device at `path` for its driver, `None` when a driver holds it or the keeper holds no such device.
-fn Base.claimed(self, path: devices::BusPath, alloc: mem::Alloc) -> Option[devices::Claimed] fails task::Cancelled uses wait {
-    let ordered = match first attempt await self.claims.claim(path, alloc, release: release_claimed) {
+/// The hardware of the device at `path` for the driver `serving` serves, whose domain the keeper abandons at a DMA fault, `None` when a driver holds it or the keeper holds no such device.
+fn Base.claimed(self, path: devices::BusPath, serving: runner::Serving, alloc: mem::Alloc) -> Option[devices::Claimed] fails task::Cancelled uses wait {
+    let ordered = match first attempt await self.claims.claim(path, abandoner: serving.abandoner.share(), alloc, release: release_claimed) {
         Ok(receiver) => receiver
         Err(devices::RootError.Cancelled(cancelled)) => fail cancelled
         Err(_) => return None
@@ -912,15 +912,10 @@ fn release_claimed(take claimed: Option[devices::Claimed]) {
     }
 } release_claimed
 
-/// Hands an attached function back to the keeper, cut off, then ends the I/O domain it was attached to.
+/// Hands an attached function back to the keeper, cut off.
 fn release_attached(take attached: devices::Attached) {
-    let devices::Attached(function: function, domain: domain, space: _, external: _) = attached
+    let devices::Attached(function: function, space: _, external: _) = attached
     take function.release()
-    match domain {
-        Some(confining) => take confining.close()
-        None => {
-        }
-    }
 } release_attached
 
 /// The genesis record the kernel image holds: the specification of each base instance, acting for `system` and running the image's bundle `bundle`, the root grant `g0`, the base instances' grants, and on a claimed machine or in `dev` mode the owner's grant.
@@ -1193,13 +1188,12 @@ fn boot_record(handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::
     return store::service::TypedValue(type: store::TypeRef.of(BOOT_STATE_TYPE, schema: mem::wire::Codec[bootfmt::BootState].schema_hash(), alloc), bytes: take bytes)
 } boot_record
 
-/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, attaching claimed functions through `iommu`, the core carves the regions of reserved instances from `frames`, prints each event `rings` record, holds the board of `/live`, `machine` its first record, writes each CPU's energy-performance preference through `cpu` on a machine with HWP, loads jobs' bundles through `loader`, and runs the toolchain `shipped`, when the start isolated one, drawing through NaN's boot heap `heap`; it never ends unless cancelled.
+/// Runs the base instances of `known` and starts `supervisor`, which starts the others in their order, while the keeper serves the device root, the core carves the regions of reserved instances from `frames`, prints each event `rings` record, holds the board of `/live`, `machine` its first record, writes each CPU's energy-performance preference through `cpu` on a machine with HWP, loads jobs' bundles through `loader`, and runs the toolchain `shipped`, when the start isolated one, drawing through NaN's boot heap `heap`; it never ends unless cancelled.
 fn run_base(
     cpu: hw::Ring0,
     rapl: Option[cpu::Rapl],
     take known: runner::Known,
     take keeper: keeper::Keeper,
-    iommu: Option[hw::Iommu],
     bundle: ident::HashValue,
     support: ident::HashValue,
     boot: devices::BootVolume,
@@ -1288,19 +1282,19 @@ fn run_base(
         discard s.spawn(fn[take toolchain_runs, mut spaces]() fails task::Cancelled uses wait limits stack 65_536 {
             try await serve_toolchain(cpu, shipped, runs: take toolchain_runs, frames: mut spaces, exec: config.exec, alloc: heap)
         })
-        let signal = held.slot_signal()
+        let signal = held.interrupts()
         let task::Channel(sender: inputs, receiver: received) = task::Channel[keeper::Input].bounded(16, alloc: config.alloc)
         let forwarding = inputs.split()
         discard s.spawn(fn[take held, take received]() fails task::Cancelled uses wait limits stack 32_768 {
             var keeping = held
             defer take keeping.release()
-            try await mut keeping.serve(take received, rings, iommu, alloc: config.alloc)
+            try await mut keeping.serve(take received, rings, alloc: config.alloc)
         })
         discard s.spawn(fn[take root_orders, take forwarding]() fails task::Cancelled uses wait limits stack 8_192 {
             try await keeper::forward(take root_orders, inputs: take forwarding)
         })
         discard s.spawn(fn[take signal, take inputs]() fails task::Cancelled uses wait limits stack 8_192 {
-            try await keeper::relay_slots(signal, take inputs)
+            try await keeper::relay_interrupts(signal, take inputs)
         })
         discard s.spawn(fn[take genesis, take resources, take account_orders, take gauges, take tracing, take arming_orders, take grants_in]() fails task::Cancelled uses wait limits stack 40_960 {
             discard try await runner::run(take genesis, components: base, journal: rings, machine: take resources, accounting: take account_orders, config, postings: posted, logs: logs.split(), gauges, tracings: take tracing, arming: take arming_orders, granting: take grants_in, body: fn(core: runner::Core) fails task::Cancelled uses wait {
