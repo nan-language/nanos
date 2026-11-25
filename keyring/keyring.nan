@@ -1,0 +1,248 @@
+//! The `keys` instance: the link, audit and keyring master keys it generates from the kernel's entropy and keeps in plaintext in its checkpoint, the principal records it writes at enrollment, rotation and revocation, and the signatures it verifies against them.
+
+/// The key of the keyed task bringing `/sys/principals/owner` to the loader's owner key.
+const OWNING: u64 = 1
+
+/// The key of the keyed task publishing what `keys` tells of the machine's security.
+const SHOWING: u64 = 2
+
+/// The key of the keyed task serving a request, plus its number.
+const SERVING: u64 = 0x1_0000_0000
+
+/// The type of the part of `/live/security` `keys` publishes.
+const KEYS_SECURITY_TYPE: Str = "os::KeysSecurity"
+
+/// The state of `keys`, its checkpoint: the machine's keys once generated.
+pub closed struct Keyring derives Encode {
+    pub held: Option[keys::Held]
+} Keyring
+
+impl Keyring: sys::Component[keys::Env, keys::Keys]
+
+impl Keyring: sys::Resume[keys::Env, keys::Keys]
+
+pub fn Keyring.start(mut env: keys::Env) -> Keyring = Keyring(held: None)
+
+/// Once its checkpoints are kept, generates the machine's keys when it holds none and has them checkpointed at once, publishes its part of `/live/security`, and brings the owner's record to the loader's owner key.
+pub fn Keyring.resume(mut self, reason: sys::ResumeReason, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
+    if not env.kept {
+        return
+    }
+    if self.held.is_none() {
+        self.held = Some(keys::generated(env.random))
+        discard attempt mut cx.sync()
+    }
+    mut self.show(mut env, mut cx)
+    let principals = env.principals
+    let events = env.events
+    let owner = env.owner
+    let alloc = env.alloc
+    mut cx.spawn(key: OWNING, run: fn(out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        try await keys::own(principals, events, owner, alloc)
+    })
+} Keyring.resume
+
+pub fn Keyring.verify(
+    mut self,
+    take principal: ident::Principal,
+    take kind: text::String,
+    take subject: ident::HashValue,
+    take signature: ident::Signature,
+    take former: bool,
+    mut env: keys::Env,
+    mut cx: sys::Cx[keys::Keys],
+    ) fails keys::KeysFailure {
+    let principals = env.principals
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail keys::KeysFailure.Unavailable
+    }
+    mut cx.spawn(key: SERVING + request, run: fn[take principal, take kind](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        let outcome = try await keys::verify(principals, principal, kind: kind.as_str(), subject, signature, former, alloc)
+        discard attempt await keys::answer(out, request, reply: keys::reply_of(outcome, alloc))
+    })
+    fail keys::KeysFailure.Unavailable
+} Keyring.verify
+
+pub fn Keyring.verify_key(
+    mut self,
+    take principal: ident::Principal,
+    take kind: text::String,
+    take key: Array[u8, 32],
+    take former: bool,
+    mut env: keys::Env,
+    mut cx: sys::Cx[keys::Keys],
+    ) fails keys::KeysFailure {
+    let principals = env.principals
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail keys::KeysFailure.Unavailable
+    }
+    mut cx.spawn(key: SERVING + request, run: fn[take principal, take kind](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        let outcome = try await keys::verify_key(principals, principal, kind: kind.as_str(), key, former, alloc)
+        discard attempt await keys::answer(out, request, reply: keys::reply_of(outcome, alloc))
+    })
+    fail keys::KeysFailure.Unavailable
+} Keyring.verify_key
+
+pub fn Keyring.enroll(
+    mut self,
+    take principal: ident::Principal,
+    take key: Array[u8, 32],
+    mut env: keys::Env,
+    mut cx: sys::Cx[keys::Keys],
+    ) fails keys::KeysFailure {
+    if not env.kept {
+        fail keys::KeysFailure.Unavailable
+    }
+    if not keys::enrollable(principal) {
+        fail keys::KeysFailure.InvalidOperand
+    }
+    let principals = env.principals
+    let data = env.data
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail keys::KeysFailure.Unavailable
+    }
+    mut cx.spawn(key: SERVING + request, run: fn[take principal](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        let outcome = try await keys::enroll(principals, data, take principal, key, alloc)
+        discard attempt await keys::answer(out, request, reply: keys::reply_of(outcome, alloc))
+    })
+    fail keys::KeysFailure.Unavailable
+} Keyring.enroll
+
+pub fn Keyring.issue(mut self, take child: ident::Principal, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) -> keys::Issued fails keys::KeysFailure {
+    if not env.kept {
+        fail keys::KeysFailure.Unavailable
+    }
+    let seed = keys::drawn(env.random)
+    return keys::Issued(key: core::crypto::SecretKey.of_seed(seed).public_key().bytes, seed: seed)
+} Keyring.issue
+
+/// The envelope of a secret record: its secret id, a random nonce, and the XChaCha20-Poly1305 sealing of `value` under its node key, with the secret id and `schema` as associated data.
+pub fn Keyring.seal_secret(
+    mut self,
+    take secret: u64,
+    take seed: Array[u8, 32],
+    take schema: ident::HashValue,
+    take value: mem::Bytes,
+    mut env: keys::Env,
+    mut cx: sys::Cx[keys::Keys],
+    ) -> mem::Bytes fails store::service::Failure {
+    let Some(held) = self.held else {
+        fail store::service::Failure.Denied
+    }
+    let alloc = env.alloc
+    var nonce = Array[u8, 24].filled(0)
+    discard attempt env.random.fill(mut nonce.view_mut())
+    var envelope = mem::Bytes.empty(alloc)
+    for at in 0..<8u32 {
+        mut envelope.push(u8.truncate(secret >> (8 * at)))
+    }
+    var aad = mem::Bytes.empty(alloc)
+    mut aad.append(envelope.view())
+    mut aad.append(schema.bytes.view())
+    mut envelope.append(nonce.view())
+    mut envelope.append(crypto::seal(keys::node_key(held.master, seed, secret, alloc), nonce, aad: aad.view(), plain: value.view(), alloc).view())
+    return envelope
+} Keyring.seal_secret
+
+pub fn Keyring.rotate(mut self, take rotation: keys::Rotation, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) fails keys::KeysFailure {
+    if not env.kept {
+        fail keys::KeysFailure.Unavailable
+    }
+    let events = env.events
+    let alloc = env.alloc
+    match rotation {
+        keys::Rotation.Principal(principal: principal, key: key) => {
+            let principals = env.principals
+            let Some(request) = mut cx.postpone() else {
+                fail keys::KeysFailure.Unavailable
+            }
+            mut cx.spawn(key: SERVING + request, run: fn[take principal](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+                let outcome = try await keys::rotate(principals, principal: ident::Principal(text: principal.text), key, alloc)
+                if outcome.is_ok() {
+                    try await events.emit("auth.key-rotated", severity: journal::Severity.Notice, payload: keys::KeyRotated.Principal(take principal), alloc)
+                }
+                discard attempt await keys::answer(out, request, reply: keys::reply_of(outcome, alloc))
+            })
+            fail keys::KeysFailure.Unavailable
+        }
+        keys::Rotation.Link => {
+            let Some(held) = mut self.held.extract() else {
+                fail keys::KeysFailure.Unavailable
+            }
+            self.held = Some(keys::Held(link_static: keys::drawn(env.random), link_identity: keys::drawn(env.random), audit: held.audit, master: held.master))
+            mut self.rotated(keys::KeyRotated.Link, mut env, mut cx)
+        }
+        keys::Rotation.Audit => {
+            let Some(held) = mut self.held.extract() else {
+                fail keys::KeysFailure.Unavailable
+            }
+            self.held = Some(keys::Held(link_static: held.link_static, link_identity: held.link_identity, audit: keys::drawn(env.random), master: held.master))
+            mut self.rotated(keys::KeyRotated.Audit, mut env, mut cx)
+        }
+    }
+} Keyring.rotate
+
+pub fn Keyring.revoke(mut self, take principal: ident::Principal, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) fails keys::KeysFailure {
+    if not env.kept {
+        fail keys::KeysFailure.Unavailable
+    }
+    let principals = env.principals
+    let events = env.events
+    let alloc = env.alloc
+    let Some(request) = mut cx.postpone() else {
+        fail keys::KeysFailure.Unavailable
+    }
+    mut cx.spawn(key: SERVING + request, run: fn[take principal](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        let outcome = try await keys::revoke(principals, principal: ident::Principal(text: principal.text), alloc)
+        if outcome.is_ok() {
+            try await events.emit("auth.key-revoked", severity: journal::Severity.Notice, payload: keys::KeyRevoked(principal: take principal), alloc)
+        }
+        discard attempt await keys::answer(out, request, reply: keys::reply_of(outcome, alloc))
+    })
+    fail keys::KeysFailure.Unavailable
+} Keyring.revoke
+
+fn Keyring.answered(
+    mut self,
+    take request: u64,
+    take reply: sys::Encoded,
+    mut env: keys::Env,
+    mut cx: sys::Cx[keys::Keys],
+    ) {
+    discard attempt mut cx.reply(request, reply)
+    mut cx.cancel(key: SERVING + request)
+} Keyring.answered
+
+/// Has the rotated machine keys checkpointed at once, emits `auth.key-rotated` naming `rotated` and publishes the new public keys.
+fn Keyring.rotated(mut self, take rotated: keys::KeyRotated, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
+    discard attempt mut cx.sync()
+    mut self.show(mut env, mut cx)
+    let events = env.events
+    let alloc = env.alloc
+    mut cx.spawn(key: SERVING, run: fn[take rotated](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        try await events.emit("auth.key-rotated", severity: journal::Severity.Notice, payload: rotated, alloc)
+    })
+} Keyring.rotated
+
+/// Publishes the part of `/live/security` `keys` tells: whether it runs in its isolated space, that it keeps its keys in software, and the public halves of the link key.
+fn Keyring.show(mut self, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
+    let alloc = env.alloc
+    let identity = match self.held {
+        Some(held) => core::crypto::SecretKey.of_seed(held.link_identity).public_key().bytes
+        None => return
+    }
+    var ed25519 = mem::Bytes.empty(alloc)
+    mut ed25519.append(identity.view())
+    let space = match env.isolated {
+        true => os::KeysSpace.Isolated
+        false => os::KeysSpace.Unconfined
+    }
+    let part = os::KeysSecurity(keys: space, key_storage: os::KeyStorage.Software, link_keys: os::LinkKeys(x25519: mem::Bytes.empty(alloc), ed25519: take ed25519))
+    let live = env.live
+    mut cx.spawn(key: SHOWING, run: fn[take part](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        try await live.publish(type: KEYS_SECURITY_TYPE, value: part, alloc)
+    })
+} Keyring.show

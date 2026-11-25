@@ -27,7 +27,13 @@ const STORE_SERVICE: Str = "store::service::Service"
 
 const JOURNAL: Str = "journal::Recorder"
 
-const KEYS: Str = "keys::Keyring"
+const KEYS: Str = "keyring::Keyring"
+
+/// The entry the `keyring` bundle exports `keys` under.
+const KEYRING_ENTRY: Str = "Keyring"
+
+/// The memory limit of `keys`.
+const KEYS_MEMORY: u64 = 16_777_216
 
 const POLICY: Str = "policy::Overseer"
 
@@ -84,7 +90,7 @@ const TRANSFER_ROOM: usize = 256
 /// How long after the core's start `store`, `keys`, `journal` and `policy` may take to run.
 const BASE_DEADLINE_NS: u64 = 30_000_000_000
 
-/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the hash of the support routines the image exports, the bytes the image spans, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, the switch of the machine's power, where `link` publishes `/live/sessions` and learns the instances calling it, the loader of jobs' bundles, and the load-time registries.
+/// The base components, by the canonical path of their state type: what they reach of the core is the device root, its claiming copy, the bundle the image's instances run, the hash of the support routines the image exports, the bytes the image spans, the boot volume the handoff record names, where the MADT routes each ISA interrupt, where the store reports its events, the wall clock, the handoff record, the feed of the core rings, where `keys` publishes its part of `/live/security` and `boot` `/live/boot`, the machine's measured facts, the switch of the machine's power, where `link` publishes `/live/sessions` and learns the instances calling it, the loader of jobs' bundles, the load-time registries, and the `keyring` bundle the generation ships.
 struct Base derives Copy {
     root: devices::Root
     claims: devices::Root
@@ -113,6 +119,7 @@ struct Base derives Copy {
     registries: devices::Registries
     jobs: BaseJobs
     toolchain: Option[code::Toolchain]
+    keyring: Option[loading::Shipped]
 } Base
 
 impl Base: runner::Components
@@ -289,7 +296,15 @@ fn config_type(component: Str) -> Option[text::Fixed[32]] {
     return None
 } config_type
 
-fn Base.serve(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+fn Base.serve(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> Result[runner::Ended, sys::Trap] fails task::Cancelled uses wait {
+    if component == KEYS {
+        return try await self.serve_keys(take world, take serving)
+    }
+    return Ok(try await self.served(component, take world, take serving))
+} Base.serve
+
+/// Runs an instance of the component of the kernel image `component`.
+fn Base.served(self, component: Str, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     if component == DEVICES {
         let Ok(control) = attempt nanos::Cap[os::Control].get(world.caps, key: "control") else {
             return runner::Ended.EnvIncomplete
@@ -335,9 +350,6 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     if component == JOURNAL {
         return try await self.serve_journal(take world, take serving)
     }
-    if component == KEYS {
-        return try await self.serve_keys(take world, take serving)
-    }
     if component == POLICY {
         return try await self.serve_policy(take world, take serving)
     }
@@ -368,7 +380,7 @@ fn Base.serve(self, component: Str, take world: nanos::World, take serving: runn
     mut peers.push(sys::Wire[store::service::Watcher].schema(alloc))
     return try await runner::Driven[supervisor::Supervision, supervisor::Env, supervisor::Supervisor].run(take env, exec, alloc, take serving, take peers, release: fn(take ended: supervisor::Env) limits stack 512 {
     })
-} Base.serve
+} Base.served
 
 fn Base.run_job(
     self,
@@ -615,28 +627,50 @@ fn Base.serve_journal(self, take world: nanos::World, take serving: runner::Serv
     })
 } Base.serve_journal
 
-/// Serves `keys` on its Views of `/sys/principals` and `/data`, the kernel's entropy, its source of events, its part of `/live/security` and the owner key the handoff record names, keeping its checkpoints when `serving` does.
-fn Base.serve_keys(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+/// Serves `keys` from the `keyring` bundle the generation ships, on its Views of `/sys/principals` and `/data`, the kernel's entropy, its source of events, its part of `/live/security` and what its start tells it: the owner key the handoff record names and whether `serving` keeps its checkpoints. It runs alone in its isolated space on a machine with `user-mode`, else in the shared space; without the bundle it is unloadable.
+fn Base.serve_keys(self, take world: nanos::World, take serving: runner::Serving) -> Result[runner::Ended, sys::Trap] fails task::Cancelled uses wait {
     let alloc = world.alloc
-    let Ok(principals) = attempt nanos::Cap[store::service::View].get(world.caps, key: "principals") else {
-        return runner::Ended.EnvIncomplete
+    let Some(keyring) = self.keyring else {
+        return Ok(no_image())
     }
-    let Ok(data) = attempt nanos::Cap[store::service::View].get(world.caps, key: "data") else {
-        return runner::Ended.EnvIncomplete
+    let Some(image) = keyring.image(alloc) else {
+        return Ok(no_image())
     }
-    let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
-        return runner::Ended.EnvIncomplete
+    let Some(code) = keyring.code() else {
+        return Ok(no_image())
     }
     var owner: Option[Array[u8, 32]] = None
     if self.handoff.owner_key != Array[u8, 32].filled(0) {
         owner = Some(self.handoff.owner_key)
     }
-    let env = keys::Env.of(principals, data, random: world.random, events, live: self.keys_live, owner, kept: serving.keeps(), alloc)
-    var peers = mem::List[sys::ProtocolSchema].empty(alloc)
-    mut peers.push(sys::Wire[store::service::Sealing].schema(alloc))
-    return try await runner::Driven[keys::Keyring, keys::Env, keys::Keys].run(take env, exec: world.exec, alloc, take serving, take peers, release: fn(take ended: keys::Env) limits stack 512 {
-    })
+    let isolated = self.machine.conditions.user_mode
+    let starts = keys::MintedStart.of(keys::Told(owner: owner, kept: serving.keeps(), isolated: isolated), alloc)
+    defer take starts.close()
+    let nanos::World(alloc: _, exec: exec, clock: clock, random: random, log: log, stdio: stdio, fs: fs, net: net, caps: caps) = world
+    var held = caps
+    mut nanos::Cap[os::Live].put(mut held, key: "live", capability: self.keys_live)
+    mut nanos::Cap[keys::Start].put(mut held, key: "start", capability: starts.mint())
+    let space = match isolated {
+        true => Some(runner::Isolation(space: os::Space.Alone(moniker: moniker("keys")).label(), principal: text::Fixed[64].of("system"), bytes: KEYS_MEMORY))
+        false => None
+    }
+    let hosting = runner::Hosting.of(take serving, protocol: sys::Wire[keys::Keys].hash(), operations: operations_of(sys::Wire[keys::Keys].schema(alloc), alloc), space, exec, alloc)
+    return try await self.host(take image, code, component: KEYRING_ENTRY, world: nanos::World(alloc: alloc, exec: exec, clock: clock, random: random, log: log, stdio: stdio, fs: fs, net: net, caps: take held), take hosting)
 } Base.serve_keys
+
+/// How an instance whose bundle has no image ends.
+fn no_image() -> runner::Ended {
+    return runner::Ended.Unloadable(code: text::Fixed[32].of("code.no-image"))
+} no_image
+
+/// The names of the operations of the protocol `schema` describes, by number.
+fn operations_of(schema: sys::ProtocolSchema, alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    for operation in schema.operations {
+        mut names.push(text::String.of(operation.name.as_str(), alloc))
+    }
+    return names
+} operations_of
 
 /// Serves `policy` on its Views of `/sys/policy` and of its configuration record, its ports to `keys` and to itself, its source of events, the kernel's entropy and the clocks, with its configuration record.
 fn Base.serve_policy(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
@@ -952,6 +986,8 @@ fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem
     discard mut building.specs.insert(moniker("fat"), value: take filing)
     discard mut building.specs.insert(moniker("store"), value: take storing)
     var keeping = os::InstanceSpec.of(principal: principal("system"), bundle, component: KEYS, alloc)
+    keeping.placement = os::Placement.Isolated
+    keeping.budget = os::Budget(limit: KEYS_MEMORY, reserved: false)
     keeping.durability = os::Durability(class: os::DurabilityClass.Checkpointed, epoch_s: None, max_bytes: 65_536)
     mut building.grant(mut keeping, holder: "keys", field: "principals", object: tree_of("/sys/principals", alloc), granted: tree_rights(alloc), alloc)
     mut building.grant(mut keeping, holder: "keys", field: "data", object: tree_of("/data", alloc), granted: tree_rights(alloc), alloc)
@@ -1209,6 +1245,7 @@ fn run_base(
     take loader: sys::load::Loader,
     spacing: sys::load::Loader,
     shipped: Option[toolchain::Shipped],
+    take keyring: Option[loading::MintedShipped],
     heap: mem::Alloc,
     ) fails task::Cancelled uses wait
     waive length "it starts every task of the core in the one scope they share"
@@ -1217,6 +1254,7 @@ fn run_base(
     let task::Channel(sender: runs, receiver: run_orders) = task::Channel[code::Run].bounded(1, alloc: config.alloc)
     let toolchains = minted_toolchain(shipped, runs, alloc: config.alloc)
     defer close_toolchains(take toolchains)
+    defer close_shipped(take keyring)
     var spaces = spaces_of(shipped, mut frames, alloc: config.alloc)
     defer mut frames.take_back(take spaces)
     var isolated = mem::List[hw::PhysFrame[4_096]].empty(config.alloc)
@@ -1241,7 +1279,7 @@ fn run_base(
     let lives = Roots.of(orders, reported, posted, switched, accounted, take transferred, loads, registered, backlog, monikers: rings.monikers(), alloc: config.alloc)
     defer take lives.close()
     let task::Channel(sender: logs, receiver: logged) = task::Channel[journal::Logged].bounded(LOG_ROOM, alloc: config.alloc)
-    let base = Base(root: lives.root.mint(claim: false), claims: lives.root.mint(claim: true), bundle: bundle, support: support, image_bytes: fixed.image, boot: boot, isa: isa, reporter: lives.reporter.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: lives.feed.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint(), loading: lives.loading.mint(), spaces: Some(placings.mint()), registries: lives.registries.mint(), jobs: BaseJobs.of(bundle, tree: toolchain_tree(shipped), alloc: config.alloc), toolchain: mint_toolchain(toolchains))
+    let base = Base(root: lives.root.mint(claim: false), claims: lives.root.mint(claim: true), bundle: bundle, support: support, image_bytes: fixed.image, boot: boot, isa: isa, reporter: lives.reporter.mint(), store_live: lives.store.mint(), devices_live: lives.devices.mint(), wall: config.wall, handoff: handoff, feed: lives.feed.mint(), keys_live: lives.keys.mint(), boot_live: lives.boot.mint(), machine: machine, switch: lives.switch.mint(), sessions_live: lives.sessions.mint(), plans_live: lives.plans.mint(), callers: lives.callers.mint(), accounts: lives.accounts.mint(), meter: lives.meter.mint(), loading: lives.loading.mint(), spaces: Some(placings.mint()), registries: lives.registries.mint(), jobs: BaseJobs.of(bundle, tree: toolchain_tree(shipped), alloc: config.alloc), toolchain: mint_toolchain(toolchains), keyring: mint_shipped(keyring))
     var requested = incoming
     let counters = Counters.of(requests.split(), alloc: config.alloc)
     let lending = requests.split()
@@ -1594,7 +1632,7 @@ test supervisor_starts_from_the_image_genesis for image_genesis {
     discard unregistered
     let registries = devices::MintedRegistries.of(registering, alloc)
     defer take registries.close()
-    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), support: ident::HashValue(bytes: bundle), image_bytes: 0, boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint(), loading: loads.mint(), spaces: None, registries: registries.mint(), jobs: BaseJobs.of(ident::HashValue(bytes: bundle), tree: None, alloc), toolchain: None)
+    let base = Base(root: minted.mint(claim: false), claims: minted.mint(claim: true), bundle: ident::HashValue(bytes: bundle), support: ident::HashValue(bytes: bundle), image_bytes: 0, boot: devices::BootVolume(scheme: 0, partition: 0, signature: Array[u8, 16].filled(0)), isa: Array[acpi::IsaRoute, 16].filled(acpi::IsaRoute(line: 0, edge: None, active_low: None)), reporter: reporting.mint(), store_live: living.mint(), devices_live: living.mint(), wall: config.wall, handoff: bootfmt::Handoff.empty(), feed: feeding.mint(), keys_live: living.mint(), boot_live: living.mint(), machine: os::Machine(arch: os::Arch.Amd64, conditions: os::Conditions(iommu: false, tpm: false, secure_boot: false, user_mode: false, invariant_tsc: false, tsc_deadline: false, pcid: false, pages_1g: false, mwait: false, watchdog: false, nic: false, meltdown_immune: false), ram_bytes: 1, cpus: 1, level: os::Level.X86v1, smt: false, numa_nodes: 1, storage: os::Storage.File, power: os::PowerSource.Mains), switch: switching.mint(), sessions_live: living.mint(), plans_live: living.mint(), callers: naming.mint(), accounts: accounts.mint(), meter: metering.mint(), loading: loads.mint(), spaces: None, registries: registries.mint(), jobs: BaseJobs.of(ident::HashValue(bytes: bundle), tree: None, alloc), toolchain: None, keyring: None)
     let task::Channel(sender: logs, receiver: unlogged) = task::Channel[journal::Logged].bounded(1, alloc)
     discard unlogged
     let task::Channel(sender: ungranted, receiver: granting) = task::Channel[os::Granted].bounded(1, alloc)

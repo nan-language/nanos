@@ -6,7 +6,7 @@ NaN OS is an operating system built for AI agents from the root, from the boot l
 
 ## Architecture
 
-The repository root is a NaN workspace: each directory holding a `package.nan` is a package, a program when its manifest names an `entry`. `loader` is the boot loader, a UEFI application (`x86_64-uefi`), and `kernel` the kernel (`x86_64-bare`); the libraries they use target `any`. `nan build` writes each program's image into `.nan/images/<target>/`, and `nan run loader` boots the loader from a FAT volume that also holds every other UEFI and bare image, `kernel.elf` included. Tests are `test` items beside the code they exercise; each of their runs on `x86_64-uefi` or `x86_64-bare` boots QEMU, and on `any` runs on the host.
+The repository root is a NaN workspace: each directory holding a `package.nan` is a package, a program when its manifest names an `entry`. `loader` is the boot loader, a UEFI application (`x86_64-uefi`), and `kernel` the kernel (`x86_64-bare`); the libraries they use target `any`. `keyring`, which runs `keys`, is a nanos program (`x86_64-nanos`) built against the kernel's interface file. `nan build` writes each program's image into `.nan/images/<target>/`, and `nan run loader` boots the loader from a FAT volume that also holds every other image, `kernel.elf` and `keyring.nbun` included. Tests are `test` items beside the code they exercise; each of their runs on `x86_64-uefi` or `x86_64-bare` boots QEMU, and on `any` runs on the host.
 
 Only what an agent needs to place a change correctly. The why is in ADRs.
 
@@ -28,7 +28,8 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `fat/` | The `fat` package: the boot volume's file system |
 | `store/` | The `store` package: the store's engine, its log, index trees, item table, blob cache and keyring, the in-memory volume its tests run on, and in `service/` the `store` instance, its protocol, Views and mappings |
 | `journal/` | The `journal` package: events and the kernel image's kind table, causes and traces, metrics, the streams of `/journal`, sources, log capabilities, and the `journal` instance |
-| `keys/` | The `keys` package: the `keys` instance, the machine's keys and the principals' |
+| `keys/` | The `keys` package: what the `keys` instance serves, its Env, what the kernel tells it at its start, and the work behind its operations on the machine's keys and the principals' |
+| `keyring/` | The `keyring` program: the `keys` instance as the bundle the generation ships |
 | `policy/` | The `policy` package: the policy's records, presets, patterns and evaluation, and the `policy` instance |
 | `generations/` | The `generations` package: the `boot` instance, recording each boot in the boot record, `/sys/boot` and `/live/boot` |
 | `clock/` | The `clock` package: the `clock` instance and its time sources |
