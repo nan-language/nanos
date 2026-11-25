@@ -110,6 +110,11 @@ pub fn Live.get(self, path: Str, alloc: mem::Alloc) -> Option[Published] fails t
             Err(_) => None
         }
     }
+    return try await got(postings, path, alloc)
+} Live.get
+
+/// The record the board `postings` reach holds at `path`.
+fn got(postings: task::Sender[Posting], path: Str, alloc: mem::Alloc) -> Option[Published] fails task::Cancelled uses wait {
     let task::Channel(sender: reply, receiver: replies) = task::Channel[Option[Published]].bounded(1, alloc)
     try await post(postings, posting: Posting.Get(path: text::String.of(path, alloc), reply: take reply))
     var receiver = replies
@@ -117,7 +122,7 @@ pub fn Live.get(self, path: Str, alloc: mem::Alloc) -> Option[Published] fails t
         return None
     }
     return found
-} Live.get
+} got
 
 /// The children of `path` named after `after`, at most `limit`; none when the capability is stale.
 pub fn Live.list(
@@ -138,6 +143,17 @@ pub fn Live.list(
             Err(_) => mem::List.empty(alloc)
         }
     }
+    return try await children(postings, path, take after, limit, alloc)
+} Live.list
+
+/// The children of `path` named after `after`, at most `limit`, that the board `postings` reach lists.
+fn children(
+    postings: task::Sender[Posting],
+    path: Str,
+    take after: Option[text::String],
+    limit: u32,
+    alloc: mem::Alloc,
+    ) -> mem::List[LiveEntry] fails task::Cancelled uses wait {
     let task::Channel(sender: reply, receiver: replies) = task::Channel[mem::List[LiveEntry]].bounded(1, alloc)
     try await post(postings, posting: Posting.List(path: text::String.of(path, alloc), after: take after, limit: limit, reply: take reply))
     var receiver = replies
@@ -145,7 +161,7 @@ pub fn Live.list(
         return mem::List.empty(alloc)
     }
     return found
-} Live.list
+} children
 
 /// Publishes `value` of the type named `type` as the record at the capability's own path; nothing once it is stale.
 pub fn Live.publish[T: Encode](self, type: Str, value: T, alloc: mem::Alloc) fails task::Cancelled uses wait {
@@ -196,7 +212,7 @@ pub fn Live.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem:
 
 /// Reads or posts, in place of the `Live` capability an isolated space holds, as the operation `operation` on the arguments `args` asks, and answers what it read.
 pub fn Live.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait limits stack 4_096 {
-    if sys::reach(self, body: fn(state: Board, record: u8) => true).is_none() {
+    let Some(postings) = sys::reach(self, body: fn(state: Board, record: u8) => state.postings.split()) else {
         fail sys::CrossError.Revoked(sys::Revoked.Stale)
     }
     var answer = mem::Bytes.empty(alloc)
@@ -205,27 +221,33 @@ pub fn Live.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::A
             let Ok(path) = attempt mem::wire::Codec[text::String].decode(args, alloc) else {
                 fail sys::CrossError.Refused
             }
-            mem::wire::Codec[Option[Published]].encode(try await self.get(path.as_str(), alloc), out: mut answer)
+            mem::wire::Codec[Option[Published]].encode(try await got(postings, path: path.as_str(), alloc), out: mut answer)
         }
         CROSS_LIST => {
             let Ok(listed) = attempt mem::wire::Codec[Listed].decode(args, alloc) else {
                 fail sys::CrossError.Refused
             }
             let Listed(path: path, after: after, limit: limit) = listed
-            mem::wire::Codec[mem::List[LiveEntry]].encode(try await self.list(path.as_str(), take after, limit, alloc), out: mut answer)
+            mem::wire::Codec[mem::List[LiveEntry]].encode(try await children(postings, path: path.as_str(), take after, limit, alloc), out: mut answer)
         }
         CROSS_PUBLISH => {
             let Ok(placed) = attempt mem::wire::Codec[Placed].decode(args, alloc) else {
                 fail sys::CrossError.Refused
             }
             let Placed(below: below, record: record) = placed
-            try await self.publish_below(below.as_str(), value: take record, alloc)
+            let Some(path) = self.path_below(below.as_str(), alloc) else {
+                fail sys::CrossError.Revoked(sys::Revoked.Stale)
+            }
+            try await post(postings, posting: Posting.Publish(path: take path, record: take record))
         }
         CROSS_WITHDRAW => {
             let Ok(below) = attempt mem::wire::Codec[text::String].decode(args, alloc) else {
                 fail sys::CrossError.Refused
             }
-            try await self.withdraw_below(below.as_str(), alloc)
+            let Some(path) = self.path_below(below.as_str(), alloc) else {
+                fail sys::CrossError.Revoked(sys::Revoked.Stale)
+            }
+            try await post(postings, posting: Posting.Withdraw(path: take path))
         }
         else => fail sys::CrossError.Refused
     }
