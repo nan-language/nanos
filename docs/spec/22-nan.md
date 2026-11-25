@@ -640,3 +640,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** the calls through a port of an isolated instance to an instance of another space carried by a channel mapped into both spaces, the sender's kernel still charging the port's credit and checking its operations.
 - **Chapters:** [07](07-communication.md).
 - **Issue:** [nan-language/nan#298](https://github.com/nan-language/nan/issues/298).
+
+## N65
+
+**Clocks of a space's jobs and instances.**
+
+- **Language 1:** the world of a job or instance of an isolated space holds the clock its space's runtime keeps time by (NaN 14 §Jobs).
+- **NaN OS requires:** an instance without a `Clock` grant denied the clock while its space keeps time.
+- **Chapters:** [06](06-execution.md).
+- **Issue:** [nan-language/nan#305](https://github.com/nan-language/nan/issues/305).

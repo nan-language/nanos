@@ -6,9 +6,10 @@ pkg struct Spaces {
 
 impl Spaces: sys::Kind[Placing, u8]
 
-/// Where the core takes the orders of isolated instances.
+/// Where the core takes the orders of isolated instances, and the clock by which their spaces keep time.
 struct Placing {
     orders: task::Sender[Input]
+    clock: sys::Clock
 } Placing
 
 /// The root entry of the capabilities the core mints, revoked when it closes.
@@ -62,9 +63,9 @@ pkg linear struct Held {
     pkg schema: Option[sys::ProtocolSchema]
 } Held
 
-/// The capabilities whose orders go to `orders`.
-pkg fn MintedSpaces.of(orders: task::Sender[Input], alloc: mem::Alloc) -> MintedSpaces {
-    return MintedSpaces(minter: sys::Minter[Spaces, Placing, u8].of(Placing(orders: orders.split()), alloc))
+/// The capabilities whose orders go to `orders`, their spaces keeping time by `clock`.
+pkg fn MintedSpaces.of(orders: task::Sender[Input], clock: sys::Clock, alloc: mem::Alloc) -> MintedSpaces {
+    return MintedSpaces(minter: sys::Minter[Spaces, Placing, u8].of(Placing(orders: orders.split(), clock: clock), alloc))
 } MintedSpaces.of
 
 pkg fn MintedSpaces.mint(self) -> Spaces {
@@ -77,7 +78,7 @@ pkg fn MintedSpaces.close(take self) {
     take minter.close()
 } MintedSpaces.close
 
-/// Runs an instance of the component the bundle of code hash `code` whose image is `image` exports as its entry `component` as `hosting` asks, in the isolated space `isolated` the core makes for it: its world there holds the clock, log, standard streams, random source and file system of `world`, and those of its capabilities that cross. A bundle that does not isolate is `Unloadable` with `code.no-image`, one without the entry with `code.malformed`, and one whose space finds too few frames with `budget.memory-pressure`.
+/// Runs an instance of the component the bundle of code hash `code` whose image is `image` exports as its entry `component` as `hosting` asks, in the isolated space `isolated` the core makes for it: its world there holds the core's clock, the log, standard streams, random source and file system of `world`, and those of its capabilities that cross. A bundle that does not isolate is `Unloadable` with `code.no-image`, one without the entry with `code.malformed`, and one whose space finds too few frames with `budget.memory-pressure`.
 pkg fn Spaces.host(
     self,
     take image: mem::Bytes,
@@ -89,13 +90,13 @@ pkg fn Spaces.host(
     ) -> Result[runner::Ended, sys::Trap] fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
-    let services = services_of(world)
-    let nanos::World(alloc: _, exec: _, clock: _, random: _, log: _, stdio: _, fs: _, net: _, caps: caps) = world
     var hosted = hosting
     defer take hosted.close()
-    let Some(orders) = sys::reach(self, body: fn(placing: Placing, record: u8) => placing.orders.split()) else {
+    let Some(Placing(orders: orders, clock: clock)) = sys::reach(self, body: fn(placing: Placing, record: u8) => Placing(orders: placing.orders.split(), clock: placing.clock)) else {
         return Ok(runner::Ended.Unloadable(code: text::Fixed[32].of("port.revoked")))
     }
+    let services = services_of(world, clock)
+    let nanos::World(alloc: _, exec: _, clock: _, random: _, log: _, stdio: _, fs: _, net: _, caps: caps) = world
     let task::Channel(sender: held, receiver: holding) = task::Channel[Result[Held, text::Fixed[32]]].bounded(1, alloc)
     let task::Channel(sender: releasing, receiver: released) = task::Channel[Unit].bounded(1, alloc)
     let order = Order(image: take image, code: code, space: isolated.space, principal: isolated.principal, component: text::String.of(component, alloc), services: services, caps: take caps, checkpoint: mut hosted.take_checkpoint(), runner: hosted.runner(), bytes: isolated.bytes, exec: exec, alloc: alloc, held: take held, released: take released)
@@ -131,7 +132,7 @@ pkg fn Spaces.host(
     }
 } Spaces.host
 
-/// Runs the job of the bundle of code hash `code` whose image is `image` on `input`, the encoding of its input, in the isolated space `isolated` the core makes for it, until it ends or `domain` abandons it: its world there holds the clock, log, standard streams, random source and file system of `world`, none of its other capabilities crossing. A bundle that does not isolate fails with `code.no-image`, one without a job with `code.malformed`, and one whose space finds too few frames with `budget.memory-pressure`.
+/// Runs the job of the bundle of code hash `code` whose image is `image` on `input`, the encoding of its input, in the isolated space `isolated` the core makes for it, until it ends or `domain` abandons it: its world there holds the core's clock and the log, standard streams, random source and file system of `world`, none of its other capabilities crossing. A bundle that does not isolate fails with `code.no-image`, one without a job with `code.malformed`, and one whose space finds too few frames with `budget.memory-pressure`.
 pkg fn Spaces.run(
     self,
     take image: mem::Bytes,
@@ -143,13 +144,13 @@ pkg fn Spaces.run(
     ) -> os::JobOutcome fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
-    let Some(orders) = sys::reach(self, body: fn(placing: Placing, record: u8) => placing.orders.split()) else {
+    let Some(Placing(orders: orders, clock: clock)) = sys::reach(self, body: fn(placing: Placing, record: u8) => Placing(orders: placing.orders.split(), clock: placing.clock)) else {
         return os::JobOutcome.Failed(text: text::String.of("port.revoked", alloc))
     }
     let task::Channel(sender: done, receiver: ending) = task::Channel[Result[nanos::Ended, text::Fixed[32]]].bounded(1, alloc)
     let task::Channel(sender: stopping, receiver: stop) = task::Channel[Unit].bounded(1, alloc)
     let task::Channel(sender: holding, receiver: parked) = task::Channel[Unit].bounded(1, alloc)
-    let order = JobOrder(image: take image, code: code, space: isolated.space, principal: isolated.principal, input: take input, services: services_of(world), bytes: isolated.bytes, exec: exec, alloc: alloc, done: take done, stop: take stop)
+    let order = JobOrder(image: take image, code: code, space: isolated.space, principal: isolated.principal, input: take input, services: services_of(world, clock), bytes: isolated.bytes, exec: exec, alloc: alloc, done: take done, stop: take stop)
     match attempt await orders.send(Input.Job(take order)) {
         Ok(_) => {
         }
@@ -239,8 +240,8 @@ pkg fn ended_job(
     return ended
 } ended_job
 
-/// What the core serves a space for `world`: its clock, log, standard streams, random source and file system.
-fn services_of(world: nanos::World) -> nanos::Services = nanos::Services(clock: world.clock, log: world.log, stdio: world.stdio, random: world.random, fs: world.fs)
+/// What the core serves a space for `world`: `clock`, and the log, standard streams, random source and file system of `world`.
+fn services_of(world: nanos::World, clock: sys::Clock) -> nanos::Services = nanos::Services(clock: clock, log: world.log, stdio: world.stdio, random: world.random, fs: world.fs)
 
 /// Abandons the instance of an answer no domain took.
 fn abandon_held(take left: Result[Held, text::Fixed[32]]) {

@@ -313,7 +313,7 @@ The runner builds the job's World from its specification:
 | `net` | the egress gate under the job's `Egress` grants ([egress](16-network.md#egress-gate)) |
 | `caps` | `nanos::World` only: the ports of `wiring` and the capabilities of the other grants, looked up by their keys; a lookup naming no capability of the requested type fails with `instance.env-incomplete` |
 
-A field whose grant is absent denies every operation. A host-compatible entry's `host::World` holds these fields except `caps`. A job whose bundle has provenance `agent` runs on a serial executor: one task at a time, its choices drawn from a generator seeded at its start, as on NaN's seeded scheduler ([NaN 22 §Seeded scheduler](https://github.com/nan-language/nan/blob/main/docs/spec/22-testing.md#seeded-scheduler)) (requires [N8](22-nan.md#n8), [N9](22-nan.md#n9)). Grants conferring `exec.parallel` give it the parallel executor, and `clock.fine` the nanosecond clock.
+A field whose grant is absent denies every operation (requires [N65](22-nan.md#n65) for the clock in an isolated space). A host-compatible entry's `host::World` holds these fields except `caps`. A job whose bundle has provenance `agent` runs on a serial executor: one task at a time, its choices drawn from a generator seeded at its start, as on NaN's seeded scheduler ([NaN 22 §Seeded scheduler](https://github.com/nan-language/nan/blob/main/docs/spec/22-testing.md#seeded-scheduler)) (requires [N8](22-nan.md#n8), [N9](22-nan.md#n9)). Grants conferring `exec.parallel` give it the parallel executor, and `clock.fine` the nanosecond clock.
 
 ### Branches and results
 
