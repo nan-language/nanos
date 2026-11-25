@@ -130,7 +130,7 @@ Only `Port`, `View`, `Control`, `Egress`, `Listen`, `WallClock` and `sys::Clock`
 
 ## Isolated transport
 
-Messages between instances in different spaces travel through **channels** (requires [N23](22-nan.md#n23), [N59](22-nan.md#n59)). The core creates a channel for each pair of a sending instance and a minted port whose target lies in another space, at its first message, and frees it when the minted port is revoked and its outstanding calls have ended. A channel is 10 frames, mapped into both spaces and charged as [transfers](05-memory.md#transfers) states, a failed draw trapping the sender:
+Messages between instances in different spaces travel through **channels** (requires [N23](22-nan.md#n23), [N59](22-nan.md#n59), [N64](22-nan.md#n64)). The core creates a channel for each pair of a sending instance and a minted port whose target lies in another space, at its first message, and frees it when the minted port is revoked and its outstanding calls have ended. A channel is 10 frames, mapped into both spaces and charged as [transfers](05-memory.md#transfers) states, a failed draw trapping the sender:
 
 | Frames | Written by | Holds |
 | --- | --- | --- |

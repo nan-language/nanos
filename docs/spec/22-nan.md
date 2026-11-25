@@ -631,3 +631,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** each job and instance of a space reaching the log, standard streams, random source and file system its kernel gives it, and a job of a space holding the capabilities its kernel gives it.
 - **Chapters:** [06](06-execution.md), [09](09-authority.md).
 - **Issue:** [nan-language/nan#297](https://github.com/nan-language/nan/issues/297).
+
+## N64
+
+**Ports over bridges.**
+
+- **Language 1:** a call through a capability of a crossing kind that an instance in an isolated space holds goes through its kernel, and a bridge carries only the calls of runner ports (NaN 14 §Crossing kinds, §Bridges).
+- **NaN OS requires:** the calls through a port of an isolated instance to an instance of another space carried by a channel mapped into both spaces, the sender's kernel still charging the port's credit and checking its operations.
+- **Chapters:** [07](07-communication.md).
+- **Issue:** [nan-language/nan#298](https://github.com/nan-language/nan/issues/298).

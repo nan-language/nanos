@@ -1,14 +1,14 @@
 //! `/live`: the records its providers publish there, what the core's board holding them takes, and the `Live` capability through which `store` reads them and a provider publishes below its own path.
 
 /// A record published below `/live`: its type's canonical name and schema hash, and its encoding.
-pub closed struct Published {
+pub closed struct Published derives Encode {
     pub type: text::String
     pub schema: mem::wire::SchemaHash
     pub bytes: mem::Bytes
 } Published
 
 /// A child of a node of `/live`: its name, the type of the record it holds, and whether nodes lie below it.
-pub closed struct LiveEntry {
+pub closed struct LiveEntry derives Encode {
     pub name: text::String
     pub type: Option[text::String]
     pub parent: bool
@@ -47,6 +47,30 @@ pub open struct Live {
 
 impl Live: sys::Kind[Board, u8]
 
+impl Live: sys::Crossing
+
+/// The operations through which the kernel holding a `Live` capability reads and posts for the one an isolated space holds in its place.
+const CROSS_GET: u64 = 0
+
+const CROSS_LIST: u64 = 1
+
+const CROSS_PUBLISH: u64 = 2
+
+const CROSS_WITHDRAW: u64 = 3
+
+/// The arguments of a listing of the children of `path` after `after`, at most `limit`.
+struct Listed derives Encode {
+    path: text::String
+    after: Option[text::String]
+    limit: u32
+} Listed
+
+/// The arguments of a publication of `record` at `below`.
+struct Placed derives Encode {
+    below: text::String
+    record: Published
+} Placed
+
 /// Where a `Live` capability's postings go, and the path below which it publishes.
 struct Board {
     postings: task::Sender[Posting]
@@ -76,7 +100,15 @@ pub fn MintedLive.close(take self) {
 /// The record at `path`, `None` when none is published there or the capability is stale.
 pub fn Live.get(self, path: Str, alloc: mem::Alloc) -> Option[Published] fails task::Cancelled uses wait {
     let Some(postings) = sys::reach(self, body: fn(state: Board, record: u8) => state.postings.split()) else {
-        return None
+        var args = mem::Bytes.empty(alloc)
+        mem::wire::Codec[text::String].encode(text::String.of(path, alloc), out: mut args)
+        let Some(answer) = try await self.relayed(CROSS_GET, args: args.view(), alloc) else {
+            return None
+        }
+        return match attempt mem::wire::Codec[Option[Published]].decode(Untrusted.of(answer.view()), alloc) {
+            Ok(found) => found
+            Err(_) => None
+        }
     }
     let task::Channel(sender: reply, receiver: replies) = task::Channel[Option[Published]].bounded(1, alloc)
     try await post(postings, posting: Posting.Get(path: text::String.of(path, alloc), reply: take reply))
@@ -96,7 +128,15 @@ pub fn Live.list(
     alloc: mem::Alloc,
     ) -> mem::List[LiveEntry] fails task::Cancelled uses wait {
     let Some(postings) = sys::reach(self, body: fn(state: Board, record: u8) => state.postings.split()) else {
-        return mem::List.empty(alloc)
+        var args = mem::Bytes.empty(alloc)
+        mem::wire::Codec[Listed].encode(Listed(path: text::String.of(path, alloc), after: take after, limit: limit), out: mut args)
+        let Some(answer) = try await self.relayed(CROSS_LIST, args: args.view(), alloc) else {
+            return mem::List.empty(alloc)
+        }
+        return match attempt mem::wire::Codec[mem::List[LiveEntry]].decode(Untrusted.of(answer.view()), alloc) {
+            Ok(found) => found
+            Err(_) => mem::List.empty(alloc)
+        }
     }
     let task::Channel(sender: reply, receiver: replies) = task::Channel[mem::List[LiveEntry]].bounded(1, alloc)
     try await post(postings, posting: Posting.List(path: text::String.of(path, alloc), after: take after, limit: limit, reply: take reply))
@@ -115,6 +155,9 @@ pub fn Live.publish[T: Encode](self, type: Str, value: T, alloc: mem::Alloc) fai
 /// Publishes `value` at `below`, a path relative to the capability's own; nothing once it is stale.
 pub fn Live.publish_below(self, below: Str, take value: Published, alloc: mem::Alloc) fails task::Cancelled uses wait {
     let Some(postings) = sys::reach(self, body: fn(state: Board, record: u8) => state.postings.split()) else {
+        var args = mem::Bytes.empty(alloc)
+        mem::wire::Codec[Placed].encode(Placed(below: text::String.of(below, alloc), record: take value), out: mut args)
+        discard try await self.relayed(CROSS_PUBLISH, args: args.view(), alloc)
         return
     }
     let Some(path) = self.path_below(below, alloc) else {
@@ -126,6 +169,9 @@ pub fn Live.publish_below(self, below: Str, take value: Published, alloc: mem::A
 /// Withdraws the record at `below`, a path relative to the capability's own; nothing once it is stale.
 pub fn Live.withdraw_below(self, below: Str, alloc: mem::Alloc) fails task::Cancelled uses wait {
     let Some(postings) = sys::reach(self, body: fn(state: Board, record: u8) => state.postings.split()) else {
+        var args = mem::Bytes.empty(alloc)
+        mem::wire::Codec[text::String].encode(text::String.of(below, alloc), out: mut args)
+        discard try await self.relayed(CROSS_WITHDRAW, args: args.view(), alloc)
         return
     }
     let Some(path) = self.path_below(below, alloc) else {
@@ -133,6 +179,58 @@ pub fn Live.withdraw_below(self, below: Str, alloc: mem::Alloc) fails task::Canc
     }
     try await post(postings, posting: Posting.Withdraw(path: take path))
 } Live.withdraw_below
+
+/// The answer the kernel holding this capability gives the operation `operation` on `args`, for a capability of an isolated space; `None` once it is stale.
+fn Live.relayed(self, operation: u64, args: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] fails task::Cancelled uses wait {
+    return match first attempt await sys::Handle.of(self).call(operation, args, alloc) {
+        Ok(answer) => Some(take answer)
+        Err(sys::CrossError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} Live.relayed
+
+/// Has nothing to do at once: a `Live` capability of an isolated space only reads and posts.
+pub fn Live.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+    fail sys::CrossError.Refused
+} Live.invoke
+
+/// Reads or posts, in place of the `Live` capability an isolated space holds, as the operation `operation` on the arguments `args` asks, and answers what it read.
+pub fn Live.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait limits stack 4_096 {
+    if sys::reach(self, body: fn(state: Board, record: u8) => true).is_none() {
+        fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    }
+    var answer = mem::Bytes.empty(alloc)
+    match operation {
+        CROSS_GET => {
+            let Ok(path) = attempt mem::wire::Codec[text::String].decode(args, alloc) else {
+                fail sys::CrossError.Refused
+            }
+            mem::wire::Codec[Option[Published]].encode(try await self.get(path.as_str(), alloc), out: mut answer)
+        }
+        CROSS_LIST => {
+            let Ok(listed) = attempt mem::wire::Codec[Listed].decode(args, alloc) else {
+                fail sys::CrossError.Refused
+            }
+            let Listed(path: path, after: after, limit: limit) = listed
+            mem::wire::Codec[mem::List[LiveEntry]].encode(try await self.list(path.as_str(), take after, limit, alloc), out: mut answer)
+        }
+        CROSS_PUBLISH => {
+            let Ok(placed) = attempt mem::wire::Codec[Placed].decode(args, alloc) else {
+                fail sys::CrossError.Refused
+            }
+            let Placed(below: below, record: record) = placed
+            try await self.publish_below(below.as_str(), value: take record, alloc)
+        }
+        CROSS_WITHDRAW => {
+            let Ok(below) = attempt mem::wire::Codec[text::String].decode(args, alloc) else {
+                fail sys::CrossError.Refused
+            }
+            try await self.withdraw_below(below.as_str(), alloc)
+        }
+        else => fail sys::CrossError.Refused
+    }
+    return answer
+} Live.call
 
 /// The path `below` names relative to the capability's own, `None` once it is stale.
 fn Live.path_below(self, below: Str, alloc: mem::Alloc) -> Option[text::String] {
