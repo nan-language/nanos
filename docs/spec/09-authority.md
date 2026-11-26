@@ -299,7 +299,7 @@ The shared space is one confidentiality domain: an instance in it may read anyth
 | Cost | Paid when | Size |
 | --- | --- | --- |
 | encoding and validating decode | each message between spaces, as between bundles ([isolated transport](07-communication.md#isolated-transport)) | the cost of a [transfer](07-communication.md#transfer) between bundles |
-| split tables | each crossing between an isolated space and the core, on a machine without `meltdown-immune` (requires [N61](22-nan.md#n61)) | two root loads per crossing ([split tables](04-kernel.md#split-tables)) |
+| split tables | each crossing between an isolated space and the core | two root loads per crossing ([split tables](04-kernel.md#split-tables)) |
 | TLB flush | each switch between spaces, on a machine without `pcid` | the CPU's non-global translations |
 | IBPB | each switch between isolated spaces of different principals (requires [N11](22-nan.md#n11), [N56](22-nan.md#n56)) | one barrier |
 | core scheduling | on a machine whose measured fact `smt` holds, the core scheduling of [wake placement](08-scheduling.md#wake-placement) | the siblings' idle time |

@@ -607,11 +607,11 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 
 ## N61
 
-**Roots and tags of isolated spaces.**
+**Tags of isolated spaces.**
 
 - **Language 1:** a space's thread always runs under a root mapping the window and the entry area alone, its translations tagged as every space's are (NaN 24 §Isolated spaces, §Split tables).
-- **NaN OS requires:** on CPUs Meltdown does not affect, a space's root sharing the kernel's tables below its window, and a tag per space.
-- **Chapters:** [04](04-kernel.md), [09](09-authority.md).
+- **NaN OS requires:** a tag per space on each CPU.
+- **Chapters:** [04](04-kernel.md).
 - **Issue:** [nan-language/nan#291](https://github.com/nan-language/nan/issues/291).
 
 ## N62

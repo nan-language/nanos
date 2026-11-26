@@ -39,7 +39,7 @@ The **core** is the kernel code that is not a component: the `kernel` package, a
 The kernel starts in these steps. A step that fails halts the kernel with its code ([Kernel halts](#kernel-halts)).
 
 1. **Handoff.** `main(take k: boot::Kernel)` starts on the boot CPU ([NaN 27 §Machine runs](https://github.com/nan-language/nan/blob/main/docs/spec/27-program-model.md#machine-runs)), reads the handoff record and the genesis record where the start information or the device tree places them (requires [N14](22-nan.md#n14)), or the genesis record the image holds when none is passed, and decodes both through their validators. A passed genesis record's hash equals the one the handoff record carries. The handoff record's entropy goes to the core's random source ([entropy](03-boot.md#entropy)). Failure: `fault.handoff-invalid`.
-2. **CPU features.** The core reads the boot CPU's identification (requires [N11](22-nan.md#n11)) and determines the [machine conditions](01-machines.md#machine-conditions) `pages-1g`, `pcid`, `invariant-tsc`, `tsc-deadline`, `mwait` and `meltdown-immune`. Failure: none; an absent condition selects its fallback.
+2. **CPU features.** The core reads the boot CPU's identification (requires [N11](22-nan.md#n11)) and determines the [machine conditions](01-machines.md#machine-conditions) `pages-1g`, `pcid`, `invariant-tsc`, `tsc-deadline` and `mwait`. Failure: none; an absent condition selects its fallback.
 3. **Frames.** The core builds the [frame allocator](05-memory.md#frames) from `k.regions()`, sets aside the [core reserve](05-memory.md#core-reserve) and makes the node [pools](05-memory.md#pools). Failure: `fault.memory-insufficient` when usable memory is below the [minimum machine](01-machines.md#minimum-machine)'s or cannot hold the core reserve.
 4. **Shared space.** The core builds the tables of the [shared space](#shared-space) and installs them on the boot CPU with `write_cr3`, `write_ttbr0` on AArch64. Failure: `fault.memory-insufficient`.
 5. **Firmware tables.** The core decodes the ACPI tables (MADT, FADT, MCFG, SRAT, SLIT, HPET, DMAR or IVRS, WDAT) or the device tree: CPUs, interrupt controllers, NUMA nodes and their distances, timers, power and reset registers, IOMMUs, the watchdog, and the PCIe configuration windows, which go to [`devices`](15-devices.md#device-discovery). Failure: `fault.firmware-tables-invalid` when the MADT or the FADT on x86_64, or the device tree's `memory`, `cpus` or interrupt controller nodes on AArch64, are missing or fail their validators. Any other table that fails its validator is ignored, and the conditions only it reports count as absent.
@@ -106,14 +106,14 @@ A **space** is an address space: the **shared space**, whose code runs in ring 0
 
 ### Isolated spaces
 
-- An isolated space has a root of its own. Below its user window it shares the shared space's tables, so the core's mappings are present and supervisor-only (requires [N23](22-nan.md#n23), [N61](22-nan.md#n61)).
+- An isolated space has a root of its own, mapping only its user window and the entry trampoline ([split tables](#split-tables)).
 - The **user window** starts at B, the first 512 GiB boundary above the highest physical address the shared space maps, and ends at 2^47 on x86_64 and at 2^48 on AArch64. A machine whose B lies above 2^46 lacks `user-mode`.
 - The window holds the code areas of the space's bundles (user, read-execute or read-only), its domains' chunks ([mappings](05-memory.md#mappings)), mapped blobs (read-only), its doorbell frame, the frames of its [channels](07-communication.md#isolated-transport) and the MMIO windows of its drivers (uncached). Nothing in it is both writable and executable.
 - The shared space uses PCID 0, ASID 0 on AArch64. Each CPU gives tags 1 to 63 to the isolated spaces it ran most recently, and reassigns the least recently used tag after invalidating its translations (requires [N61](22-nan.md#n61)). On a machine without `pcid`, every switch between spaces flushes the CPU's non-global translations.
 
 ### Split tables
 
-On a machine without `meltdown-immune`, each isolated space has a second root, its user root, mapping only the user window and the entry trampoline (requires [N23](22-nan.md#n23)). A CPU runs user code on the user root, switches to the kernel root at every entry to the core, by system call, exception or interrupt, and back at every return. On a machine with `pcid`, the user root's PCID is the kernel root's plus 2,048, so the switch flushes nothing. [Costs of isolation](09-authority.md#costs-of-isolation) gives the price of each crossing.
+A CPU runs an isolated space's user code on the space's root, switches to the shared space's root at every entry to the core, by system call, exception or interrupt, and back at every return (requires [N23](22-nan.md#n23)). On a machine with `pcid`, the space's root has the PCID 2,048 plus the tag the CPU gives the space, so the switch flushes nothing. [Costs of isolation](09-authority.md#costs-of-isolation) gives the price of each crossing.
 
 ### Switches and shootdowns
 

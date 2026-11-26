@@ -50,7 +50,6 @@ A **machine condition** is a hardware feature some rules depend on. A machine la
 | `mwait` | CPUID leaf 1 ECX bit 3; never on AArch64 | idle CPUs wait with HLT, on AArch64 with WFI ([08-scheduling](08-scheduling.md#idle)) |
 | `watchdog` | an ACPI WDAT table, an Intel TCO watchdog whose NO_REBOOT bit the kernel can clear, or an SP805 the device tree or ACPI lists | a halted machine stays stopped ([03-boot](03-boot.md#reboot-after-a-halt)) |
 | `nic` | a NIC of medium `ethernet` ([Nic](15-devices.md#nic)) is bound to a driver of the base set ([15-devices](15-devices.md#drivers)) | the link runs on serial and vsock transports only ([18-link](18-link.md#transports)) |
-| `meltdown-immune` | `IA32_ARCH_CAPABILITIES` bit 0 (RDCL_NO) is 1, or the CPU vendor is AMD or Hygon; on AArch64, `ID_AA64PFR0_EL1.CSV3` is 1 | an isolated space's user code runs on a root mapping only its user window and the entry trampoline ([split tables](04-kernel.md#split-tables)) |
 
 - The loader detects `tpm` and `secure-boot` (requires [N14](22-nan.md#n14)) and passes them in the [handoff record](03-boot.md#handoff-record). The kernel detects the others except `nic` at start, before it starts any instance, reading CPUID with the `cpuid` intrinsic (requires [N11](22-nan.md#n11)) and `IA32_ARCH_CAPABILITIES` (MSR `0x10A`) only when CPUID leaf 7 EDX bit 29 enumerates it.
 - `nic` holds while `devices` has such a NIC bound. Every other condition is fixed for the boot.
@@ -89,7 +88,6 @@ pub closed struct Conditions derives Copy, Eq, Render, Encode {
     pub mwait: bool
     pub watchdog: bool
     pub nic: bool
-    pub meltdown_immune: bool
 } Conditions
 
 pub closed enum Storage derives Copy, Eq, Render, Encode {
@@ -145,7 +143,7 @@ The sandbox is the machine `tools/sandbox start` boots ([sandbox](../sandbox.md)
 - The 16550 serial port, on the sandbox's standard output and standard input (requires [N22](22-nan.md#n22)), carrying the console and the link's serial transport, and the console port, a second 16550 on a socket.
 - The exit port: writing the byte v ends the run with status v mod 128. [Power off and reboot](08-scheduling.md#power-off-and-reboot) write it, and a halt writes 70; a reset ends the run with status 70, so the sandbox never reboots.
 
-Its facts are `arch: Arch.Amd64`, `cpus: 4`, `smt: false`, `numa_nodes: 1`, `storage: Storage.File` and `power: PowerSource.Mains`, its `level` being the CPU model's, `Level.X86v3` on `max`. `iommu`, `tpm`, `user-mode` and `nic` hold, and `secure-boot` does not. On `max`, whose vendor is AMD, `pages-1g` and `meltdown-immune` hold, and `invariant-tsc`, `tsc-deadline`, `pcid` and `mwait` do not; under KVM, the CPU's conditions are the host's.
+Its facts are `arch: Arch.Amd64`, `cpus: 4`, `smt: false`, `numa_nodes: 1`, `storage: Storage.File` and `power: PowerSource.Mains`, its `level` being the CPU model's, `Level.X86v3` on `max`. `iommu`, `tpm`, `user-mode` and `nic` hold, and `secure-boot` does not. On `max`, `pages-1g` holds, and `invariant-tsc`, `tsc-deadline`, `pcid` and `mwait` do not; under KVM, the CPU's conditions are the host's.
 
 The sandbox exercises:
 
