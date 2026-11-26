@@ -1,12 +1,16 @@
-//! Uploads: `put` streaming the bytes of its data lines into a draft of the store, then committing the blob at its path.
+//! Uploads: `put` streaming the bytes of its data lines, gathered into pieces, into a draft of the store, then committing the blob at its path.
 
-/// The data lines one upload holds before its keyed task appends them; one more fails it.
-const QUEUED_CHUNKS: usize = 256
+/// The bytes of data lines an upload gathers into each piece its keyed task appends, and the pieces it holds before the task appends them; one more fails it.
+const UPLOAD_PIECE_BYTES: usize = 16_384
 
-/// An upload under way: the `put` it serves and where its data lines go.
+const UPLOAD_PIECES: usize = 16
+
+/// An upload under way: the `put` it serves, where its pieces go, the bytes gathered into the next piece, and the bytes its data lines are still to bring.
 pub open struct Upload derives Send {
     number: u64
-    chunks: task::Sender[mem::Bytes]
+    pieces: task::Sender[mem::Bytes]
+    gathered: mem::Bytes
+    left: u64
 } Upload
 
 /// What a `put` uploads: its path, its size and the blob id, in a short or full form, its bytes must have, the principal and session it acts for, the origin labels of its commit, `upload.<session>` among the session's taint, and its request key.
@@ -40,8 +44,8 @@ fn Linker.put(
             return
         }
     }
-    let task::Channel(sender: chunks, receiver: arriving) = task::Channel[mem::Bytes].bounded(QUEUED_CHUNKS, alloc)
-    mut env.uploads.push(Upload(number: number, chunks: take chunks))
+    let task::Channel(sender: pieces, receiver: arriving) = task::Channel[mem::Bytes].bounded(UPLOAD_PIECES, alloc)
+    mut env.uploads.push(Upload(number: number, pieces: take pieces, gathered: mem::Bytes.empty(alloc), left: putting.size))
     let block = self.running[at].block(Verdict.Ok, alloc)
     let failed = self.running[at].block(Verdict.Failed, alloc)
     let slot = self.running[at].slot
@@ -50,12 +54,12 @@ fn Linker.put(
     mut cx.spawn(key: ANSWERING + slot, run: fn[take putting, take arriving, take block, take charge, take failed](out: sys::Outbox[LinkSession]) fails task::Cancelled uses wait limits stack 16_384 {
         let answered = match try await open_account(take charge, alloc) {
             Ok(account) => match try await sys::Domain.run(fn[take putting, take arriving, take block]() -> Option[Block] fails task::Cancelled uses wait limits stack 32_768 {
-                var given = Some(Uploading(putting: take putting, chunks: take arriving, block: take block))
+                var given = Some(Uploading(putting: take putting, pieces: take arriving, block: take block))
                 return try await sys::run_headed(work_header(account), body: fn[mut given]() -> Option[Block] fails task::Cancelled uses wait {
-                    let Some(Uploading(putting: upload, chunks: incoming, block: reply)) = mut given.extract() else {
+                    let Some(Uploading(putting: upload, pieces: incoming, block: reply)) = mut given.extract() else {
                         return None
                     }
-                    return Some(try await uploaded(putting: take upload, chunks: take incoming, block: take reply, tree, alloc: account.alloc))
+                    return Some(try await uploaded(putting: take upload, pieces: take incoming, block: take reply, tree, alloc: account.alloc))
                 })
             }, exec: account.exec, alloc: account.alloc) {
                 Ok(Some(given)) => given
@@ -68,10 +72,10 @@ fn Linker.put(
     })
 } Linker.put
 
-/// What the work of a `put` takes away: what it uploads, the chunks arriving, and the block it answers in.
+/// What the work of a `put` takes away: what it uploads, the pieces arriving, and the block it answers in.
 struct Uploading {
     putting: Putting
-    chunks: task::Receiver[mem::Bytes]
+    pieces: task::Receiver[mem::Bytes]
     block: Block
 } Uploading
 
@@ -127,7 +131,7 @@ fn upload_label(session: ident::SessionId) -> ident::OriginLabel {
     return ident::OriginLabel(text: label)
 } upload_label
 
-/// Passes the bytes of a data line received on the connection numbered `connection` to the upload of its `put`; an upload without room for them fails.
+/// Gathers the bytes of a data line received on the connection numbered `connection` into the next piece of the upload of its `put`, passing on each piece they complete; an upload without room for a piece fails.
 fn Linker.upload(mut self, connection: u64, take bytes: mem::Bytes, mut env: Env) {
     let Some(at) = self.running.position(fn(each: Running) => each.connection == connection and each.verb.as_str() == "put") else {
         return
@@ -136,7 +140,10 @@ fn Linker.upload(mut self, connection: u64, take bytes: mem::Bytes, mut env: Env
     let Some(upload) = env.uploads.position(fn(each: Upload) => each.number == number) else {
         return
     }
-    match env.uploads[upload].chunks.offer(take bytes) {
+    let Some(piece) = mut env.uploads[upload].gather(bytes.view(), alloc: env.alloc) else {
+        return
+    }
+    match env.uploads[upload].pieces.offer(take piece) {
         Some(_) => {
             discard mut env.uploads.remove(upload)
         }
@@ -145,21 +152,34 @@ fn Linker.upload(mut self, connection: u64, take bytes: mem::Bytes, mut env: Env
     }
 } Linker.upload
 
+/// The piece `line` completes: the bytes gathered with it once they hold `UPLOAD_PIECE_BYTES` or the last the `put` expects, none before.
+fn Upload.gather(mut self, line: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] {
+    mut self.gathered.append(line)
+    self.left = self.left.saturating_sub(u64.widen(line.len()))
+    if self.gathered.len() < UPLOAD_PIECE_BYTES and self.left > 0 {
+        return None
+    }
+    var piece = mem::Bytes.empty(alloc)
+    mut piece.append(self.gathered.view())
+    mut self.gathered.truncate(0)
+    return Some(take piece)
+} Upload.gather
+
 /// Forgets the upload of the `put` numbered `number`, ending its data.
 fn Env.forget_upload(mut self, number: u64) {
     mut self.uploads.retain(fn(each: Upload) => each.number != number)
 } Env.forget_upload
 
-/// Uploads the bytes `chunks` brings into a draft through a View acting for the principal of `putting`, closes it into a blob, which must have the id `putting` names, and commits it at its path, giving `block` with its `blob` record, or failed with the store's code.
+/// Uploads the bytes `pieces` brings into a draft through a View acting for the principal of `putting`, closes it into a blob, which must have the id `putting` names, and commits it at its path, giving `block` with its `blob` record, or failed with the store's code.
 fn uploaded(
     take putting: Putting,
-    take chunks: task::Receiver[mem::Bytes],
+    take pieces: task::Receiver[mem::Bytes],
     take block: Block,
     tree: store::service::View,
     alloc: mem::Alloc,
     ) -> Block fails task::Cancelled uses wait {
     var answered = block
-    let failure = match try await stored(putting, take chunks, tree, alloc) {
+    let failure = match try await stored(putting, take pieces, tree, alloc) {
         Ok(stored_blob) => {
             var record = Record.of("blob", alloc)
             mut record.subject(Dyn[Render].view(putting.path))
@@ -183,8 +203,8 @@ pub closed struct StoredBlob derives Copy {
     pub commit: ident::CommitId
 } StoredBlob
 
-/// The blob `putting` uploads from `chunks`, `request.hash-mismatch` when its id is not the one `putting` names.
-fn stored(putting: Putting, take chunks: task::Receiver[mem::Bytes], tree: store::service::View, alloc: mem::Alloc) -> Result[StoredBlob, Failure] fails task::Cancelled uses wait {
+/// The blob `putting` uploads from `pieces`, `request.hash-mismatch` when its id is not the one `putting` names.
+fn stored(putting: Putting, take pieces: task::Receiver[mem::Bytes], tree: store::service::View, alloc: mem::Alloc) -> Result[StoredBlob, Failure] fails task::Cancelled uses wait {
     let subject = putting.path.text.as_str()
     let acting = match first attempt await tree.acting(ident::Principal(text: putting.principal.text), session: putting.session, origins: labels_of(putting.origins, alloc), alloc) {
         Ok(view) => view
@@ -196,17 +216,17 @@ fn stored(putting: Putting, take chunks: task::Receiver[mem::Bytes], tree: store
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         Err(failed) => return Err(Failure.of(failed.code().as_str(), subject, alloc))
     }
-    var receiver = chunks
+    var receiver = pieces
     var received: u64 = 0
     while received < putting.size {
-        let Some(chunk) = try await mut receiver.receive() else {
+        let Some(piece) = try await mut receiver.receive() else {
             return Err(Failure.of("request.too-large", subject, alloc).expecting("the data lines of the put", found: "an upload without room for them", alloc))
         }
-        received = received.saturating_add(u64.widen(chunk.len()))
+        received = received.saturating_add(u64.widen(piece.len()))
         if received > putting.size {
             return Err(Failure.of("request.hash-mismatch", subject, alloc).expecting("the bytes the size names", found: "more bytes", alloc))
         }
-        match first attempt await acting.draft_append(draft, bytes: take chunk, alloc) {
+        match first attempt await acting.draft_append(draft, bytes: take piece, alloc) {
             Ok(_) => {
             }
             Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
@@ -240,3 +260,22 @@ fn stored(putting: Putting, take chunks: task::Receiver[mem::Bytes], tree: store
         Err(failed) => Err(Failure.of(failed.code().as_str(), subject, alloc))
     }
 } stored
+
+test uploads_pass_their_data_on_in_pieces_and_the_rest_with_the_last_line for Upload.gather {
+    let alloc = testing::world().alloc
+    let task::Channel(sender: pieces, receiver: _) = task::Channel[mem::Bytes].bounded(1, alloc)
+    var upload = Upload(number: 1, pieces: take pieces, gathered: mem::Bytes.empty(alloc), left: u64.widen(UPLOAD_PIECE_BYTES) + 3)
+    let bulk = mem::Bytes.zeroed(UPLOAD_PIECE_BYTES - 1, alloc)
+    let gathering = mut upload.gather(bulk.view(), alloc)
+    expect gathering.is_none()
+    let Some(full) = mut upload.gather(b"ab", alloc) else {
+        expect false
+        return
+    }
+    expect full.len() == UPLOAD_PIECE_BYTES + 1
+    let Some(last) = mut upload.gather(b"cd", alloc) else {
+        expect false
+        return
+    }
+    expect last.view() == b"cd" and upload.left == 0
+} uploads_pass_their_data_on_in_pieces_and_the_rest_with_the_last_line
