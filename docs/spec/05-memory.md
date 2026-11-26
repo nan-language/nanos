@@ -174,7 +174,7 @@ pub closed struct MemorySummary derives Encode {
     pub store_cache: u64
     /// The store's cache of blob pieces.
     pub blob_cache: u64
-    /// Reserved regions not drawn, and the frames set aside for the runs of the `nan` job.
+    /// Reserved regions not drawn, the frames set aside for the runs of the `nan` job, and those lent to isolated spaces.
     pub reserved: u64
     /// Chunks drawn through instance, principal and session cells, the caches and intake cells excepted.
     pub accounts: u64

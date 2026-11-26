@@ -1,6 +1,6 @@
 # Requirements on NaN
 
-This chapter defines the features NaN OS requires of NaN beyond language 1 as the toolchain v0.1.0 implements it. Each requirement states what language 1 provides, what NaN OS requires, the chapters whose rules depend on it, and the issue of the NaN repository that requests it. A rule elsewhere followed by `(requires Nn)`, linked to its entry here, depends on Nn. The identifiers are stable; N18, N51 and N53 are unassigned.
+This chapter defines the features NaN OS requires of NaN beyond language 1 as the toolchain v0.1.0 implements it. Each requirement states what language 1 provides, what NaN OS requires, the chapters whose rules depend on it, and the issue of the NaN repository that requests it. A rule elsewhere followed by `(requires Nn)`, linked to its entry here, depends on Nn. The identifiers are stable; N18, N51, N53 and N64 are unassigned.
 
 ## N1
 
@@ -632,15 +632,6 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **Chapters:** [06](06-execution.md), [09](09-authority.md).
 - **Issue:** [nan-language/nan#297](https://github.com/nan-language/nan/issues/297).
 
-## N64
-
-**Ports over bridges.**
-
-- **Language 1:** a call through a capability of a crossing kind that an instance in an isolated space holds goes through its kernel, and a bridge carries only the calls of runner ports (NaN 14 §Crossing kinds, §Bridges).
-- **NaN OS requires:** the calls through a port of an isolated instance to an instance of another space carried by a channel mapped into both spaces, the sender's kernel still charging the port's credit and checking its operations.
-- **Chapters:** [07](07-communication.md).
-- **Issue:** [nan-language/nan#298](https://github.com/nan-language/nan/issues/298).
-
 ## N65
 
 **Clocks of a space's jobs and instances.**
@@ -658,3 +649,30 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** the packages of a bundle's closure that the running kernel's interface file lists, with the code roots it records, judged as the kernel's, outside the release gate.
 - **Chapters:** [10](10-code.md).
 - **Issue:** [nan-language/nan#310](https://github.com/nan-language/nan/issues/310).
+
+## N67
+
+**Frames of each job and instance of a space.**
+
+- **Language 1:** every job and instance of an isolated space draws from the frames `isolate` takes, once, and a fault for which they hold none ends each of them (NaN 14 §Jobs).
+- **NaN OS requires:** the frames each job and instance placed in a space draws from given with it and back once it ends, a draw past them failing in it alone.
+- **Chapters:** [04](04-kernel.md), [09](09-authority.md).
+- **Issue:** [nan-language/nan#311](https://github.com/nan-language/nan/issues/311).
+
+## N68
+
+**Capabilities in calls of crossing kinds.**
+
+- **Language 1:** the operations of a crossing kind take and give bytes alone (NaN 14 §Crossing kinds).
+- **NaN OS requires:** a call through a port of an isolated instance, and its reply, carrying capabilities.
+- **Chapters:** [07](07-communication.md).
+- **Issue:** [nan-language/nan#312](https://github.com/nan-language/nan/issues/312).
+
+## N69
+
+**Headers across isolated spaces.**
+
+- **Language 1:** an inbox call is served by a task of the instance's domain, and a call of a crossing kind from an isolated space by a task of its kernel, neither under the header of the task that made it (NaN 14 §Component instances, NaN 26 §Headers).
+- **NaN OS requires:** each handler call of an instance in an isolated space running under the header its runner gives it, and each call the instance makes through a port reaching the core under the header of the task making it.
+- **Chapters:** [07](07-communication.md), [08](08-scheduling.md).
+- **Issue:** [nan-language/nan#313](https://github.com/nan-language/nan/issues/313).

@@ -1,6 +1,6 @@
 # 0158. Isolated spaces keep time by the core's clock
 
-Status: accepted
+Status: superseded by 0161
 
 ## Context
 

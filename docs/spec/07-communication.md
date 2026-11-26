@@ -130,55 +130,13 @@ Only `Port`, `View`, `Control`, `Egress`, `Listen`, `WallClock` and `sys::Clock`
 
 ## Isolated transport
 
-Messages between instances in different spaces travel through **channels** (requires [N23](22-nan.md#n23), [N59](22-nan.md#n59), [N64](22-nan.md#n64)). The core creates a channel for each pair of a sending instance and a minted port whose target lies in another space, at its first message, and frees it when the minted port is revoked and its outstanding calls have ended. A channel is 10 frames, mapped into both spaces and charged as [transfers](05-memory.md#transfers) states, a failed draw trapping the sender:
+Messages to and from an instance in an isolated space travel through the channels of its link with the core (requires [N23](22-nan.md#n23), [N59](22-nan.md#n59)). Its runner keeps its intake in the core:
 
-| Frames | Written by | Holds |
-| --- | --- | --- |
-| 0 | the core; read-only in both spaces | the channel's state, mask and credit |
-| 1 | both sides | the indexes |
-| 2 to 5 | the sender | the **forward ring**: one-way messages and requests |
-| 6 to 9 | the receiver | the **reply ring**: replies and failed requests |
-
-| Frame 0 field | Offset | Size | Meaning |
-| --- | --- | --- | --- |
-| `state` | 0 | 4 | 0 open, 1 closed |
-| `messages`, `calls` | 4, 6 | 2 each | the credit |
-| `mask` | 8 | 32 | bit i set when the sender holds a live port of this minted port whose mask has operation i |
-
-| Frame 1 field | Offset | Size | Meaning |
-| --- | --- | --- | --- |
-| `forward_tail` | 0 | 8 | bytes the sender has written to the forward ring |
-| `reply_head` | 8 | 8 | bytes the sender has consumed from the reply ring |
-| `sender_waiting` | 16 | 4 | 1 while the sender sleeps until a doorbell |
-| `forward_head` | 64 | 8 | bytes the receiver has consumed from the forward ring |
-| `reply_tail` | 72 | 8 | bytes the receiver has written to the reply ring |
-| `receiver_waiting` | 80 | 4 | 1 while the receiver sleeps until a doorbell |
-
-Each ring is 16,384 bytes of records, at offsets taken modulo 16,384. A record never wraps: one that does not fit before the end of the ring follows a padding record that fills it.
-
-| Record field | Offset | Size | Meaning |
-| --- | --- | --- | --- |
-| `size` | 0 | 4 | bytes of the record, a multiple of 8 |
-| `kind` | 4 | 1 | 0 padding, 1 one-way message, 2 request, 3 reply, 4 failed request |
-| `reserved` | 5 | 1 | 0 |
-| `caps` | 6 | 2 | the number of capability ids after the payload |
-| `call` | 8 | 8 | for a request, a number its sender gives it, whose high 32 bits are the low 32 bits of the sender's incarnation; for a reply or a failed request, the number of the request; otherwise 0 |
-| `header` | 16 | 24 | the [header](#headers) |
-| `length` | 40 | 4 | the payload's bytes |
-| `transfer` | 44 | 4 | 0 for an inline payload, otherwise the number of the core transfer holding it |
-| `payload` | 48 | `length` when inline | the `mem::wire` encoding of the arguments, of the `Result[R, E]`, or for a failed request of its code as text |
-| capability ids | after the payload, at a multiple of 8 | 8 each | the received-capability entries the core added for this record |
-
-These rules govern a channel:
-
-- **Payloads.** A payload of at most 4 KiB travels inline. A larger one travels through a core transfer (`transfer` and `accept`, [system calls](04-kernel.md#system-calls)), which copies it below 256 KiB and moves its frames from the sender's space into the receiver's from 256 KiB.
-- **Capabilities.** For a message with capability arguments, the sender passes each capability to the core (`pass`), which adds its entry to the receiver's received-capability table, pending for this channel; the receiver claims the entries that the record lists (`claim`) when a handler call takes the message.
-- **Credit.** The receiver copies a one-way message out of the forward ring only while fewer than `messages` of the channel's messages wait in its intake, and a request only while fewer than `calls` of the channel's requests are outstanding. Records beyond that wait in the ring. A new incarnation of the sender discards the replies to its earlier incarnations' requests.
-- **Doorbells.** A side writes its indexes with release ordering and reads the other side's with acquire ordering. Before it sleeps (`wait`), a side sets its `waiting` field, issues a full fence and reads the other side's indexes again. After advancing an index, a side issues a full fence and rings the other side's doorbell (`ring`) only when that side's `waiting` field is 1; a woken side clears its own.
-- **Revocation.** When the minted port is revoked or its target removed, the core sets `state` to closed. The receiver discards every forward record it has not consumed; the reply ring serves the outstanding calls.
-- **Untrusted sides.** Each side reads the other's indexes and records as `Untrusted`, and copies a record out of the ring before decoding it. In a record from an isolated space, the receiver replaces `account` with the sending instance's account. A record or an index out of range, an operation outside `mask`, or a capability id that is not pending for the channel is handled as an integrity fault of the instance whose side wrote it ([faults](04-kernel.md#faults)).
-
-A message through a channel costs a record write and a copy out, and a doorbell only for a sleeping side.
+- **Handler calls.** The runner calls the instance's handlers down the link, each under the header of the message it handles (requires [N69](22-nan.md#n69)), and takes up it their replies and the messages the instance sends itself.
+- **Messages out.** A message through a port of an isolated instance goes up its link to the core, which charges the port's credit, checks its mask and the target's state as for any sender, gives it the header of the work that sent it (requires [N69](22-nan.md#n69)) and puts it in the target's intake; a reply goes back down. A call between instances of two isolated spaces thus crosses the core twice.
+- **Payloads.** A message past 1 MiB moves by its frames ([transfers](05-memory.md#transfers)).
+- **Capabilities.** A capability argument of a message an isolated instance handles crosses into its space with the handler call; a message or reply through a port of an isolated instance carrying one fails with `port.malformed` (requires [N68](22-nan.md#n68)).
+- **Untrusted sides.** The core reads what a space sends as untrusted: a message it does not decode, or past 1 MiB without moving, breaches the link, an integrity fault of the instance ([faults](04-kernel.md#faults)).
 
 ## Events
 

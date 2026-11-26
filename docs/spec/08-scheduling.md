@@ -78,7 +78,7 @@ A direct switch costs two task switches and no run-queue operation.
 An **account** is the unit that CPU time, I/O and energy are charged to: one per instance and one per session. Its number is the 4-byte account field of the [message header](07-communication.md#headers), and `/live/accounts` publishes its counters ([`/live`](13-tree.md#live)).
 
 - A dispatch is charged to the account its message carries, that of the session or instance that caused it; a task, to the account it runs under ([Run queues](#run-queues)).
-- In an isolated space, a space thread's time is charged to the account of the instance its last `run` named ([system calls](04-kernel.md#system-calls)); a message from an isolated space carries its sender's account ([isolated transport](07-communication.md#isolated-transport)).
+- In an isolated space, a space thread's time is charged to the account of the instance its last `run` named ([system calls](04-kernel.md#system-calls)); a message from an isolated space carries its sender's account ([isolated transport](07-communication.md#isolated-transport); requires [N69](22-nan.md#n69)).
 - Time in interrupt fns, landing fns and core tasks is charged to no account; `/live/cpus` reports it per CPU.
 - The core reads the clock once per dispatch and per task switch, adds the elapsed time to a per-CPU accumulator, and folds the accumulator into the account at each switch.
 - The driver or the [egress gate](16-network.md#egress-gate) that performs a transfer charges its bytes to the account of the message that requested it.
