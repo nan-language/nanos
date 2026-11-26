@@ -135,7 +135,7 @@ Messages to and from an instance in an isolated space travel through the channel
 - **Handler calls.** The runner calls the instance's handlers down the link, each under the header of the message it handles (requires [N69](22-nan.md#n69)), and takes up it their replies and the messages the instance sends itself.
 - **Messages out.** A message through a port of an isolated instance goes up its link to the core, which charges the port's credit, checks its mask and the target's state as for any sender, gives it the header of the work that sent it (requires [N69](22-nan.md#n69)) and puts it in the target's intake; a reply goes back down. A call between instances of two isolated spaces thus crosses the core twice.
 - **Payloads.** A message past 1 MiB moves by its frames ([transfers](05-memory.md#transfers)).
-- **Capabilities.** A capability argument of a message an isolated instance handles crosses into its space with the handler call; a message or reply through a port of an isolated instance carrying one fails with `port.malformed` (requires [N68](22-nan.md#n68)).
+- **Capabilities.** A capability argument of a message an isolated instance handles crosses into its space with the handler call, and one of a message or reply through a port of an isolated instance crosses with it (requires [N68](22-nan.md#n68)).
 - **Untrusted sides.** The core reads what a space sends as untrusted: a message it does not decode, or past 1 MiB without moving, breaches the link, an integrity fault of the instance ([faults](04-kernel.md#faults)).
 
 ## Events

@@ -210,7 +210,8 @@ pub fn PortHandle.post(self, hash: sys::ProtocolHash, take call: sys::Encoded, a
     match self.reach(hash, encoded: call.bytes.view()) {
         Ok(reached) => try await reached.post(hash, take call)
         Err(Refusal.Unreached) => {
-            discard try await self.relayed(CROSS_POST, hash, take call, alloc)
+            let answer = try await self.relayed(CROSS_POST, hash, take call, alloc)
+            try settled(try relayed_of(answer, alloc))
         }
         Err(Refusal.Revoked) => fail PortError.Revoked
         Err(Refusal.Stopped) => fail PortError.Stopped
@@ -231,7 +232,15 @@ pub fn Port.offer(self, take call: sys::Encoded, alloc: mem::Alloc) -> bool fail
     let hash = sys::Wire[P].hash()
     return match self.handle.reach(hash, encoded: call.bytes.view()) {
         Ok(reached) => try await reached.offer(hash, take call)
-        Err(Refusal.Unreached) => try await self.handle.relayed(CROSS_OFFER, hash, take call, alloc) == Relayed.Taken
+        Err(Refusal.Unreached) => {
+            let answer = try await self.handle.relayed(CROSS_OFFER, hash, take call, alloc)
+            let relayed = try relayed_of(answer, alloc)
+            if relayed == Relayed.Declined {
+                return false
+            }
+            try settled(relayed)
+            return true
+        }
         Err(Refusal.Revoked) => fail PortError.Revoked
         Err(Refusal.Stopped) => fail PortError.Stopped
     }
@@ -260,10 +269,7 @@ pub fn Port.call[R: Send, E: Send](self, take call: sys::Encoded, reply: sys::Re
 pub fn PortHandle.request(self, hash: sys::ProtocolHash, take call: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails PortError[Never] uses wait {
     let reached = match self.reach(hash, encoded: call.bytes.view()) {
         Ok(given) => given
-        Err(Refusal.Unreached) => {
-            let relayed = try await self.relayed(CROSS_REQUEST, hash, take call, alloc)
-            return try take relayed.reply(alloc)
-        }
+        Err(Refusal.Unreached) => return try replied(try await self.relayed(CROSS_REQUEST, hash, take call, alloc), alloc)
         Err(Refusal.Revoked) => fail PortError.Revoked
         Err(Refusal.Stopped) => fail PortError.Stopped
     }
@@ -280,49 +286,94 @@ pub fn PortHandle.request_held(self, hash: sys::ProtocolHash, take call: sys::En
     return try await reached.request(hash, take call, alloc)
 } PortHandle.request_held
 
-/// The answer the kernel holding this port gives `call` of the protocol of hash `hash`, which it carries out as the operation `operation` for a port of an isolated space; a call carrying capabilities is malformed, as none cross.
+/// The answer the kernel holding this port gives `call` of the protocol of hash `hash`, which it carries out as the operation `operation` for a port of an isolated space, the capabilities of the call crossing beside its bytes.
 fn PortHandle.relayed(
     self,
     operation: u64,
     hash: sys::ProtocolHash,
     take call: sys::Encoded,
     alloc: mem::Alloc,
-    ) -> Relayed fails PortError[Never] uses wait {
-    if call.handles.len() > 0 {
-        fail PortError.Malformed
-    }
-    let sys::Encoded(bytes: sent, handles: _) = call
+    ) -> sys::Encoded fails PortError[Never] uses wait {
+    let sys::Encoded(bytes: sent, handles: handles) = call
     var args = mem::Bytes.empty(alloc)
     mem::wire::Codec[Crossed].encode(Crossed(hash: hash, bytes: take sent), out: mut args)
-    let answer = match first attempt await sys::Handle.of(self).call(operation, args: args.view(), alloc) {
+    return match first attempt await sys::Handle.of(self).call(operation, args: args.view(), handles: handles.view(), alloc) {
         Ok(given) => given
         Err(sys::CrossError.Cancelled(cancelled)) => fail cancelled
         Err(sys::CrossError.Revoked(_)) => fail PortError.Revoked
         Err(sys::CrossError.Refused) => fail PortError.Malformed
     }
-    return match attempt mem::wire::Codec[Relayed].decode(Untrusted.of(answer.view()), alloc) {
+} PortHandle.relayed
+
+/// What the kernel answered for a call it carried out in place of a capability an isolated space holds, as `answer` encodes it.
+fn relayed_of(answer: sys::Encoded, alloc: mem::Alloc) -> Relayed fails PortError[Never] {
+    return match attempt mem::wire::Codec[Relayed].decode(Untrusted.of(answer.bytes.view()), alloc) {
         Ok(relayed) => relayed
         Err(_) => fail PortError.Malformed
     }
-} PortHandle.relayed
+} relayed_of
+
+/// The failure of a one-way call whose answer is `relayed`, nothing when its instance took it.
+fn settled(relayed: Relayed) fails PortError[Never] {
+    match relayed {
+        Relayed.Taken => {
+        }
+        Relayed.Revoked => fail PortError.Revoked
+        Relayed.Stopped => fail PortError.Stopped
+        Relayed.ServerStopped => fail PortError.ServerStopped
+        Relayed.Reset => fail PortError.Reset
+        Relayed.Unplugged => fail PortError.Unplugged
+        else => fail PortError.Malformed
+    }
+} settled
+
+/// The reply the answer `answer` of the kernel carrying out a call in place of a capability an isolated space holds gives, with the capabilities that crossed beside it, or the failure of the call.
+pub fn replied(take answer: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded fails PortError[Never] {
+    let relayed = try relayed_of(answer, alloc)
+    let sys::Encoded(bytes: _, handles: handles) = answer
+    return match relayed {
+        Relayed.Replied(bytes) => sys::Encoded(bytes: take bytes, handles: take handles)
+        Relayed.Revoked => fail PortError.Revoked
+        Relayed.Stopped => fail PortError.Stopped
+        Relayed.ServerStopped => fail PortError.ServerStopped
+        Relayed.Reset => fail PortError.Reset
+        Relayed.Unplugged => fail PortError.Unplugged
+        else => fail PortError.Malformed
+    }
+} replied
 
 /// Has nothing to do at once: a port of an isolated space only calls.
-pub fn PortHandle.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+pub fn PortHandle.invoke(
+    self,
+    operation: u64,
+    args: Untrusted[Slice[u8]],
+    handles: Slice[sys::Handle],
+    alloc: mem::Alloc,
+    ) -> sys::Encoded fails sys::CrossError limits stack 4_096 {
     fail sys::CrossError.Refused
 } PortHandle.invoke
 
-/// Carries out, in place of the port an isolated space holds, the operation `operation` on the call its arguments encode: posting it, offering it or calling it, and answers what came of it.
-pub fn PortHandle.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait limits stack 4_096 {
+/// Carries out, in place of the port an isolated space holds, the operation `operation` on the call its arguments encode with the capabilities `handles` names: posting it, offering it or calling it, and answers what came of it, with the capabilities of its reply.
+pub fn PortHandle.call(
+    self,
+    operation: u64,
+    args: Untrusted[Slice[u8]],
+    handles: Slice[sys::Handle],
+    alloc: mem::Alloc,
+    ) -> sys::Encoded fails sys::CrossError uses wait limits stack 4_096 {
     let Ok(crossed) = attempt mem::wire::Codec[Crossed].decode(args, alloc) else {
         fail sys::CrossError.Refused
     }
     let Crossed(hash: hash, bytes: bytes) = crossed
-    let call = sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc))
+    var call = sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc))
+    for handle in handles {
+        mut call.handles.push(handle)
+    }
     let reached = match self.reach(hash, encoded: call.bytes.view()) {
         Ok(given) => given
         Err(Refusal.Unreached) => fail sys::CrossError.Revoked(sys::Revoked.Stale)
-        Err(Refusal.Revoked) => return Relayed.Revoked.bytes(alloc)
-        Err(Refusal.Stopped) => return Relayed.Stopped.bytes(alloc)
+        Err(Refusal.Revoked) => return Relayed.Revoked.answer(alloc)
+        Err(Refusal.Stopped) => return Relayed.Stopped.answer(alloc)
     }
     let relayed = match operation {
         CROSS_POST => match first attempt await reached.post(hash, take call) {
@@ -337,30 +388,28 @@ pub fn PortHandle.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: 
             Err(failure) => Relayed.of_failure(failure)
         }
         CROSS_REQUEST => match first attempt await reached.request(hash, take call, alloc) {
-            Ok(reply) => Relayed.of_reply(take reply)
+            Ok(reply) => return Relayed.answered(take reply, alloc)
             Err(PortError.Cancelled(cancelled)) => fail cancelled
             Err(failure) => Relayed.of_failure(failure)
         }
         else => fail sys::CrossError.Refused
     }
-    return take relayed.bytes(alloc)
+    return take relayed.answer(alloc)
 } PortHandle.call
 
-/// The encoding of this answer.
-pub fn Relayed.bytes(take self, alloc: mem::Alloc) -> mem::Bytes {
+/// This answer, with no capability beside it.
+pub fn Relayed.answer(take self, alloc: mem::Alloc) -> sys::Encoded {
     var bytes = mem::Bytes.empty(alloc)
     mem::wire::Codec[Relayed].encode(self, out: mut bytes)
-    return bytes
-} Relayed.bytes
+    return sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc))
+} Relayed.answer
 
-/// The answer of a call whose reply is `reply`: malformed when it carries capabilities, as none cross.
-pub fn Relayed.of_reply(take reply: sys::Encoded) -> Relayed {
-    if reply.handles.len() > 0 {
-        return Relayed.Malformed
-    }
-    let sys::Encoded(bytes: bytes, handles: _) = reply
-    return Relayed.Replied(take bytes)
-} Relayed.of_reply
+/// The answer of a call whose reply is `reply`, the capabilities of the reply beside it.
+pub fn Relayed.answered(take reply: sys::Encoded, alloc: mem::Alloc) -> sys::Encoded {
+    let sys::Encoded(bytes: bytes, handles: handles) = reply
+    let sys::Encoded(bytes: answer, handles: _) = Relayed.Replied(take bytes).answer(alloc)
+    return sys::Encoded(bytes: take answer, handles: take handles)
+} Relayed.answered
 
 /// The answer of a call through a port that failed with `failure`.
 pub fn Relayed.of_failure(failure: PortError[Never]) -> Relayed {
@@ -373,19 +422,6 @@ pub fn Relayed.of_failure(failure: PortError[Never]) -> Relayed {
         else => Relayed.Malformed
     }
 } Relayed.of_failure
-
-/// The reply this answer gives, or the failure of its call.
-pub fn Relayed.reply(take self, alloc: mem::Alloc) -> sys::Encoded fails PortError[Never] {
-    return match self {
-        Relayed.Replied(bytes) => sys::Encoded(bytes: take bytes, handles: mem::List.empty(alloc))
-        Relayed.Revoked => fail PortError.Revoked
-        Relayed.Stopped => fail PortError.Stopped
-        Relayed.ServerStopped => fail PortError.ServerStopped
-        Relayed.Reset => fail PortError.Reset
-        Relayed.Unplugged => fail PortError.Unplugged
-        else => fail PortError.Malformed
-    }
-} Relayed.reply
 
 /// Posts `call` of the protocol of hash `hash` once the port has a message's credit, giving it back when its instance takes it.
 fn Reached.post(self, hash: sys::ProtocolHash, take call: sys::Encoded) fails PortError[Never] uses wait {
@@ -620,11 +656,12 @@ test ports_carry_out_the_calls_of_isolated_spaces_their_kernels_relay for PortHa
     let sent = ping.bytes.len()
     var args = mem::Bytes.empty(alloc)
     mem::wire::Codec[Crossed].encode(Crossed(hash: sys::Wire[Pinging].hash(), bytes: take ping.bytes), out: mut args)
-    let Ok(answer) = attempt await sys::Handle.of(minted.handle()).call(CROSS_POST, args: args.view(), alloc) else {
+    let passed = Array[sys::Handle, 1].filled(sys::Handle.of(world.log))
+    let Ok(answer) = attempt await sys::Handle.of(minted.handle()).call(CROSS_POST, args: args.view(), handles: passed.view(), alloc) else {
         expect false
         return
     }
-    let Ok(relayed) = attempt mem::wire::Codec[Relayed].decode(Untrusted.of(answer.view()), alloc) else {
+    let Ok(relayed) = attempt mem::wire::Codec[Relayed].decode(Untrusted.of(answer.bytes.view()), alloc) else {
         expect false
         return
     }
@@ -634,8 +671,9 @@ test ports_carry_out_the_calls_of_isolated_spaces_their_kernels_relay for PortHa
         return
     }
     try await take lease.release()
-    expect relayed == Relayed.Taken and posted.bytes.len() == sent
-    let undecodable = attempt await sys::Handle.of(minted.handle()).call(CROSS_REQUEST, args: b"", alloc)
+    expect relayed == Relayed.Taken and posted.bytes.len() == sent and posted.handles.len() == 1
+    let none = mem::List[sys::Handle].empty(alloc)
+    let undecodable = attempt await sys::Handle.of(minted.handle()).call(CROSS_REQUEST, args: b"", handles: none.view(), alloc)
     expect undecodable.is_err()
     var late = sys::Encoded.empty(alloc)
     sys::Wire[Pinging].ping(mut late)
@@ -645,3 +683,20 @@ test ports_carry_out_the_calls_of_isolated_spaces_their_kernels_relay for PortHa
     }
     expect revoked
 } ports_carry_out_the_calls_of_isolated_spaces_their_kernels_relay
+
+test replies_of_relayed_calls_keep_their_capabilities for replied {
+    let world = testing::world()
+    let alloc = world.alloc
+    var reply = sys::Encoded.empty(alloc)
+    mut reply.bytes.append(b"total")
+    mut reply.handles.push(sys::Handle.of(world.log))
+    let Ok(back) = attempt replied(Relayed.answered(take reply, alloc), alloc) else {
+        expect false
+        return
+    }
+    let refused = match attempt replied(Relayed.Stopped.answer(alloc), alloc) {
+        Err(PortError.Stopped) => true
+        else => false
+    }
+    expect back.bytes.view() == b"total" and back.handles.len() == 1 and refused
+} replies_of_relayed_calls_keep_their_capabilities

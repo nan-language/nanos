@@ -217,7 +217,7 @@ The runner **loads** a bundle into a space when it starts an instance of the bun
 2. It binds the image's support-routine imports to the kernel's exports; an image whose `support` differs fails with `code.no-image`.
 3. It adds the bundle's registry contributions ([registries](#registries)) and emits `code.loaded`.
 
-The frames of a loaded bundle are charged to the memory budget ([cells and limits](05-memory.md#cells-and-limits)) of the instance whose start loaded it into the space, and pass to another instance using it there when that one stops. When no instance in a space uses the bundle, the runner removes its contributions, unmaps it and emits `code.unloaded`; its frames are freed once no space maps them. The time to start an instance or a job from an admitted bundle is bounded in [Performance](21-performance.md).
+The frames of a loaded bundle are charged to the memory budget ([cells and limits](05-memory.md#cells-and-limits)) of the instance whose start loaded it into the space, and pass to another instance using it there when that one stops. When no instance in a space uses the bundle, the runner removes its contributions, unmaps it and emits `code.unloaded`; its frames are freed once no space maps them (requires [N71](22-nan.md#n71)). The time to start an instance or a job from an admitted bundle is bounded in [Performance](21-performance.md).
 
 ## Registries
 

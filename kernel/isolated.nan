@@ -1,6 +1,6 @@
-//! The isolated spaces of jobs and instances: the core runs each job and holds each instance an order brings in a space of its own, on frames of a pool that grows by what the memory keeper lends and keeps the frames of ended spaces.
+//! The isolated spaces of jobs and instances: the core runs each job and holds each instance an order brings in a space of its own, which it lends the frames of the job's or instance's memory limit, on frames of a pool that grows by what the memory keeper lends and keeps the frames of ended spaces.
 
-/// The bytes a space takes beyond its instance's memory limit and two copies of its bundle's image: the user-mode runtime's image, its stack and data, the frames it shares with the core and its tables.
+/// The bytes a space takes for itself beyond two copies of its bundle's image: the user-mode runtime's image and records, the chunks it keeps, the frames it shares with the core and its tables.
 const SPACE_ALLOWANCE: u64 = 16_777_216
 
 const SPACE_PAGE: u64 = 4_096
@@ -128,7 +128,7 @@ fn borrowed(requests: task::Sender[MemoryRequest], count: u64, alloc: mem::Alloc
     return given
 } borrowed
 
-/// Holds the instance `order` asks for in an isolated space of its own for `tenant`, made of the frames `lent`, on `cpu`: isolates its bundle through `loader`, recording it loaded into the space through `rings`, gives the instance to its domain and holds it until the domain releases it, then records it unloaded and returns the frames through `returning`.
+/// Holds the instance `order` asks for in an isolated space of its own for `tenant`, made of the frames `lent`, on `cpu`: isolates its bundle through `loader`, recording it loaded into the space through `rings`, gives the instance to its domain and holds it, lending the space the frames of its memory limit, until the domain releases it, then records it unloaded and returns the frames through `returning`.
 fn held_in_space(
     cpu: hw::Ring0,
     loader: sys::load::Loader,
@@ -138,7 +138,7 @@ fn held_in_space(
     take lent: mem::List[hw::PhysFrame[4_096]],
     returning: task::Sender[isolation::Input],
     ) fails task::Cancelled uses wait {
-    let isolation::Order(image: image, code: code, space: label, principal: _, component: component, services: services, caps: caps, clock: clock, checkpoint: resumed, runner: runner, bytes: _, exec: exec, alloc: cell, held: held, released: released) = order
+    let isolation::Order(image: image, code: code, space: label, principal: _, component: component, services: services, caps: caps, clock: clock, checkpoint: resumed, runner: runner, bytes: bytes, exec: exec, alloc: cell, held: held, released: released) = order
     var frames = lent
     let isolating = trusted "the generation ships the image built against the kernel's interface, or admission took it as one the toolchain built against that interface and the runner checked its blob id against the one admission recorded" { attempt loader.isolate_unverified(image.view(), alloc: cell) }
     let Ok(job) = isolating else {
@@ -151,17 +151,18 @@ fn held_in_space(
     let inbound = mut frames.remove(frames.len() - 1)
     discard mut link.open(INSTANCE_CHANNEL, take inbound, outbound: mut frames.remove(frames.len() - 1))
     var extended = Some(hw::ExtendedState.of(mut frames.remove(frames.len() - 1)))
+    var loan = isolation::loaned(mut frames, count: bytes / SPACE_PAGE, alloc: cell)
     var handing = Some(take held)
     var releasing = Some(take released)
     var described = Some(job.schema(component.as_str(), alloc: cell))
     var resuming = Some(take resumed)
     var holds = false
-    let outcome = attempt await nanos::isolate(cpu, tenant, services: isolation::spaced(services, clock), mut frames, mut extended, exec, alloc: cell, body: fn[mut handing, mut releasing, mut described, mut resuming, mut holds](space: nanos::Isolation) fails task::Cancelled uses wait limits stack 131_072 {
+    let outcome = attempt await nanos::isolate(cpu, tenant, services: isolation::spaced(services, clock), mut frames, mut extended, exec, alloc: cell, body: fn[mut handing, mut releasing, mut described, mut resuming, mut holds, mut loan](space: nanos::Isolation) fails task::Cancelled uses wait limits stack 131_072 {
         let checkpoint = match mut resuming.extract() {
             Some(given) => given
             None => None
         }
-        let held_instance = try await nanos::hold_isolated(space, job, component: component.as_str(), link, services, caps, take checkpoint, runner, alloc: cell, body: fn[mut handing, mut releasing, mut described](take instance: nanos::Instance) fails task::Cancelled uses wait limits stack 65_536 {
+        let held_instance = try await nanos::hold_isolated(space, job, component: component.as_str(), link, services, caps, take checkpoint, runner, frames: mut loan, alloc: cell, body: fn[mut handing, mut releasing, mut described](take instance: nanos::Instance) fails task::Cancelled uses wait limits stack 65_536 {
             let Some(sender) = mut handing.extract() else {
                 take instance.abandon()
                 return
@@ -181,6 +182,9 @@ fn held_in_space(
         holds = held_instance.is_some()
     })
     runner::Journal.record(rings, slot: 0, cause: 0, event: runner::Event.Unloaded(code: code, space: label))
+    for frame in take loan {
+        mut frames.push(take frame)
+    }
     take link.release(mut frames)
     match extended {
         Some(owned) => mut frames.push(take owned.into_frame())
@@ -204,7 +208,7 @@ fn held_in_space(
     }
 } held_in_space
 
-/// Runs the job `order` asks for in an isolated space of its own for `tenant`, made of the frames `lent`, on `cpu`: isolates its bundle through `loader`, recording it loaded into the space through `rings`, runs the job until it ends or its domain releases the stop, records it unloaded, gives how it ended, then returns the frames through `returning`.
+/// Runs the job `order` asks for in an isolated space of its own for `tenant`, made of the frames `lent`, on `cpu`: isolates its bundle through `loader`, recording it loaded into the space through `rings`, runs the job, lending the space the frames of its memory limit, until it ends or its domain releases the stop, records it unloaded, gives how it ended, then returns the frames through `returning`.
 fn ran_in_space(
     cpu: hw::Ring0,
     loader: sys::load::Loader,
@@ -214,7 +218,7 @@ fn ran_in_space(
     take lent: mem::List[hw::PhysFrame[4_096]],
     returning: task::Sender[isolation::Input],
     ) fails task::Cancelled uses wait {
-    let isolation::JobOrder(image: image, code: code, space: label, principal: _, input: input, services: services, caps: caps, clock: clock, bytes: _, exec: exec, alloc: cell, done: done, stop: stop) = order
+    let isolation::JobOrder(image: image, code: code, space: label, principal: _, input: input, services: services, caps: caps, clock: clock, bytes: bytes, exec: exec, alloc: cell, done: done, stop: stop) = order
     var frames = lent
     let isolating = trusted "admission took the image as one the toolchain built against the kernel's interface, and the runner checked its blob id against the one admission recorded" { attempt loader.isolate_unverified(image.view(), alloc: cell) }
     let Ok(job) = isolating else {
@@ -225,11 +229,12 @@ fn ran_in_space(
     runner::Journal.record(rings, slot: 0, cause: 0, event: runner::Event.Loaded(code: code, bytes: u64.widen(image.len()), space: label))
     let link = nanos::Link.of(mut frames.remove(frames.len() - 1), alloc: cell)
     var extended = Some(hw::ExtendedState.of(mut frames.remove(frames.len() - 1)))
+    var loan = isolation::loaned(mut frames, count: bytes / SPACE_PAGE, alloc: cell)
     var ended: Result[nanos::Ended, text::Fixed[32]] = Ok(nanos::Ended.Cancelled)
     var inputs = Some(take input)
     var stops = Some(take stop)
     var held = Some(take caps)
-    let scoped = attempt await nanos::isolate(cpu, tenant, services: isolation::spaced(services, clock), mut frames, mut extended, exec, alloc: cell, body: fn[mut ended, mut inputs, mut stops, mut held](space: nanos::Isolation) fails task::Cancelled uses wait limits stack 131_072 {
+    let scoped = attempt await nanos::isolate(cpu, tenant, services: isolation::spaced(services, clock), mut frames, mut extended, exec, alloc: cell, body: fn[mut ended, mut inputs, mut stops, mut held, mut loan](space: nanos::Isolation) fails task::Cancelled uses wait limits stack 131_072 {
         let Some(given) = mut inputs.extract() else {
             return
         }
@@ -239,7 +244,7 @@ fn ran_in_space(
         let Some(world_caps) = mut held.extract() else {
             return
         }
-        match try await isolation::ended_job(space, job, link, services, caps: take world_caps, input: take given, stop: take watched, exec, alloc: cell) {
+        match try await isolation::ended_job(space, job, link, services, caps: take world_caps, input: take given, stop: take watched, frames: mut loan, exec, alloc: cell) {
             Some(outcome) => {
                 ended = outcome
             }
@@ -248,6 +253,9 @@ fn ran_in_space(
         }
     })
     runner::Journal.record(rings, slot: 0, cause: 0, event: runner::Event.Unloaded(code: code, space: label))
+    for frame in take loan {
+        mut frames.push(take frame)
+    }
     take link.release(mut frames)
     match extended {
         Some(owned) => mut frames.push(take owned.into_frame())

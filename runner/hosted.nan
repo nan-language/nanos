@@ -17,8 +17,30 @@ struct Hosted {
     served: Option[mem::Bytes]
 } Hosted
 
-/// The longest the holder of an instance waits for a message before it looks again for what its dispatcher ordered, a health probe to run or a hibernation, in nanoseconds.
-const LOOK_NS: u64 = 1_000_000_000
+/// What the dispatcher of an instance sets for its holder: the milliseconds without a message after which the instance is suspended, a health probe to run and a hibernation to take, and the signal it posts once it has set one.
+struct Flagged {
+    quiet: mem::Shared[core::atomic::AtomicU64]
+    probe: mem::Shared[core::atomic::AtomicBool]
+    hibernate: mem::Shared[core::atomic::AtomicBool]
+    wake: mem::Shared[hw::Signal[Unit]]
+} Flagged
+
+/// Flags of an instance suspended after `suspend_ms` without a message, never when 0.
+fn Flagged.of(suspend_ms: u64, alloc: mem::Alloc) -> Flagged {
+    return Flagged(quiet: mem::Shared.of(core::atomic::AtomicU64.of(suspend_ms), alloc), probe: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), hibernate: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), wake: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
+} Flagged.of
+
+/// The same flags.
+fn Flagged.share(self) -> Flagged {
+    return Flagged(quiet: self.quiet.share(), probe: self.probe.share(), hibernate: self.hibernate.share(), wake: self.wake.share())
+} Flagged.share
+
+/// Wakes the holder once a flag is set.
+fn Flagged.woken(self) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+        self.wake.contents().post(t, value: Unit)
+    })
+} Flagged.woken
 
 /// What an instance of a bundle's component takes from its driver before the kernel holds it: what the driver serves it, the protocol its component serves and the names of its operations by number, the encoding of the protocol schema its bundle gives for it, the isolated space it runs in, none when it runs in the shared space, the executor and allocator of its domain, the cell it draws what it hands the driver through, and the runner capability its component hands the replies to postponed requests through, with the queue of those replies, their signal and whether a checkpoint is asked for.
 pub open linear struct Hosting {
@@ -372,9 +394,7 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
         }
         try await tell(reports, incarnation, report: Report.Running(from: started_from(restored, revival, updated), operations: names_in(steps.contents().operations, alloc)))
         let inbox = held.inbox()
-        let quiet = mem::Shared.of(core::atomic::AtomicU64.of(u64.widen(suspend_ms)), alloc)
-        let probe = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
-        let hibernate = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
+        let flags = Flagged.of(u64.widen(suspend_ms), alloc)
         var given = Some(HostedGiven(deliveries: take deliveries, finishes: take finishes))
         var due_at = epoch_after(keeping, clock)
         let looped = attempt await task::scope(exec, body: fn[mut held, mut given, mut due_at, mut image](s: task::Scope) fails Stopping uses wait {
@@ -383,11 +403,9 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
             }
             let sending = reports.split()
             let counted = steps.share()
-            let setting = quiet.share()
-            let probing = probe.share()
-            let hibernating = hibernate.share()
-            discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take setting, take probing, take hibernating]() fails Stopping uses wait limits stack 40_960 {
-                try await dispatch_hosted(inbox, protocol, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, quiet: setting, probe: probing, hibernate: hibernating, handed, alloc)
+            let flagging = flags.share()
+            discard s.spawn(fn[take receiver, take finishing, take sending, take counted, take flagging]() fails Stopping uses wait limits stack 40_960 {
+                try await dispatch_hosted(inbox, protocol, deliveries: take receiver, steps: counted, finishes: take finishing, reports: sending, incarnation, flags: flagging, handed, alloc)
             })
             let answering = reports.split()
             let queued = replies.share()
@@ -395,7 +413,7 @@ pub fn Hosting.run(take self, take instance: nanos::Instance) -> Result[Ended, s
             discard s.spawn(fn[take answering, take queued, take ringing]() fails task::Cancelled uses wait limits stack 16_384 {
                 try await hand_over(queued, signal: ringing, reports: answering, incarnation)
             })
-            match attempt await hold_hosted(mut held, keeping, mut due_at, syncing: syncing.contents(), quiet: quiet.contents(), probe: probe.contents(), hibernate: hibernate.contents(), updated, protocol, telling) {
+            match attempt await hold_hosted(mut held, keeping, mut due_at, syncing: syncing.contents(), flags, updated, protocol, telling, exec) {
                 Ok(taken) => {
                     image = Some(take taken)
                 }
@@ -488,7 +506,7 @@ fn begin_hosted(
     }
 } begin_hosted
 
-/// Serves each call delivered to the instance through `inbox` as a call of `protocol`, the protocol its component serves, whose schema serves the calls of the client protocol a port may carry, one at a time and in order, until told to stop, keeping in `quiet` the time without a message after which it is suspended, setting `probe` for each health probe ordered and `hibernate` for each hibernation, telling the driver that the instance serves on for a hibernation only an idle instance takes, refusing each other order for its holder and drawing the replies it hands the driver through `handed`.
+/// Serves each call delivered to the instance through `inbox` as a call of `protocol`, the protocol its component serves, whose schema serves the calls of the client protocol a port may carry, one at a time and in order, until told to stop, setting in `flags` the time without a message after which it is suspended, each health probe ordered and each hibernation and waking the holder, telling the driver that the instance serves on for a hibernation only an idle instance takes, refusing each other order for its holder and drawing the replies it hands the driver through `handed`.
 fn dispatch_hosted(
     inbox: nanos::Inbox,
     protocol: sys::ProtocolHash,
@@ -497,9 +515,7 @@ fn dispatch_hosted(
     take finishes: task::Receiver[u64],
     reports: task::Sender[Input],
     incarnation: u64,
-    quiet: mem::Shared[core::atomic::AtomicU64],
-    probe: mem::Shared[core::atomic::AtomicBool],
-    hibernate: mem::Shared[core::atomic::AtomicBool],
+    flags: Flagged,
     handed: mem::Alloc,
     alloc: mem::Alloc,
     ) fails Stopping uses wait {
@@ -526,14 +542,23 @@ fn dispatch_hosted(
                 try await settle_call(take outcome, id, request, steps: counts, mut signals, reports, incarnation, handed)
                 counts.deadline.store(os::NO_DEADLINE)
             }
-            Delivery.SuspendAfter(ms: ms) => quiet.contents().store(u64.widen(ms))
+            Delivery.SuspendAfter(ms: ms) => {
+                flags.quiet.contents().store(u64.widen(ms))
+                flags.woken()
+            }
             Delivery.Hold(order: order) => {
                 match order {
-                    HolderOrder.Health => probe.contents().store(true)
+                    HolderOrder.Health => {
+                        flags.probe.contents().store(true)
+                        flags.woken()
+                    }
                     HolderOrder.Hibernate(idle: only_idle) => {
                         match only_idle {
                             true => try await tell(reports, incarnation, report: Report.Hibernation(image: None))
-                            false => hibernate.contents().store(true)
+                            false => {
+                                flags.hibernate.contents().store(true)
+                                flags.woken()
+                            }
                         }
                     }
                     else => try await take order.refuse()
@@ -544,25 +569,24 @@ fn dispatch_hosted(
     }
 } dispatch_hosted
 
-/// Holds the instance until its domain ends, the task is cancelled or it is ordered to hibernate through `hibernate`, then giving its hibernation image, or telling the driver that it serves on when it gives none: waits for its messages, suspending it after `quiet` without one, and calls their handlers. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the instance is idle.
+/// Holds the instance until its domain ends, the task is cancelled or it is ordered to hibernate through `flags`, then giving its hibernation image, or telling the driver that it serves on when it gives none: waits for its messages, suspending it after the time `flags` holds without one, and calls their handlers, running a health probe once `flags` orders one; its waits take the tasks they start from `exec`. With `keeping`, a checkpoint falls due at `due_at`, an epoch after the first handler call since the last checkpoint or the failure of one, at once when a handler asked for one through `syncing`, and is kept once the instance is idle.
 fn hold_hosted(
     mut instance: nanos::Instance,
     keeping: Option[Keeping],
     mut due_at: Option[u64],
     syncing: core::atomic::AtomicBool,
-    quiet: core::atomic::AtomicU64,
-    probe: core::atomic::AtomicBool,
-    hibernate: core::atomic::AtomicBool,
+    flags: Flagged,
     updated: bool,
     protocol: sys::ProtocolHash,
     telling: Telling,
+    exec: task::Executor,
     ) -> Image fails nanos::InstanceError uses wait {
     let clock = telling.clock
     loop {
         if syncing.swap(false) {
             due_at = Some(now(clock))
         }
-        if probe.swap(false) {
+        if flags.probe.contents().swap(false) {
             let probing = telling.begin(call: SystemCall.Health)
             let health = try await mut instance.health()
             telling.end_system(probing)
@@ -576,7 +600,7 @@ fn hold_hosted(
                 }
             }
         }
-        if hibernate.swap(false) {
+        if flags.hibernate.contents().swap(false) {
             match try await hibernation_hosted(mut instance, keeping, dirty: due_at.is_some(), protocol, telling) {
                 Some(image) => return image
                 None => {
@@ -590,13 +614,9 @@ fn hold_hosted(
         }
         match first keeping {
             Some(kept) if due_at.is_some() => {
-                let until_due = due_at.value_or(0).saturating_sub(now(clock))
-                let bound = until_due.min(LOOK_NS)
-                let arrived = try await task::within_ns(clock, ns: bound, body: fn() fails nanos::InstanceError uses wait {
-                    try await instance.incoming()
-                })
-                if arrived.is_none() and not try await instance.ready() {
-                    if bound == until_due {
+                let due = due_at.value_or(0)
+                if not try await arrives_before(instance, flags, bound: Some(due.saturating_sub(now(clock))), clock, exec) and not try await instance.ready() {
+                    if now(clock) >= due {
                         due_at = try await due_after_keeping(instance, kept, keeping, telling)
                     }
                     continue
@@ -604,14 +624,11 @@ fn hold_hosted(
             }
             else => {
                 if updated {
-                    let arrived = try await task::within_ns(clock, ns: LOOK_NS, body: fn() fails nanos::InstanceError uses wait {
-                        try await instance.incoming()
-                    })
-                    if arrived.is_none() {
+                    if not try await arrives_before(instance, flags, bound: None, clock, exec) {
                         continue
                     }
                 } else {
-                    try await idle_hosted(mut instance, quiet, hibernate, telling)
+                    try await idle_hosted(mut instance, flags, telling, exec)
                 }
             }
         }
@@ -629,17 +646,21 @@ fn due_after_keeping(instance: nanos::Instance, kept: Keeping, keeping: Option[K
     }
 } due_after_keeping
 
-/// Waits until a message waits for the instance or it is ordered to hibernate through `hibernate`, looking for the order every `LOOK_NS`; once it has had no message for the time `quiet` holds, never when 0, suspends it until either and then wakes it, telling the driver of both.
-fn idle_hosted(mut instance: nanos::Instance, quiet: core::atomic::AtomicU64, hibernate: core::atomic::AtomicBool, telling: Telling) fails nanos::InstanceError uses wait {
+/// Waits until a message waits for the instance or `flags` orders it to hibernate; once it has had no message for the time `flags` holds, never when 0, suspends it until either and then wakes it, telling the driver of both.
+fn idle_hosted(mut instance: nanos::Instance, flags: Flagged, telling: Telling, exec: task::Executor) fails nanos::InstanceError uses wait {
     let clock = telling.clock
     let idle_since = now(clock)
     loop {
-        if try await arrives_within(instance, clock) or hibernate.load() {
-            return
+        let ms = flags.quiet.contents().load()
+        let bound: Option[u64] = match ms {
+            0 => None
+            else => Some(idle_since.saturating_add(ms.saturating_mul(1_000_000)).saturating_sub(now(clock)))
         }
-        let ms = quiet.load()
-        if ms != 0 and now(clock).saturating_sub(idle_since) >= ms.saturating_mul(1_000_000) {
+        if bound == Some(0u64) {
             break
+        }
+        if try await arrives_before(instance, flags, bound, clock, exec) or flags.hibernate.contents().load() {
+            return
         }
     }
     let suspending = telling.begin(call: SystemCall.Suspend)
@@ -647,7 +668,7 @@ fn idle_hosted(mut instance: nanos::Instance, quiet: core::atomic::AtomicU64, hi
     telling.end_system(suspending)
     try await telling.tell(report: Report.Suspended)
     loop {
-        if try await arrives_within(instance, clock) or hibernate.load() {
+        if try await arrives_before(instance, flags, bound: None, clock, exec) or flags.hibernate.contents().load() {
             break
         }
     }
@@ -657,13 +678,37 @@ fn idle_hosted(mut instance: nanos::Instance, quiet: core::atomic::AtomicU64, hi
     try await telling.tell(report: Report.Woken)
 } idle_hosted
 
-/// Whether a message waits for the instance within `LOOK_NS`.
-fn arrives_within(instance: nanos::Instance, clock: sys::Clock) -> bool fails nanos::InstanceError uses wait {
-    let arrived = try await task::within_ns(clock, ns: LOOK_NS, body: fn() fails nanos::InstanceError uses wait {
+/// Whether a message waits for the instance before `flags` wakes its holder or, when given, `bound` nanoseconds pass; the wait takes the task watching `flags` from `exec`.
+fn arrives_before(
+    instance: nanos::Instance,
+    flags: Flagged,
+    bound: Option[u64],
+    clock: sys::Clock,
+    exec: task::Executor,
+    ) -> bool fails nanos::InstanceError uses wait {
+    var arrived = false
+    var waking = Some(flags.wake.share())
+    try await task::scope(exec, body: fn[mut arrived, mut waking](s: task::Scope) fails nanos::InstanceError uses wait {
+        let Some(wake) = mut waking.extract() else {
+            return
+        }
+        discard s.spawn(fn[take wake]() fails task::Cancelled uses wait limits stack 8_192 {
+            match bound {
+                Some(ns) => {
+                    discard try await task::within_ns(clock, ns, body: fn() fails task::Cancelled uses wait {
+                        try await wake.contents().wait()
+                    })
+                }
+                None => try await wake.contents().wait()
+            }
+            s.cancel()
+        })
         try await instance.incoming()
+        arrived = true
+        s.cancel()
     })
-    return arrived.is_some()
-} arrives_within
+    return arrived
+} arrives_before
 
 /// The hibernation image of the instance: calls the handlers of the messages waiting, keeps a checkpoint when the state is `dirty` or they ran, and gives the state's encoding with the messages its handlers sent it that wait for their delay, which it takes from it; `None` without `keeping`, when that checkpoint failed or when the state passes the bytes `keeping` allows, the instance then serving on.
 fn hibernation_hosted(

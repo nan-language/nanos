@@ -126,7 +126,7 @@ A CPU runs an isolated space's user code on the space's root, switches to the sh
 [Placement](09-authority.md#placement) decides, when an instance starts, whether it runs in the shared space or in an isolated space; the core carries the decision out.
 
 - An instance placed shared runs its tasks in ring 0.
-- An instance placed isolated runs in the isolated space that placement names. The core creates an isolated space when an instance first starts in it, and destroys it, freeing its tables, when its last instance has stopped (requires [N55](22-nan.md#n55), [N63](22-nan.md#n63), [N67](22-nan.md#n67)).
+- An instance placed isolated runs in the isolated space that placement names. The core creates an isolated space when an instance first starts in it, and destroys it, freeing its tables, when its last instance has stopped (requires [N55](22-nan.md#n55), [N63](22-nan.md#n63), [N67](22-nan.md#n67), [N70](22-nan.md#n70), [N71](22-nan.md#n71)).
 - The runner loads a bundle into each space where an instance of it starts ([loading](10-code.md#loading)).
 - An instance moves to another space only by a restart there ([provenance](09-authority.md#provenance)).
 - On a machine without `user-mode`, the core creates no isolated space ([machine conditions](09-authority.md#machine-conditions)).
@@ -159,7 +159,7 @@ A system call passes its number and up to six arguments in the registers NaN 24 
 | 9 | `pass` | channel, handle | a capability id pending for the channel | `stale`, `invalid` |
 | 10 | `claim` | channel, pending capability id, domain slot | a handle | `invalid` |
 
-- `run` names the domain whose code the thread runs next: its account is charged for the thread ([accounting](08-scheduling.md#accounting)), and its domain answers for an exception. A space thread runs the domain of the instance the core started it for as long as it has not called `run` (requires [N55](22-nan.md#n55)).
+- `run` names the domain whose code the thread runs next: its account is charged for the thread ([accounting](08-scheduling.md#accounting)), and its domain answers for an exception. A space thread runs the domain of the instance the core started it for as long as it has not called `run` (requires [N55](22-nan.md#n55), [N70](22-nan.md#n70)).
 - `wait` blocks the thread while no bit of the doorbell frame is set, at most to the deadline; a waiting space thread costs nothing.
 - `draw` draws chunks through the domain's cell and maps them; `release` unmaps and returns them ([mappings](05-memory.md#mappings)).
 - `invoke` performs an operation that never waits of a kernel-implemented [capability kind](09-authority.md#capability-kinds) (requires [N27](22-nan.md#n27), [N54](22-nan.md#n54)); its arguments and result are `mem::wire` encodings, read and written by bounded copies (requires [N23](22-nan.md#n23)). An operation that waits reaches the instance serving it through a channel.

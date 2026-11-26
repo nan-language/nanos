@@ -676,3 +676,21 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** each handler call of an instance in an isolated space running under the header its runner gives it, and each call the instance makes through a port reaching the core under the header of the task making it.
 - **Chapters:** [07](07-communication.md), [08](08-scheduling.md).
 - **Issue:** [nan-language/nan#313](https://github.com/nan-language/nan/issues/313).
+
+## N70
+
+**Accounts of a space's jobs and instances.**
+
+- **Language 1:** a task of the executor `isolate` takes runs the space's thread for every job and instance of the space (NaN 14 §Jobs).
+- **NaN OS requires:** the time a space's thread runs a job's or instance's domain charged to the account its kernel gives with it.
+- **Chapters:** [04](04-kernel.md), [08](08-scheduling.md), [09](09-authority.md).
+- **Issue:** [nan-language/nan#315](https://github.com/nan-language/nan/issues/315).
+
+## N71
+
+**Bundles of a space's jobs and instances.**
+
+- **Language 1:** a space maps the image of each bundle it places from the frames `isolate` takes, and keeps it until it runs no job or instance (NaN 14 §Jobs).
+- **NaN OS requires:** the frames of a bundle's image lent with the job or instance whose start maps it, and the image unmapped and its frames given back once no job or instance of the space uses it.
+- **Chapters:** [04](04-kernel.md), [09](09-authority.md), [10](10-code.md).
+- **Issue:** [nan-language/nan#316](https://github.com/nan-language/nan/issues/316).
