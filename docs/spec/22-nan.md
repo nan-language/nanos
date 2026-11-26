@@ -649,3 +649,12 @@ This chapter defines the features NaN OS requires of NaN beyond language 1 as th
 - **NaN OS requires:** an instance without a `Clock` grant denied the clock while its space keeps time.
 - **Chapters:** [06](06-execution.md).
 - **Issue:** [nan-language/nan#305](https://github.com/nan-language/nan/issues/305).
+
+## N66
+
+**Kernel packages in the release gate.**
+
+- **Language 1:** `nan verify` gates every package that a package reaches through relative-path dependencies, whatever interface file its bundle is built against (NaN 31 §Release gate).
+- **NaN OS requires:** the packages of a bundle's closure that the running kernel's interface file lists, with the code roots it records, judged as the kernel's, outside the release gate.
+- **Chapters:** [10](10-code.md).
+- **Issue:** [nan-language/nan#310](https://github.com/nan-language/nan/issues/310).

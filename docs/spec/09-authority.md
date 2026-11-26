@@ -254,7 +254,7 @@ A session acts with exactly its principal's grants. Its **root capability** is t
 The **provenance class** of a bundle is computed at admission from its signatures ([signatures and provenance](10-code.md#signatures-and-provenance)), in this order:
 
 1. `vendor`: the kernel image's base bundle, or a bundle carrying a `bundle` signature by a `vendor.*` principal with a record.
-2. `reviewed`: every package of its closure outside std carries a `review` signature by a **reviewer**, a `human.*` or `owner` principal the [policy](19-oversight.md#policy) names as reviewer, and every trust escape of the closure a `seal` signature by a reviewer who is an author of neither the sealed item's package nor any package holding an item of its closure entries ([NaN 31 §Seals](https://github.com/nan-language/nan/blob/main/docs/spec/31-trust.md#seals)).
+2. `reviewed`: every package of its closure outside std and the running kernel's own ([admission](10-code.md#admission) step 4) carries a `review` signature by a **reviewer**, a `human.*` or `owner` principal the [policy](19-oversight.md#policy) names as reviewer, and every trust escape of those packages a `seal` signature by a reviewer who is an author of neither the sealed item's package nor any package holding an item of its closure entries ([NaN 31 §Seals](https://github.com/nan-language/nan/blob/main/docs/spec/31-trust.md#seals)).
 3. `agent`: every other bundle, every one built from source an `agent.*` principal wrote included, whatever the taint of its session.
 
 ```nan

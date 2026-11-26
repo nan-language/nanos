@@ -7,10 +7,12 @@ const INTERFACE_MAGIC: Slice[u8] = b"NLIF"
 /// The format version of the artefacts and interface files read.
 const FORMAT_VERSION: u64 = 1
 
-/// The keys of an interface file's toolchain hash, target and codegen level.
+/// The keys of an interface file's toolchain hash, target, packages and codegen level.
 const TOOLCHAIN_PART: u64 = 1
 
 const TARGET_PART: u64 = 2
+
+const PACKAGES_PART: u64 = 3
 
 const LEVEL_PART: u64 = 6
 
@@ -33,10 +35,10 @@ struct Rooted {
 } Rooted
 
 /// What an interface file tells of the images built against it: the toolchain that built its kernel and the codegen level they are lowered at.
-struct Interface derives Copy {
+struct Lowering derives Copy {
     toolchain: ident::HashValue
     level: Level
-} Interface
+} Lowering
 
 /// The bundle of the root package `root` whose bundle build wrote `image` against the interface file `interface_file`, and the artefacts of its closure as `.narts` lists them, carrying `sources`, with the code hash of its closure; `None` when the artefacts or the interface file do not decode.
 pub validator fn Bundle.made(
@@ -169,7 +171,21 @@ fn code_root_of(artefact: Slice[u8]) -> Option[ident::HashValue] {
 } code_root_of
 
 /// The toolchain and codegen level the interface file `raw` records; `None` when it is no interface file of the format version read, or lacks either.
-fn interface_of(raw: Slice[u8]) -> Option[Interface] {
+fn interface_of(raw: Slice[u8]) -> Option[Lowering] {
+    let Some(toolchain) = read_part(raw, key: TOOLCHAIN_PART, body: fn(content: Slice[u8]) => hash_of(content)) else {
+        return None
+    }
+    let arm = read_part(raw, key: TARGET_PART, body: fn(content: Slice[u8]) -> Option[bool] {
+        return Some(content.prefix(7) == Some(b"aarch64"))
+    }) == Some(true)
+    let Some(level) = read_part(raw, key: LEVEL_PART, body: fn(content: Slice[u8]) => level_named(content, arm)) else {
+        return None
+    }
+    return Some(Lowering(toolchain: toolchain, level: level))
+} interface_of
+
+/// What `body` gives of the content of the part of key `key` of the interface file `raw`; `None` when it is no interface file of the format version read, or lacks the part.
+fn read_part[T: Any](raw: Slice[u8], key: u64, body: fn(content: Slice[u8]) -> Option[T]) -> Option[T] {
     let Some(magic) = raw.prefix(4) else {
         return None
     }
@@ -179,46 +195,33 @@ fn interface_of(raw: Slice[u8]) -> Option[Interface] {
     let Some(version) = uvar_at(raw, at: 4) else {
         return None
     }
-    let Some(count) = uvar_at(raw, at: version.end) else {
-        return None
-    }
     if version.value != FORMAT_VERSION {
         return None
     }
-    var toolchain: Option[ident::HashValue] = None
-    var arm = false
-    var level: Option[Level] = None
+    let Some(count) = uvar_at(raw, at: version.end) else {
+        return None
+    }
     var at = count.end
     for _ in 0..<count.value {
-        let Some(key) = uvar_at(raw, at) else {
+        let Some(read) = uvar_at(raw, at) else {
             return None
         }
-        let Some(span) = bytes_at(raw, at: key.end) else {
+        let Some(span) = bytes_at(raw, at: read.end) else {
             return None
         }
-        let Some(parts) = raw.split_at(span.start) else {
-            return None
-        }
-        let Some(content) = parts.tail.prefix(span.end - span.start) else {
-            return None
-        }
-        if key.value == TOOLCHAIN_PART {
-            toolchain = hash_of(content)
-        } else if key.value == TARGET_PART {
-            arm = content.prefix(7) == Some(b"aarch64")
-        } else if key.value == LEVEL_PART {
-            level = level_named(content, arm)
+        if read.value == key {
+            let Some(parts) = raw.split_at(span.start) else {
+                return None
+            }
+            let Some(content) = parts.tail.prefix(span.end - span.start) else {
+                return None
+            }
+            return body(content)
         }
         at = span.end
     }
-    let Some(hash) = toolchain else {
-        return None
-    }
-    let Some(named) = level else {
-        return None
-    }
-    return Some(Interface(toolchain: hash, level: named))
-} interface_of
+    return None
+} read_part
 
 /// The codegen level of the name an interface file gives it, the base set of AArch64 when `arm`, else of x86_64, for the empty name.
 fn level_named(name: Slice[u8], arm: bool) -> Option[Level] {
@@ -337,16 +340,18 @@ fn artefact_of(code_root: Slice[u8], magic: Slice[u8], alloc: mem::Alloc) -> mem
     return artefact
 } artefact_of
 
-/// An interface file of a kernel built by `toolchain` for x86_64 at the codegen level `level`.
-fn interface_file_of(toolchain: ident::HashValue, level: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+/// An interface file of a kernel built by `toolchain` for x86_64 at the codegen level `level`, listing the packages part `packages`.
+fn interface_file_of(toolchain: ident::HashValue, level: Slice[u8], packages: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
     var file = mem::Bytes.empty(alloc)
     mut file.append(INTERFACE_MAGIC)
     push_uvar(mut file, value: FORMAT_VERSION)
-    push_uvar(mut file, value: 3)
+    push_uvar(mut file, value: 4)
     push_uvar(mut file, value: TOOLCHAIN_PART)
     push_bytes(mut file, bytes: toolchain.bytes.view())
     push_uvar(mut file, value: TARGET_PART)
     push_bytes(mut file, bytes: b"x86_64-bare")
+    push_uvar(mut file, value: PACKAGES_PART)
+    push_bytes(mut file, bytes: packages)
     push_uvar(mut file, value: LEVEL_PART)
     push_bytes(mut file, bytes: level)
     return file
@@ -359,7 +364,7 @@ test bundles_hold_their_closure_by_code_root_beside_the_image_lowered_against_an
     push_uvar(mut listed, value: 2)
     push_bytes(mut listed, bytes: artefact_of(b"root of hello", magic: ARTEFACT_MAGIC, alloc).view())
     push_bytes(mut listed, bytes: artefact_of(b"root of core", magic: ARTEFACT_MAGIC, alloc).view())
-    let interface_file = interface_file_of(toolchain, level: b"x86_64-v3", alloc)
+    let interface_file = interface_file_of(toolchain, level: b"x86_64-v3", packages: b"\x00", alloc)
     let Some(Made(bundle: bundle, code: code)) = Bundle.made("hello", image: Untrusted.of(b"image"), artefacts: Untrusted.of(listed.view()), interface_file: Untrusted.of(interface_file.view()), sources: mem::List.empty(alloc), alloc) else {
         expect false
         return
