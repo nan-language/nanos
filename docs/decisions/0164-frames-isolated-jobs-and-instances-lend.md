@@ -1,6 +1,6 @@
 # 0164. Frames isolated jobs and instances lend, in spaces of their own
 
-Status: accepted
+Status: superseded by 0167
 
 ## Context
 
