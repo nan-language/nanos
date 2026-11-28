@@ -180,7 +180,7 @@ Generations, slots, the floor, owner and loader requests and the health gate ([B
 | `rollback` | — | — | `boot.no-fallback` | `restorable` |
 | `recovery` | — | — | — | `restorable` |
 | `retire` | `generation: u64` | — | `boot.floor-too-high` | `irreversible{erase}` |
-| `replace_loader` | `loader: HashValue`, `version: u32`, `signature: Signature` | — | `auth.bad-signature`, `boot.write-failed` | `irreversible{actuate}` |
+| `replace_loader` | `loader: Path`, `version: u32`, `signature: Signature` | — | `auth.bad-signature`, `boot.write-failed` | `irreversible{actuate}` |
 | `replace_owner` | `key: Array[u8, 32]`, `recovery: Array[u8, 32]`, `signature: Signature`, `manifests: mem::List[Signature]` | — | `auth.bad-signature`, `boot.resign-required`, `boot.write-failed` | `irreversible{actuate}` |
 | `claim` | `key: Array[u8, 32]`, `recovery: Array[u8, 32]` | — | `policy.already-claimed`, `policy.unclaimable` | `irreversible{actuate}` |
 | `recover` | `code: Array[u8, 16]`, `key: Array[u8, 32]`, `recovery: Array[u8, 32]`, `manifests: mem::List[Signature]` | — | `policy.recovery-code-invalid`, `boot.resign-required`, `boot.write-failed` | `irreversible{actuate}` |
@@ -188,7 +188,7 @@ Generations, slots, the floor, owner and loader requests and the health gate ([B
 
 - `install` serves the plan step `generation`. `rollback` and `recovery` serve owner sessions and `console` ([emergency controls](19-oversight.md#emergency-controls)); `replace_loader` follows [loader replacement](03-boot.md#loader-replacement), and `replace_owner`, `claim` and `recover` [owner key requests](03-boot.md#owner-key-requests), their `manifests` being the requested key's signatures over the manifests of the generations signed by `owner` that the boot record names, in generation order; `set_recovery` follows [generation operations](03-boot.md#generation-operations). `link` and `console` hold `claim`, and `console` `recover`.
 - After a direct boot every operation fails with `boot.no-boot-volume` ([direct boot](03-boot.md#direct-boot)).
-- Wiring: ports to `fat`, `power`, `supervisor`, `keys` and `journal`; the `tpm` role.
+- Wiring: ports to `fat`, `power`, `supervisor`, `keys` and `journal`; a View reading `/data`, where `install` and `replace_loader` find their blobs, and one reading `/live/instances`, which the health gate watches; the `tpm` role.
 
 ## `clock`
 

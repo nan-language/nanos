@@ -1,36 +1,64 @@
-//! The `boot` instance: at each start it records the boot, writing the boot counter into the boot record when the loader did not, mirroring the record in `/sys/boot`, emitting `fault.previous-boot-unhealthy` when the record shows a boot that ended before its health gate, and publishing `/live/boot`.
+//! The `boot` instance: at each start it records the boot, writing the boot counter into the boot record when the loader did not, retiring the generations below a floor the loader raised, mirroring the record and the boot volume's generations in `/sys/boot`, reporting a boot that ended before its health gate and the requests the loader handled, publishing `/live/boot` and, in a `normal` boot, having the store take the trial branch left of its generation; then it runs the health gate of a `trial` boot and carries out its operations one at a time.
 
-/// The key of the keyed task recording the boot.
+/// The keys of the keyed tasks recording the boot and carrying out an operation.
 const RECORDING: u64 = 1
 
-/// The files of the boot record's two copies on the boot volume.
-const RECORD_COPIES: Str = "/nanos/boot.rec /nanos/boot.bak"
+const OPERATING: u64 = 2
+
+const GATING: u64 = 3
 
 const BOOT_STATE_TYPE: Str = "bootfmt::BootState"
 
 const LIVE_BOOT_TYPE: Str = "os::LiveBoot"
 
-/// What `boot` serves: what its recording task reports.
+/// What `boot` serves: its operations, and what its keyed tasks report.
 pub protocol Generations {
-    /// The boot was recorded, `/sys/boot` written anew when `written`.
-    fn noted(written: bool) limits traceless
+    /// Installs the generation whose manifest blob is at `manifest`, its files the blobs beside it, in the idle slot: its number.
+    pub fn install(manifest: ident::Path) -> u64 fails BootFailure limits restorable
+    /// Sets the running slot `bad` and reboots.
+    pub fn rollback() fails BootFailure limits restorable
+    /// Reboots into recovery mode.
+    pub fn recovery() fails BootFailure limits restorable
+    /// Requests the floor `generation` of the loader.
+    pub fn retire(generation: u64) fails BootFailure limits irreversible(erase)
+    /// Requests the replacement of the loader by the blob at `loader`, of version `version`, which the owner signed with `signature`.
+    pub fn replace_loader(loader: ident::Path, version: u32, signature: ident::Signature) fails BootFailure limits irreversible(actuate)
+    /// Requests the replacement of the owner key by `key` with the recovery digest `recovery`, the owner key signing it with `signature`, `manifests` being `key`'s signatures of the owner's generations.
+    pub fn replace_owner(key: Array[u8, 32], recovery: Array[u8, 32], signature: ident::Signature, manifests: mem::List[ident::Signature]) fails BootFailure limits irreversible(actuate)
+    /// Requests the claim of the machine by the owner key `key` with the recovery digest `recovery`.
+    pub fn claim(key: Array[u8, 32], recovery: Array[u8, 32]) fails BootFailure limits irreversible(actuate)
+    /// Requests the replacement of a lost owner key by `key` with the recovery digest `recovery`, the recovery code `code` proving it.
+    pub fn recover(code: Array[u8, 16], key: Array[u8, 32], recovery: Array[u8, 32], manifests: mem::List[ident::Signature]) fails BootFailure limits irreversible(actuate)
+    /// Makes `generation` the recovery generation.
+    pub fn set_recovery(generation: u64) fails BootFailure limits restorable
+    /// The boot was recorded.
+    fn noted() limits traceless
+    /// The operation of the request `request`, `None` for a one-way call, ended with `reply`.
+    fn answered(request: Option[u64], reply: sys::Encoded) limits traceless
 } Generations
 
-/// The Env of `boot`: the port to `fat`, its View of `/sys/boot`, where it publishes `/live/boot`, its source of events, the handoff record, the hash of the support routines the kernel image exports, the monotonic clock and its cell.
+/// The Env of `boot`: the port to `fat`, its View of `/sys/boot`, its View reading `/data`, where it finds the files of a generation or loader it writes, its View reading `/live/instances`, its port to `power`, where it publishes `/live/boot`, its source of events, the handoff record, the code hash of the base bundle, the health gate's settings, the hash of the support routines the kernel image exports, the monotonic clock and its cell.
 pub open struct Env derives Send {
     fat: os::Port[devices::Fat]
     mirror: store::service::View
+    tree: store::service::View
+    instances: store::service::View
+    power: os::Port[power::Power]
     live: os::Live
     events: journal::Source
     handoff: bootfmt::Handoff
+    base: ident::HashValue
+    health: HealthGate
     support: ident::HashValue
     clock: sys::Clock
     alloc: mem::Alloc
 } Env
 
-/// The state of `boot`: whether it recorded this boot.
-pub closed struct Boot derives Render, Encode {
+/// The state of `boot`: whether it recorded this boot, the operations waiting, and whether one is under way.
+pub closed struct Boot derives Encode {
     pub recorded: bool
+    pub waiting: mem::List[Pending]
+    pub busy: bool
 } Boot
 
 /// The payload of `fault.previous-boot-unhealthy`: the generation, slot, tries left and state of the slot whose boot ended before its health gate.
@@ -41,6 +69,31 @@ pub closed struct PreviousUnhealthy derives Render, Encode {
     pub state: bootfmt::SlotCondition
 } PreviousUnhealthy
 
+/// The kind of an owner request.
+pub closed enum OwnerRequest derives Copy, Eq, Render, Encode {
+    Claim
+    BySignature
+    ByRecoveryCode
+} OwnerRequest
+
+/// The payload of `boot.owner-request`.
+pub closed struct OwnerRequested derives Render, Encode {
+    pub kind: OwnerRequest
+    pub applied: bool
+} OwnerRequested
+
+/// The payload of `boot.loader-request`: the requested loader's blob id, `None` when its file cannot be read.
+pub closed struct LoaderRequested derives Render, Encode {
+    pub loader: Option[ident::HashValue]
+    pub applied: bool
+} LoaderRequested
+
+/// The payload of `boot.retired`.
+pub closed struct Retired derives Render, Encode {
+    pub floor: u64
+    pub deleted: mem::List[u64]
+} Retired
+
 impl Boot: sys::Component[Env, Generations]
 
 impl Boot: sys::Resume[Env, Generations]
@@ -48,58 +101,190 @@ impl Boot: sys::Resume[Env, Generations]
 pub fn Env.of(
     fat: os::Port[devices::Fat],
     mirror: store::service::View,
+    tree: store::service::View,
+    instances: store::service::View,
+    power: os::Port[power::Power],
     live: os::Live,
     events: journal::Source,
     handoff: bootfmt::Handoff,
+    base: ident::HashValue,
+    health: HealthGate,
     support: ident::HashValue,
     clock: sys::Clock,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(fat: fat, mirror: mirror, live: live, events: events, handoff: handoff, support: support, clock: clock, alloc: alloc)
+    return Env(fat: fat, mirror: mirror, tree: tree, instances: instances, power: power, live: live, events: events, handoff: handoff, base: base, health: health, support: support, clock: clock, alloc: alloc)
 } Env.of
 
-pub fn Boot.start(mut env: Env) -> Boot = Boot(recorded: false)
+pub fn Boot.start(mut env: Env) -> Boot = Boot(recorded: false, waiting: mem::List.empty(env.alloc), busy: false)
 
 /// Records the boot from a keyed task.
 pub fn Boot.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sys::Cx[Generations]) {
     let world = env.surroundings()
     mut cx.spawn(key: RECORDING, run: fn(out: sys::Outbox[Generations]) fails task::Cancelled uses wait limits stack 32_768 {
-        let written = try await world.record()
-        discard attempt await out.noted(written)
+        try await world.record()
+        discard attempt await out.noted()
     })
 } Boot.resume
 
-fn Boot.noted(mut self, take written: bool, mut env: Env, mut cx: sys::Cx[Generations]) {
+/// Runs the health gate of a `trial` boot from a keyed task once the boot is recorded, and starts the operations waiting.
+fn Boot.noted(mut self, mut env: Env, mut cx: sys::Cx[Generations]) {
     self.recorded = true
+    if env.handoff.mode == bootfmt::Mode.Trial.to_bits() {
+        let world = env.surroundings()
+        mut cx.spawn(key: GATING, run: fn(out: sys::Outbox[Generations]) fails task::Cancelled uses wait limits stack 32_768 {
+            try await world.gate()
+        })
+    }
+    mut self.start_next(mut env, mut cx)
 } Boot.noted
 
-/// What the recording task reads of the Env.
+pub fn Boot.install(mut self, take manifest: ident::Path, mut env: Env, mut cx: sys::Cx[Generations]) -> u64 {
+    mut self.queue(Operation.Install(manifest: take manifest), mut env, mut cx)
+    return 0
+} Boot.install
+
+pub fn Boot.rollback(mut self, mut env: Env, mut cx: sys::Cx[Generations]) {
+    mut self.queue(Operation.Rollback, mut env, mut cx)
+} Boot.rollback
+
+pub fn Boot.recovery(mut self, mut env: Env, mut cx: sys::Cx[Generations]) {
+    mut self.queue(Operation.Recovery, mut env, mut cx)
+} Boot.recovery
+
+pub fn Boot.retire(mut self, take generation: u64, mut env: Env, mut cx: sys::Cx[Generations]) {
+    mut self.queue(Operation.Retire(generation: generation), mut env, mut cx)
+} Boot.retire
+
+pub fn Boot.replace_loader(
+    mut self,
+    take loader: ident::Path,
+    take version: u32,
+    take signature: ident::Signature,
+    mut env: Env,
+    mut cx: sys::Cx[Generations],
+    ) {
+    mut self.queue(Operation.ReplaceLoader(loader: take loader, version: version, signature: signature), mut env, mut cx)
+} Boot.replace_loader
+
+pub fn Boot.replace_owner(
+    mut self,
+    take key: Array[u8, 32],
+    take recovery: Array[u8, 32],
+    take signature: ident::Signature,
+    take manifests: mem::List[ident::Signature],
+    mut env: Env,
+    mut cx: sys::Cx[Generations],
+    ) {
+    mut self.queue(Operation.ReplaceOwner(key: key, recovery: recovery, signature: signature, manifests: take manifests), mut env, mut cx)
+} Boot.replace_owner
+
+pub fn Boot.claim(
+    mut self,
+    take key: Array[u8, 32],
+    take recovery: Array[u8, 32],
+    mut env: Env,
+    mut cx: sys::Cx[Generations],
+    ) {
+    mut self.queue(Operation.Claim(key: key, recovery: recovery), mut env, mut cx)
+} Boot.claim
+
+pub fn Boot.recover(
+    mut self,
+    take code: Array[u8, 16],
+    take key: Array[u8, 32],
+    take recovery: Array[u8, 32],
+    take manifests: mem::List[ident::Signature],
+    mut env: Env,
+    mut cx: sys::Cx[Generations],
+    ) {
+    mut self.queue(Operation.Recover(code: code, key: key, recovery: recovery, manifests: take manifests), mut env, mut cx)
+} Boot.recover
+
+pub fn Boot.set_recovery(mut self, take generation: u64, mut env: Env, mut cx: sys::Cx[Generations]) {
+    mut self.queue(Operation.SetRecovery(generation: generation), mut env, mut cx)
+} Boot.set_recovery
+
+/// Gives the reply of the operation under way and starts the next.
+fn Boot.answered(
+    mut self,
+    take request: Option[u64],
+    take reply: sys::Encoded,
+    mut env: Env,
+    mut cx: sys::Cx[Generations],
+    ) {
+    match request {
+        Some(number) => {
+            discard attempt mut cx.reply(number, reply)
+        }
+        None => {
+        }
+    }
+    self.busy = false
+    mut self.start_next(mut env, mut cx)
+} Boot.answered
+
+/// Has `operation` wait for the operations before it, its request postponed until it ends.
+fn Boot.queue(mut self, take operation: Operation, mut env: Env, mut cx: sys::Cx[Generations]) {
+    let request = mut cx.postpone()
+    mut self.waiting.push(Pending(request: request, operation: take operation))
+    mut self.start_next(mut env, mut cx)
+} Boot.queue
+
+/// Has a keyed task carry out the first waiting operation once the boot is recorded and no other runs, rebooting once it gave the reply when the operation asks it.
+fn Boot.start_next(mut self, mut env: Env, mut cx: sys::Cx[Generations]) {
+    if self.busy or not self.recorded or self.waiting.len() == 0 {
+        return
+    }
+    self.busy = true
+    let Pending(request: request, operation: operation) = mut self.waiting.remove(0)
+    let world = env.surroundings()
+    mut cx.spawn(key: OPERATING, run: fn[take operation](out: sys::Outbox[Generations]) fails task::Cancelled uses wait limits stack 65_536 {
+        let Outcome(reply: reply, reboots: reboots) = try await world.operate(take operation)
+        discard attempt await out.answered(request, take reply)
+        if reboots {
+            try await world.reboot()
+        }
+    })
+} Boot.start_next
+
+/// What the keyed tasks read of the Env.
 struct Surroundings derives Copy {
     fat: os::Port[devices::Fat]
     mirror: store::service::View
+    tree: store::service::View
+    instances: store::service::View
+    power: os::Port[power::Power]
     live: os::Live
     events: journal::Source
     handoff: bootfmt::Handoff
+    base: ident::HashValue
+    health: HealthGate
     support: ident::HashValue
     clock: sys::Clock
     alloc: mem::Alloc
 } Surroundings
 
 fn Env.surroundings(self) -> Surroundings {
-    return Surroundings(fat: self.fat, mirror: self.mirror, live: self.live, events: self.events, handoff: self.handoff, support: self.support, clock: self.clock, alloc: self.alloc)
+    return Surroundings(fat: self.fat, mirror: self.mirror, tree: self.tree, instances: self.instances, power: self.power, live: self.live, events: self.events, handoff: self.handoff, base: self.base, health: self.health, support: self.support, clock: self.clock, alloc: self.alloc)
 } Env.surroundings
 
-/// Records the boot: the boot counter written into the boot record when the loader did not, the record mirrored in `/sys/boot`, a boot that ended before its health gate reported, and `/live/boot` published; whether it wrote `/sys/boot`.
-fn Surroundings.record(self) -> bool fails task::Cancelled uses wait {
+/// Records the boot: the boot counter written into the boot record when the loader did not, the slots, directories and trial branches below a raised floor retired, the record mirrored in `/sys/boot`, a boot that ended before its health gate and the requests the loader handled reported, `/live/boot` published, and in a `normal` boot the trial branch left of its generation taken into `main`.
+fn Surroundings.record(self) fails task::Cancelled uses wait {
     let alloc = self.alloc
-    var held = try await self.read_record()
     let flags = self.handoff.flags
+    var held = try await self.read_record()
     match held {
         Some(found) => {
+            var updated = found.record
             if not flags.record_written {
-                var counted = found.record
-                counted.boot_counter = self.handoff.boot_counter
-                let written = counted.write_over(Some(found))
+                updated.boot_counter = self.handoff.boot_counter
+            }
+            if flags.floor_raised {
+                emptied_below(mut updated, floor: self.handoff.floor)
+            }
+            if updated != found.record {
+                let written = updated.write_over(Some(found))
                 if try await self.write_record(written) {
                     held = Some(written)
                 }
@@ -108,11 +293,11 @@ fn Surroundings.record(self) -> bool fails task::Cancelled uses wait {
         None => {
         }
     }
-    let state = match held {
-        Some(found) => state_of(found.record, floor: self.handoff.floor, alloc)
-        None => bootfmt::BootState.of_handoff(self.handoff, alloc)
-    }
     let previous = try await self.mirrored()
+    if flags.floor_raised {
+        try await self.retire_directories()
+    }
+    let state = try await self.state_of_volume(record_of(held), previous)
     let unhealthy = match previous {
         Some(mirror) => ended_early(state, mirror, alloc)
         None => None
@@ -126,45 +311,113 @@ fn Surroundings.record(self) -> bool fails task::Cancelled uses wait {
         None => {
         }
     }
-    let written = try await self.write_mirror(state)
+    try await self.report_requests()
+    discard try await self.write_mirror(state)
     try await self.live.publish(type: LIVE_BOOT_TYPE, value: self.live_boot(health), alloc)
-    return written
+    if self.handoff.mode == bootfmt::Mode.Normal.to_bits() {
+        try await self.take_trial()
+    }
 } Surroundings.record
 
-/// The boot record the boot volume holds and the copy holding it, `None` when neither copy is valid.
-fn Surroundings.read_record(self) -> Option[bootfmt::Held] fails task::Cancelled uses wait {
+/// Deletes the directories and trial branches of the generations below the floor and emits `boot.retired`.
+fn Surroundings.retire_directories(self) fails task::Cancelled uses wait {
     let alloc = self.alloc
-    let names = copy_names(alloc)
-    let rec = try await self.read_copy(text::String.of(names[0].as_str(), alloc))
-    let bak = try await self.read_copy(text::String.of(names[1].as_str(), alloc))
-    return bootfmt::BootRecord.current(rec, bak)
-} Surroundings.read_record
-
-/// The record the copy at `path` holds when it is valid.
-fn Surroundings.read_copy(self, take path: text::String) -> Option[bootfmt::BootRecord] fails task::Cancelled uses wait {
-    var call = sys::Encoded.empty(self.alloc)
-    let reply = sys::Wire[devices::Fat].read(mut call, take path, offset: 0, count: 512)
-    return match first attempt await self.fat.call(take call, reply, alloc: self.alloc) {
-        Ok(bytes) => bootfmt::BootRecord.read(bytes.view())
-        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => None
+    match first attempt await self.mirror.drop_trials(self.handoff.floor, alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
     }
-} Surroundings.read_copy
+    var deleted = mem::List[u64].empty(alloc)
+    for generation in try await self.directories() {
+        if generation < self.handoff.floor {
+            try await self.remove_directory(generation)
+            mut deleted.push(generation)
+        }
+    }
+    try await self.events.emit("boot.retired", severity: journal::Severity.Notice, payload: Retired(floor: self.handoff.floor, deleted: take deleted), alloc)
+} Surroundings.retire_directories
 
-/// Writes `held` over its copy on the boot volume; whether the write succeeded.
-fn Surroundings.write_record(self, held: bootfmt::Held) -> bool fails task::Cancelled uses wait {
+/// Emits `boot.owner-request` and `boot.loader-request` for the requests the loader applied or refused.
+fn Surroundings.report_requests(self) fails task::Cancelled uses wait {
     let alloc = self.alloc
-    let names = copy_names(alloc)
-    var bytes = mem::Bytes.empty(alloc)
-    mut bytes.append(held.record.to_bits().view())
-    var call = sys::Encoded.empty(alloc)
-    let reply = sys::Wire[devices::Fat].overwrite(mut call, path: text::String.of(names[usize.widen(held.copy)].as_str(), alloc), offset: 0, data: take bytes)
-    return match first attempt await self.fat.call(take call, reply, alloc) {
-        Ok(_) => true
-        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => false
+    let flags = self.handoff.flags
+    if flags.owner_request_applied or flags.owner_request_refused {
+        let kind = match bootfmt::OwnerRequestKind.checked_from_bits(self.handoff.owner_request) {
+            Some(bootfmt::OwnerRequestKind.Claim) => Some(OwnerRequest.Claim)
+            Some(bootfmt::OwnerRequestKind.BySignature) => Some(OwnerRequest.BySignature)
+            Some(bootfmt::OwnerRequestKind.ByRecoveryCode) => Some(OwnerRequest.ByRecoveryCode)
+            else => None
+        }
+        match kind {
+            Some(requested) => try await self.events.emit("boot.owner-request", severity: journal::Severity.Notice, payload: OwnerRequested(kind: requested, applied: flags.owner_request_applied), alloc)
+            None => {
+            }
+        }
     }
-} Surroundings.write_record
+    if flags.loader_request_applied or flags.loader_request_refused {
+        let path = match flags.loader_request_applied {
+            true => LOADER_FILE
+            false => NEW_LOADER_FILE
+        }
+        let loader = try await self.file_id(text::String.of(path, alloc))
+        try await self.events.emit("boot.loader-request", severity: journal::Severity.Notice, payload: LoaderRequested(loader: loader, applied: flags.loader_request_applied), alloc)
+    }
+} Surroundings.report_requests
+
+/// Mirrors `record`, or the handoff record when there is none, and the boot volume's generations in `/sys/boot`, stamping the generation `installed`, 0 for none, with the commit that first mirrors it.
+fn Surroundings.mirror_record(self, record: Option[bootfmt::BootRecord], installed: u64) fails task::Cancelled uses wait {
+    let previous = try await self.mirrored()
+    var state = try await self.state_of_volume(record, previous)
+    let Some(committed) = try await self.write_mirror(state) else {
+        return
+    }
+    if installed == 0 {
+        return
+    }
+    for at in 0..<state.generations.len() {
+        if state.generations[at].number == installed {
+            state.generations[at].installed = committed.time
+            state.generations[at].base = committed.number
+        }
+    }
+    discard try await self.write_mirror(state)
+} Surroundings.mirror_record
+
+/// The boot state of `record`, or of the handoff record when there is none, with the generations whose directories hold a manifest of their number, each keeping the installation time and commit `previous` gives it.
+fn Surroundings.state_of_volume(self, record: Option[bootfmt::BootRecord], previous: Option[bootfmt::BootState]) -> bootfmt::BootState fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var generations = mem::List[bootfmt::Generation].empty(alloc)
+    for number in try await self.directories() {
+        let Some(signed) = try await self.read_manifest(number) else {
+            continue
+        }
+        let manifest = signed.manifest
+        if manifest.generation != number {
+            continue
+        }
+        let hash = manifest.hash(alloc)
+        var installed = ident::WallTime.unknown()
+        var base = ident::CommitId(number: 1)
+        match previous {
+            Some(mirror) => {
+                for known in mirror.generations {
+                    if known.number == number and known.manifest == hash {
+                        installed = known.installed
+                        base = known.base
+                    }
+                }
+            }
+            None => {
+            }
+        }
+        mut generations.push(bootfmt::Generation(number: number, manifest: hash, kernel: manifest.kernel, genesis: manifest.genesis, keyring: manifest.keyring, min_loader: manifest.min_loader, store_format: manifest.store_format, signer: take manifest.signer, installed: installed, base: base))
+    }
+    let bootfmt::BootState(slots: slots, recovery: recovery, floor: floor, floor_request: floor_request, generations: _) = match record {
+        Some(found) => state_of(found, floor: self.handoff.floor, alloc)
+        None => bootfmt::BootState.of_handoff(self.handoff, alloc)
+    }
+    return bootfmt::BootState(slots: take slots, recovery: recovery, floor: floor, floor_request: floor_request, generations: take generations)
+} Surroundings.state_of_volume
 
 /// The state `/sys/boot` holds, `None` when it holds none that decodes.
 fn Surroundings.mirrored(self) -> Option[bootfmt::BootState] fails task::Cancelled uses wait {
@@ -180,8 +433,8 @@ fn Surroundings.mirrored(self) -> Option[bootfmt::BootState] fails task::Cancell
     return state_from(value.view(), alloc)
 } Surroundings.mirrored
 
-/// Writes `state` at `/sys/boot`; whether the commit succeeded.
-fn Surroundings.write_mirror(self, state: bootfmt::BootState) -> bool fails task::Cancelled uses wait {
+/// Writes `state` at `/sys/boot`: the commit, `None` when it failed.
+fn Surroundings.write_mirror(self, state: bootfmt::BootState) -> Option[store::Committed] fails task::Cancelled uses wait {
     let alloc = self.alloc
     var bytes = mem::Bytes.empty(alloc)
     mem::wire::Codec[bootfmt::BootState].encode(state, out: mut bytes)
@@ -189,11 +442,22 @@ fn Surroundings.write_mirror(self, state: bootfmt::BootState) -> bool fails task
     mut writes.push(store::Write.Put(path: ident::Path(text: text::String.of("/", alloc)), value: store::Value.Record(type: store::TypeRef.of(BOOT_STATE_TYPE, schema: mem::wire::Codec[bootfmt::BootState].schema_hash(), alloc), bytes: take bytes, secret: false)))
     let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: Some(text::String.of("boot", alloc)))
     return match first attempt await self.mirror.commit(take transaction, typed: true, alloc) {
-        Ok(_) => true
+        Ok(committed) => Some(take committed)
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => false
+        Err(_) => None
     }
 } Surroundings.write_mirror
+
+/// Reboots the machine through `power`.
+fn Surroundings.reboot(self) fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(self.alloc)
+    let reply = sys::Wire[power::Power].reboot(mut call)
+    match first attempt await self.power.call(take call, reply, alloc: self.alloc) {
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} Surroundings.reboot
 
 /// The record of `/live/boot` the handoff record tells, the previous boot ending as `previous`.
 fn Surroundings.live_boot(self, previous: os::PreviousBoot) -> os::LiveBoot {
@@ -224,7 +488,25 @@ fn Surroundings.live_boot(self, previous: os::PreviousBoot) -> os::LiveBoot {
     return os::LiveBoot(generation: handoff.generation, mode: mode, slot: take slot, boot_counter: handoff.boot_counter, loader: handoff.loader_version, floor: handoff.floor, loader_entry: handoff.entry_counter, kernel_entry: 0, counter_hz: 0, support: self.support, previous: previous, failures: take failures, as_of: now)
 } Surroundings.live_boot
 
-/// The boot state a boot record gives, the floor being `floor`.
+fn record_of(held: Option[bootfmt::Held]) -> Option[bootfmt::BootRecord] {
+    return match held {
+        Some(found) => Some(found.record)
+        None => None
+    }
+} record_of
+
+/// Empties the slots of `record` holding generations below `floor`.
+fn emptied_below(mut record: bootfmt::BootRecord, floor: u64) {
+    let empty = bootfmt::SlotEntry(generation: 0, state: bootfmt::SlotState.Empty.to_bits(), tries: 0, reserved: Array[u8, 6].filled(0))
+    if record.slot_a.generation < floor {
+        record.slot_a = empty
+    }
+    if record.slot_b.generation < floor {
+        record.slot_b = empty
+    }
+} emptied_below
+
+/// The boot state a boot record gives, the floor being `floor`, without the generations of the boot volume.
 fn state_of(record: bootfmt::BootRecord, floor: u64, alloc: mem::Alloc) -> bootfmt::BootState {
     var slots = mem::List[bootfmt::BootSlot].empty(alloc)
     mut slots.push(slot_of("a", entry: record.slot_a, alloc))
@@ -275,22 +557,6 @@ fn failure_text(failure: bootfmt::Failure, alloc: mem::Alloc) -> text::String {
     return text
 } failure_text
 
-/// The paths of the boot record's copies, copy 0 first.
-fn copy_names(alloc: mem::Alloc) -> mem::List[text::String] {
-    var names = mem::List[text::String].empty(alloc)
-    var name = text::String.empty(alloc)
-    for byte in RECORD_COPIES.as_bytes() {
-        if byte == b' ' {
-            mut names.push(take name)
-            name = text::String.empty(alloc)
-        } else {
-            mut name.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
-        }
-    }
-    mut names.push(take name)
-    return names
-} copy_names
-
 validator fn state_from(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[bootfmt::BootState] {
     return match attempt mem::wire::Codec[bootfmt::BootState].decode(raw, alloc) {
         Ok(found) => Some(take found)
@@ -313,3 +579,11 @@ test boots_ending_before_their_gate_show_against_the_mirror for ended_early {
     let bad = ended_early(rejected, mirror, alloc)
     expect tried.is_none() and bad.is_some()
 } boots_ending_before_their_gate_show_against_the_mirror
+
+test a_raised_floor_empties_the_slots_below_it for emptied_below {
+    var record = bootfmt::BootRecord.empty()
+    record.slot_a = bootfmt::SlotEntry(generation: 2, state: bootfmt::SlotState.Good.to_bits(), tries: 0, reserved: Array[u8, 6].filled(0))
+    record.slot_b = bootfmt::SlotEntry(generation: 3, state: bootfmt::SlotState.Trial.to_bits(), tries: 2, reserved: Array[u8, 6].filled(0))
+    emptied_below(mut record, floor: 3)
+    expect record.slot_a.generation == 0 and record.slot_a.state == bootfmt::SlotState.Empty.to_bits() and record.slot_b.generation == 3
+} a_raised_floor_empties_the_slots_below_it

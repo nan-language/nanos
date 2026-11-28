@@ -149,7 +149,7 @@ fn Base.served(self, component: Str, take world: nanos::World, take serving: run
     }
     let exec = world.exec
     let alloc = world.alloc
-    let Ok(env) = attempt supervisor::Env.build(take world, registries: self.registries) else {
+    let Ok(env) = attempt supervisor::Env.build(take world, registries: self.registries, recovery: self.handoff.mode == bootfmt::Mode.Recovery.to_bits()) else {
         return runner::Ended.EnvIncomplete
     }
     var peers = mem::List[sys::ProtocolSchema].empty(alloc)
@@ -423,7 +423,7 @@ fn Base.serve_store(self, take world: nanos::World, take serving: runner::Servin
     let Some(genesis) = boot_genesis(self.genesis, handoff: self.handoff, image: genesis::Image(bundle: self.bundle, support: self.support, bytes: self.image_bytes), jobs: self.jobs, alloc) else {
         return runner::Ended.EnvIncomplete
     }
-    let env = store::service::Env.of(volume, take genesis, boot: boot_record(self.handoff, alloc), clock: world.clock, wall: self.wall, random: world.random, reporter: self.reporter, live: self.store_live, devices: manager, keys: keyring, alloc)
+    let env = store::service::Env.of(volume, take genesis, boot: boot_record(self.handoff, alloc), running: store::service::Running(trial: trial_boot(self.handoff), recovery: self.handoff.mode == bootfmt::Mode.Recovery.to_bits()), clock: world.clock, wall: self.wall, random: world.random, reporter: self.reporter, live: self.store_live, devices: manager, keys: keyring, alloc)
     return try await runner::Driven[store::service::Service, store::service::Env, store::service::Store].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: store::service::Env) limits stack 8_192 {
     })
 } Base.serve_store
@@ -529,7 +529,7 @@ fn Base.serve_policy(self, take world: nanos::World, take serving: runner::Servi
     })
 } Base.serve_policy
 
-/// Serves `boot` on its port to `fat`, its View of `/sys/boot`, its source of events and the handoff record.
+/// Serves `boot` on its ports to `fat` and `power`, its Views of `/sys/boot`, `/data` and `/live/instances`, its source of events, the handoff record, the base bundle and its configuration record, the configuration by default when it has none.
 fn Base.serve_boot(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
     let alloc = world.alloc
     let Ok(filing) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "fat") else {
@@ -538,13 +538,33 @@ fn Base.serve_boot(self, take world: nanos::World, take serving: runner::Serving
     let Some(files) = os::Port[devices::Fat].of(filing) else {
         return runner::Ended.EnvIncomplete
     }
+    let Ok(powering) = attempt nanos::Cap[os::PortHandle].get(world.caps, key: "power") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Some(power) = os::Port[power::Power].of(powering) else {
+        return runner::Ended.EnvIncomplete
+    }
     let Ok(mirror) = attempt nanos::Cap[store::service::View].get(world.caps, key: "mirror") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(tree) = attempt nanos::Cap[store::service::View].get(world.caps, key: "tree") else {
+        return runner::Ended.EnvIncomplete
+    }
+    let Ok(instances) = attempt nanos::Cap[store::service::View].get(world.caps, key: "instances") else {
         return runner::Ended.EnvIncomplete
     }
     let Ok(events) = attempt nanos::Cap[journal::Source].get(world.caps, key: "events") else {
         return runner::Ended.EnvIncomplete
     }
-    let env = generations::Env.of(fat: files, mirror, live: self.boot_live, events, handoff: self.handoff, support: self.support, clock: world.clock, alloc)
+    let config = match mut serving.take_config() {
+        Some(record) => match attempt mem::wire::Codec[generations::BootConfig].decode(record.view(), alloc) {
+            Ok(configured) => configured
+            Err(_) => return runner::Ended.EnvIncomplete
+        }
+        None => generations::BootConfig.default_of()
+    }
+    try await self.switch.order(power::Switching.Watchdog(timeout_s: config.watchdog_s))
+    let env = generations::Env.of(fat: files, mirror, tree, instances, power, live: self.boot_live, events, handoff: self.handoff, base: self.bundle, health: config.health, support: self.support, clock: world.clock, alloc)
     return try await runner::Driven[generations::Boot, generations::Env, generations::Generations].run(take env, exec: world.exec, alloc, take serving, peers: mem::List.empty(alloc), release: fn(take ended: generations::Env) limits stack 512 {
     })
 } Base.serve_boot
@@ -774,6 +794,15 @@ fn release_attached(take attached: devices::Attached) {
 } release_attached
 
 /// The record of `/sys/boot` the handoff record tells.
+/// The trial branch the boot `handoff` tells runs on: one its generation's boot in mode `trial` creates, or one a later `normal` boot of it finds.
+fn trial_boot(handoff: bootfmt::Handoff) -> Option[store::service::TrialBoot] {
+    let creates = handoff.mode == bootfmt::Mode.Trial.to_bits()
+    if handoff.generation == 0 or not (creates or handoff.mode == bootfmt::Mode.Normal.to_bits()) {
+        return None
+    }
+    return Some(store::service::TrialBoot(generation: handoff.generation, creates: creates))
+} trial_boot
+
 fn boot_record(handoff: bootfmt::Handoff, alloc: mem::Alloc) -> store::service::TypedValue {
     var bytes = mem::Bytes.empty(alloc)
     mem::wire::Codec[bootfmt::BootState].encode(bootfmt::BootState.of_handoff(handoff, alloc), out: mut bytes)
@@ -870,7 +899,10 @@ fn run_base(
             try await record_store_events(take store_events, rings, blob_cache: counters.blob_cache.share(), store_cache: counters.store_cache.share(), granted: take grants_out)
         })
         discard s.spawn(fn[take switch_orders]() fails task::Cancelled uses wait limits stack 4_096 {
-            try await switch_power(take switch_orders, reset, cpus: cpus.share())
+            try await switch_power(take switch_orders, reset, cpus: cpus.share(), clock: config.clock)
+        })
+        discard s.spawn(fn() fails task::Cancelled uses wait limits stack 8_192 {
+            try await refresh_watchdog(cpus.share(), clock: config.clock, exec: config.exec)
         })
         discard s.spawn(fn[take log_records]() fails task::Cancelled uses wait limits stack 16_384 {
             try await hold_logs(take log_records, backlog)

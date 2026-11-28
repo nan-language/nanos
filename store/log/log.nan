@@ -11,12 +11,13 @@ pkg enum SegmentState derives Copy, Eq {
     Freed
 } SegmentState
 
-/// What the store keeps per segment: its state, its live bytes, the time of its newest batch, and for a freed segment the index flush that freed it.
+/// What the store keeps per segment: its state, its live bytes, the time of its newest batch, for a freed segment the index flush that freed it, and whether it holds records written before the volume's encryption began.
 pkg struct Segment derives Copy, Eq {
     pkg state: SegmentState
     pkg live: u64
     pkg written: i64
     pkg freed_at: u64
+    pkg plain: bool
 } Segment
 
 /// Where the log continues: the open segment, its header's sequence, its successor, the next block in it and the next batch's number.
@@ -42,9 +43,11 @@ pkg struct Appended derives Copy, Eq {
     pkg pointer: disk::Pointer
 } Appended
 
-/// The log as the store writes it: its volume, its segments, where it continues, the blocks the next log flush writes, and the batch being laid out with its first block, count of records and time.
+/// The log as the store writes it: its volume and the volume's format, the volume key it seals records under on an encrypted volume, its segments, where it continues, the blocks the next log flush writes, and the batch being laid out with its first block, count of records and time.
 pkg struct Log {
     pkg volume_id: Array[u8, 16]
+    pkg format: u32
+    pkg sealing: Option[Sealing]
     pkg segments: mem::List[Segment]
     pkg position: Position
     pkg appended: u64
@@ -55,6 +58,24 @@ pkg struct Log {
     batch_time: i64
 } Log
 
+/// The volume key a log seals its records under, and the nonces it draws: a prefix drawn at mount, then a count.
+pkg struct Sealing derives Copy {
+    pkg key: Array[u8, 32]
+    pkg prefix: Array[u8, 16]
+    pkg next: u64
+} Sealing
+
+/// The next nonce.
+pkg fn Sealing.nonce(mut self) -> Array[u8, 24] {
+    var nonce = Array[u8, 24].filled(0)
+    for at in 0..<16usize {
+        nonce[at] = self.prefix[at]
+    }
+    mut nonce.view_mut().write_u64_le(16, value: self.next)
+    self.next += 1
+    return nonce
+} Sealing.nonce
+
 /// Blocks to write at the next log flush.
 struct Write {
     block: u64
@@ -62,8 +83,14 @@ struct Write {
 } Write
 
 /// A log over `segments`, continuing at `position`.
-pkg fn Log.of(volume_id: Array[u8, 16], take segments: mem::List[Segment], position: Position, alloc: mem::Alloc) -> Log {
-    return Log(volume_id: volume_id, segments: take segments, position: position, appended: 0, writes: mem::List.empty(alloc), batch: None, batch_block: 0, batch_records: 0, batch_time: 0)
+pkg fn Log.of(
+    volume_id: Array[u8, 16],
+    format: u32,
+    take segments: mem::List[Segment],
+    position: Position,
+    alloc: mem::Alloc,
+    ) -> Log {
+    return Log(volume_id: volume_id, format: format, sealing: None, segments: take segments, position: position, appended: 0, writes: mem::List.empty(alloc), batch: None, batch_block: 0, batch_records: 0, batch_time: 0)
 } Log.of
 
 /// The segment numbered `segment`, from 1.
@@ -116,7 +143,7 @@ pkg fn Log.append(
     let Some(length) = u32.checked_fit(payload.len()) else {
         fail LogFailure.TooLarge
     }
-    if most_record_span() < disk::record_span(length) + disk::BLOCK_BYTES {
+    if most_record_span() < self.span_of(length) + disk::BLOCK_BYTES {
         fail LogFailure.TooLarge
     }
     let laid = match self.batch {
@@ -134,9 +161,9 @@ pkg fn Log.append(
     let address = (disk::segment_start(self.position.segment) + u64.widen(self.batch_block)) * u64.widen(disk::BLOCK_BYTES) + u64.widen(offset)
     let pointer = disk::Pointer(target: address, length: length, kind: kind.code(), by_item: false, checksum: disk::record_checksum(key, payload, alloc))
     let open = usize.widen(self.position.segment) - 1
-    self.segments[open].live += u64.widen(disk::record_span(length))
+    self.segments[open].live += u64.widen(self.span_of(length))
     self.segments[open].written = time
-    self.appended += u64.widen(disk::record_span(length))
+    self.appended += u64.widen(self.span_of(length))
     return Appended(address: address, pointer: pointer)
 } Log.append
 
@@ -159,25 +186,28 @@ pkg fn Log.free_freed(mut self, flushed: u64, alloc: mem::Alloc) -> mem::List[u3
     var freed = mem::List[u32].empty(alloc)
     for at in 0..<self.segments.len() {
         if self.segments[at].state == SegmentState.Freed and self.segments[at].freed_at + 1 <= flushed {
-            self.segments[at] = Segment(state: SegmentState.Free, live: 0, written: 0, freed_at: 0)
+            self.segments[at] = Segment(state: SegmentState.Free, live: 0, written: 0, freed_at: 0, plain: false)
             mut freed.push(u32.truncate(at + 1))
         }
     }
     return freed
 } Log.free_freed
 
-/// The full segment the cleaner takes next at time `now`, `skipped` aside: of live fraction u below a quarter, the highest (1 − u) · age / (1 + u), `None` when no segment is one.
+/// The full segment the cleaner takes next at time `now`, `skipped` aside: one holding plain records first, the one of least live data; else of live fraction u below a quarter, the highest (1 − u) · age / (1 + u); `None` when no segment is one.
 pkg fn Log.cleaning_candidate(self, now: i64, skipped: mem::Set[u32]) -> Option[u32] {
     let capacity = disk::SEGMENT_BLOCKS * u64.widen(disk::BLOCK_BYTES)
     var best: Option[u32] = None
     var best_score: u64 = 0
     for at in 0..<self.segments.len() {
         let segment = self.segments[at]
-        if segment.state != SegmentState.Full or segment.live * 4 >= capacity or skipped.contains(u32.truncate(at + 1)) {
+        if segment.state != SegmentState.Full or (segment.live * 4 >= capacity and not segment.plain) or skipped.contains(u32.truncate(at + 1)) {
             continue
         }
         let age = u64.saturate(now.saturating_sub(segment.written)) / 1_000_000 + 1
-        let score = (capacity - segment.live).saturating_mul(age) / (capacity + segment.live)
+        var score = (capacity - segment.live.min(capacity)).saturating_mul(age) / (capacity + segment.live)
+        if segment.plain {
+            score = 0xFFFF_FFFF_FFFF_FFFF - segment.live
+        }
         if best.is_none() or score > best_score {
             best = Some(u32.truncate(at + 1))
             best_score = score
@@ -188,8 +218,32 @@ pkg fn Log.cleaning_candidate(self, now: i64, skipped: mem::Set[u32]) -> Option[
 
 /// Marks segment `segment` freed by the cleaner, free once the second index flush after flush `flush` is durable.
 pkg fn Log.freed(mut self, segment: u32, flush: u64) {
-    self.segments[usize.widen(segment) - 1] = Segment(state: SegmentState.Freed, live: 0, written: 0, freed_at: flush + 1)
+    self.segments[usize.widen(segment) - 1] = Segment(state: SegmentState.Freed, live: 0, written: 0, freed_at: flush + 1, plain: false)
 } Log.freed
+
+/// Ends the open segment, its records then those of a full segment the cleaner may take.
+pkg fn Log.close_open(mut self, time: i64, alloc: mem::Alloc) fails LogFailure {
+    try mut self.end_segment(time, alloc)
+} Log.close_open
+
+/// Marks every segment holding records as holding plain ones, as the volume's encryption begins.
+pkg fn Log.mark_plain(mut self) {
+    for at in 0..<self.segments.len() {
+        if self.segments[at].state == SegmentState.Open or self.segments[at].state == SegmentState.Full {
+            self.segments[at].plain = true
+        }
+    }
+} Log.mark_plain
+
+/// Whether a segment holds plain records.
+pkg fn Log.holds_plain(self) -> bool {
+    for segment in self.segments {
+        if segment.plain {
+            return true
+        }
+    }
+    return false
+} Log.holds_plain
 
 /// Writes the sealed batches and segment headers, then makes them durable.
 pkg fn Log.flush[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails LogFailure uses wait {
@@ -243,7 +297,7 @@ fn Log.fits(self, kind: disk::RecordKind, length: u32) -> bool {
         Some(bytes) => bytes.len()
         None => disk::BATCH_HEADER_BYTES
     }
-    let needed = placed_end(used, kind, length)
+    let needed = self.placed_start(used, kind) + self.span_of(length)
     let room = usize.widen(u32.truncate(disk::SEGMENT_BLOCKS) - start) * disk::BLOCK_BYTES
     return needed <= room
 } Log.fits
@@ -275,7 +329,7 @@ fn Log.choose_free(self, not_segment: u32) -> u32 fails LogFailure {
 
 /// Queues the open segment's header, written before its first batch.
 fn Log.write_header(mut self, alloc: mem::Alloc) {
-    let header = disk::SegmentHeader(sequence: self.position.sequence, volume_id: self.volume_id, segment: self.position.segment, next: self.position.next, format: disk::FORMAT)
+    let header = disk::SegmentHeader(sequence: self.position.sequence, volume_id: self.volume_id, segment: self.position.segment, next: self.position.next, format: self.format)
     mut self.writes.push(Write(block: disk::segment_start(self.position.segment), bytes: header.to_block(alloc)))
 } Log.write_header
 
@@ -320,7 +374,7 @@ fn Log.place(
     }
     var bytes = laid
     let at = bytes.len()
-    let start = placed_start(at, kind)
+    let start = self.placed_start(at, kind)
     if start > at {
         let pad = start - at
         mut bytes.reserve(pad)
@@ -331,21 +385,39 @@ fn Log.place(
         self.batch_records += 1
     }
     let length = u32.truncate(payload.len())
-    let span = disk::record_span(length)
+    let span = self.span_of(length)
     mut bytes.reserve(span)
     for _ in 0..<span {
         mut bytes.push(0)
     }
-    disk::put_record_header(mut bytes, at: start, kind, key, length)
-    disk::put_bytes(mut bytes, at: start + disk::RECORD_HEADER_BYTES, data: payload)
+    match self.sealing {
+        Some(drawing) => {
+            var sealing = drawing
+            let nonce = mut sealing.nonce()
+            self.sealing = Some(sealing)
+            disk::put_sealed_record(mut bytes, at: start, kind, key, payload, volume: sealing.key, nonce, alloc)
+        }
+        None => {
+            disk::put_record_header(mut bytes, at: start, kind, key, length)
+            disk::put_bytes(mut bytes, at: start + disk::RECORD_HEADER_BYTES, data: payload)
+        }
+    }
     self.batch_records += 1
     self.batch = Some(take bytes)
     return start
 } Log.place
 
-/// Where a record of `kind` placed at `at` of a batch starts: there, or for a piece or index record the header before the next block boundary leaving room for a pad record.
-fn placed_start(at: usize, kind: disk::RecordKind) -> usize {
-    if not kind.is_aligned() {
+/// The bytes a record of `length` payload bytes occupies in a batch, sealed or plain.
+fn Log.span_of(self, length: u32) -> usize {
+    return match self.sealing {
+        Some(_) => disk::sealed_record_span(length)
+        None => disk::record_span(length)
+    }
+} Log.span_of
+
+/// Where a record of `kind` placed at `at` of a batch starts: there, or on a volume without encryption for a piece or index record the header before the next block boundary leaving room for a pad record.
+fn Log.placed_start(self, at: usize, kind: disk::RecordKind) -> usize {
+    if self.sealing.is_some() or not kind.is_aligned() {
         return at
     }
     let boundary = (at + disk::RECORD_HEADER_BYTES + disk::BLOCK_BYTES - 1) / disk::BLOCK_BYTES * disk::BLOCK_BYTES
@@ -354,9 +426,4 @@ fn placed_start(at: usize, kind: disk::RecordKind) -> usize {
         return start
     }
     return start + disk::BLOCK_BYTES
-} placed_start
-
-/// Where a record of `kind` and `length` payload bytes placed at `at` of a batch ends.
-fn placed_end(at: usize, kind: disk::RecordKind, length: u32) -> usize {
-    return placed_start(at, kind) + disk::record_span(length)
-} placed_end
+} Log.placed_start

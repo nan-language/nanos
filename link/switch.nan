@@ -1,0 +1,182 @@
+//! The checks of the plan step `generation`: what the new generation's genesis record, the blob `genesis` beside its manifest, changes of the running system.
+
+/// The most specifications one check reads.
+const MOST_SPECS: u32 = 4_096
+
+/// The refusal the switch to the generation whose manifest blob is at `manifest` meets, read through `view`: `boot.file-unreadable` without a genesis record beside it, `code.schema-incompatible` when the new base bundle reads no running state of a checkpointed base instance, `port.incompatible` when it changes the protocol of a base instance another bundle's instance has a port to, and `code.no-image` when a bundle an instance runs has no image for the new kernel's support routines and the new generation ships no `nan` job; `None` when it meets none.
+pub fn switch_refusal(manifest: ident::Path, view: store::service::View, alloc: mem::Alloc) -> Option[Failure] fails task::Cancelled uses wait {
+    let subject = manifest.text.as_str()
+    let unreadable = Failure.of("boot.file-unreadable", subject, alloc)
+    let raw = match first attempt await view.read_blob(beside(manifest, name: "genesis", alloc), alloc) {
+        Ok(bytes) => bytes
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return Some(take unreadable)
+    }
+    let Some(record) = genesis_from(Untrusted.of(raw.view()), alloc) else {
+        return Some(take unreadable)
+    }
+    let Some(moving) = admission_from(Untrusted.of(record.admission.bytes.view()), alloc) else {
+        return Some(take unreadable)
+    }
+    let specs = try await specs_of(view, alloc)
+    let Some(running_base) = base_bundle(specs) else {
+        return None
+    }
+    let Ok(running) = try await admission_at(view, bundle: running_base, alloc) else {
+        return None
+    }
+    for each in record.instances {
+        let spec = each.value()
+        if spec.durability.class != os::DurabilityClass.Checkpointed {
+            continue
+        }
+        let Some(old) = component_at(running, state: spec.component.as_str()) else {
+            continue
+        }
+        let schema = running.components[old].schema
+        let reads = match component_at(moving, state: spec.component.as_str()) {
+            Some(new) => moving.components[new].schema == schema or moving.components[new].earlier.position(fn(earlier: code::Earlier) => earlier.schema == schema).is_some()
+            None => false
+        }
+        if not reads {
+            return Some(Failure.of("code.schema-incompatible", subject: each.key().text.as_str(), alloc))
+        }
+    }
+    let ships_nan = ships_toolchain(record, alloc)
+    for held in specs {
+        if held.spec.bundle == running_base {
+            continue
+        }
+        for wired in held.spec.wiring {
+            let os::Target.Instance(target) = wired.value().target else {
+                continue
+            }
+            let Some(base) = record.instances.get(ident::Moniker(text: target.text)) else {
+                continue
+            }
+            let changed = match component_at(running, state: base.component.as_str()) {
+                Some(old) => match component_at(moving, state: base.component.as_str()) {
+                    Some(new) => moving.components[new].protocol != running.components[old].protocol
+                    None => true
+                }
+                None => false
+            }
+            if changed {
+                return Some(Failure.of("port.incompatible", subject: held.moniker.as_str(), alloc))
+            }
+        }
+        if ships_nan {
+            continue
+        }
+        let Ok(ran) = try await admission_at(view, bundle: held.spec.bundle, alloc) else {
+            continue
+        }
+        if ran.image.support != moving.image.support {
+            return Some(Failure.of("code.no-image", subject: held.moniker.as_str(), alloc))
+        }
+    }
+    return None
+} switch_refusal
+
+/// A specification of `/sys/instances` and the moniker naming it.
+struct HeldSpec {
+    moniker: text::String
+    spec: os::InstanceSpec
+} HeldSpec
+
+/// The specifications of `/sys/instances`.
+fn specs_of(view: store::service::View, alloc: mem::Alloc) -> mem::List[HeldSpec] fails task::Cancelled uses wait {
+    var held = mem::List[HeldSpec].empty(alloc)
+    let nodes = match first attempt await view.scan(ident::Path(text: text::String.of("/sys/instances", alloc)), from: text::String.empty(alloc), to: text::String.empty(alloc), limit: MOST_SPECS, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return held
+    }
+    for node in nodes {
+        let Some(value) = node.value else {
+            continue
+        }
+        let Ok(spec) = attempt mem::wire::Codec[os::InstanceSpec].decode(value.view(), alloc) else {
+            continue
+        }
+        mut held.push(HeldSpec(moniker: last_segment(node.path, alloc), spec: take spec))
+    }
+    return held
+} specs_of
+
+/// The bundle of `supervisor`, the base bundle of the running generation.
+fn base_bundle(specs: mem::List[HeldSpec]) -> Option[ident::HashValue] {
+    for held in specs {
+        if held.moniker.as_str() == "supervisor" {
+            return Some(held.spec.bundle)
+        }
+    }
+    return None
+} base_bundle
+
+/// The index of the component of `record` of state type `state`.
+fn component_at(record: code::Admission, state: Str) -> Option[usize] {
+    return record.components.position(fn(component: code::Component) => component.state.as_str() == state)
+} component_at
+
+/// Whether the jobs of `record` hold the `nan` job's bundle.
+fn ships_toolchain(record: store::service::Genesis, alloc: mem::Alloc) -> bool {
+    for job in record.jobs {
+        match admission_from(Untrusted.of(job.value().bytes.view()), alloc) {
+            Some(shipped) => {
+                if shipped.root.as_str() == "nan" {
+                    return true
+                }
+            }
+            None => {
+            }
+        }
+    }
+    return false
+} ships_toolchain
+
+/// The path of the blob `name` beside `path`.
+fn beside(path: ident::Path, name: Str, alloc: mem::Alloc) -> ident::Path {
+    let text = path.text.as_str()
+    var cut: usize = 0
+    for at in 0..<text.byte_len() {
+        if text.as_bytes()[at] == b'/' {
+            cut = at
+        }
+    }
+    var reached = match text.slice_bytes(0, end: cut) {
+        Some(dir) => text::String.of(dir, alloc)
+        None => text::String.empty(alloc)
+    }
+    mut reached.push('/')
+    mut reached.append(name)
+    return ident::Path(text: take reached)
+} beside
+
+fn last_segment(path: ident::Path, alloc: mem::Alloc) -> text::String {
+    let text = path.text.as_str()
+    var cut: usize = 0
+    for at in 0..<text.byte_len() {
+        if text.as_bytes()[at] == b'/' {
+            cut = at + 1
+        }
+    }
+    return match text.slice_bytes(cut, end: text.byte_len()) {
+        Some(name) => text::String.of(name, alloc)
+        None => text::String.empty(alloc)
+    }
+} last_segment
+
+validator fn genesis_from(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[store::service::Genesis] {
+    return match attempt mem::wire::Codec[store::service::Genesis].decode(raw, alloc) {
+        Ok(found) => Some(take found)
+        Err(_) => None
+    }
+} genesis_from
+
+validator fn admission_from(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[code::Admission] {
+    return match attempt mem::wire::Codec[code::Admission].decode(raw, alloc) {
+        Ok(found) => Some(take found)
+        Err(_) => None
+    }
+} admission_from

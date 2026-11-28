@@ -1,0 +1,512 @@
+//! The operations of `boot` on the boot volume: installing a generation, rolling back, booting recovery, raising the floor, replacing the loader, the owner's requests and choosing the recovery generation.
+
+/// The tries of a slot an install makes `trial`.
+const TRIAL_TRIES: u8 = 3
+
+/// An operation waiting for its turn: the request asking it, `None` for a one-way call, and what it asks.
+pub closed struct Pending derives Encode {
+    pub request: Option[u64]
+    pub operation: Operation
+} Pending
+
+pub closed enum Operation derives Encode {
+    Install(manifest: ident::Path)
+    Rollback
+    Recovery
+    Retire(generation: u64)
+    ReplaceLoader(loader: ident::Path, version: u32, signature: ident::Signature)
+    ReplaceOwner(key: Array[u8, 32], recovery: Array[u8, 32], signature: ident::Signature, manifests: mem::List[ident::Signature])
+    Claim(key: Array[u8, 32], recovery: Array[u8, 32])
+    Recover(code: Array[u8, 16], key: Array[u8, 32], recovery: Array[u8, 32], manifests: mem::List[ident::Signature])
+    SetRecovery(generation: u64)
+} Operation
+
+/// Why an operation of `boot` failed: chapter 03's codes, `auth.bad-signature`, and the codes of a claim and of a recovery.
+pub closed enum BootFailure derives Copy, Eq, Render, Encode {
+    NoBootVolume
+    ManifestUnreadable
+    ManifestMalformed
+    SignerUnknown
+    SignatureInvalid
+    BelowFloor
+    LoaderTooOld
+    FileUnreadable
+    HashMismatch
+    StoreFormat
+    TrialPending
+    WriteFailed
+    VolumeFull
+    NoFallback
+    FloorTooHigh
+    NotGood
+    ResignRequired
+    BadSignature
+    AlreadyClaimed
+    Unclaimable
+    RecoveryCodeInvalid
+} BootFailure
+
+/// The code of the failure.
+pub fn BootFailure.code(self) -> text::Fixed[32] {
+    let name = match self {
+        BootFailure.NoBootVolume => "boot.no-boot-volume"
+        BootFailure.ManifestUnreadable => "boot.manifest-unreadable"
+        BootFailure.ManifestMalformed => "boot.manifest-malformed"
+        BootFailure.SignerUnknown => "boot.signer-unknown"
+        BootFailure.SignatureInvalid => "boot.signature-invalid"
+        BootFailure.BelowFloor => "boot.below-floor"
+        BootFailure.LoaderTooOld => "boot.loader-too-old"
+        BootFailure.FileUnreadable => "boot.file-unreadable"
+        BootFailure.HashMismatch => "boot.hash-mismatch"
+        BootFailure.StoreFormat => "boot.store-format"
+        BootFailure.TrialPending => "boot.trial-pending"
+        BootFailure.WriteFailed => "boot.write-failed"
+        BootFailure.VolumeFull => "boot.volume-full"
+        BootFailure.NoFallback => "boot.no-fallback"
+        BootFailure.FloorTooHigh => "boot.floor-too-high"
+        BootFailure.NotGood => "boot.not-good"
+        BootFailure.ResignRequired => "boot.resign-required"
+        BootFailure.BadSignature => "auth.bad-signature"
+        BootFailure.AlreadyClaimed => "policy.already-claimed"
+        BootFailure.Unclaimable => "policy.unclaimable"
+        BootFailure.RecoveryCodeInvalid => "policy.recovery-code-invalid"
+    }
+    return text::Fixed[32].of(name)
+} BootFailure.code
+
+/// The payload of `boot.generation-installed`.
+pub closed struct Installed derives Render, Encode {
+    pub generation: u64
+    pub slot: text::String
+} Installed
+
+/// What an operation ends with: the encoding of its reply, and whether the machine reboots once it is given.
+struct Outcome {
+    reply: sys::Encoded
+    reboots: bool
+} Outcome
+
+/// Carries out `operation`.
+fn Surroundings.operate(self, take operation: Operation) -> Outcome fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    if self.handoff.volume_scheme == bootfmt::VolumeScheme.Unknown.to_bits() {
+        let refused: Result[Unit, BootFailure] = Err(BootFailure.NoBootVolume)
+        return Outcome(reply: encoded(refused, alloc), reboots: false)
+    }
+    let restarts = match operation {
+        Operation.Rollback or Operation.Recovery => true
+        else => false
+    }
+    var done = false
+    let reply = match operation {
+        Operation.Install(manifest: manifest) => try self.ended(attempt await self.install(take manifest), mut done)
+        Operation.Rollback => try self.ended(attempt await self.rollback(), mut done)
+        Operation.Recovery => try self.ended(attempt await self.recover_next(), mut done)
+        Operation.Retire(generation: generation) => try self.ended(attempt await self.retire(generation), mut done)
+        Operation.ReplaceLoader(loader: loader, version: version, signature: signature) => try self.ended(attempt await self.replace_loader(take loader, version, signature), mut done)
+        Operation.ReplaceOwner(key: key, recovery: recovery, signature: signature, manifests: manifests) => try self.ended(attempt await self.replace_owner(key, recovery, signature, manifests), mut done)
+        Operation.Claim(key: key, recovery: recovery) => try self.ended(attempt await self.claim(key, recovery), mut done)
+        Operation.Recover(code: code, key: key, recovery: recovery, manifests: manifests) => try self.ended(attempt await self.recover_owner(code, key, recovery, manifests), mut done)
+        Operation.SetRecovery(generation: generation) => try self.ended(attempt await self.set_recovery(generation), mut done)
+    }
+    return Outcome(reply: take reply, reboots: restarts and done)
+} Surroundings.operate
+
+/// The reply of an operation that ended as `outcome`, `done` set when it succeeded.
+fn Surroundings.ended[T: Encode](self, take outcome: Result[T, Failing], mut done: bool) -> sys::Encoded fails task::Cancelled {
+    let given = try settled(take outcome)
+    done = given.is_ok()
+    return encoded(given, alloc: self.alloc)
+} Surroundings.ended
+
+/// Installs the generation whose manifest blob is at `manifest`: verifies the manifest as the loader does against the handoff record's floor and loader version and the store's format, copies the blobs beside it and then the manifest to `/nanos/gen/<n>/`, each read back, and makes the idle slot `trial` with 3 tries, `next once` naming it; the generation's number.
+fn Surroundings.install(self, take manifest: ident::Path) -> u64 fails Failing uses wait {
+    let alloc = self.alloc
+    if self.handoff.mode == bootfmt::Mode.Trial.to_bits() {
+        fail BootFailure.TrialPending
+    }
+    let Some(reached) = in_data(manifest, alloc) else {
+        fail BootFailure.ManifestUnreadable
+    }
+    let source = parent_of(reached, alloc)
+    let raw = match first attempt await self.tree.read(take reached, at: None, offset: 0, length: MOST_MANIFEST, alloc) {
+        Ok(bytes) => bytes
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail BootFailure.ManifestUnreadable
+    }
+    let Some(signed) = bootfmt::SignedManifest.read(raw.view(), alloc) else {
+        fail BootFailure.ManifestMalformed
+    }
+    let Some(key) = signed.manifest.signer_key(owner: self.owner(), development: self.handoff.flags.development) else {
+        fail BootFailure.SignerUnknown
+    }
+    if not signed.verifies(key, alloc) {
+        fail BootFailure.SignatureInvalid
+    }
+    let n = signed.manifest.generation
+    if n == 0 or n < self.handoff.floor {
+        fail BootFailure.BelowFloor
+    }
+    if signed.manifest.min_loader > self.handoff.loader_version {
+        fail BootFailure.LoaderTooOld
+    }
+    let format = match first attempt await self.tree.stats(alloc) {
+        Ok(stats) => stats.format
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail BootFailure.StoreFormat
+    }
+    if signed.manifest.store_format != format and signed.manifest.store_format != format + 1 {
+        fail BootFailure.StoreFormat
+    }
+    let target = generation_dir(n, alloc)
+    try await self.copy_file(source, target, name: bootfmt::KERNEL_FILE, expected: signed.manifest.kernel)
+    try await self.copy_file(source, target, name: bootfmt::GENESIS_FILE, expected: signed.manifest.genesis)
+    try await self.copy_file(source, target, name: bootfmt::KEYRING_FILE, expected: signed.manifest.keyring)
+    let interface_file = child_of(target, name: bootfmt::INTERFACE_FILE, alloc)
+    let copied = try await self.copy_blob(child_of(source, name: bootfmt::INTERFACE_FILE, alloc), target: text::String.of(interface_file.as_str(), alloc), expected: None)
+    if copied.is_none() {
+        discard try await self.remove(take interface_file)
+    }
+    try await self.write_whole(child_of(target, name: bootfmt::MANIFEST_FILE, alloc), data: plain_copy(raw.view(), alloc))
+    let held = try await self.read_record()
+    var record = current(held)
+    let slot = idle_slot(record, handoff: self.handoff)
+    mut record.set_slot(slot, held: bootfmt::SlotEntry(generation: n, state: bootfmt::SlotState.Trial.to_bits(), tries: TRIAL_TRIES, reserved: Array[u8, 6].filled(0)))
+    record.next_once = next_naming(slot)
+    try await self.store_record(record, held, installed: n)
+    try await self.events.emit("boot.generation-installed", severity: journal::Severity.Notice, payload: Installed(generation: n, slot: slot_name(slot, alloc)), alloc)
+    return n
+} Surroundings.install
+
+/// Copies the blob `name` of the tree's dir `source` to the boot volume's dir `target`, the blob having the id `expected`.
+fn Surroundings.copy_file(
+    self,
+    source: text::String,
+    target: text::String,
+    name: Str,
+    expected: ident::HashValue,
+    ) fails Failing uses wait {
+    let alloc = self.alloc
+    let copied = try await self.copy_blob(child_of(source, name, alloc), target: child_of(target, name, alloc), expected: Some(expected))
+    if copied.is_none() {
+        fail BootFailure.FileUnreadable
+    }
+} Surroundings.copy_file
+
+/// Sets the running slot `bad`, when the other slot is `good` with a generation at or above the floor.
+fn Surroundings.rollback(self) fails Failing uses wait {
+    let running = self.handoff.slot
+    if running != bootfmt::Slot.A.to_bits() and running != bootfmt::Slot.B.to_bits() {
+        fail BootFailure.NoFallback
+    }
+    let held = try await self.read_record()
+    var record = current(held)
+    let fallback = record.slot(other_slot(running))
+    if fallback.state != bootfmt::SlotState.Good.to_bits() or fallback.generation < self.handoff.floor {
+        fail BootFailure.NoFallback
+    }
+    var failing = record.slot(running)
+    failing.state = bootfmt::SlotState.Bad.to_bits()
+    mut record.set_slot(running, held: failing)
+    try await self.store_record(record, held, installed: 0)
+} Surroundings.rollback
+
+/// Has the next boot boot the recovery list.
+fn Surroundings.recover_next(self) fails Failing uses wait {
+    let held = try await self.read_record()
+    var record = current(held)
+    record.next_once = bootfmt::NextOnce.Recovery.to_bits()
+    try await self.store_record(record, held, installed: 0)
+} Surroundings.recover_next
+
+/// Requests the floor `generation`, when it is at most the running generation and the recovery generation.
+fn Surroundings.retire(self, generation: u64) fails Failing uses wait {
+    let held = try await self.read_record()
+    var record = current(held)
+    if generation > self.handoff.generation or generation > record.recovery_generation {
+        fail BootFailure.FloorTooHigh
+    }
+    record.floor_request = generation
+    try await self.store_record(record, held, installed: 0)
+} Surroundings.retire
+
+/// Writes the blob at `loader` to `/EFI/nanos/loader.new`, read back, and the loader request of its blob id and `version`, once `signature` verifies as the owner's over them.
+fn Surroundings.replace_loader(self, take loader: ident::Path, version: u32, signature: ident::Signature) fails Failing uses wait {
+    let alloc = self.alloc
+    let Some(owner) = self.owner() else {
+        fail BootFailure.BadSignature
+    }
+    let Some(reached) = in_data(loader, alloc) else {
+        fail BootFailure.FileUnreadable
+    }
+    let node = match first attempt await self.tree.get(ident::Path(text: text::String.of(reached.text.as_str(), alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => fail BootFailure.FileUnreadable
+    }
+    let Some(blob) = node.hash else {
+        fail BootFailure.FileUnreadable
+    }
+    if not signature.verifies(owner, object: bootfmt::LoaderRequest(loader: blob, version: version).hash(alloc)) {
+        fail BootFailure.BadSignature
+    }
+    let copied = try await self.copy_blob(reached.text, target: text::String.of(NEW_LOADER_FILE, alloc), expected: Some(blob))
+    if copied.is_none() {
+        fail BootFailure.FileUnreadable
+    }
+    let held = try await self.read_record()
+    var record = current(held)
+    record.loader_request = blob.bytes
+    record.loader_request_version = version
+    record.loader_request_signature = signature.bytes
+    try await self.store_record(record, held, installed: 0)
+} Surroundings.replace_loader
+
+/// Writes the request replacing the owner key by `key` with the recovery digest `recovery`, once `signature` verifies as the owner's over them and every manifest the owner signed carries `key`'s signature too.
+fn Surroundings.replace_owner(
+    self,
+    key: Array[u8, 32],
+    recovery: Array[u8, 32],
+    signature: ident::Signature,
+    manifests: mem::List[ident::Signature],
+    ) fails Failing uses wait {
+    let Some(stored) = self.owner() else {
+        fail BootFailure.BadSignature
+    }
+    let request = bootfmt::OwnerKeyRequest(current: stored, key: key, recovery: recovery)
+    if not signature.verifies(stored, object: request.hash(self.alloc)) {
+        fail BootFailure.BadSignature
+    }
+    try await self.resign(key, manifests)
+    try await self.request_owner(kind: bootfmt::OwnerRequestKind.BySignature, key, recovery, proof: signature.bytes)
+} Surroundings.replace_owner
+
+/// Writes the claim request of the owner key `key` with the recovery digest `recovery`, on an unclaimed machine that can keep an owner record.
+fn Surroundings.claim(self, key: Array[u8, 32], recovery: Array[u8, 32]) fails Failing uses wait {
+    if self.owner().is_some() {
+        fail BootFailure.AlreadyClaimed
+    }
+    if not (self.handoff.flags.floor_in_tpm or self.handoff.flags.floor_in_variable) {
+        fail BootFailure.Unclaimable
+    }
+    try await self.request_owner(kind: bootfmt::OwnerRequestKind.Claim, key, recovery, proof: Array[u8, 64].filled(0))
+} Surroundings.claim
+
+/// Writes the request replacing a lost owner key by `key` with the recovery digest `recovery`, once the digest of `code` is the stored one and every manifest the owner signed carries `key`'s signature too.
+fn Surroundings.recover_owner(
+    self,
+    code: Array[u8, 16],
+    key: Array[u8, 32],
+    recovery: Array[u8, 32],
+    manifests: mem::List[ident::Signature],
+    ) fails Failing uses wait {
+    let digest = ident::HashValue.of_content(code.view())
+    for at in 0..<32usize {
+        if digest.bytes[at + 1] != self.handoff.recovery_digest[at] {
+            fail BootFailure.RecoveryCodeInvalid
+        }
+    }
+    try await self.resign(key, manifests)
+    var proof = Array[u8, 64].filled(0)
+    for at in 0..<16usize {
+        proof[at] = code[at]
+    }
+    try await self.request_owner(kind: bootfmt::OwnerRequestKind.ByRecoveryCode, key, recovery, proof)
+} Surroundings.recover_owner
+
+/// Makes `generation` the recovery generation, when a `good` slot at or above the floor holds it.
+fn Surroundings.set_recovery(self, generation: u64) fails Failing uses wait {
+    let held = try await self.read_record()
+    var record = current(held)
+    if generation < self.handoff.floor or not (holds_good(record.slot_a, generation) or holds_good(record.slot_b, generation)) {
+        fail BootFailure.NotGood
+    }
+    record.recovery_generation = generation
+    try await self.store_record(record, held, installed: 0)
+} Surroundings.set_recovery
+
+/// Writes the owner request of `kind` into the boot record.
+fn Surroundings.request_owner(
+    self,
+    kind: bootfmt::OwnerRequestKind,
+    key: Array[u8, 32],
+    recovery: Array[u8, 32],
+    proof: Array[u8, 64],
+    ) fails Failing uses wait {
+    let held = try await self.read_record()
+    var record = current(held)
+    record.owner_request_kind = kind.to_bits()
+    record.owner_request_key = key
+    record.owner_request_recovery = recovery
+    record.owner_request_proof = proof
+    try await self.store_record(record, held, installed: 0)
+} Surroundings.request_owner
+
+/// Has each manifest signed by `owner` of a generation the boot record names carry the signature by `key` that `manifests` gives for it, in generation order, beside its signature by the stored owner key, each read back; `boot.resign-required` before any write when one is missing or does not verify.
+fn Surroundings.resign(self, key: Array[u8, 32], manifests: mem::List[ident::Signature]) fails Failing uses wait {
+    let alloc = self.alloc
+    let record = current(try await self.read_record())
+    let stored = self.owner().value_or(key)
+    var resigned = mem::List[Resigned].empty(alloc)
+    for generation in named_generations(record, alloc) {
+        let Some(signed) = try await self.read_manifest(generation) else {
+            continue
+        }
+        if not signed.manifest.owners() {
+            continue
+        }
+        let Some(added) = manifests.get(resigned.len()) else {
+            fail BootFailure.ResignRequired
+        }
+        let hash = signed.manifest.hash(alloc)
+        if not added.verifies(key, object: hash) {
+            fail BootFailure.ResignRequired
+        }
+        var signatures = mem::Bounded[ident::Signature, 2].empty()
+        for kept in signed.signatures.view() {
+            if signatures.len() == 0 and kept.verifies(stored, object: hash) {
+                mut signatures.push(kept)
+            }
+        }
+        mut signatures.push(added)
+        mut resigned.push(Resigned(generation: generation, signed: bootfmt::SignedManifest(manifest: take signed.manifest, signatures: signatures)))
+    }
+    for each in resigned {
+        var bytes = mem::Bytes.empty(alloc)
+        mem::wire::Codec[bootfmt::SignedManifest].encode(each.signed, out: mut bytes)
+        try await self.write_whole(generation_file(each.generation, name: bootfmt::MANIFEST_FILE, alloc), data: take bytes)
+    }
+} Surroundings.resign
+
+/// A manifest with its signatures replaced, and its generation.
+struct Resigned {
+    generation: u64
+    signed: bootfmt::SignedManifest
+} Resigned
+
+/// The stored owner key, `None` on an unclaimed machine.
+fn Surroundings.owner(self) -> Option[Array[u8, 32]] {
+    if self.handoff.owner_key == Array[u8, 32].filled(0) {
+        return None
+    }
+    return Some(self.handoff.owner_key)
+} Surroundings.owner
+
+/// An operation's outcome as its task gives it: its value, or its failure; a cancellation stays one.
+fn settled[T](take outcome: Result[T, Failing]) -> Result[T, BootFailure] fails task::Cancelled {
+    return match outcome {
+        Ok(value) => Ok(take value)
+        Err(Failing.Failure(failure)) => Err(failure)
+        Err(Failing.Cancelled(cancelled)) => fail cancelled
+    }
+} settled
+
+/// The encoding of an operation's reply.
+fn encoded[T: Encode](outcome: Result[T, BootFailure], alloc: mem::Alloc) -> sys::Encoded {
+    var reply = sys::Encoded.empty(alloc)
+    mem::wire::Codec[Result[T, BootFailure]].encode(outcome, out: mut reply.bytes)
+    return reply
+} encoded
+
+/// The record a boot volume holds, every slot `empty` when it holds none.
+fn current(held: Option[bootfmt::Held]) -> bootfmt::BootRecord {
+    return match held {
+        Some(found) => found.record
+        None => bootfmt::BootRecord.empty()
+    }
+} current
+
+/// Whether `entry` is a `good` slot holding `generation`.
+fn holds_good(entry: bootfmt::SlotEntry, generation: u64) -> bool = entry.state == bootfmt::SlotState.Good.to_bits() and entry.generation == generation
+
+/// The idle slot: the slot not holding the running generation; in `recovery` and `dev` modes an `empty` or `bad` slot, else the one of the lower generation.
+fn idle_slot(record: bootfmt::BootRecord, handoff: bootfmt::Handoff) -> u8 {
+    let a = bootfmt::Slot.A.to_bits()
+    let b = bootfmt::Slot.B.to_bits()
+    if handoff.slot == a or handoff.slot == b {
+        return other_slot(handoff.slot)
+    }
+    if free(record.slot_a) {
+        return a
+    }
+    if free(record.slot_b) {
+        return b
+    }
+    if record.slot_b.generation < record.slot_a.generation {
+        return b
+    }
+    return a
+} idle_slot
+
+fn free(entry: bootfmt::SlotEntry) -> bool = entry.state == bootfmt::SlotState.Empty.to_bits() or entry.state == bootfmt::SlotState.Bad.to_bits()
+
+fn other_slot(slot: u8) -> u8 {
+    if slot == bootfmt::Slot.A.to_bits() {
+        return bootfmt::Slot.B.to_bits()
+    }
+    return bootfmt::Slot.A.to_bits()
+} other_slot
+
+/// The `next once` value naming `slot`.
+fn next_naming(slot: u8) -> u8 {
+    if slot == bootfmt::Slot.B.to_bits() {
+        return bootfmt::NextOnce.SlotB.to_bits()
+    }
+    return bootfmt::NextOnce.SlotA.to_bits()
+} next_naming
+
+fn slot_name(slot: u8, alloc: mem::Alloc) -> text::String {
+    if slot == bootfmt::Slot.B.to_bits() {
+        return text::String.of("b", alloc)
+    }
+    return text::String.of("a", alloc)
+} slot_name
+
+/// The generations the boot record names, its slots' and its recovery generation, each once, in ascending order.
+fn named_generations(record: bootfmt::BootRecord, alloc: mem::Alloc) -> mem::List[u64] {
+    var named = mem::List[u64].empty(alloc)
+    var candidates = Array[u64, 3].filled(0)
+    candidates[0] = record.slot_a.generation
+    candidates[1] = record.slot_b.generation
+    candidates[2] = record.recovery_generation
+    var above: u64 = 0
+    loop {
+        var least: u64 = 0
+        for generation in candidates {
+            if generation > above and (least == 0 or generation < least) {
+                least = generation
+            }
+        }
+        if least == 0 {
+            return named
+        }
+        mut named.push(least)
+        above = least
+    }
+} named_generations
+
+fn sample_slot(generation: u64, state: bootfmt::SlotState) -> bootfmt::SlotEntry = bootfmt::SlotEntry(generation: generation, state: state.to_bits(), tries: 0, reserved: Array[u8, 6].filled(0))
+
+test installs_go_to_the_slot_not_running for idle_slot {
+    var record = bootfmt::BootRecord.empty()
+    record.slot_a = sample_slot(4, state: bootfmt::SlotState.Good)
+    record.slot_b = sample_slot(3, state: bootfmt::SlotState.Good)
+    var running = bootfmt::Handoff.empty()
+    running.slot = bootfmt::Slot.B.to_bits()
+    let recovering = bootfmt::Handoff.empty()
+    let beside_b = idle_slot(record, handoff: running)
+    let lower = idle_slot(record, handoff: recovering)
+    record.slot_a.state = bootfmt::SlotState.Bad.to_bits()
+    let rejected = idle_slot(record, handoff: recovering)
+    expect beside_b == bootfmt::Slot.A.to_bits() and lower == bootfmt::Slot.B.to_bits() and rejected == bootfmt::Slot.A.to_bits()
+} installs_go_to_the_slot_not_running
+
+test the_record_names_each_generation_once_in_order for named_generations {
+    let alloc = testing::world().alloc
+    var record = bootfmt::BootRecord.empty()
+    record.slot_a = sample_slot(5, state: bootfmt::SlotState.Trial)
+    record.slot_b = sample_slot(3, state: bootfmt::SlotState.Good)
+    record.recovery_generation = 3
+    let named = named_generations(record, alloc)
+    expect named.len() == 2 and named[0] == 3 and named[1] == 5
+} the_record_names_each_generation_once_in_order

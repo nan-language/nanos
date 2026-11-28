@@ -1,0 +1,374 @@
+//! The boot volume as `boot` reaches it through `fat`: the boot record's copies, the generations' directories and their files, and the loader's files, each write read back.
+
+/// The bytes one step of a copy or a read back moves: one piece of a blob.
+const COPY_BYTES: u32 = 65_536
+
+/// The most bytes a manifest file holds.
+const MOST_MANIFEST: u32 = 4_096
+
+/// The files of the boot record's two copies on the boot volume.
+const RECORD_COPIES: Str = "/nanos/boot.rec /nanos/boot.bak"
+
+const GENERATIONS_DIR: Str = "/nanos/gen"
+
+/// The subtree `boot`'s View of the tree reads.
+const DATA_TREE: Str = "/data"
+
+/// The loader's file, and the loader waiting to replace it.
+const LOADER_FILE: Str = "/EFI/BOOT/BOOTX64.EFI"
+
+const NEW_LOADER_FILE: Str = "/EFI/nanos/loader.new"
+
+/// How a write to the boot volume stops: its failure, or the cancellation of its task.
+pub closed enum Failing {
+    Failure(BootFailure) from
+    Cancelled(task::Cancelled) from
+} Failing
+
+/// The boot record the boot volume holds and the copy holding it, `None` when neither copy is valid.
+fn Surroundings.read_record(self) -> Option[bootfmt::Held] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let names = copy_names(alloc)
+    let rec = try await self.read_copy(text::String.of(names[0].as_str(), alloc))
+    let bak = try await self.read_copy(text::String.of(names[1].as_str(), alloc))
+    return bootfmt::BootRecord.current(rec, bak)
+} Surroundings.read_record
+
+/// The record the copy at `path` holds when it is valid.
+fn Surroundings.read_copy(self, take path: text::String) -> Option[bootfmt::BootRecord] fails task::Cancelled uses wait {
+    let Some(bytes) = try await self.read_part(take path, offset: 0, count: 512) else {
+        return None
+    }
+    return bootfmt::BootRecord.read(bytes.view())
+} Surroundings.read_copy
+
+/// Writes `held` over its copy on the boot volume; whether the write succeeded.
+fn Surroundings.write_record(self, held: bootfmt::Held) -> bool fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let names = copy_names(alloc)
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(held.record.to_bits().view())
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Fat].overwrite(mut call, path: text::String.of(names[usize.widen(held.copy)].as_str(), alloc), offset: 0, data: take bytes)
+    return match first attempt await self.fat.call(take call, reply, alloc) {
+        Ok(_) => true
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => false
+    }
+} Surroundings.write_record
+
+/// Writes `record` over the copy not holding `held` and mirrors it in `/sys/boot`, `installed` being the generation an install just wrote, 0 for none.
+fn Surroundings.store_record(self, record: bootfmt::BootRecord, held: Option[bootfmt::Held], installed: u64) fails Failing uses wait {
+    if not try await self.write_record(record.write_over(held)) {
+        fail BootFailure.WriteFailed
+    }
+    try await self.mirror_record(Some(record), installed)
+} Surroundings.store_record
+
+/// The signed manifest of generation `generation` on the boot volume, `None` when it is missing or does not decode.
+fn Surroundings.read_manifest(self, generation: u64) -> Option[bootfmt::SignedManifest] fails task::Cancelled uses wait {
+    let Some(raw) = try await self.read_part(generation_file(generation, name: bootfmt::MANIFEST_FILE, alloc: self.alloc), offset: 0, count: MOST_MANIFEST) else {
+        return None
+    }
+    return bootfmt::SignedManifest.read(raw.view(), alloc: self.alloc)
+} Surroundings.read_manifest
+
+/// The generations whose directories `/nanos/gen` holds, in ascending order.
+fn Surroundings.directories(self) -> mem::List[u64] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var found = mem::List[u64].empty(alloc)
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Fat].list(mut call, path: text::String.of(GENERATIONS_DIR, alloc))
+    let entries = match first attempt await self.fat.call(take call, reply, alloc) {
+        Ok(listed) => listed
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return found
+    }
+    for entry in entries {
+        if not entry.dir {
+            continue
+        }
+        let Some(generation) = decimal_of(entry.name) else {
+            continue
+        }
+        var at: usize = 0
+        while at < found.len() and found[at] < generation {
+            at += 1
+        }
+        mut found.insert(at, value: generation)
+    }
+    return found
+} Surroundings.directories
+
+/// Removes the directory of generation `generation` and every file in it.
+fn Surroundings.remove_directory(self, generation: u64) fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let dir = generation_dir(generation, alloc)
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Fat].list(mut call, path: text::String.of(dir.as_str(), alloc))
+    let entries = match first attempt await self.fat.call(take call, reply, alloc) {
+        Ok(listed) => listed
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return
+    }
+    for entry in entries {
+        let Some(name) = file_name(entry.name, alloc) else {
+            continue
+        }
+        if not entry.dir {
+            discard try await self.remove(child_of(dir, name: name.as_str(), alloc))
+        }
+    }
+    discard try await self.remove(take dir)
+} Surroundings.remove_directory
+
+/// Removes the file or empty directory `path`; whether it is gone.
+fn Surroundings.remove(self, take path: text::String) -> bool fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(self.alloc)
+    let reply = sys::Wire[devices::Fat].remove(mut call, take path)
+    return match first attempt await self.fat.call(take call, reply, alloc: self.alloc) {
+        Ok(_) => true
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(os::PortError.Failed(devices::FatError.NotFound)) => true
+        Err(_) => false
+    }
+} Surroundings.remove
+
+/// Copies the blob at `source` in the tree to the file `target` of the boot volume, a piece at a time, and reads the copy back: the blob's id, which must be `expected` when given; `None` for a missing blob.
+fn Surroundings.copy_blob(self, source: text::String, target: text::String, expected: Option[ident::HashValue]) -> Option[ident::HashValue] fails Failing uses wait {
+    let alloc = self.alloc
+    let node = match first attempt await self.tree.get(ident::Path(text: text::String.of(source.as_str(), alloc)), at: None, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(blob) = node.hash else {
+        return None
+    }
+    if node.kind != store::NodeKind.Blob {
+        return None
+    }
+    match expected {
+        Some(id) => {
+            if id != blob {
+                fail BootFailure.HashMismatch
+            }
+        }
+        None => {
+        }
+    }
+    discard try await self.remove(text::String.of(target.as_str(), alloc))
+    var making = sys::Encoded.empty(alloc)
+    let made = sys::Wire[devices::Fat].allocate(mut making, path: text::String.of(target.as_str(), alloc), bytes: node.size)
+    try await self.fat_call(take making, reply: made)
+    var offset: u64 = 0
+    while offset < node.size {
+        let length = u32.truncate((node.size - offset).min(u64.widen(COPY_BYTES)))
+        let piece = match first attempt await self.tree.read(ident::Path(text: text::String.of(source.as_str(), alloc)), at: Some(node.version), offset, length, alloc) {
+            Ok(bytes) => bytes
+            Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+            Err(_) => fail BootFailure.FileUnreadable
+        }
+        var call = sys::Encoded.empty(alloc)
+        let reply = sys::Wire[devices::Fat].overwrite(mut call, path: text::String.of(target.as_str(), alloc), offset, data: plain_copy(piece.view(), alloc))
+        try await self.fat_call(take call, reply)
+        offset += u64.widen(length)
+    }
+    if try await self.file_id(target) != Some(blob) {
+        fail BootFailure.WriteFailed
+    }
+    return Some(blob)
+} Surroundings.copy_blob
+
+/// Writes `data` as the whole file `path` of the boot volume and reads it back.
+fn Surroundings.write_whole(self, path: text::String, take data: mem::Bytes) fails Failing uses wait {
+    let id = ident::HashValue.of_content(data.view())
+    var call = sys::Encoded.empty(self.alloc)
+    let reply = sys::Wire[devices::Fat].write(mut call, path: text::String.of(path.as_str(), alloc: self.alloc), take data)
+    try await self.fat_call(take call, reply)
+    if try await self.file_id(path) != Some(id) {
+        fail BootFailure.WriteFailed
+    }
+} Surroundings.write_whole
+
+/// The blob id of the file `path` of the boot volume, read a piece at a time; `None` when it cannot be read.
+fn Surroundings.file_id(self, path: text::String) -> Option[ident::HashValue] fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    var keys = mem::List[Array[u8, 32]].empty(alloc)
+    var single = mem::Bytes.empty(alloc)
+    var offset: u64 = 0
+    loop {
+        let Some(raw) = try await self.read_part(text::String.of(path.as_str(), alloc), offset, count: COPY_BYTES) else {
+            return None
+        }
+        let piece = plain_copy(raw.view(), alloc)
+        let length = piece.len()
+        if length == 0 {
+            break
+        }
+        if length > ident::PIECE_BYTES {
+            return None
+        }
+        mut keys.push(ident::piece_key(piece.view(), index: offset / u64.widen(COPY_BYTES)))
+        if offset == 0 {
+            single = piece
+        }
+        offset += u64.widen(length)
+        if length < usize.widen(COPY_BYTES) {
+            break
+        }
+    }
+    if keys.len() < 2 {
+        return Some(ident::HashValue.of_content(single.view()))
+    }
+    return Some(ident::HashValue.of_pieces(keys.view(), alloc))
+} Surroundings.file_id
+
+/// At most `count` bytes of the file `path` of the boot volume from `offset`; `None` when it cannot be read.
+fn Surroundings.read_part(self, take path: text::String, offset: u64, count: u32) -> Option[Untrusted[mem::Bytes]] fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(self.alloc)
+    let reply = sys::Wire[devices::Fat].read(mut call, take path, offset, count)
+    return match first attempt await self.fat.call(take call, reply, alloc: self.alloc) {
+        Ok(bytes) => Some(take bytes)
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} Surroundings.read_part
+
+/// Calls `fat` for a write: a full volume fails with `boot.volume-full`, any other failure with `boot.write-failed`.
+fn Surroundings.fat_call(self, take call: sys::Encoded, reply: sys::Reply[Unit, devices::FatError]) fails Failing uses wait {
+    match first attempt await self.fat.call(take call, reply, alloc: self.alloc) {
+        Ok(_) => {
+        }
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(os::PortError.Failed(devices::FatError.NoSpace)) => fail BootFailure.VolumeFull
+        Err(os::PortError.Failed(devices::FatError.NotContiguous)) => fail BootFailure.VolumeFull
+        Err(_) => fail BootFailure.WriteFailed
+    }
+} Surroundings.fat_call
+
+/// The paths of the boot record's copies, copy 0 first.
+fn copy_names(alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    var name = text::String.empty(alloc)
+    for byte in RECORD_COPIES.as_bytes() {
+        if byte == b' ' {
+            mut names.push(take name)
+            name = text::String.empty(alloc)
+        } else {
+            mut name.push(char.checked_from_bits(u32.widen(byte)).value_or('?'))
+        }
+    }
+    mut names.push(take name)
+    return names
+} copy_names
+
+/// The directory of generation `generation`.
+fn generation_dir(generation: u64, alloc: mem::Alloc) -> text::String {
+    var path = text::String.of(GENERATIONS_DIR, alloc)
+    mut path.push('/')
+    for digit in store::decimal_name(generation, alloc) {
+        mut path.push(char.checked_from_bits(u32.widen(digit)).value_or('0'))
+    }
+    return path
+} generation_dir
+
+/// The path of the file `name` of generation `generation`'s directory.
+fn generation_file(generation: u64, name: Str, alloc: mem::Alloc) -> text::String {
+    return child_of(generation_dir(generation, alloc), name, alloc)
+} generation_file
+
+fn child_of(dir: text::String, name: Str, alloc: mem::Alloc) -> text::String {
+    var path = text::String.of(dir.as_str(), alloc)
+    mut path.push('/')
+    mut path.append(name)
+    return path
+} child_of
+
+/// The path the tree path `path` has in `boot`'s View of `/data`, `None` for one outside it.
+fn in_data(path: ident::Path, alloc: mem::Alloc) -> Option[ident::Path] {
+    let text = path.text.as_str()
+    if not text.starts_with(DATA_TREE) {
+        return None
+    }
+    let Some(rest) = text.slice_bytes(DATA_TREE.byte_len(), end: text.byte_len()) else {
+        return None
+    }
+    if not rest.starts_with("/") {
+        return None
+    }
+    return Some(ident::Path(text: text::String.of(rest, alloc)))
+} in_data
+
+/// The directory holding `path`.
+fn parent_of(path: ident::Path, alloc: mem::Alloc) -> text::String {
+    let bytes = path.text.as_str().as_bytes()
+    var cut: usize = 0
+    for at in 0..<bytes.len() {
+        if bytes[at] == b'/' {
+            cut = at
+        }
+    }
+    return match path.text.as_str().slice_bytes(0, end: cut) {
+        Some(dir) => text::String.of(dir, alloc)
+        None => text::String.empty(alloc)
+    }
+} parent_of
+
+/// A copy of bytes read from the tree or the boot volume, which `boot` moves as they are.
+validator fn plain_copy(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect())
+    return bytes
+} plain_copy
+
+/// The generation a directory name gives: decimal digits without a leading zero, at least 1.
+validator fn decimal_of(raw: Untrusted[text::String]) -> Option[u64] {
+    let digits = raw.inspect().as_str().as_bytes()
+    if digits.len() == 0 or digits.len() > 19 or digits[0] == b'0' {
+        return None
+    }
+    var value: u64 = 0
+    for digit in digits {
+        if digit < b'0' or digit > b'9' {
+            return None
+        }
+        value = value * 10 + u64.widen(digit - b'0')
+    }
+    return Some(value)
+} decimal_of
+
+/// A file name a listing gives, `None` for `.`, `..` and names holding `/`.
+validator fn file_name(raw: Untrusted[text::String], alloc: mem::Alloc) -> Option[text::String] {
+    let name = raw.inspect().as_str()
+    if name == "." or name == ".." or name.byte_len() == 0 {
+        return None
+    }
+    for byte in name.as_bytes() {
+        if byte == b'/' {
+            return None
+        }
+    }
+    return Some(text::String.of(name, alloc))
+} file_name
+
+test tree_paths_reach_the_view_of_data for in_data {
+    let alloc = testing::world().alloc
+    let inside = in_data(ident::Path(text: text::String.of("/data/gen/2/manifest", alloc)), alloc)
+    let beside = in_data(ident::Path(text: text::String.of("/database/x", alloc)), alloc)
+    let outside = in_data(ident::Path(text: text::String.of("/sys/boot", alloc)), alloc)
+    let reached = match inside {
+        Some(found) => found.text.as_str() == "/gen/2/manifest"
+        None => false
+    }
+    expect reached and beside.is_none() and outside.is_none()
+} tree_paths_reach_the_view_of_data
+
+test directory_names_give_generations for decimal_of {
+    let alloc = testing::world().alloc
+    let named = decimal_of(Untrusted.of(text::String.of("12", alloc)))
+    let zero = decimal_of(Untrusted.of(text::String.of("0", alloc)))
+    let padded = decimal_of(Untrusted.of(text::String.of("07", alloc)))
+    let other = decimal_of(Untrusted.of(text::String.of("..", alloc)))
+    expect named == Some(12) and zero.is_none() and padded.is_none() and other.is_none()
+} directory_names_give_generations

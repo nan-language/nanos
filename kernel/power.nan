@@ -1,4 +1,4 @@
-//! Power off, through the sandbox's exit port, and reboot, through the reset register the FADT names, as the core carries them out, the power settings it applies, the energy-performance preferences it writes on a machine with HWP, and its calibration of the power of a running CPU on a machine with RAPL.
+//! Power off, through the sandbox's exit port, and reboot, through the reset register the FADT names, as the core carries them out with the watchdog stopped, the power settings it applies, the energy-performance preferences it writes on a machine with HWP, and its calibration of the power of a running CPU on a machine with RAPL.
 
 const EXIT_PORT: u16 = 0xF4
 
@@ -176,8 +176,11 @@ test calibrations_divide_the_energy_by_the_work for power_mw {
     expect power_mw(before, after: Sample(count: 0x1000, busy_ns: 61_000_000_000, at_ns: 61_000_000_000), shift: 14).is_none()
 } calibrations_divide_the_energy_by_the_work
 
-/// Carries out each power off or reboot `orders` brings, a reboot through the reset register `reset` when the FADT names one, and applies each setting of power to `cpus`, for as long as they come.
-fn switch_power(take orders: task::Receiver[power::Switching], reset: Option[acpi::ResetRegister], cpus: mem::Shared[sched::State]) fails task::Cancelled uses wait {
+/// The time after a power off or a reboot by which the machine stopped, else the watchdog counts again.
+const SWITCH_WAIT_MS: u64 = 5_000
+
+/// Carries out each power off or reboot `orders` brings, a reboot through the reset register `reset` when the FADT names one, the watchdog stopped meanwhile and armed again when the machine still runs 5 s on, applies each setting of power to `cpus`, and times the watchdog, for as long as they come.
+fn switch_power(take orders: task::Receiver[power::Switching], reset: Option[acpi::ResetRegister], cpus: mem::Shared[sched::State], clock: sys::Clock) fails task::Cancelled uses wait {
     var receiver = orders
     loop {
         let Some(switching) = try await mut receiver.receive() else {
@@ -185,15 +188,41 @@ fn switch_power(take orders: task::Receiver[power::Switching], reset: Option[acp
         }
         match switching {
             power::Switching.Off => {
+                cpus.contents().stop_watchdog()
                 var port = trusted "the exit port is I/O port 0xF4, which the sandbox decodes and the core maps nowhere else" { hw::Ports[ExitPort].map(port: EXIT_PORT) }
                 mut port.write(ExitPort.status, value: OFF)
                 take port.unmap()
+                try await clock.sleep(SWITCH_WAIT_MS)
+                cpus.contents().resume_watchdog()
             }
-            power::Switching.Reboot => reboot(reset)
+            power::Switching.Reboot => {
+                cpus.contents().stop_watchdog()
+                reboot(reset)
+                try await clock.sleep(SWITCH_WAIT_MS)
+                cpus.contents().resume_watchdog()
+            }
             power::Switching.Apply(busy_mw: busy_mw, preferences: preferences, idle_states: idle_states) => cpus.contents().apply(busy_mw, preferences, idle_states: idle_states_of(idle_states))
+            power::Switching.Watchdog(timeout_s: timeout_s) => cpus.contents().time_watchdog(timeout_s)
         }
     }
 } switch_power
+
+/// Refreshes the watchdog a third of its timeout after its last refresh, from deferrable work of `exec`, whose timers never wake an idle machine.
+fn refresh_watchdog(cpus: mem::Shared[sched::State], clock: sys::Clock, exec: task::Executor) fails task::Cancelled uses wait {
+    let account = exec.split(task::Share(weight: 1, class: sched::classes()[3], reserve_ppm: 0))
+    defer take account.close()
+    try await task::scope(account.executor(), body: fn(s: task::Scope) {
+        discard s.spawn(fn() fails task::Cancelled uses wait limits stack 4_096 {
+            loop {
+                let Some(period) = cpus.contents().refresh_period() else {
+                    return
+                }
+                try await clock.sleep(period)
+                cpus.contents().refresh_watchdog()
+            }
+        })
+    })
+} refresh_watchdog
 
 /// Writes the reset value to the reset register `reset`, when there is one.
 fn reboot(reset: Option[acpi::ResetRegister]) {
@@ -241,7 +270,7 @@ test settings_apply_to_the_cores_state for switch_power {
     states[0] = Some(power::IdleState(hint: 0x20, exit_latency_us: 2))
     try await orders.send(power::Switching.Apply(busy_mw: 2_500, preferences: preferences, idle_states: states))
     discard orders
-    try await switch_power(take ordered, reset: None, cpus: cpus.share())
+    try await switch_power(take ordered, reset: None, cpus: cpus.share(), clock: world.clock)
     let after = cpus.contents().busy_mw.contents().load()
     let applied = cpus.contents().preferences.load()
     let scheduler = sched::Scheduler.of(cpus.share())

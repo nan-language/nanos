@@ -176,7 +176,8 @@ The **handoff record** is what the loader passes to the kernel: a 512-byte layou
 | conditions | 55 | 1 | bit 0 `tpm`, bit 1 `secure-boot`, other bits 0 |
 | failure count | 56 | 1 | the failures entries in use, 0 to 4 |
 | volume scheme | 57 | 1 | the boot volume's partitioning: 0 unknown, 1 MBR, 2 GPT |
-| reserved | 58 | 6 | 0 |
+| owner request | 58 | 1 | the kind of the owner request step 2 applied or refused, else 0 |
+| reserved | 59 | 5 | 0 |
 | volume signature | 64 | 16 | the GPT unique partition GUID, or the MBR disk signature in bytes 0 to 3 |
 | owner key | 80 | 32 | the stored owner key, zeros when unclaimed |
 | recovery digest | 112 | 32 | the stored digest of the recovery code |
@@ -267,7 +268,7 @@ These operations of `boot` ([20-base](20-base.md#boot)) change the boot volume.
 
 - `install`, for the plan step `generation` ([14-changes](14-changes.md#steps)):
     1. Verify the manifest as step 4 of the loader does, against the handoff record's floor and loader version, and check that the store's format version is the manifest's `store_format` or the one before it (`boot.store-format`). An install in `trial` mode fails with `boot.trial-pending`.
-    2. Write `manifest`, `kernel.elf` and `genesis` to `/nanos/gen/<n>/`, reading each back and comparing its blob id (`boot.write-failed`, `boot.volume-full`).
+    2. Write the blobs `kernel.elf`, `genesis` and `keyring.nbun` beside the manifest in the tree (`boot.file-unreadable`, `boot.hash-mismatch`), `kernel.nlif` when the tree holds it there, then `manifest`, to `/nanos/gen/<n>/`, reading each back and comparing its blob id (`boot.write-failed`, `boot.volume-full`).
     3. Write the record: the idle slot becomes `trial` with generation n and 3 tries, and `next once` names it. The idle slot is the slot not holding the running generation; in `recovery` and `dev` modes it is an `empty` or `bad` slot, else the one with the lower generation. The kernel emits `boot.generation-installed`.
     4. The [generation switch](10-code.md#generation-switch) reboots.
 - `rollback` sets the running slot `bad` and reboots, when the other slot is `good` with a generation at or above the floor (`boot.no-fallback`).
@@ -279,7 +280,7 @@ These operations of `boot` ([20-base](20-base.md#boot)) change the boot volume.
 
 Replacing the loader is an `irreversible{actuate}` operation of `boot` ([14-changes](14-changes.md#reversibility)).
 
-1. `replace_loader` writes the new loader to `/EFI/nanos/loader.new`, reads it back, and writes the loader request: the new loader's blob id, its version, and the owner's signature of kind `request` ([02-identifiers](02-identifiers.md#hashes)) over the `mem::wire` encoding of a `LoaderRequest` record of fields `loader`, that blob id (`HashValue`), and `version`, that version (`u32`), having verified that signature ([`auth.bad-signature`](09-authority.md#codes)). The plan then reboots.
+1. `replace_loader` writes the new loader, the blob at its path, to `/EFI/nanos/loader.new`, reads it back, and writes the loader request: the new loader's blob id, its version, and the owner's signature of kind `request` ([02-identifiers](02-identifiers.md#hashes)) over the `mem::wire` encoding of a `LoaderRequest` record of fields `loader`, that blob id (`HashValue`), and `version`, that version (`u32`), having verified that signature ([`auth.bad-signature`](09-authority.md#codes)). The plan then reboots.
 2. In step 2 of the next boot, the loader applies the request when the signature verifies with the owner key, the version exceeds its own and `loader.new` has the requested blob id: running from `/EFI/BOOT/BOOTX64.EFI`, it copies that file to `/EFI/nanos/loader.prev`; it sets the UEFI boot entries `NaN OS` for `\EFI\BOOT\BOOTX64.EFI` and `NaN OS previous loader` for `\EFI\nanos\loader.prev` at the head of `BootOrder`, in that order; it replaces `/EFI/BOOT/BOOTX64.EFI` with `loader.new`, reading it back, and deletes `loader.new`. Otherwise it refuses the request. The kernel emits `boot.loader-request`.
 3. The new loader starts at the boot after. When the firmware cannot start it, or refuses it on a machine with `secure-boot`, the firmware starts the previous loader through its boot entry.
 

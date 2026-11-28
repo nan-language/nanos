@@ -12,6 +12,7 @@ const GRANTS_LISTED: u32 = 256
 /// What the sequencer draws on besides its hand-off: the volume's port, the clocks, the random source, the reporter, its cell, and the cell it draws what it sends out of the store's domain through.
 struct Surroundings derives Copy {
     volume: os::Port[devices::Block]
+    running: Running
     clock: sys::Clock
     wall: ident::Wall
     random: sys::Random
@@ -32,10 +33,12 @@ struct Subscription {
     lost: u64
 } Subscription
 
-/// The engine on its volume, the subscriptions, where `devices` placed the volume, and the bytes of its blob cache and of its index nodes last reported.
+/// The engine on its volume, the trial branch the running generation runs on, whose Views of `main` reach it, and the trial branch taken into `main`, whose Views reach `main`, the subscriptions, where `devices` placed the volume, and the bytes of its blob cache and of its index nodes last reported.
 struct Sequencer {
     engine: store::Store
     volume: Volume
+    running: Option[text::String]
+    taken: Option[text::String]
     subscriptions: mem::List[Subscription]
     placement: devices::StorePlacement
     cached: u64
@@ -122,22 +125,35 @@ fn mount(world: Surroundings, take genesis: Genesis, boot: TypedValue) -> Sequen
     let volume = try await Volume.of(world.volume, transport: world.transport, alloc)
     var id = Array[u8, 16].filled(0)
     discard attempt world.random.fill(mut id.view_mut())
-    var engine = try await store::Store.mount(volume, volume_id: id, now: world.now(), alloc)
+    let sealer = Sealer(keys: world.keys, random: world.random, transport: world.transport)
+    let key = match try await store::Store.sealed_binding(volume, alloc) {
+        Some(sealed) => Some(try await sealer.open_volume(take sealed, alloc))
+        None => None
+    }
+    var nonces = Array[u8, 16].filled(0)
+    discard attempt world.random.fill(mut nonces.view_mut())
+    var engine = try await store::Store.unlocked(volume, volume_id: id, key, nonces, now: world.now(), alloc)
     let generation = genesis.generation
-    match first attempt engine.branch_named("main", alloc) {
-        Err(store::StoreError.NotFound) => {
-            discard try await mut engine.genesis(volume, writes: take genesis.writes(boot, alloc), stamp: system_stamp(alloc), intent: intent_of("genesis", number: generation, alloc), now: world.now(), alloc)
-        }
-        Ok(_) => {
-            let writes = try await genesis.changes(mut engine, device: volume, now: world.now(), alloc)
-            if writes.len() > 0 {
-                let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: Some(intent_of("generation", number: generation, alloc)))
-                discard try await mut engine.commit(volume, branch: "main", take transaction, stamp: system_stamp(alloc), now: world.now(), alloc)
-            }
-        }
+    let blank = match first attempt engine.branch_named("main", alloc) {
+        Err(store::StoreError.NotFound) => true
+        Ok(_) => false
         Err(failure) => fail failure
     }
-    let config = attempt await mut engine.get(volume, branch: "main", path: ident::Path(text: text::String.of("/sys/config/store", alloc)), now: world.now(), alloc)
+    var running: Option[text::String] = None
+    if blank {
+        discard try await mut engine.genesis(volume, writes: take genesis.writes(boot, alloc), stamp: system_stamp(alloc), intent: intent_of("genesis", number: generation, alloc), now: world.now(), alloc)
+        running = try await trial_of(mut engine, volume, trial: world.running.trial, now: world.now(), alloc)
+    } else {
+        running = try await trial_of(mut engine, volume, trial: world.running.trial, now: world.now(), alloc)
+        let branch = branch_of(running, alloc)
+        let writes = try await genesis.changes(mut engine, device: volume, branch: branch.as_str(), now: world.now(), alloc)
+        if writes.len() > 0 {
+            let transaction = store::Transaction(base: None, reads: mem::List.empty(alloc), expects: mem::List.empty(alloc), writes: take writes, key: None, plan: None, intent: Some(intent_of("generation", number: generation, alloc)))
+            discard try await mut engine.commit(volume, branch: branch.as_str(), take transaction, stamp: system_stamp(alloc), now: world.now(), alloc)
+        }
+    }
+    let branch = branch_of(running, alloc)
+    let config = attempt await mut engine.get(volume, branch: branch.as_str(), path: ident::Path(text: text::String.of("/sys/config/store", alloc)), now: world.now(), alloc)
     match first config {
         Ok(node) => {
             match node.value {
@@ -156,8 +172,142 @@ fn mount(world: Surroundings, take genesis: Genesis, boot: TypedValue) -> Sequen
         Err(_) => {
         }
     }
-    return Sequencer(engine: take engine, volume: volume, subscriptions: mem::List.empty(alloc), placement: try await placement_of(world.devices, transport: world.transport, alloc), cached: 0, nodes: 0)
+    return Sequencer(engine: take engine, volume: volume, running: take running, taken: None, subscriptions: mem::List.empty(alloc), placement: try await placement_of(world.devices, transport: world.transport, alloc), cached: 0, nodes: 0)
 } mount
+
+/// The trial branch a boot of generation n runs on, `trial/<n>`: in mode `trial`, the one forked at or after the commit that installed n, which `/sys/boot` on `main` names, else one the boot creates at the head of `main` in place of an older one; for a later boot of n, the one that remains; `None` otherwise.
+fn trial_of(
+    mut engine: store::Store,
+    volume: Volume,
+    trial: Option[TrialBoot],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Option[text::String] fails store::StoreError uses wait {
+    let Some(booting) = trial else {
+        return None
+    }
+    var name = text::String.of("trial/", alloc)
+    for digit in store::decimal_name(booting.generation, alloc) {
+        mut name.push(char.checked_from_bits(u32.widen(digit)).value_or('0'))
+    }
+    let found = match first attempt engine.branch_named(name.as_str(), alloc) {
+        Ok(branch) => Some(take branch)
+        Err(store::StoreError.NotFound) => None
+        Err(failure) => fail failure
+    }
+    if not booting.creates {
+        return match found {
+            Some(_) => Some(take name)
+            None => None
+        }
+    }
+    let installed = try await installed_at(mut engine, volume, generation: booting.generation, now, alloc)
+    match found {
+        Some(branch) => {
+            if branch.fork.number >= installed.number {
+                return Some(take name)
+            }
+            try await mut engine.delete_branch(volume, name: name.as_str(), now, alloc)
+        }
+        None => {
+        }
+    }
+    discard try await mut engine.branch(volume, name: name.as_str(), from: "main", at: None, by: ident::Principal(text: text::Fixed[64].of("system")), expires: None, system: true, now, alloc)
+    return Some(take name)
+} trial_of
+
+/// The commit that installed generation `generation`, as `/sys/boot` on `main` names it, `#0` when it names none.
+fn installed_at(
+    mut engine: store::Store,
+    volume: Volume,
+    generation: u64,
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> ident::CommitId fails store::StoreError uses wait {
+    let node = match first attempt await mut engine.get(volume, branch: "main", path: ident::Path(text: text::String.of("/sys/boot", alloc)), now, alloc) {
+        Ok(found) => found
+        Err(store::StoreError.Cancelled(cancelled)) => fail store::StoreError.Cancelled(take cancelled)
+        Err(_) => return ident::CommitId(number: 0)
+    }
+    let Some(value) = node.value else {
+        return ident::CommitId(number: 0)
+    }
+    let Ok(state) = attempt mem::wire::Codec[bootfmt::BootState].decode(value.view(), alloc) else {
+        return ident::CommitId(number: 0)
+    }
+    for each in state.generations {
+        if each.number == generation {
+            return each.base
+        }
+    }
+    return ident::CommitId(number: 0)
+} installed_at
+
+/// The branch the running generation runs on.
+fn Sequencer.running_name(self, alloc: mem::Alloc) -> text::String {
+    return branch_of(self.running, alloc)
+} Sequencer.running_name
+
+/// The branch `running` names, `main` for none.
+fn branch_of(running: Option[text::String], alloc: mem::Alloc) -> text::String {
+    return match running {
+        Some(trial) => text::String.of(trial.as_str(), alloc)
+        None => text::String.of("main", alloc)
+    }
+} branch_of
+
+/// `scope` as the running branch gives it: a View of `main` reaches the running trial branch, and one of a trial branch taken reaches `main`.
+fn Sequencer.on_running(self, take scope: Scoped, alloc: mem::Alloc) -> Scoped {
+    var reached = scope
+    match self.running {
+        Some(trial) => {
+            if reached.branch.as_str() == "main" {
+                reached.branch = text::String.of(trial.as_str(), alloc)
+            }
+        }
+        None => {
+        }
+    }
+    match self.taken {
+        Some(trial) => {
+            if reached.branch.as_str() == trial.as_str() {
+                reached.branch = text::String.of("main", alloc)
+            }
+        }
+        None => {
+        }
+    }
+    return reached
+} Sequencer.on_running
+
+/// Takes the running trial branch into `main`, taking the sides `takes` names where they conflict: `main` runs from then on, and every subscription of the trial branch watches it; `conflict.merge` emitting `store.trial-merge-conflict`, the trial branch running still.
+fn Sequencer.take_running(mut self, take takes: mem::List[store::Take], world: Surroundings) -> Result[store::Committed, Failure] fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Some(trial) = self.running else {
+        return Err(Failure.NotFound)
+    }
+    let name = text::String.of(trial.as_str(), alloc)
+    let taken = attempt await mut self.engine.take_branch(self.volume, source: name.as_str(), take takes, stamp: system_stamp(alloc), now: world.now(), alloc)
+    match first taken {
+        Ok(done) => {
+            for at in 0..<self.subscriptions.len() {
+                if self.subscriptions[at].branch.as_str() == name.as_str() {
+                    self.subscriptions[at].branch = text::String.of("main", alloc)
+                }
+            }
+            self.taken = Some(take name)
+            self.running = None
+            try await mut self.hold_grants(world)
+            return Ok(take done)
+        }
+        Err(store::StoreError.Cancelled(cancelled)) => fail cancelled
+        Err(store::StoreError.ConflictMerge(conflicts)) => {
+            mut self.engine.events.push(store::Event.TrialMergeConflict(branch: take name, conflicts: u32.saturate(conflicts.len())))
+            return Err(Failure.of(store::StoreError.ConflictMerge(take conflicts)))
+        }
+        Err(failure) => return Err(Failure.of(take failure))
+    }
+} Sequencer.take_running
 
 /// Where `devices` placed the volume, unplaced when it does not tell, its call drawn through `transport`.
 fn placement_of(devices: os::Port[devices::Devices], transport: mem::Alloc, alloc: mem::Alloc) -> devices::StorePlacement fails store::StoreError uses wait {
@@ -248,8 +398,13 @@ fn Sequencer.serve(
     let alloc = world.alloc
     var run = Run.empty(alloc)
     for queued in take batch {
-        let Queued(request: request, scope: scope, job: job) = queued
-        match job {
+        let Queued(request: request, scope: asked, job: job) = queued
+        let scope = self.on_running(take asked, alloc)
+        match first job {
+            Job.Commit(transaction: _, typed: _) or Job.Merge(source: _, takes: _) or Job.Erase(path: _) or Job.Revert(commit: _, dry_run: _) if world.running.recovery and not recovering(scope, job) => {
+                let refused: Result[Unit, Failure] = Err(Failure.ReadOnly)
+                discard attempt await out.answered(request, reply: plain(encoded(refused, alloc), alloc))
+            }
             Job.Commit(transaction: transaction, typed: typed) => {
                 match attempt scope.transaction(take transaction, alloc) {
                     Ok(resolved) => {
@@ -308,6 +463,16 @@ fn Sequencer.serve(
     try await mut self.flush_run(take run, world, out)
 } Sequencer.serve
 
+/// Whether recovery mode accepts the versioned write `job` makes through `scope`: an owner session's revert, a commit made as `system`, or a write of `/sys/boot` by `boot`.
+fn recovering(scope: Scoped, job: Job) -> bool {
+    let system = scope.principal.text.as_str() == "system"
+    return match job {
+        Job.Revert(commit: _, dry_run: _) => system or (scope.principal.text.as_str() == "owner" and scope.session.is_some())
+        Job.Commit(transaction: _, typed: _) => system or scope.covers_boot()
+        else => system
+    }
+} recovering
+
 fn Run.empty(alloc: mem::Alloc) -> Run {
     return Run(requests: mem::List.empty(alloc), commits: mem::List.empty(alloc), paths: mem::List.empty(alloc))
 } Run.empty
@@ -329,7 +494,7 @@ fn Sequencer.flush_run(mut self, take run: Run, world: Surroundings, out: sys::O
         var reply = mem::Bytes.empty(alloc)
         match outcome {
             Ok(done) => {
-                if branches[at].as_str() == "main" {
+                if branches[at] == self.running_name(alloc) {
                     try await mut self.tell_grants(paths[at], whole: false, world)
                 }
                 try await mut self.tell(branch: branches[at].as_str(), commit: done.number, paths: paths[at], transport: world.transport, alloc)
@@ -354,7 +519,7 @@ fn Sequencer.hold_grants(mut self, world: Surroundings) fails task::Cancelled us
     var paths = mem::List[ident::Path].empty(alloc)
     var after: Option[text::String] = None
     loop {
-        let listing = match first attempt await mut self.engine.list(self.volume, branch: "main", path: dir, after, limit: GRANTS_LISTED, now: world.now(), alloc) {
+        let listing = match first attempt await mut self.engine.list(self.volume, branch: self.running_name(alloc).as_str(), path: dir, after, limit: GRANTS_LISTED, now: world.now(), alloc) {
             Ok(found) => found
             Err(store::StoreError.Cancelled(cancelled)) => fail cancelled
             Err(_) => return
@@ -381,7 +546,7 @@ fn Sequencer.tell_grants(mut self, paths: mem::List[ident::Path], whole: bool, w
         let Some(number) = grant_number(path, alloc) else {
             continue
         }
-        let grant = match first attempt await mut self.engine.get(self.volume, branch: "main", path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), now: world.now(), alloc) {
+        let grant = match first attempt await mut self.engine.get(self.volume, branch: self.running_name(alloc).as_str(), path: ident::Path(text: text::String.of(path.text.as_str(), alloc)), now: world.now(), alloc) {
             Ok(node) => match node.value {
                 Some(value) => match attempt mem::wire::Codec[os::Grant].decode(value.view(), alloc: world.transport) {
                     Ok(decoded) => Some(take decoded)

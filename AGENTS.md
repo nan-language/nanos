@@ -33,7 +33,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `keyring/` | The `keyring` program: the `keys` instance as the bundle the generation ships |
 | `policy/` | The `policy` package: the policy's records, presets, patterns and evaluation, and the `policy` instance |
 | `genesis/` | The `genesis` package: a kernel image's genesis record, its base components with their protocols and state schemas, and their specifications, grants and admission records |
-| `generations/` | The `generations` package: the `boot` instance, recording each boot in the boot record, `/sys/boot` and `/live/boot` |
+| `generations/` | The `generations` package: the `boot` instance, recording each boot in the boot record, `/sys/boot` and `/live/boot`, its operations on the boot volume, and the health gate |
 | `clock/` | The `clock` package: the `clock` instance and its time sources |
 | `power/` | The `power` package: the `power` instance, the power settings and the switch the core carries out |
 | `link/` | The `link` package: requests, blocks in canonical rendering and JSON, sessions under their principals' grants, queries, watches, plans with their previews, applies and undos, uploads, request keys, the primer, the code catalogue and the `link` instance on the serial and port transports; in `transcripts/` the link transcripts `tools/transcripts` runs |

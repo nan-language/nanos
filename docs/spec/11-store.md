@@ -189,7 +189,7 @@ For an instance, each `write_all`, `remove` and release of a writing `File` is o
 
 ## The Store protocol
 
-`store` serves the `Store` protocol (requires [N4](22-nan.md#n4)). Each operation arrives through a [`View`](09-authority.md#capability-kinds), whose subtree, branch, rights and as-of apply to every path. Reads need `read` rights; `commit`, `append`, drafts, `revert` and `erase` need `write`; `branch`, `delete_branch`, `keep_branch`, `merge`, `pin`, `unpin`, `scrub` and `gc` need `admin`, and `keyring_seed` a View covering `/state/keys`, which only `keys` holds; a missing right fails with `store.denied`, and a revoked View fails as [revocation](09-authority.md#revocation) states.
+`store` serves the `Store` protocol (requires [N4](22-nan.md#n4)). Each operation arrives through a [`View`](09-authority.md#capability-kinds), whose subtree, branch, rights and as-of apply to every path. Reads need `read` rights; `commit`, `append`, drafts, `revert` and `erase` need `write`; `branch`, `delete_branch`, `keep_branch`, `merge`, `pin`, `unpin`, `scrub` and `gc` need `admin`, `keyring_seed` a View covering `/state/keys`, which only `keys` holds, `take_trial`, `drop_trials` and `upgrade_format` a View writing `/sys/boot`, which only `boot` holds, and `encrypt` a View with admin rights over the whole tree; a missing right fails with `store.denied`, and a revoked View fails as [revocation](09-authority.md#revocation) states.
 
 | Operation | Arguments | Result | Failures | Reversibility |
 | --- | --- | --- | --- | --- |
@@ -221,6 +221,10 @@ For an instance, each `write_all`, `remove` and release of a writing `File` is o
 | `gc` | — | commits thinned and bytes freed | — | `none` |
 | `stats` | — | `LiveStore` ([13-tree.md](13-tree.md#live)) | — | `none` |
 | `keyring_seed` | secret id | its seed | `store.denied`, `store.erased` | `none` |
+| `take_trial` | — | `Committed` | `store.not-found`, `store.denied`, `conflict.merge` | `recorded` |
+| `drop_trials` | floor: `u64` | the generations whose trial branches it deleted | `store.denied` | `irreversible{erase}` |
+| `upgrade_format` | floor: `u32`, the least `store_format` of the generations the boot record names | whether it upgraded | `store.denied` | `recorded` |
+| `encrypt` | — | — | `store.denied`, `store.locked` | `irreversible{actuate}` |
 
 `Node` is `{ path, kind, version: CommitId, subtree: Option[CommitId], declared: Option[TypeRef], hash: Option[HashValue], size: u64, origins: mem::List[OriginLabel], secret: bool, expires: Option[WallTime], declaration: Option[Declaration], value: Option[Untrusted[mem::Bytes]] }` (requires [N29](22-nan.md#n29)); `size` counts bytes, children or entries. `Listing` is `{ entries: mem::List[Entry], next: Option[text::String] }`, `Entry` holding a child's name, kind, version, size and type name. `count` reads the index's subtree counts ([12-store-format.md](12-store-format.md#index-trees)).
 

@@ -80,12 +80,14 @@ enum Carried derives Copy, Eq {
     Wake
 } Carried
 
+/// The Env of `supervisor`; in recovery mode, when `recovery`, it reconciles the base instances alone.
 pub closed struct Env {
     pub control: os::Control
     pub devices: Option[os::Port[devices::Devices]]
     pub tree: Option[store::service::View]
     pub admission: Option[os::Port[admission::Admitting]]
     pub registries: devices::Registries
+    pub recovery: bool
     pub exec: task::Executor
     pub alloc: mem::Alloc
 } Env
@@ -110,7 +112,7 @@ impl Supervision: sys::Component[Env, Supervisor]
 
 impl Supervision: sys::Resume[Env, Supervisor]
 
-pub fn Env.build(take world: nanos::World, registries: devices::Registries) -> Env fails nanos::CapError {
+pub fn Env.build(take world: nanos::World, registries: devices::Registries, recovery: bool) -> Env fails nanos::CapError {
     let devices = match attempt nanos::Cap[os::PortHandle].get(world.caps, key: "devices") {
         Ok(handle) => os::Port[devices::Devices].of(handle)
         Err(_) => None
@@ -123,7 +125,7 @@ pub fn Env.build(take world: nanos::World, registries: devices::Registries) -> E
         Ok(handle) => os::Port[admission::Admitting].of(handle)
         Err(_) => None
     }
-    return Env(control: try nanos::Cap[os::Control].get(world.caps, key: "control"), devices: devices, tree: tree, admission: admitting, registries: registries, exec: world.exec, alloc: world.alloc)
+    return Env(control: try nanos::Cap[os::Control].get(world.caps, key: "control"), devices: devices, tree: tree, admission: admitting, registries: registries, recovery: recovery, exec: world.exec, alloc: world.alloc)
 } Env.build
 
 pub fn Supervision.start(mut env: Env) -> Supervision = Supervision(listed: mem::List.empty(env.alloc), reconciling: false, due: false, sources: mem::List.empty(env.alloc), pass: Pass.Idle)
@@ -387,9 +389,10 @@ fn Supervision.reconcile(mut self, mut env: Env, mut cx: sys::Cx[Supervisor]) {
         mut before.push(ident::Moniker(text: moniker.text))
     }
     let control = env.control
+    let recovery = env.recovery
     let alloc = env.alloc
     mut cx.spawn(key: RECONCILING, run: fn[take before](out: sys::Outbox[Supervisor]) fails task::Cancelled uses wait limits stack 32_768 {
-        let Reconciled(listed: listed, updates: updates) = try await reconcile(control, view, take before, alloc)
+        let Reconciled(listed: listed, updates: updates) = try await reconcile(control, view, take before, recovery, alloc)
         discard attempt await out.reconciled(listed: take listed, take updates)
     })
 } Supervision.reconcile
@@ -484,8 +487,14 @@ struct Reconciled {
     updates: mem::List[Update]
 } Reconciled
 
-/// Brings the instances to the specifications of `/instances`: each stopped as its specification asks or started, created first when the runner has none, and each instance of `before` whose specification is gone deleted; gives the monikers it found and the updates it started.
-fn reconcile(control: os::Control, view: store::service::View, take before: mem::List[ident::Moniker], alloc: mem::Alloc) -> Reconciled fails task::Cancelled uses wait {
+/// Brings the instances to the specifications of `/instances`, those of the base instances alone when `recovery`: each stopped as its specification asks or started, created first when the runner has none, and each instance of `before` whose specification is gone deleted; gives the monikers it found and the updates it started.
+fn reconcile(
+    control: os::Control,
+    view: store::service::View,
+    take before: mem::List[ident::Moniker],
+    recovery: bool,
+    alloc: mem::Alloc,
+    ) -> Reconciled fails task::Cancelled uses wait {
     var listed = mem::List[ident::Moniker].empty(alloc)
     var updates = mem::List[Update].empty(alloc)
     var after: Option[text::String] = None
@@ -498,7 +507,7 @@ fn reconcile(control: os::Control, view: store::service::View, take before: mem:
         for entry in listing.entries {
             var name = text::Fixed[59].empty()
             mut name.append(entry.name.as_str())
-            if not ident::is_moniker(name) {
+            if not ident::is_moniker(name) or (recovery and name.as_str().find(".").is_some()) {
                 continue
             }
             match try await converge(control, view, moniker: ident::Moniker(text: name), alloc) {

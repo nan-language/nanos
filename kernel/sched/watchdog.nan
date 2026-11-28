@@ -1,0 +1,151 @@
+//! The watchdog the core drives on a machine with `watchdog`: the Intel TCO timer of an ICH9 LPC bridge, whose second expiry resets the machine, refreshed by deferrable work of the core, stopped while the machine idles and armed again before a task runs on it.
+
+registers Tco {
+    reload: u16 at 0x0 write
+    first_status: u16 at 0x4 read write
+    second_status: u16 at 0x6 read write
+    control: u16 at 0x8 read write
+    timer: u16 at 0x12 read write
+} Tco
+
+/// The control bit halting the timer.
+const HALT: u16 = 0x0800
+
+/// The status bits of the first and second expiries, each cleared by writing it.
+const FIRST_EXPIRY: u16 = 0x0008
+
+const SECOND_EXPIRY: u16 = 0x0002
+
+/// The timer's tick in ms, and the counts it takes.
+const TICK_MS: u64 = 600
+
+const LEAST_TICKS: u64 = 4
+
+const MOST_TICKS: u64 = 1_023
+
+/// The states of the watchdog: off, counting, stopped while the machine idles.
+const OFF: u32 = 0
+
+const ARMED: u32 = 1
+
+const STOPPED: u32 = 2
+
+/// How soon a timer must be due for a machine whose CPUs all idle not to be idle.
+const IDLE_HORIZON_NS: u64 = 1_000_000_000
+
+/// The ticks of half of `timeout_s`, which the timer counts down twice.
+pkg fn ticks_of(timeout_s: u32) -> u16 {
+    let ticks = u64.widen(timeout_s) * 1_000 / 2 / TICK_MS
+    return u16.truncate(ticks.max(LEAST_TICKS).min(MOST_TICKS))
+} ticks_of
+
+/// The time between two refreshes of a watchdog of `ticks`: a third of its timeout.
+pkg fn refresh_ms(ticks: u16) -> u64 = u64.widen(ticks) * 2 * TICK_MS / 3
+
+/// Arms the TCO timer at the I/O port `base` with a timeout of `timeout_s`: start step 7 of the core.
+pkg fn State.arm_watchdog(self, base: u16, timeout_s: u32) {
+    self.watchdog_ticks.store(u32.widen(ticks_of(timeout_s)))
+    self.watchdog_base.store(u32.widen(base))
+    self.watchdog.store(ARMED)
+    self.load_watchdog()
+} State.arm_watchdog
+
+/// Has the watchdog time out after `timeout_s` from now on.
+pkg fn State.time_watchdog(self, timeout_s: u32) {
+    self.watchdog_ticks.store(u32.widen(ticks_of(timeout_s)))
+    if self.watchdog.load() == ARMED {
+        self.load_watchdog()
+    }
+} State.time_watchdog
+
+/// The time between two refreshes, `None` without a watchdog.
+pkg fn State.refresh_period(self) -> Option[u64] {
+    if self.watchdog_base.load() == 0 {
+        return None
+    }
+    return Some(refresh_ms(u16.truncate(self.watchdog_ticks.load())))
+} State.refresh_period
+
+/// Refreshes the watchdog while it counts.
+pkg fn State.refresh_watchdog(self) limits notrap, terminates, noalloc {
+    if self.watchdog.load() == ARMED {
+        var tco = self.tco()
+        mut tco.write(Tco.reload, value: 1)
+        take tco.unmap()
+    }
+} State.refresh_watchdog
+
+/// Stops the watchdog for a power off or a reboot, whose failure arms it again through `resume_watchdog`.
+pkg fn State.stop_watchdog(self) {
+    if self.watchdog.swap(OFF) != OFF {
+        self.halt_watchdog()
+    }
+} State.stop_watchdog
+
+/// Arms the watchdog again after a power off or reboot that failed.
+pkg fn State.resume_watchdog(self) {
+    if self.watchdog_base.load() != 0 and self.watchdog.swap(ARMED) == OFF {
+        self.load_watchdog()
+    }
+} State.resume_watchdog
+
+/// Stops the watchdog when the machine became idle, every started CPU idling with no timer due within 1 s of `now_ns`, `until_ns` the earliest timer of the CPU that idles last.
+fn State.idle_watchdog(self, t: hw::IrqsDisabled, now_ns: u64, until_ns: Option[u64]) limits notrap, terminates, noalloc {
+    if self.watchdog.load() != ARMED {
+        return
+    }
+    match until_ns {
+        Some(due) => {
+            if due.saturating_sub(now_ns) <= IDLE_HORIZON_NS {
+                return
+            }
+        }
+        None => {
+        }
+    }
+    for cpu in 0..<self.cpus.len() {
+        let number = u32.truncate(cpu)
+        if self.is_started(t, cpu: number) and not self.is_idle(t, cpu: number) {
+            return
+        }
+    }
+    if self.watchdog.swap(STOPPED) == ARMED {
+        self.halt_watchdog()
+    }
+} State.idle_watchdog
+
+/// Arms the watchdog stopped while the machine idled, refreshed and counting, before a task runs.
+fn State.wake_watchdog(self) limits notrap, terminates, noalloc {
+    if self.watchdog.load() == STOPPED and self.watchdog.swap(ARMED) == STOPPED {
+        self.load_watchdog()
+    }
+} State.wake_watchdog
+
+/// Loads the timer with its ticks, clears its expiries and starts it.
+fn State.load_watchdog(self) limits notrap, terminates, noalloc {
+    var tco = self.tco()
+    mut tco.write(Tco.timer, value: u16.truncate(self.watchdog_ticks.load()))
+    mut tco.write(Tco.reload, value: 1)
+    mut tco.write(Tco.first_status, value: FIRST_EXPIRY)
+    mut tco.write(Tco.second_status, value: SECOND_EXPIRY)
+    let control = mut tco.read(Tco.control)
+    mut tco.write(Tco.control, value: control & ~HALT)
+    take tco.unmap()
+} State.load_watchdog
+
+fn State.halt_watchdog(self) limits notrap, terminates, noalloc {
+    var tco = self.tco()
+    let control = mut tco.read(Tco.control)
+    mut tco.write(Tco.control, value: control | HALT)
+    take tco.unmap()
+} State.halt_watchdog
+
+fn State.tco(self) -> hw::Ports[Tco] limits notrap, terminates, noalloc {
+    let base = u16.truncate(self.watchdog_base.load())
+    return trusted "the TCO timer's registers lie at the base the start sequence found in the ICH9's power management I/O space, which only the watchdog maps" { hw::Ports[Tco].map(port: base) }
+} State.tco
+
+test timeouts_count_down_twice_in_ticks for ticks_of {
+    expect ticks_of(30) == 25 and ticks_of(1) == 4 and ticks_of(10_000) == 1_023
+    expect refresh_ms(25) == 10_000
+} timeouts_count_down_twice_in_ticks

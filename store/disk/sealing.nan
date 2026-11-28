@@ -1,0 +1,182 @@
+//! Volume encryption as the volume lays it out: the binding of the volume key a superblock holds, sealed log records, and sealed head-area blocks.
+
+/// The superblock flags of an encrypted volume and of one converting to encryption.
+pub const ENCRYPTED: u32 = 0x1
+
+pub const CONVERTING: u32 = 0x4
+
+/// The scheme of the volume key's binding: XChaCha20-Poly1305.
+const XCHACHA20_POLY1305: u32 = 1
+
+/// The bytes of the binding's field in a superblock, and of its scheme and length before the sealed key.
+pub const BINDING_BYTES: usize = 1_024
+
+const BINDING_HEAD: usize = 6
+
+/// The bytes of a nonce and of a tag.
+pub const NONCE_BYTES: usize = 24
+
+pub const TAG_BYTES: usize = 16
+
+/// The bytes a sealed record's prefix holds: kind, flags, reserved and length.
+pub const PREFIX_BYTES: usize = 8
+
+/// A log record's flag of a sealed record.
+pub const SEALED_RECORD: u8 = 0x1
+
+/// The bytes of a head-area block's header the sealing leaves in plaintext, and the end of the plaintext it seals.
+const HEAD_HEADER: usize = 16
+
+const HEAD_SEALED_END: usize = 4_040
+
+/// The volume key's binding: the sealed key `sealed` as a superblock's field holds it, `None` when it does not fit.
+pub fn binding_of(sealed: Slice[u8]) -> Option[Array[u8, 1_024]] {
+    if sealed.len() > BINDING_BYTES - BINDING_HEAD {
+        return None
+    }
+    var field = Array[u8, 1_024].filled(0)
+    mut field.view_mut().write_u32_le(0, value: XCHACHA20_POLY1305)
+    mut field.view_mut().write_u16_le(4, value: u16.truncate(sealed.len()))
+    for at in 0..<sealed.len() {
+        field[BINDING_HEAD + at] = sealed[at]
+    }
+    return Some(field)
+} binding_of
+
+/// The sealed key a superblock's binding holds, `None` for another scheme or a length past the field.
+pub validator fn sealed_key(field: Untrusted[Array[u8, 1_024]], alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let bytes = field.inspect()
+    if bytes.view().u32_le(0) != XCHACHA20_POLY1305 {
+        return None
+    }
+    let length = usize.widen(bytes.view().u16_le(4))
+    if length == 0 or length > BINDING_BYTES - BINDING_HEAD {
+        return None
+    }
+    var key = mem::Bytes.empty(alloc)
+    for at in 0..<length {
+        mut key.push(bytes[BINDING_HEAD + at])
+    }
+    return Some(take key)
+} sealed_key
+
+/// The bytes of a sealed log record of `payload` bytes: its prefix, nonce, sealed key and payload, and tag.
+pub fn sealed_record_bytes(payload: u32) -> usize = PREFIX_BYTES + NONCE_BYTES + 32 + usize.widen(payload) + TAG_BYTES
+
+/// The bytes a sealed record occupies in a batch: its own, rounded up to a multiple of 8.
+pub fn sealed_record_span(payload: u32) -> usize = (sealed_record_bytes(payload) + 7) / 8 * 8
+
+/// Writes the sealed record of `kind`, `key` and `payload` at `at` of `batch` under the volume key `volume` and the nonce `nonce`.
+pub fn put_sealed_record(
+    mut batch: mem::Bytes,
+    at: usize,
+    kind: RecordKind,
+    key: Array[u8, 32],
+    payload: Slice[u8],
+    volume: Array[u8, 32],
+    nonce: Array[u8, 24],
+    alloc: mem::Alloc,
+    ) {
+    batch[at] = kind.code()
+    batch[at + 1] = SEALED_RECORD
+    mut batch.view_mut().write_u32_le(at + 4, value: u32.truncate(payload.len()))
+    var prefix = Array[u8, 8].filled(0)
+    for i in 0..<PREFIX_BYTES {
+        prefix[i] = batch[at + i]
+    }
+    var plain = mem::Bytes.empty(alloc)
+    mut plain.append(key.view())
+    mut plain.append(payload)
+    let sealing = crypto::seal(crypto::Key.of(volume), nonce, aad: prefix.view(), plain: plain.view(), alloc)
+    put_bytes(mut batch, at: at + PREFIX_BYTES, data: nonce.view())
+    put_bytes(mut batch, at: at + PREFIX_BYTES + NONCE_BYTES, data: sealing.view())
+} put_sealed_record
+
+/// The key and payload of the sealed record whose bytes from its prefix on are `raw`, `None` when they do not lie within it or its tag differs.
+pub validator fn open_record(raw: Untrusted[Slice[u8]], volume: Array[u8, 32], alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let bytes = raw.inspect()
+    if bytes.len() < PREFIX_BYTES + NONCE_BYTES + 32 + TAG_BYTES {
+        return None
+    }
+    let length = usize.widen(bytes.u32_le(4))
+    let Some(parts) = bytes.split_at(PREFIX_BYTES) else {
+        return None
+    }
+    let Some(after) = parts.tail.split_at(NONCE_BYTES) else {
+        return None
+    }
+    let Some(sealed) = after.tail.prefix(32 + length + TAG_BYTES) else {
+        return None
+    }
+    var nonce = Array[u8, 24].filled(0)
+    mut nonce.view_mut().copy_from(after.head)
+    return crypto::open(crypto::Key.of(volume), nonce, aad: parts.head, sealed, alloc)
+} open_record
+
+/// The head-area block `plain` sealed under the volume key `volume` and the nonce `nonce`: its header, the nonce, the sealing of its bytes 16 to 4,039 and the tag, then its closing checksum.
+pub fn seal_head(plain: Slice[u8], volume: Array[u8, 32], nonce: Array[u8, 24], alloc: mem::Alloc) -> mem::Bytes {
+    var block = zero_block(alloc)
+    let Some(parts) = plain.split_at(HEAD_HEADER) else {
+        return block
+    }
+    let Some(body) = parts.tail.prefix(HEAD_SEALED_END - HEAD_HEADER) else {
+        return block
+    }
+    let sealing = crypto::seal(crypto::Key.of(volume), nonce, aad: parts.head, plain: body, alloc)
+    put_bytes(mut block, at: 0, data: parts.head)
+    put_bytes(mut block, at: HEAD_HEADER, data: nonce.view())
+    put_bytes(mut block, at: HEAD_HEADER + NONCE_BYTES, data: sealing.view())
+    close_at(mut block, at: CLOSING_CHECKSUM)
+    return block
+} seal_head
+
+/// The plain form of the sealed head-area block `raw`, its checksum closing it again, `None` when its tag differs.
+pub validator fn open_head(raw: Untrusted[Slice[u8]], volume: Array[u8, 32], alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let bytes = raw.inspect()
+    if bytes.len() < BLOCK_BYTES or not closes(bytes, at: CLOSING_CHECKSUM) {
+        return None
+    }
+    let Some(parts) = bytes.split_at(HEAD_HEADER) else {
+        return None
+    }
+    let Some(after) = parts.tail.split_at(NONCE_BYTES) else {
+        return None
+    }
+    let Some(sealed) = after.tail.prefix(HEAD_SEALED_END - HEAD_HEADER + TAG_BYTES) else {
+        return None
+    }
+    var nonce = Array[u8, 24].filled(0)
+    mut nonce.view_mut().copy_from(after.head)
+    let Some(body) = crypto::open(crypto::Key.of(volume), nonce, aad: parts.head, sealed, alloc) else {
+        return None
+    }
+    var block = zero_block(alloc)
+    put_bytes(mut block, at: 0, data: parts.head)
+    put_bytes(mut block, at: HEAD_HEADER, data: body.view())
+    close_at(mut block, at: CLOSING_CHECKSUM)
+    return Some(take block)
+} open_head
+
+test sealed_records_and_head_blocks_open_under_their_key for open_record {
+    let alloc = testing::world().alloc
+    let volume = Array[u8, 32].filled(7)
+    var batch = mem::Bytes.zeroed(sealed_record_bytes(5), alloc)
+    put_sealed_record(mut batch, at: 0, kind: RecordKind.Value, key: Array[u8, 32].filled(2), payload: b"hello", volume, nonce: Array[u8, 24].filled(3), alloc)
+    let unsealed = open_record(Untrusted.of(batch.view()), volume, alloc)
+    let wrong = open_record(Untrusted.of(batch.view()), volume: Array[u8, 32].filled(8), alloc)
+    let sealed_ok = match unsealed {
+        Some(plain) => plain.len() == 37 and plain[32] == b'h'
+        None => false
+    }
+    var plain_head = zero_block(alloc)
+    put_bytes(mut plain_head, at: 0, data: b"NANOSFR1")
+    plain_head[100] = 9
+    close_at(mut plain_head, at: CLOSING_CHECKSUM)
+    let sealed_head = seal_head(plain_head.view(), volume, nonce: Array[u8, 24].filled(4), alloc)
+    let reopened = open_head(Untrusted.of(sealed_head.view()), volume, alloc)
+    let head_ok = match reopened {
+        Some(block) => block.view() == plain_head.view()
+        None => false
+    }
+    expect sealed_ok and wrong.is_none() and sealed_head[100] != 9 and head_ok
+} sealed_records_and_head_blocks_open_under_their_key

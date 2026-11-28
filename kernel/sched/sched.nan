@@ -96,7 +96,7 @@ struct Reserved derives Copy, Eq {
 /// A free slot of a CPU's reservations.
 const FREE_RESERVED: Reserved = Reserved(id: 0, runtime_ns: 0, period_ns: 0, since_ns: 0, used_ns: 0)
 
-/// What the policy and the core's tasks share: each CPU's state behind its lock, the terms of the accounts the core tells of in slots that grow through `alloc`, where each CPU lies, the running CPU's number, the clock, whether the CPUs have MWAIT, the power of a running CPU in mW, which charges the energy of CPU time, and whether a calibration set it, the energy-performance preferences of `latency`, `normal` and `background` work in bits 7:0, 15:8 and 23:16, on a machine with HWP the signal through which each CPU posts the preference it wants, and on a machine with RAPL the one through which each running CPU asks for a calibration.
+/// What the policy and the core's tasks share: each CPU's state behind its lock, the terms of the accounts the core tells of in slots that grow through `alloc`, where each CPU lies, the running CPU's number, the clock, whether the CPUs have MWAIT, the power of a running CPU in mW, which charges the energy of CPU time, and whether a calibration set it, the energy-performance preferences of `latency`, `normal` and `background` work in bits 7:0, 15:8 and 23:16, on a machine with HWP the signal through which each CPU posts the preference it wants, on a machine with RAPL the one through which each running CPU asks for a calibration, and the watchdog's I/O base, 0 for none, its ticks and its state.
 pkg struct State {
     cpus: mem::List[hw::SpinLock[Cpu]]
     accounts: hw::SpinLock[mem::List[Terms]]
@@ -110,6 +110,9 @@ pkg struct State {
     pkg preferences: core::atomic::AtomicU32
     wanting: mem::List[mem::Shared[hw::Signal[u8]]]
     calibrating: mem::List[mem::Shared[hw::Signal[Unit]]]
+    watchdog_base: core::atomic::AtomicU32
+    watchdog_ticks: core::atomic::AtomicU32
+    watchdog: core::atomic::AtomicU32
     alloc: mem::Alloc
 } State
 
@@ -301,7 +304,7 @@ pkg fn State.of(
     chosen[1] = defaults.preference_normal
     chosen[2] = defaults.preference_background
     let preferences = core::atomic::AtomicU32.of(pack(chosen))
-    return State(cpus: take cpus, accounts: hw::SpinLock.of(mem::List[Terms].empty(alloc)), places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), mwait: mwait, busy_mw: take busy_mw, calibrated: core::atomic::AtomicBool.of(false), preferences: take preferences, wanting: take wanting, calibrating: take calibrating, alloc: alloc)
+    return State(cpus: take cpus, accounts: hw::SpinLock.of(mem::List[Terms].empty(alloc)), places: take places, here: hw::PerCpu.of(init: fn(cpu: u32) => cpu, alloc), clock: clock, started: core::atomic::AtomicBool.of(false), mwait: mwait, busy_mw: take busy_mw, calibrated: core::atomic::AtomicBool.of(false), preferences: take preferences, wanting: take wanting, calibrating: take calibrating, watchdog_base: core::atomic::AtomicU32.of(0), watchdog_ticks: core::atomic::AtomicU32.of(0), watchdog: core::atomic::AtomicU32.of(OFF), alloc: alloc)
 } State.of
 
 /// Applies the power settings: a running CPU's power `busy_mw`, unless a calibration set it, `preferences`, those of `latency`, `normal` and `background` work, and on a machine with MWAIT the idle states `idle_states`.
@@ -819,9 +822,10 @@ pkg fn Scheduler.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Optio
     return best
 } Scheduler.steal
 
-/// The slice of `task` as CPU `cpu` switches to it; when the preference the CPU wants changes, it posts the new one.
+/// The slice of `task` as CPU `cpu` switches to it, the watchdog the machine's idling stopped armed again first; when the preference the CPU wants changes, it posts the new one.
 pkg fn Scheduler.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
     let state = self.state.contents()
+    state.wake_watchdog()
     let now = state.now()
     let preferences = state.preferences.load()
     let Some(lock) = state.cpus.get(usize.widen(cpu)) else {
@@ -911,7 +915,7 @@ fn bounded(value: u64, low: u64, high: u64) -> u64 limits notrap, terminates, no
     return value
 } bounded
 
-/// The idle state of a CPU with no work: the deepest MWAIT state whose exit latency is below half the rest it predicts and below its latency tolerance, else HLT.
+/// The idle state of a CPU with no work: the deepest MWAIT state whose exit latency is below half the rest it predicts and below its latency tolerance, else HLT; the watchdog stops when the machine becomes idle.
 pkg fn Scheduler.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
     let state = self.state.contents()
     let now = state.now()
@@ -926,6 +930,7 @@ pkg fn Scheduler.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]
         }
         return current.resting_in
     })
+    state.idle_watchdog(t, now_ns: now, until_ns)
     return match entered {
         Some(hint) => hw::Idle.Mwait(hint)
         None => hw::Idle.Halt

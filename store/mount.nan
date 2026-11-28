@@ -1,7 +1,32 @@
 //! Mounting: the valid superblock with the higher sequence, the latest flush record whose catalog and item table verify or the one before it, the catalog's branches, segments and counters, and the log replayed from the flush record's position.
 
-/// Mounts the volume `device` holds, formatting it under `volume_id` when neither superblock holds the magic.
+/// Mounts the volume `device` holds, formatting it under `volume_id` when neither superblock holds the magic; `store.locked` for an encrypted one.
 pub fn Store.mount[D: disk::Device](device: D, volume_id: Array[u8, 16], now: ident::WallTime, alloc: mem::Alloc) -> Store fails StoreError uses wait {
+    return try await Store.unlocked(device, volume_id, key: None, nonces: Array[u8, 16].filled(0), now, alloc)
+} Store.mount
+
+/// The volume key's sealing a superblock of the volume `device` holds, `None` for a volume without encryption.
+pub fn Store.sealed_binding[D: disk::Device](device: D, alloc: mem::Alloc) -> Option[mem::Bytes] fails StoreError uses wait {
+    let copy_a = try await read_blocks(device, block: disk::SUPERBLOCK_A, count: 1, alloc)
+    let copy_b = try await read_blocks(device, block: disk::SUPERBLOCK_B, count: 1, alloc)
+    let disk::Found.Valid(superblock) = chosen(disk::Superblock.read(copy_a.view()), other: disk::Superblock.read(copy_b.view())) else {
+        return None
+    }
+    if (superblock.flags & (disk::ENCRYPTED | disk::CONVERTING)) == 0 {
+        return None
+    }
+    return disk::sealed_key(Untrusted.of(superblock.binding), alloc)
+} Store.sealed_binding
+
+/// Mounts the volume `device` holds as `Store.mount` does, an encrypted one under the volume key `key`, the nonces of the records it seals then starting with `nonces`; `store.locked` without the key that opens it.
+pub fn Store.unlocked[D: disk::Device](
+    device: D,
+    volume_id: Array[u8, 16],
+    key: Option[Array[u8, 32]],
+    nonces: Array[u8, 16],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) -> Store fails StoreError uses wait {
     let blocks = device.blocks() / disk::SEGMENT_BLOCKS * disk::SEGMENT_BLOCKS
     if blocks < LEAST_VOLUME_BLOCKS {
         fail StoreError.NoVolume
@@ -14,19 +39,27 @@ pub fn Store.mount[D: disk::Device](device: D, volume_id: Array[u8, 16], now: id
         disk::Found.Damaged => fail StoreError.Corrupt
         disk::Found.Blank => return try await Store.format(device, volume_id, now, alloc)
     }
-    if superblock.format != disk::FORMAT {
+    if superblock.format != disk::FORMAT and superblock.format + 1 != disk::FORMAT {
         fail StoreError.FormatUnsupported
     }
-    if (superblock.flags & 0b101) != 0 {
-        fail StoreError.Locked
+    var volume: Option[Array[u8, 32]] = None
+    if (superblock.flags & (disk::ENCRYPTED | disk::CONVERTING)) != 0 {
+        let Some(given) = key else {
+            fail StoreError.Locked
+        }
+        volume = Some(given)
     }
     let ring = try await read_blocks(device, block: disk::FLUSH_RING, count: u32.truncate(disk::FLUSH_SLOTS), alloc)
-    let records = flush_records(ring.view(), alloc)
+    let records = flush_records(ring.view(), volume, alloc)
+    if records.len() == 0 and volume.is_some() {
+        fail StoreError.Locked
+    }
     for at in 0..<records.len() {
         if at > 1 {
             break
         }
         var store = Store.over(superblock, alloc)
+        mut store.unlock(volume, nonces)
         match first attempt await mut store.load_flushed(device, record: records[at], alloc) {
             Ok(_) => {
             }
@@ -38,7 +71,104 @@ pub fn Store.mount[D: disk::Device](device: D, volume_id: Array[u8, 16], now: id
         return store
     }
     fail StoreError.Corrupt
-} Store.mount
+} Store.unlocked
+
+/// Has the store open and seal under the volume key `volume`, its nonces starting with `nonces`; nothing for none.
+fn Store.unlock(mut self, volume: Option[Array[u8, 32]], nonces: Array[u8, 16]) {
+    let Some(key) = volume else {
+        return
+    }
+    self.volume_key = Some(key)
+    self.index.volume = Some(key)
+    self.log.sealing = Some(log::Sealing(key: key, prefix: nonces, next: 0))
+} Store.unlock
+
+/// A head-area block as the volume holds it: `plain` sealed on an encrypted volume.
+pkg fn Store.head_block(mut self, take plain: mem::Bytes, alloc: mem::Alloc) -> mem::Bytes {
+    let Some(drawing) = self.log.sealing else {
+        return plain
+    }
+    var sealing = drawing
+    let nonce = mut sealing.nonce()
+    self.log.sealing = Some(sealing)
+    return disk::seal_head(plain.view(), volume: sealing.key, nonce, alloc)
+} Store.head_block
+
+/// Starts encrypting the volume under `key`, whose sealing by the TPM is `sealed`, its nonces starting with `nonces`: writes the binding and the converting flag to both superblocks, then the head area sealed; from then on every record is written sealed, and the cleaner rewrites the segments holding plain ones. `store.locked` for a binding past its field.
+pub fn Store.encrypt[D: disk::Device](
+    mut self,
+    device: D,
+    key: Array[u8, 32],
+    sealed: Slice[u8],
+    nonces: Array[u8, 16],
+    now: ident::WallTime,
+    alloc: mem::Alloc,
+    ) fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    if (self.superblock.flags & (disk::ENCRYPTED | disk::CONVERTING)) != 0 {
+        return
+    }
+    let Some(binding) = disk::binding_of(sealed) else {
+        fail StoreError.Locked
+    }
+    mut self.log.mark_plain()
+    match attempt mut self.log.close_open(now.utc_ns, alloc) {
+        Ok(_) => {
+        }
+        Err(failure) => fail StoreError.of_log(take failure)
+    }
+    var converting = self.superblock
+    converting.flags = converting.flags | disk::CONVERTING
+    converting.binding = binding
+    converting.sequence += 1
+    try await mut self.guarded_write(device, block: disk::SUPERBLOCK_A, data: converting.to_block(alloc), alloc)
+    try await mut self.guarded_flush(device, alloc)
+    try await mut self.guarded_write(device, block: disk::SUPERBLOCK_B, data: converting.to_block(alloc), alloc)
+    try await mut self.guarded_flush(device, alloc)
+    self.superblock = converting
+    mut self.unlock(Some(key), nonces)
+    try await mut self.rewrite_keyring(device, alloc)
+    try await mut self.index_flush(device, now, alloc)
+} Store.encrypt
+
+/// Marks the volume encrypted once no segment holds plain records.
+pkg fn Store.finish_converting[D: disk::Device](mut self, device: D, alloc: mem::Alloc) fails StoreError uses wait {
+    if (self.superblock.flags & disk::CONVERTING) == 0 or self.log.holds_plain() {
+        return
+    }
+    var encrypted = self.superblock
+    encrypted.flags = (encrypted.flags & ~disk::CONVERTING) | disk::ENCRYPTED
+    encrypted.sequence += 1
+    try await mut self.guarded_write(device, block: disk::SUPERBLOCK_A, data: encrypted.to_block(alloc), alloc)
+    try await mut self.guarded_flush(device, alloc)
+    try await mut self.guarded_write(device, block: disk::SUPERBLOCK_B, data: encrypted.to_block(alloc), alloc)
+    try await mut self.guarded_flush(device, alloc)
+    self.superblock = encrypted
+} Store.finish_converting
+
+/// Upgrades a volume of the format before the one this store writes: rewrites both superblocks with that format, which the log writes from then on; whether it upgraded.
+pub fn Store.upgrade_format[D: disk::Device](mut self, device: D, alloc: mem::Alloc) -> bool fails StoreError uses wait {
+    if self.read_only {
+        fail StoreError.ReadOnly
+    }
+    let from = self.superblock.format
+    if from == disk::FORMAT {
+        return false
+    }
+    var upgraded = self.superblock
+    upgraded.format = disk::FORMAT
+    upgraded.sequence += 1
+    try await mut self.guarded_write(device, block: disk::SUPERBLOCK_A, data: upgraded.to_block(alloc), alloc)
+    try await mut self.guarded_flush(device, alloc)
+    try await mut self.guarded_write(device, block: disk::SUPERBLOCK_B, data: upgraded.to_block(alloc), alloc)
+    try await mut self.guarded_flush(device, alloc)
+    self.superblock = upgraded
+    self.log.format = disk::FORMAT
+    mut self.events.push(Event.FormatUpgraded(from: from, to: disk::FORMAT))
+    return true
+} Store.upgrade_format
 
 /// Commits `writes` as genesis, commit #1, on a new branch `main` with the intent `intent`, and flushes the index.
 pub fn Store.genesis[D: disk::Device](
@@ -83,8 +213,8 @@ fn chosen(one: disk::Found, other: disk::Found) -> disk::Found {
     }
 } chosen
 
-/// The valid flush records of the ring, highest flush number first.
-fn flush_records(ring: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::List[disk::FlushRecord] {
+/// The valid flush records of the ring, sealed under the volume key `volume` on an encrypted volume, highest flush number first.
+fn flush_records(ring: Untrusted[Slice[u8]], volume: Option[Array[u8, 32]], alloc: mem::Alloc) -> mem::List[disk::FlushRecord] {
     var records = mem::List[disk::FlushRecord].empty(alloc)
     for slot in 0..<usize.widen(disk::FLUSH_SLOTS) {
         let Some(parts) = ring.split_at(slot * disk::BLOCK_BYTES) else {
@@ -93,7 +223,14 @@ fn flush_records(ring: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::List[dis
         let Some(block) = parts.tail.prefix(disk::BLOCK_BYTES) else {
             break
         }
-        match disk::FlushRecord.read(block) {
+        let found = match volume {
+            Some(sealing) => match disk::open_head(block, volume: sealing, alloc) {
+                Some(plain) => disk::FlushRecord.read(Untrusted.of(plain.view()))
+                None => None
+            }
+            None => disk::FlushRecord.read(block)
+        }
+        match found {
             Some(record) => mut records.push(record)
             None => {
             }
@@ -107,6 +244,7 @@ fn flush_records(ring: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::List[dis
 fn Store.load_flushed[D: disk::Device](mut self, device: D, record: disk::FlushRecord, alloc: mem::Alloc) fails StoreError uses wait {
     let items = tree::Root(tree: 5, node: record.items.target, pointer: record.items)
     self.index = tree::Index.of(items, next_item: record.next_item, alloc)
+    self.index.volume = self.volume_key
     self.catalog = tree::Root(tree: TREE_CATALOG, node: record.catalog.target, pointer: record.catalog)
     match attempt await mut self.index.load(device, tree: 5, id: items.node, pointer: items.pointer, alloc) {
         Ok(_) => {
@@ -173,7 +311,7 @@ fn Store.load_segments[D: disk::Device](mut self, device: D, alloc: mem::Alloc) 
             fail StoreError.Corrupt
         }
         let at = usize.widen(segment) - 1
-        self.log.segments[at] = log::Segment(state: state_of_code(entry.state), live: entry.live, written: entry.written, freed_at: 0)
+        self.log.segments[at] = log::Segment(state: state_of_code(entry.state & ~PLAIN_CODE), live: entry.live, written: entry.written, freed_at: 0, plain: (entry.state & PLAIN_CODE) != 0)
     }
     mut self.segments_written.truncate(0)
     for segment in self.log.segments {

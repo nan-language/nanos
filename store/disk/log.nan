@@ -189,8 +189,8 @@ pub validator fn batch_verifies(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) ->
     return checksum(copy.view()) == array16(bytes, at: 40)
 } batch_verifies
 
-/// The records a verified batch holds, in order, `None` when one does not lie within it or has no known kind.
-pub validator fn batch_records(raw: Untrusted[Slice[u8]], header: BatchHeader, alloc: mem::Alloc) -> Option[mem::List[Placed]] {
+/// The records a verified batch holds, in order, a sealed one opened under the volume key `volume`; `None` when one does not lie within it, has no known kind or does not open.
+pub validator fn batch_records(raw: Untrusted[Slice[u8]], header: BatchHeader, volume: Option[Array[u8, 32]], alloc: mem::Alloc) -> Option[mem::List[Placed]] {
     let bytes = raw.inspect()
     var placed = mem::List[Placed].empty(alloc)
     var at = BATCH_HEADER_BYTES
@@ -202,6 +202,14 @@ pub validator fn batch_records(raw: Untrusted[Slice[u8]], header: BatchHeader, a
             return None
         }
         let stated = bytes.u32_le(at + 4)
+        if (bytes[at + 1] & SEALED_RECORD) != 0 {
+            let Some(record) = opened(bytes, at, kind, volume, alloc) else {
+                return None
+            }
+            mut placed.push(Placed(offset: at, record: take record))
+            at += sealed_record_span(stated)
+            continue
+        }
         let length = usize.widen(stated)
         if bytes.len() - at - RECORD_HEADER_BYTES < length {
             return None
@@ -213,20 +221,53 @@ pub validator fn batch_records(raw: Untrusted[Slice[u8]], header: BatchHeader, a
     return Some(take placed)
 } batch_records
 
+/// The sealed record of `kind` at `at` of `bytes`, opened under the volume key `volume`, `None` without one or when it does not open.
+fn opened(
+    bytes: Slice[u8],
+    at: usize,
+    kind: RecordKind,
+    volume: Option[Array[u8, 32]],
+    alloc: mem::Alloc,
+    ) -> Option[Record] {
+    let Some(key) = volume else {
+        return None
+    }
+    let Some(parts) = bytes.split_at(at) else {
+        return None
+    }
+    let Some(plain) = open_record(Untrusted.of(take parts.tail), volume: key, alloc) else {
+        return None
+    }
+    let payload = copy_range(plain.view(), at: 32, count: plain.len().saturating_sub(32), alloc)
+    return Some(Record(kind: kind, key: array32(plain.view(), at: 0), payload: Untrusted.of(take payload)))
+} opened
+
 /// A record and its offset in its batch.
 pub closed struct Placed {
     pub offset: usize
     pub record: Record
 } Placed
 
-/// The payload of the record whose bytes from its header on are `raw`, `None` unless its kind and length match `pointer`'s and its key and payload hold `pointer`'s checksum.
-pub validator fn read_named(raw: Untrusted[Slice[u8]], pointer: Pointer, alloc: mem::Alloc) -> Option[Record] {
+/// The payload of the record whose bytes from its header on are `raw`, a sealed one opened under the volume key `volume`, `None` unless its kind and length match `pointer`'s and its key and payload hold `pointer`'s checksum.
+pub validator fn read_named(raw: Untrusted[Slice[u8]], pointer: Pointer, volume: Option[Array[u8, 32]], alloc: mem::Alloc) -> Option[Record] {
     let bytes = raw.inspect()
     let length = usize.widen(pointer.length)
-    if bytes.len() < RECORD_HEADER_BYTES or bytes.len() - RECORD_HEADER_BYTES < length {
+    if bytes.len() < PREFIX_BYTES or bytes[0] != pointer.kind or usize.widen(bytes.u32_le(4)) != length {
         return None
     }
-    if bytes[0] != pointer.kind or usize.widen(bytes.u32_le(4)) != length {
+    if (bytes[1] & SEALED_RECORD) != 0 {
+        let Some(kind) = RecordKind.of_code(bytes[0]) else {
+            return None
+        }
+        let Some(record) = opened(bytes, at: 0, kind, volume, alloc) else {
+            return None
+        }
+        if record_checksum(record.key, payload: record.payload.inspect().view(), alloc) != pointer.checksum {
+            return None
+        }
+        return Some(take record)
+    }
+    if bytes.len() < RECORD_HEADER_BYTES or bytes.len() - RECORD_HEADER_BYTES < length {
         return None
     }
     let Some(parts) = bytes.split_at(8) else {

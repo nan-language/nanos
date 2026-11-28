@@ -1,0 +1,179 @@
+//! The health gate of a `trial` boot, and the configuration of `boot`.
+
+/// How often the gate checks its conditions.
+const GATE_POLL_MS: u64 = 1_000
+
+const NS_PER_S: u64 = 1_000_000_000
+
+/// The most instances one check of the gate reads.
+const MOST_INSTANCES: u32 = 1_024
+
+/// How long the gate's conditions must hold together, and when it gives up after the kernel's start, in seconds.
+pub closed struct HealthGate derives Copy, Eq, Render, Encode {
+    pub window_s: u32
+    pub deadline_s: u32
+} HealthGate
+
+/// The record of `/sys/config/boot`: the health gate's settings, and the watchdog's timeout in seconds.
+pub closed struct BootConfig derives Copy, Eq, Render, Encode {
+    pub health: HealthGate
+    pub watchdog_s: u32
+} BootConfig
+
+pub fn BootConfig.default_of() -> BootConfig = BootConfig(health: HealthGate(window_s: 30, deadline_s: 300), watchdog_s: 30)
+
+/// The payload of `boot.generation-good`.
+pub closed struct GenerationGood derives Render, Encode {
+    pub generation: u64
+    pub slot: text::String
+} GenerationGood
+
+/// The payload of `boot.gate-timeout`.
+pub closed struct GateTimeout derives Render, Encode {
+    pub generation: u64
+} GateTimeout
+
+/// Runs the health gate: passes it once its conditions hold together for its window; emits `boot.gate-timeout` and reboots when its deadline after the kernel's start comes first.
+fn Surroundings.gate(self) fails task::Cancelled uses wait {
+    let window_ns = u64.widen(self.health.window_s) * NS_PER_S
+    let deadline_ns = u64.widen(self.health.deadline_s) * NS_PER_S
+    var since: Option[u64] = None
+    loop {
+        let now = self.elapsed()
+        if try await self.healthy() {
+            let held = since.value_or(now)
+            since = Some(held)
+            if now - held >= window_ns {
+                try await self.pass_gate()
+                return
+            }
+        } else {
+            since = None
+        }
+        if now >= deadline_ns {
+            try await self.events.emit("boot.gate-timeout", severity: journal::Severity.Error, payload: GateTimeout(generation: self.handoff.generation), alloc: self.alloc)
+            try await self.reboot()
+            return
+        }
+        try await self.clock.sleep(GATE_POLL_MS)
+    }
+} Surroundings.gate
+
+/// Whether the gate's conditions hold: the store answers, every instance of the base bundle is converged, and the link wrote its ready record.
+fn Surroundings.healthy(self) -> bool fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    match first attempt await self.mirror.stats(alloc) {
+        Ok(_) => {
+        }
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return false
+    }
+    let nodes = match first attempt await self.instances.scan(ident::Path(text: text::String.of("/", alloc)), from: text::String.empty(alloc), to: text::String.empty(alloc), limit: MOST_INSTANCES, alloc) {
+        Ok(found) => found
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return false
+    }
+    var linked = false
+    for node in nodes {
+        let Some(value) = node.value else {
+            continue
+        }
+        let Some(instance) = instance_from(value.view(), alloc) else {
+            continue
+        }
+        if instance.bundle != self.base {
+            continue
+        }
+        if instance.status.state != os::ReconcileState.Converged {
+            return false
+        }
+        if node.path.text.as_str().ends_with("/link") {
+            linked = ready_link(instance, alloc)
+        }
+    }
+    return linked
+} Surroundings.healthy
+
+/// Whether the record of `link` shows the ready record written.
+fn ready_link(instance: os::LiveInstance, alloc: mem::Alloc) -> bool {
+    let Some(summary) = instance.summary else {
+        return false
+    }
+    return match summary_from(Untrusted.of(summary.view()), alloc) {
+        Some(linked) => linked.ready_ns > 0
+        None => false
+    }
+} ready_link
+
+/// Passes the gate: sets the running slot `good`, has the store take the trial branch into `main` and upgrade its volume's format when every generation the boot record names reads the newer one, and emits `boot.generation-good`.
+fn Surroundings.pass_gate(self) fails task::Cancelled uses wait {
+    let alloc = self.alloc
+    let running = self.handoff.slot
+    let held = try await self.read_record()
+    let record = current(held)
+    var good = record.slot(running)
+    if held.is_some() and good.generation == self.handoff.generation {
+        var passed = record
+        good.state = bootfmt::SlotState.Good.to_bits()
+        mut passed.set_slot(running, held: good)
+        if try await self.write_record(passed.write_over(held)) {
+            try await self.mirror_record(Some(passed), installed: 0)
+        }
+    }
+    try await self.take_trial()
+    if held.is_some() {
+        try await self.upgrade_store(record)
+    }
+    try await self.events.emit("boot.generation-good", severity: journal::Severity.Notice, payload: GenerationGood(generation: self.handoff.generation, slot: slot_name(running, alloc)), alloc)
+} Surroundings.pass_gate
+
+/// Has the store upgrade its volume's format to the one every generation `record` names reads, when it reads the format before.
+fn Surroundings.upgrade_store(self, record: bootfmt::BootRecord) fails task::Cancelled uses wait {
+    let named = named_generations(record, alloc: self.alloc)
+    if named.len() == 0 {
+        return
+    }
+    var floor: u32 = 0xFFFF_FFFF
+    for generation in named {
+        let Some(signed) = try await self.read_manifest(generation) else {
+            return
+        }
+        floor = floor.min(signed.manifest.store_format)
+    }
+    match first attempt await self.mirror.upgrade_format(floor, alloc: self.alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} Surroundings.upgrade_store
+
+/// Has the store take the trial branch the boot runs on into `main`, when one runs; a conflict leaves it running.
+fn Surroundings.take_trial(self) fails task::Cancelled uses wait {
+    match first attempt await self.mirror.take_trial(self.alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} Surroundings.take_trial
+
+/// The monotonic time since the kernel's start.
+fn Surroundings.elapsed(self) -> u64 {
+    return match attempt self.clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} Surroundings.elapsed
+
+validator fn instance_from(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[os::LiveInstance] {
+    return match attempt mem::wire::Codec[os::LiveInstance].decode(raw, alloc) {
+        Ok(found) => Some(take found)
+        Err(_) => None
+    }
+} instance_from
+
+validator fn summary_from(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[os::LinkSummary] {
+    return match attempt mem::wire::Codec[os::LinkSummary].decode(raw, alloc) {
+        Ok(found) => Some(take found)
+        Err(_) => None
+    }
+} summary_from

@@ -171,6 +171,10 @@ fn Sequencer.run(mut self, take scope: Scoped, take job: Job, world: Surrounding
         Job.Merge(source: source, takes: takes) => encoded(try await mut self.merge(scope, source, take takes, world), alloc)
         Job.Revert(commit: commit, dry_run: dry_run) => encoded(try await mut self.revert(scope, commit, dry_run, world), alloc)
         Job.KeepBranch(name: name, until: until) => encoded(try await mut self.keep_branch(scope, name, until, world), alloc)
+        Job.TakeTrial => encoded(try await mut self.take_trial(scope, world), alloc)
+        Job.DropTrials(floor: floor) => encoded(try await mut self.drop_trials(scope, floor, world), alloc)
+        Job.UpgradeFormat(floor: floor) => encoded(try await mut self.upgrade_format(scope, floor, world), alloc)
+        Job.Encrypt => encoded(try await mut self.encrypt(scope, world), alloc)
         Job.Erase(path: path) => encoded(try await mut self.erase(scope, path, world), alloc)
         Job.Pin(commit: commit, note: note) => encoded(try await mut self.pin(scope, commit, take note, world), alloc)
         Job.Unpin(commit: commit) => encoded(try await mut self.unpin(scope, commit, world), alloc)
@@ -613,8 +617,74 @@ fn Sequencer.merge(
     if (attempt scope.check(need: Need.Admin)).is_err() or (attempt source.check(need: Need.Read)).is_err() or scope.prefix != source.prefix {
         return Err(Failure.Denied)
     }
+    match self.running {
+        Some(trial) => {
+            if scope.branch.as_str() == trial.as_str() and source.branch.as_str() == trial.as_str() {
+                return try await mut self.take_running(take takes, world)
+            }
+        }
+        None => {
+        }
+    }
     return try settled(attempt await mut self.engine.merge(self.volume, target: scope.branch.as_str(), source: source.branch.as_str(), take takes, fast_forward: not source.branch.as_str().starts_with(JOB_BRANCHES), stamp: scope.stamp(typed: false, alloc: world.alloc), now: world.now(), alloc: world.alloc))
 } Sequencer.merge
+
+/// Takes the running trial branch into `main`, for a View covering `/sys/boot`.
+fn Sequencer.take_trial(mut self, scope: Scoped, world: Surroundings) -> Result[store::Committed, Failure] fails task::Cancelled uses wait {
+    if not scope.covers_boot() {
+        return Err(Failure.Denied)
+    }
+    return try await mut self.take_running(mem::List.empty(world.alloc), world)
+} Sequencer.take_trial
+
+/// Deletes the trial branches of the generations below `floor`, the running one excepted, for a View covering `/sys/boot`.
+fn Sequencer.drop_trials(mut self, scope: Scoped, floor: u64, world: Surroundings) -> Result[mem::List[u64], Failure] fails task::Cancelled uses wait {
+    if not scope.covers_boot() {
+        return Err(Failure.Denied)
+    }
+    let kept = match self.running {
+        Some(trial) => Some(text::String.of(trial.as_str(), alloc: world.alloc))
+        None => None
+    }
+    let spared = match kept {
+        Some(trial) => Some(trial.as_str())
+        None => None
+    }
+    return try settled(attempt await mut self.engine.delete_trials(self.volume, floor, kept: spared, now: world.now(), alloc: world.alloc))
+} Sequencer.drop_trials
+
+/// Upgrades a volume of the format before the one the store writes, for a View covering `/sys/boot`, when `floor` is that one.
+fn Sequencer.upgrade_format(mut self, scope: Scoped, floor: u32, world: Surroundings) -> Result[bool, Failure] fails task::Cancelled uses wait {
+    if not scope.covers_boot() {
+        return Err(Failure.Denied)
+    }
+    if floor < disk::FORMAT {
+        return Ok(false)
+    }
+    return try settled(attempt await mut self.engine.upgrade_format(self.volume, alloc: world.alloc))
+} Sequencer.upgrade_format
+
+/// Encrypts the volume, for a View with admin rights over the whole tree, under a key `keys` makes and the TPM seals.
+fn Sequencer.encrypt(mut self, scope: Scoped, world: Surroundings) -> Result[Unit, Failure] fails task::Cancelled uses wait {
+    if (attempt scope.check(need: Need.Admin)).is_err() or scope.prefix.text.as_str() != "/" {
+        return Err(Failure.Denied)
+    }
+    let alloc = world.alloc
+    let sealer = Sealer(keys: world.keys, random: world.random, transport: world.transport)
+    let made = match first attempt await sealer.volume_key(alloc) {
+        Ok(found) => found
+        Err(store::StoreError.Cancelled(cancelled)) => fail cancelled
+        Err(failure) => return Err(Failure.of(take failure))
+    }
+    var nonces = Array[u8, 16].filled(0)
+    discard attempt world.random.fill(mut nonces.view_mut())
+    return try settled(attempt await mut self.engine.encrypt(self.volume, key: made.key, sealed: made.sealed.view(), nonces, now: world.now(), alloc))
+} Sequencer.encrypt
+
+/// Whether the View writes `/sys/boot`, which only `boot` does.
+fn Scoped.covers_boot(self) -> bool {
+    return self.prefix.text.as_str() == "/sys/boot" and Rights.from_bits(self.rights).write
+} Scoped.covers_boot
 
 fn Sequencer.erase(mut self, scope: Scoped, path: ident::Path, world: Surroundings) -> Result[store::Committed, Failure] fails task::Cancelled uses wait {
     let alloc = world.alloc
@@ -724,7 +794,7 @@ fn Sequencer.live_store(mut self, world: Surroundings) -> Result[LiveStore, Fail
     for other in self.placement.others {
         mut others.push(text::String.of(other.as_str(), alloc))
     }
-    return Ok(LiveStore(placement: text::String.of(self.placement.placement.as_str(), alloc), others: take others, capacity: capacity, used: used, history: history, agents: agents, free: free, format: format, encrypted: false, head: head.number, branches: branches, pins: pins, replayed: replayed, flushed: flushed, free_segments: free_segments, scrub: take scrub, as_of: now_ns(world.clock)))
+    return Ok(LiveStore(placement: text::String.of(self.placement.placement.as_str(), alloc), others: take others, capacity: capacity, used: used, history: history, agents: agents, free: free, format: format, encrypted: (self.engine.superblock.flags & disk::ENCRYPTED) != 0, head: head.number, branches: branches, pins: pins, replayed: replayed, flushed: flushed, free_segments: free_segments, scrub: take scrub, as_of: now_ns(world.clock)))
 } Sequencer.live_store
 
 test dated_views_read_at_their_commit_or_earlier for Scoped.at {

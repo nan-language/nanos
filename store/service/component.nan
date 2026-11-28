@@ -9,11 +9,12 @@ const HANDED: usize = 16
 /// The limit of the cell the sequencer draws what it sends out of the store's domain through, which the store's own cell bounds.
 const TRANSPORT_LIMIT: usize = 0xFFFF_FFFF_FFFF_FFFF
 
-/// The Env of `store`: the port of the `store-volume` role, the genesis record and the `/sys/boot` record genesis commits, the monotonic and wall clocks, the random source volume ids draw on, where it reports its events, where it publishes its record, the port to `devices` telling its placement, its cell, the hand-off to its sequencer and the requests waiting for room in it.
+/// The Env of `store`: the port of the `store-volume` role, the genesis record and the `/sys/boot` record genesis commits, how the boot runs it, the monotonic and wall clocks, the random source volume ids draw on, where it reports its events, where it publishes its record, the port to `devices` telling its placement, its cell, the hand-off to its sequencer and the requests waiting for room in it.
 pub open struct Env derives Send {
     volume: os::Port[devices::Block]
     genesis: Option[Genesis]
     boot: Option[TypedValue]
+    running: Running
     clock: sys::Clock
     wall: ident::Wall
     random: sys::Random
@@ -25,6 +26,18 @@ pub open struct Env derives Send {
     handoff: Handoff
     waiting: mem::List[Queued]
 } Env
+
+/// The trial branch of a boot of generation `generation`: the boot in mode `trial` creating it when `creates`, else a later boot running on it while it remains.
+pub closed struct TrialBoot derives Copy, Encode {
+    pub generation: u64
+    pub creates: bool
+} TrialBoot
+
+/// How the boot runs the store: on the trial branch `trial` gives, and in recovery mode when `recovery`, accepting only the versioned writes recovery allows.
+pub closed struct Running derives Copy, Encode {
+    pub trial: Option[TrialBoot]
+    pub recovery: bool
+} Running
 
 /// The requests handed to the sequencer, whether memory pressure asks it to drop the blob pieces no mapping holds and its clean index nodes, and the signal its waits end on.
 struct Handoff {
@@ -86,6 +99,10 @@ enum Job {
     Scrub
     Gc
     Stats
+    TakeTrial
+    DropTrials(floor: u64)
+    UpgradeFormat(floor: u32)
+    Encrypt
 } Job
 
 /// The state of `store`: whether its sequencer has mounted the volume, the mount's failure, and the number of the next subscription.
@@ -101,11 +118,12 @@ impl Service: sys::Resume[Env, Store]
 
 impl Service: sys::Pressure[Env, Store]
 
-/// The Env of a store on the volume behind `volume`, committing `genesis` and `boot` on an empty one.
+/// The Env of a store on the volume behind `volume`, committing `genesis` and `boot` on an empty one, and run as `running` tells.
 pub fn Env.of(
     volume: os::Port[devices::Block],
     take genesis: Genesis,
     take boot: TypedValue,
+    running: Running,
     clock: sys::Clock,
     wall: ident::Wall,
     random: sys::Random,
@@ -116,7 +134,7 @@ pub fn Env.of(
     alloc: mem::Alloc,
     ) -> Env {
     let handoff = Handoff(queued: mem::Shared.of(hw::SpinLock.of(mem::Bounded[Queued, HANDED].empty()), alloc), relieving: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), signal: mem::Shared.of(hw::Signal[Unit].empty(), alloc))
-    return Env(volume: volume, genesis: Some(take genesis), boot: Some(take boot), clock: clock, wall: wall, random: random, reporter: reporter, live: live, devices: devices, keys: keys, alloc: alloc, handoff: take handoff, waiting: mem::List.empty(alloc))
+    return Env(volume: volume, genesis: Some(take genesis), boot: Some(take boot), running: running, clock: clock, wall: wall, random: random, reporter: reporter, live: live, devices: devices, keys: keys, alloc: alloc, handoff: take handoff, waiting: mem::List.empty(alloc))
 } Env.of
 
 /// Hands the waiting requests to the sequencer while the hand-off has room, signalling it when it took any.
@@ -205,9 +223,9 @@ pub fn Service.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx:
         return
     }
     let transport = env.alloc.split(TRANSPORT_LIMIT)
-    let world = Surroundings(volume: env.volume, clock: env.clock, wall: env.wall, random: env.random, reporter: env.reporter, live: env.live, devices: env.devices, keys: env.keys, alloc: env.alloc, transport: transport.alloc())
+    let world = Surroundings(volume: env.volume, running: env.running, clock: env.clock, wall: env.wall, random: env.random, reporter: env.reporter, live: env.live, devices: env.devices, keys: env.keys, alloc: env.alloc, transport: transport.alloc())
     let handoff = env.handoff.share()
-    mut cx.spawn(key: SEQUENCING, run: fn[take genesis, take boot, take handoff, take transport](out: sys::Outbox[Store]) fails task::Cancelled uses wait limits stack 131_072 {
+    mut cx.spawn(key: SEQUENCING, run: fn[take genesis, take boot, take handoff, take transport](out: sys::Outbox[Store]) fails task::Cancelled uses wait limits stack 196_608 {
         defer take transport.close()
         try await sequence(world, take genesis, take boot, take handoff, out)
     })
@@ -564,3 +582,31 @@ pub fn Service.gc(mut self, take view: View, mut env: Env, mut cx: sys::Cx[Store
 pub fn Service.stats(mut self, take view: View, mut env: Env, mut cx: sys::Cx[Store]) -> LiveStore fails Failure {
     fail mut self.queue(view, job: Job.Stats, mut env, mut cx)
 } Service.stats
+
+pub fn Service.take_trial(mut self, take view: View, mut env: Env, mut cx: sys::Cx[Store]) -> store::Committed fails Failure {
+    fail mut self.queue(view, job: Job.TakeTrial, mut env, mut cx)
+} Service.take_trial
+
+pub fn Service.drop_trials(
+    mut self,
+    take view: View,
+    take floor: u64,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> mem::List[u64] fails Failure {
+    fail mut self.queue(view, job: Job.DropTrials(floor: floor), mut env, mut cx)
+} Service.drop_trials
+
+pub fn Service.upgrade_format(
+    mut self,
+    take view: View,
+    take floor: u32,
+    mut env: Env,
+    mut cx: sys::Cx[Store],
+    ) -> bool fails Failure {
+    fail mut self.queue(view, job: Job.UpgradeFormat(floor: floor), mut env, mut cx)
+} Service.upgrade_format
+
+pub fn Service.encrypt(mut self, take view: View, mut env: Env, mut cx: sys::Cx[Store]) fails Failure {
+    fail mut self.queue(view, job: Job.Encrypt, mut env, mut cx)
+} Service.encrypt

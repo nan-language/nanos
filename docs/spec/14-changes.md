@@ -64,7 +64,7 @@ A **plan** is a list of steps with options, previewed together and applied by it
 | `call <moniker> <op>(<args>)` | observed | sends a request to the instance |
 | `revert <commit>` | `recorded` | writes the inverse of the commit, three-way checked against the [commits](11-store.md#transactions) after it ([revert](11-store.md#revert-and-diff)) |
 | `run <spec>` | declared by the job's entry | starts a job acting for the plan's principal, from a `JobSpec` construction literal ([jobs](06-execution.md#jobs)) |
-| `generation <manifest>` | `restorable` | installs the generation whose manifest blob is at the path, its kernel image and genesis record being blobs the store holds, and reboots ([generation switch](10-code.md#generation-switch)) |
+| `generation <manifest>` | `restorable` | installs the generation whose manifest blob is at the path, its other files being the blobs beside it, and reboots ([generation switch](10-code.md#generation-switch)) |
 | `redeliver <moniker> <seq>` | observed | sends the instance's dead letter `<seq>` again ([dead letters](06-execution.md#dead-letters)) |
 | `restore-checkpoint <moniker> <n>` | `restorable` | restarts the instance from a copy of its checkpoint `<n>`, added as its latest checkpoint ([checkpoints](06-execution.md#checkpoints)) |
 
