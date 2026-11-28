@@ -67,7 +67,7 @@ These configuration records have the types their owning chapters define:
 | `floor_request` | `u64` | the floor raise requested of the loader, 0 for none |
 | `generations` | `mem::List[Generation]` | the generations on the boot volume |
 
-`Generation` is `{ number: u64, manifest: HashValue, kernel: HashValue, genesis: HashValue, keyring: HashValue, min_loader: u32, store_format: u32, signer: Principal, installed: WallTime, base: CommitId }`: the manifest's fields ([03-boot.md](03-boot.md#generations-and-manifests)), the installation time, and `base`, the commit `boot` pins for it ([11-store.md](11-store.md#pins)).
+`Generation` is `{ number: u64, manifest: HashValue, kernel: HashValue, genesis: HashValue, keyring: HashValue, min_loader: u32, store_format: u32, signer: Principal, installed: WallTime, base: CommitId, bundle: Option[HashValue] }`: the manifest's fields ([03-boot.md](03-boot.md#generations-and-manifests)), the installation time, `base`, the commit `boot` pins for it ([11-store.md](11-store.md#pins)), and `bundle`, the code hash of its base bundle, `None` when its genesis record is unreadable.
 
 ## The system definition
 

@@ -37,13 +37,14 @@ pub protocol Generations {
     fn answered(request: Option[u64], reply: sys::Encoded) limits traceless
 } Generations
 
-/// The Env of `boot`: the port to `fat`, its View of `/sys/boot`, its View reading `/data`, where it finds the files of a generation or loader it writes, its View reading `/live/instances`, its port to `power`, where it publishes `/live/boot`, its source of events, the handoff record, the code hash of the base bundle, the health gate's settings, the hash of the support routines the kernel image exports, the monotonic clock and its cell.
+/// The Env of `boot`: the port to `fat`, its View of `/sys/boot`, its View reading `/data`, where it finds the files of a generation or loader it writes, its View reading `/live/instances`, its port to `power`, the switch halting the kernel, where it publishes `/live/boot`, its source of events, the handoff record, the code hash of the base bundle, the health gate's settings, the hash of the support routines the kernel image exports, the monotonic clock and its cell.
 pub open struct Env derives Send {
     fat: os::Port[devices::Fat]
     mirror: store::service::View
     tree: store::service::View
     instances: store::service::View
     power: os::Port[power::Power]
+    switch: power::Switch
     live: os::Live
     events: journal::Source
     handoff: bootfmt::Handoff
@@ -104,6 +105,7 @@ pub fn Env.of(
     tree: store::service::View,
     instances: store::service::View,
     power: os::Port[power::Power],
+    switch: power::Switch,
     live: os::Live,
     events: journal::Source,
     handoff: bootfmt::Handoff,
@@ -113,7 +115,7 @@ pub fn Env.of(
     clock: sys::Clock,
     alloc: mem::Alloc,
     ) -> Env {
-    return Env(fat: fat, mirror: mirror, tree: tree, instances: instances, power: power, live: live, events: events, handoff: handoff, base: base, health: health, support: support, clock: clock, alloc: alloc)
+    return Env(fat: fat, mirror: mirror, tree: tree, instances: instances, power: power, switch: switch, live: live, events: events, handoff: handoff, base: base, health: health, support: support, clock: clock, alloc: alloc)
 } Env.of
 
 pub fn Boot.start(mut env: Env) -> Boot = Boot(recorded: false, waiting: mem::List.empty(env.alloc), busy: false)
@@ -255,6 +257,7 @@ struct Surroundings derives Copy {
     tree: store::service::View
     instances: store::service::View
     power: os::Port[power::Power]
+    switch: power::Switch
     live: os::Live
     events: journal::Source
     handoff: bootfmt::Handoff
@@ -266,7 +269,7 @@ struct Surroundings derives Copy {
 } Surroundings
 
 fn Env.surroundings(self) -> Surroundings {
-    return Surroundings(fat: self.fat, mirror: self.mirror, tree: self.tree, instances: self.instances, power: self.power, live: self.live, events: self.events, handoff: self.handoff, base: self.base, health: self.health, support: self.support, clock: self.clock, alloc: self.alloc)
+    return Surroundings(fat: self.fat, mirror: self.mirror, tree: self.tree, instances: self.instances, power: self.power, switch: self.switch, live: self.live, events: self.events, handoff: self.handoff, base: self.base, health: self.health, support: self.support, clock: self.clock, alloc: self.alloc)
 } Env.surroundings
 
 /// Records the boot: the boot counter written into the boot record when the loader did not, the slots, directories and trial branches below a raised floor retired, the record mirrored in `/sys/boot`, a boot that ended before its health gate and the requests the loader handled reported, `/live/boot` published, and in a `normal` boot the trial branch left of its generation taken into `main`.
@@ -295,7 +298,7 @@ fn Surroundings.record(self) fails task::Cancelled uses wait {
     }
     let previous = try await self.mirrored()
     if flags.floor_raised {
-        try await self.retire_directories()
+        try await self.retire_directories(previous)
     }
     let state = try await self.state_of_volume(record_of(held), previous)
     let unhealthy = match previous {
@@ -319,9 +322,24 @@ fn Surroundings.record(self) fails task::Cancelled uses wait {
     }
 } Surroundings.record
 
-/// Deletes the directories and trial branches of the generations below the floor and emits `boot.retired`.
-fn Surroundings.retire_directories(self) fails task::Cancelled uses wait {
+/// Deletes the directories, trial branches and pins of the generations below the floor and emits `boot.retired`.
+fn Surroundings.retire_directories(self, previous: Option[bootfmt::BootState]) fails task::Cancelled uses wait {
     let alloc = self.alloc
+    match previous {
+        Some(mirror) => {
+            for known in mirror.generations {
+                if known.number < self.handoff.floor {
+                    match first attempt await self.mirror.unpin(known.base, alloc) {
+                        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+                        else => {
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+        }
+    }
     match first attempt await self.mirror.drop_trials(self.handoff.floor, alloc) {
         Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
         else => {
@@ -364,7 +382,7 @@ fn Surroundings.report_requests(self) fails task::Cancelled uses wait {
     }
 } Surroundings.report_requests
 
-/// Mirrors `record`, or the handoff record when there is none, and the boot volume's generations in `/sys/boot`, stamping the generation `installed`, 0 for none, with the commit that first mirrors it.
+/// Mirrors `record`, or the handoff record when there is none, and the boot volume's generations in `/sys/boot`, stamping the generation `installed`, 0 for none, with the commit that first mirrors it, which it pins.
 fn Surroundings.mirror_record(self, record: Option[bootfmt::BootRecord], installed: u64) fails task::Cancelled uses wait {
     let previous = try await self.mirrored()
     var state = try await self.state_of_volume(record, previous)
@@ -381,9 +399,14 @@ fn Surroundings.mirror_record(self, record: Option[bootfmt::BootRecord], install
         }
     }
     discard try await self.write_mirror(state)
+    match first attempt await self.mirror.pin(committed.number, note: Some(text::String.of("generation", alloc: self.alloc)), alloc: self.alloc) {
+        Err(store::service::ViewError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
 } Surroundings.mirror_record
 
-/// The boot state of `record`, or of the handoff record when there is none, with the generations whose directories hold a manifest of their number, each keeping the installation time and commit `previous` gives it.
+/// The boot state of `record`, or of the handoff record when there is none, with the generations whose directories hold a manifest of their number, each keeping the installation time, commit and base bundle `previous` gives it, its base bundle otherwise read from its genesis record.
 fn Surroundings.state_of_volume(self, record: Option[bootfmt::BootRecord], previous: Option[bootfmt::BootState]) -> bootfmt::BootState fails task::Cancelled uses wait {
     let alloc = self.alloc
     var generations = mem::List[bootfmt::Generation].empty(alloc)
@@ -398,19 +421,24 @@ fn Surroundings.state_of_volume(self, record: Option[bootfmt::BootRecord], previ
         let hash = manifest.hash(alloc)
         var installed = ident::WallTime.unknown()
         var base = ident::CommitId(number: 1)
+        var bundle: Option[ident::HashValue] = None
         match previous {
             Some(mirror) => {
                 for known in mirror.generations {
                     if known.number == number and known.manifest == hash {
                         installed = known.installed
                         base = known.base
+                        bundle = known.bundle
                     }
                 }
             }
             None => {
             }
         }
-        mut generations.push(bootfmt::Generation(number: number, manifest: hash, kernel: manifest.kernel, genesis: manifest.genesis, keyring: manifest.keyring, min_loader: manifest.min_loader, store_format: manifest.store_format, signer: take manifest.signer, installed: installed, base: base))
+        if bundle.is_none() {
+            bundle = try await self.bundle_of(number, genesis: manifest.genesis)
+        }
+        mut generations.push(bootfmt::Generation(number: number, manifest: hash, kernel: manifest.kernel, genesis: manifest.genesis, keyring: manifest.keyring, min_loader: manifest.min_loader, store_format: manifest.store_format, signer: take manifest.signer, installed: installed, base: base, bundle: bundle))
     }
     let bootfmt::BootState(slots: slots, recovery: recovery, floor: floor, floor_request: floor_request, generations: _) = match record {
         Some(found) => state_of(found, floor: self.handoff.floor, alloc)
@@ -448,7 +476,7 @@ fn Surroundings.write_mirror(self, state: bootfmt::BootState) -> Option[store::C
     }
 } Surroundings.write_mirror
 
-/// Reboots the machine through `power`.
+/// Reboots the machine through `power`, returning only when the reboot fails.
 fn Surroundings.reboot(self) fails task::Cancelled uses wait {
     var call = sys::Encoded.empty(self.alloc)
     let reply = sys::Wire[power::Power].reboot(mut call)

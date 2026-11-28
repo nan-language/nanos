@@ -3,7 +3,7 @@
 /// The most specifications one check reads.
 const MOST_SPECS: u32 = 4_096
 
-/// The refusal the switch to the generation whose manifest blob is at `manifest` meets, read through `view`: `boot.file-unreadable` without a genesis record beside it, `code.schema-incompatible` when the new base bundle reads no running state of a checkpointed base instance, `port.incompatible` when it changes the protocol of a base instance another bundle's instance has a port to, and `code.no-image` when a bundle an instance runs has no image for the new kernel's support routines and the new generation ships no `nan` job; `None` when it meets none.
+/// The refusal the switch to the generation whose manifest blob is at `manifest` meets, read through `view`: `boot.file-unreadable` without a genesis record beside it, `code.schema-incompatible` when the new base bundle reads no running state of a checkpointed base instance or the base bundle of a generation the switch falls back to reads none of its new state, `port.incompatible` when it changes the protocol of a base instance another bundle's instance has a port to, and `code.no-image` when a bundle an instance runs has no image for the new kernel's support routines and the new generation ships no `nan` job; `None` when it meets none.
 pub fn switch_refusal(manifest: ident::Path, view: store::service::View, alloc: mem::Alloc) -> Option[Failure] fails task::Cancelled uses wait {
     let subject = manifest.text.as_str()
     let unreadable = Failure.of("boot.file-unreadable", subject, alloc)
@@ -25,21 +25,9 @@ pub fn switch_refusal(manifest: ident::Path, view: store::service::View, alloc: 
     let Ok(running) = try await admission_at(view, bundle: running_base, alloc) else {
         return None
     }
-    for each in record.instances {
-        let spec = each.value()
-        if spec.durability.class != os::DurabilityClass.Checkpointed {
-            continue
-        }
-        let Some(old) = component_at(running, state: spec.component.as_str()) else {
-            continue
-        }
-        let schema = running.components[old].schema
-        let reads = match component_at(moving, state: spec.component.as_str()) {
-            Some(new) => moving.components[new].schema == schema or moving.components[new].earlier.position(fn(earlier: code::Earlier) => earlier.schema == schema).is_some()
-            None => false
-        }
-        if not reads {
-            return Some(Failure.of("code.schema-incompatible", subject: each.key().text.as_str(), alloc))
+    match try await schema_refusal(record, moving, running, view, alloc) {
+        Some(incompatible) => return Some(take incompatible)
+        None => {
         }
     }
     let ships_nan = ships_toolchain(record, alloc)
@@ -77,6 +65,148 @@ pub fn switch_refusal(manifest: ident::Path, view: store::service::View, alloc: 
     }
     return None
 } switch_refusal
+
+/// `code.schema-incompatible` for the first checkpointed base instance of the genesis record `record`, whose base bundle `moving` admits, when the new bundle reads no state of the running base bundle `running`, or the base bundle of a generation the switch falls back to, as `view` tells them, reads none of the new one's.
+fn schema_refusal(
+    record: store::service::Genesis,
+    moving: code::Admission,
+    running: code::Admission,
+    view: store::service::View,
+    alloc: mem::Alloc,
+    ) -> Option[Failure] fails task::Cancelled uses wait {
+    var priors = mem::List[code::Admission].empty(alloc)
+    for fallback in try await fallback_bundles(view, alloc) {
+        match try await admission_at(view, bundle: fallback, alloc) {
+            Ok(prior) => mut priors.push(take prior)
+            Err(_) => {
+            }
+        }
+    }
+    for each in record.instances {
+        let spec = each.value()
+        if spec.durability.class != os::DurabilityClass.Checkpointed {
+            continue
+        }
+        let state_type = spec.component.as_str()
+        let new = component_at(moving, state: state_type)
+        match component_at(running, state: state_type) {
+            Some(old) => {
+                if not reads_schema(moving, at: new, schema: running.components[old].schema) {
+                    return Some(Failure.of("code.schema-incompatible", subject: each.key().text.as_str(), alloc))
+                }
+            }
+            None => {
+            }
+        }
+        let Some(at) = new else {
+            continue
+        }
+        for prior in priors {
+            match component_at(prior, state: state_type) {
+                Some(old) => {
+                    if not reads_schema(prior, at: Some(old), schema: moving.components[at].schema) {
+                        return Some(Failure.of("code.schema-incompatible", subject: each.key().text.as_str(), alloc))
+                    }
+                }
+                None => {
+                }
+            }
+        }
+    }
+    return None
+} schema_refusal
+
+/// Whether the component at `at` of `record` reads state of schema `schema`: its own schema, or one it records as earlier.
+fn reads_schema(record: code::Admission, at: Option[usize], schema: ident::HashValue) -> bool {
+    let Some(found) = at else {
+        return false
+    }
+    return record.components[found].schema == schema or record.components[found].earlier.position(fn(earlier: code::Earlier) => earlier.schema == schema).is_some()
+} reads_schema
+
+/// The base bundles of the generations a switch falls back to, as `/sys/boot` and `/live/boot` read through `view` tell them.
+fn fallback_bundles(view: store::service::View, alloc: mem::Alloc) -> mem::List[ident::HashValue] fails task::Cancelled uses wait {
+    var bundles = mem::List[ident::HashValue].empty(alloc)
+    let Some(state) = try await Records[bootfmt::BootState].at(view, path: "/sys/boot", alloc) else {
+        return bundles
+    }
+    let running = try await running_slot(view, alloc)
+    for number in fallbacks(state, running, alloc) {
+        for generation in state.generations {
+            match generation.bundle {
+                Some(bundle) => {
+                    if generation.number == number {
+                        mut bundles.push(bundle)
+                    }
+                }
+                None => {
+                }
+            }
+        }
+    }
+    return bundles
+} fallback_bundles
+
+/// The slot of the running generation `/live/boot` read through `view` tells, `None` outside a slot.
+fn running_slot(view: store::service::View, alloc: mem::Alloc) -> Option[text::String] fails task::Cancelled uses wait {
+    let Some(live) = try await Records[os::LiveBoot].at(view, path: "/live/boot", alloc) else {
+        return None
+    }
+    let Some(slot) = live.slot else {
+        return None
+    }
+    return Some(text::String.of(slot.as_str(), alloc))
+} running_slot
+
+/// The generations a switch falls back to: the recovery generation of `state` and the `good` generation of its slot other than the idle slot, the running generation being in the slot `running`.
+fn fallbacks(state: bootfmt::BootState, running: Option[text::String], alloc: mem::Alloc) -> mem::List[u64] {
+    var numbers = mem::List[u64].empty(alloc)
+    if state.recovery != 0 {
+        mut numbers.push(state.recovery)
+    }
+    let idle = idle_of(state, running, alloc)
+    for slot in state.slots {
+        if slot.state == bootfmt::SlotCondition.Good and slot.name.as_str() != idle.as_str() and slot.generation != state.recovery {
+            mut numbers.push(slot.generation)
+        }
+    }
+    return numbers
+} fallbacks
+
+/// The name of the idle slot of `state`: the slot other than `running`, or without one an `empty` or `bad` slot, else the one of the lower generation.
+fn idle_of(state: bootfmt::BootState, running: Option[text::String], alloc: mem::Alloc) -> text::String {
+    match running {
+        Some(name) => {
+            if name.as_str() == "a" {
+                return text::String.of("b", alloc)
+            }
+            return text::String.of("a", alloc)
+        }
+        None => {
+        }
+    }
+    var lowest: Option[usize] = None
+    for at in 0..<state.slots.len() {
+        let condition = state.slots[at].state
+        if condition == bootfmt::SlotCondition.Empty or condition == bootfmt::SlotCondition.Bad {
+            return text::String.of(state.slots[at].name.as_str(), alloc)
+        }
+        match lowest {
+            Some(held) => {
+                if state.slots[at].generation < state.slots[held].generation {
+                    lowest = Some(at)
+                }
+            }
+            None => {
+                lowest = Some(at)
+            }
+        }
+    }
+    return match lowest {
+        Some(at) => text::String.of(state.slots[at].name.as_str(), alloc)
+        None => text::String.empty(alloc)
+    }
+} idle_of
 
 /// A specification of `/sys/instances` and the moniker naming it.
 struct HeldSpec {
@@ -180,3 +310,15 @@ validator fn admission_from(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Opt
         Err(_) => None
     }
 } admission_from
+
+test switches_fall_back_to_the_recovery_generation_and_the_good_slot_kept for fallbacks {
+    let alloc = testing::world().alloc
+    var slots = mem::List[bootfmt::BootSlot].empty(alloc)
+    mut slots.push(bootfmt::BootSlot(name: text::String.of("a", alloc), generation: 5, state: bootfmt::SlotCondition.Good, tries_left: 0))
+    mut slots.push(bootfmt::BootSlot(name: text::String.of("b", alloc), generation: 4, state: bootfmt::SlotCondition.Good, tries_left: 0))
+    let state = bootfmt::BootState(slots: take slots, recovery: 3, floor: 1, floor_request: 0, generations: mem::List.empty(alloc))
+    let from_a = fallbacks(state, running: Some(text::String.of("a", alloc)), alloc)
+    let from_b = fallbacks(state, running: Some(text::String.of("b", alloc)), alloc)
+    let unslotted = fallbacks(state, running: None, alloc)
+    expect from_a.len() == 2 and from_a[0] == 3 and from_a[1] == 5 and from_b.len() == 2 and from_b[1] == 4 and unslotted.len() == 2 and unslotted[1] == 5
+} switches_fall_back_to_the_recovery_generation_and_the_good_slot_kept
