@@ -138,10 +138,10 @@ The sandbox is the machine `tools/sandbox start` boots ([sandbox](../sandbox.md)
 
 - A q35 machine with 4 CPUs and 512 MiB of RAM, on the host's CPU model under KVM when the host offers it, else on QEMU's `max` model without `monitor`.
 - OVMF without secure boot, whose UEFI variables last until the next start.
-- A virtio-blk disk holding the [boot volume](03-boot.md#boot-volume) as a virtual FAT volume made from a host directory at each start: the development loader at `/EFI/BOOT/BOOTX64.EFI`, the kernel image at `/kernel.elf`, and the files the machine writes. It holds no `/nanos` directory, which the loader cannot create, so the loader neither finds nor writes a boot record.
+- A virtio-blk disk holding the [boot volume](03-boot.md#boot-volume) as a virtual FAT volume made from a host directory at each start: the development loader at `/EFI/BOOT/BOOTX64.EFI`, the kernel image at `/kernel.elf`, and the files the machine writes. It starts without `/nanos`, which the loader creates when it writes the boot record.
 - A blank virtio-blk disk of 256 MiB, a virtio-net NIC on QEMU's user network, a virtio-rng device, an Intel VT-d IOMMU, a TPM 2.0 that swtpm emulates and an i6300esb watchdog.
 - The 16550 serial port, on the sandbox's standard output and standard input (requires [N22](22-nan.md#n22)), carrying the console and the link's serial transport, and the console port, a second 16550 on a socket.
-- The exit port: writing the byte v ends the run with status v mod 128. [Power off and reboot](08-scheduling.md#power-off-and-reboot) write it, and a halt writes 70; a reset ends the run with status 70, so the sandbox never reboots.
+- The exit port: writing the byte v ends the run with status v mod 128. [Power off](08-scheduling.md#power-off-and-reboot) writes byte 0, and a halt writes 70. A reset, which a reboot writes to the FADT's reset register, reboots the machine with its boot volume, disks, UEFI variables and TPM state as the run left them.
 
 Its facts are `arch: Arch.Amd64`, `cpus: 4`, `smt: false`, `numa_nodes: 1`, `storage: Storage.File` and `power: PowerSource.Mains`, its `level` being the CPU model's, `Level.X86v3` on `max`. `iommu`, `tpm`, `user-mode` and `nic` hold, and `secure-boot` does not. On `max`, `pages-1g` holds, and `invariant-tsc`, `tsc-deadline`, `pcid` and `mwait` do not; under KVM, the CPU's conditions are the host's.
 
@@ -152,4 +152,4 @@ The sandbox exercises:
 - on `max`, 1 GiB pages, MWAIT, HPET time, the local APIC one-shot timer and switches between spaces that flush translations;
 - halts, power off and reboot, through the exit port.
 
-It exercises no rule that needs a reboot or state kept across starts: trial boots and the health gate, generation switches, recovery, the floor, owner key requests and loader replacement; nor AArch64.
+It exercises no rule that needs state kept across starts, nor AArch64.

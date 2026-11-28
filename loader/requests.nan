@@ -1,0 +1,144 @@
+//! The owner and loader requests the boot record carries, which the loader applies or refuses at step 2.
+
+/// The loader's own file, the previous loader's, and the loader waiting to replace it.
+const LOADER_FILE: Str = "EFI/BOOT/BOOTX64.EFI"
+
+const PREVIOUS_FILE: Str = "EFI/nanos/loader.prev"
+
+const NEW_FILE: Str = "EFI/nanos/loader.new"
+
+/// Applies the owner request `record` holds: a claim when no owner record is stored, a replacement whose proof is the stored owner's signature or a recovery code whose digest is the stored one; sets the handoff flag of the outcome.
+fn apply_owner_request(record: bootfmt::BootRecord, mut kept: Kept, mut handoff: bootfmt::Handoff, alloc: mem::Alloc) {
+    let Some(kind) = bootfmt::OwnerRequestKind.checked_from_bits(record.owner_request_kind) else {
+        return
+    }
+    if kind == bootfmt::OwnerRequestKind.Absent {
+        return
+    }
+    let requested = OwnerRecord(key: record.owner_request_key, recovery: record.owner_request_recovery)
+    let proof = record.owner_request_proof
+    let applies = match kept.owner {
+        None => kind == bootfmt::OwnerRequestKind.Claim and zero(proof.view())
+        Some(stored) => stored.key == requested.key or (kind == bootfmt::OwnerRequestKind.BySignature and signed_over(stored, requested, proof, alloc)) or (kind == bootfmt::OwnerRequestKind.ByRecoveryCode and recovers(stored, proof))
+    }
+    if applies {
+        kept.owner = Some(requested)
+        handoff.flags.owner_request_applied = true
+    } else {
+        handoff.flags.owner_request_refused = true
+    }
+} apply_owner_request
+
+/// Whether `proof` is the stored owner's signature of the request to store `requested`.
+fn signed_over(stored: OwnerRecord, requested: OwnerRecord, proof: Array[u8, 64], alloc: mem::Alloc) -> bool {
+    let request = bootfmt::OwnerKeyRequest(current: stored.key, key: requested.key, recovery: requested.recovery)
+    return ident::Signature(bytes: proof).verifies(stored.key, object: request.hash(alloc))
+} signed_over
+
+/// Whether `proof` is a recovery code whose BLAKE3-256 digest is the stored one, followed by zeros.
+fn recovers(stored: OwnerRecord, proof: Array[u8, 64]) -> bool {
+    let Some(parts) = proof.view().split_at(16) else {
+        return false
+    }
+    let digest = ident::HashValue.of_content(parts.head)
+    for at in 0..<32usize {
+        if digest.bytes[at + 1] != stored.recovery[at] {
+            return false
+        }
+    }
+    return zero(parts.tail)
+} recovers
+
+/// Applies the loader request `record` holds when the stored owner signed it, its version exceeds this loader's and `loader.new` has its blob id: keeps this loader as `loader.prev` when it runs as `BOOTX64.EFI`, sets the boot entries of both loaders at the head of `BootOrder`, and makes the new loader `BOOTX64.EFI`; sets the handoff flags of the outcome.
+fn apply_loader_request(
+    services: boot::Services,
+    record: bootfmt::BootRecord,
+    kept: Kept,
+    own: Option[text::String],
+    volume: Option[boot::Partition],
+    mut handoff: bootfmt::Handoff,
+    alloc: mem::Alloc,
+    ) {
+    if zero(record.loader_request.view()) {
+        return
+    }
+    let request = bootfmt::LoaderRequest(loader: ident::HashValue(bytes: record.loader_request), version: record.loader_request_version)
+    let signed = match kept.owner {
+        Some(stored) => ident::Signature(bytes: record.loader_request_signature).verifies(stored.key, object: request.hash(alloc))
+        None => false
+    }
+    let new = match signed and request.version > VERSION {
+        true => attempt services.read_file(NEW_FILE, alloc)
+        false => Err(boot::ServiceError.Denied)
+    }
+    let Ok(bytes) = new else {
+        handoff.flags.loader_request_refused = true
+        return
+    }
+    if blob_id(bytes) != request.loader.bytes {
+        handoff.flags.loader_request_refused = true
+        return
+    }
+    if running_as_loader(own) {
+        let Ok(current) = attempt services.read_file(LOADER_FILE, alloc) else {
+            handoff.flags.loader_request_refused = true
+            return
+        }
+        if not copied_back(services, path: PREVIOUS_FILE, data: current.view(), alloc) {
+            handoff.flags.loader_request_refused = true
+            return
+        }
+    }
+    handoff.flags.previous_loader_entry = boot_entries(services, volume, alloc)
+    if not copied_back(services, path: LOADER_FILE, data: bytes.view(), alloc) {
+        handoff.flags.loader_request_refused = true
+        return
+    }
+    discard attempt services.delete_file(NEW_FILE)
+    handoff.flags.loader_request_applied = true
+} apply_loader_request
+
+/// Whether the loader runs from `/EFI/BOOT/BOOTX64.EFI`, names compared without regard to case.
+fn running_as_loader(own: Option[text::String]) -> bool {
+    let Some(path) = own else {
+        return false
+    }
+    let bytes = path.as_str().as_bytes()
+    let wanted = LOADER_FILE.as_bytes()
+    if bytes.len() != wanted.len() {
+        return false
+    }
+    for at in 0..<bytes.len() {
+        if lowered(bytes[at]) != lowered(wanted[at]) {
+            return false
+        }
+    }
+    return true
+} running_as_loader
+
+fn lowered(byte: u8) -> u8 {
+    if byte >= b'A' and byte <= b'Z' {
+        return byte + 32
+    }
+    return byte
+} lowered
+
+/// Writes `data`, a file the loader read, as the file `path` and reads it back: whether the file then holds those bytes.
+validator fn copied_back(services: boot::Services, path: Str, data: Untrusted[Slice[u8]], alloc: mem::Alloc) -> bool {
+    if (attempt services.write_file(path, data: data.inspect())).is_err() {
+        return false
+    }
+    let Ok(back) = attempt services.read_file(path, alloc) else {
+        return false
+    }
+    return blob_id(back) == ident::HashValue.of_untrusted(data).bytes
+} copied_back
+
+fn zero(bytes: Slice[u8]) -> bool {
+    for byte in bytes {
+        if byte != 0 {
+            return false
+        }
+    }
+    return true
+} zero

@@ -1,0 +1,201 @@
+//! The UEFI boot entries of a loader replacement: `NaN OS` for the loader and `NaN OS previous loader` for the one it replaced, first in `BootOrder`.
+
+/// The descriptions of the two entries and the files they start.
+const LOADER_ENTRY: Str = "NaN OS"
+
+const PREVIOUS_ENTRY: Str = "NaN OS previous loader"
+
+const LOADER_PATH: Str = "\\EFI\\BOOT\\BOOTX64.EFI"
+
+const PREVIOUS_PATH: Str = "\\EFI\\nanos\\loader.prev"
+
+/// The most boot entries the loader looks through for its own or a free number.
+const MOST_ENTRIES: u16 = 256
+
+/// The attributes of an active load option.
+const LOAD_OPTION_ACTIVE: u32 = 0x1
+
+/// Sets the entries `NaN OS` and `NaN OS previous loader` on the boot volume `volume` at the head of `BootOrder`, in that order, reusing entries of those descriptions; whether the previous loader's entry is set.
+fn boot_entries(services: boot::Services, volume: Option[boot::Partition], alloc: mem::Alloc) -> bool {
+    let Some(partition) = volume else {
+        return false
+    }
+    let Some(loader) = entry_number(services, description: LOADER_ENTRY, other: None, alloc) else {
+        return false
+    }
+    let Some(previous) = entry_number(services, description: PREVIOUS_ENTRY, other: Some(loader), alloc) else {
+        return false
+    }
+    if not set_entry(services, number: loader, description: LOADER_ENTRY, path: LOADER_PATH, partition, alloc) {
+        return false
+    }
+    if not set_entry(services, number: previous, description: PREVIOUS_ENTRY, path: PREVIOUS_PATH, partition, alloc) {
+        return false
+    }
+    var order = mem::Bytes.empty(alloc)
+    push_u16(mut order, value: loader)
+    push_u16(mut order, value: previous)
+    match attempt services.get_variable("BootOrder", vendor: GLOBAL_GUID, alloc) {
+        Ok(variable) => {
+            for number in order_of(variable.data.view(), alloc) {
+                if number != loader and number != previous {
+                    push_u16(mut order, value: number)
+                }
+            }
+        }
+        Err(_) => {
+        }
+    }
+    return (attempt services.set_variable("BootOrder", vendor: GLOBAL_GUID, attributes: runtime_attributes(), data: order.view())).is_ok()
+} boot_entries
+
+/// The number of the boot entry of `description`, else the lowest unused one other than `other`.
+fn entry_number(services: boot::Services, description: Str, other: Option[u16], alloc: mem::Alloc) -> Option[u16] {
+    var free: Option[u16] = None
+    for number in 0..<MOST_ENTRIES {
+        if Some(number) == other {
+            continue
+        }
+        match first attempt services.get_variable(entry_name(number).as_str(), vendor: GLOBAL_GUID, alloc) {
+            Ok(variable) => {
+                if describes(variable.data.view(), description) {
+                    return Some(number)
+                }
+            }
+            Err(boot::ServiceError.NotFound) => {
+                if free.is_none() {
+                    free = Some(number)
+                }
+            }
+            Err(_) => {
+            }
+        }
+    }
+    return free
+} entry_number
+
+/// Writes the boot entry `number`: an active load option of `description` starting the file `path` on `partition`.
+fn set_entry(
+    services: boot::Services,
+    number: u16,
+    description: Str,
+    path: Str,
+    partition: boot::Partition,
+    alloc: mem::Alloc,
+    ) -> bool {
+    var device = mem::Bytes.empty(alloc)
+    hard_drive(mut device, partition)
+    file_node(mut device, path, alloc)
+    mut device.append(b"\x7f\xff\x04\x00")
+    var option = mem::Bytes.zeroed(6, alloc)
+    mut option.view_mut().write_u32_le(0, value: LOAD_OPTION_ACTIVE)
+    mut option.view_mut().write_u16_le(4, value: u16.fit(device.len()))
+    push_utf16(mut option, text: description)
+    mut option.append(device.view())
+    return (attempt services.set_variable(entry_name(number).as_str(), vendor: GLOBAL_GUID, attributes: runtime_attributes(), data: option.view())).is_ok()
+} set_entry
+
+/// The hard drive media node of `partition`: its number, first block, block count and signature, with the partitioning it names.
+fn hard_drive(mut device: mem::Bytes, partition: boot::Partition) {
+    var node = Array[u8, 42].filled(0)
+    node[0] = 0x04
+    node[1] = 0x01
+    mut node.view_mut().write_u16_le(2, value: 42)
+    mut node.view_mut().write_u32_le(4, value: partition.number)
+    mut node.view_mut().write_u64_le(8, value: partition.start)
+    mut node.view_mut().write_u64_le(16, value: partition.blocks)
+    match partition.signature {
+        boot::PartitionSignature.Gpt(guid) => {
+            mut node.view_mut().write_u32_le(24, value: guid.data1)
+            mut node.view_mut().write_u16_le(28, value: guid.data2)
+            mut node.view_mut().write_u16_le(30, value: guid.data3)
+            mut node.view_mut().write_u64_be(32, value: guid.data4)
+            node[40] = 0x02
+            node[41] = 0x02
+        }
+        boot::PartitionSignature.Mbr(signature) => {
+            mut node.view_mut().write_u32_le(24, value: signature)
+            node[40] = 0x01
+            node[41] = 0x01
+        }
+        boot::PartitionSignature.Unsigned => {
+            node[40] = 0x01
+        }
+    }
+    mut device.append(node.view())
+} hard_drive
+
+/// The file path media node of `path`, in UTF-16 with its NUL.
+fn file_node(mut device: mem::Bytes, path: Str, alloc: mem::Alloc) {
+    var name = mem::Bytes.empty(alloc)
+    push_utf16(mut name, text: path)
+    mut device.append(b"\x04\x04")
+    push_u16(mut device, value: u16.fit(name.len() + 4))
+    mut device.append(name.view())
+} file_node
+
+/// Whether the load option `raw` holds describes itself as `description`.
+validator fn describes(raw: Untrusted[Slice[u8]], description: Str) -> bool {
+    let bytes = raw.inspect()
+    var at: usize = 6
+    for byte in description.as_bytes() {
+        if at + 2 > bytes.len() or bytes.u16_le(at) != u16.widen(byte) {
+            return false
+        }
+        at += 2
+    }
+    return at + 2 <= bytes.len() and bytes.u16_le(at) == 0
+} describes
+
+/// The entry numbers `BootOrder` lists.
+validator fn order_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::List[u16] {
+    let bytes = raw.inspect()
+    var numbers = mem::List[u16].empty(alloc)
+    var at: usize = 0
+    while at + 2 <= bytes.len() {
+        mut numbers.push(bytes.u16_le(at))
+        at += 2
+    }
+    return numbers
+} order_of
+
+/// The variable name of boot entry `number`: `Boot` and four uppercase hexadecimal digits.
+fn entry_name(number: u16) -> text::Fixed[8] {
+    var name = text::Fixed[8].of("Boot")
+    var shift: u16 = 16
+    while shift > 0 {
+        shift -= 4
+        let digit = u8.truncate((number >> u32.widen(shift)) & 0xF)
+        mut name.push(char.checked_from_bits(u32.widen(hex_digit(digit))).value_or('0'))
+    }
+    return name
+} entry_name
+
+fn hex_digit(value: u8) -> u8 {
+    if value < 10 {
+        return b'0' + value
+    }
+    return b'A' + value - 10
+} hex_digit
+
+/// Non-volatile, reached during boot services and at run time.
+fn runtime_attributes() -> boot::VariableAttributes {
+    var attributes = boot::VariableAttributes.from_bits(0)
+    attributes.non_volatile = true
+    attributes.boot_service_access = true
+    attributes.runtime_access = true
+    return attributes
+} runtime_attributes
+
+/// Appends the ASCII text `text` in UTF-16LE, then its NUL.
+fn push_utf16(mut bytes: mem::Bytes, text: Str) {
+    for byte in text.as_bytes() {
+        push_u16(mut bytes, value: u16.widen(byte))
+    }
+    push_u16(mut bytes, value: 0)
+} push_utf16
+
+fn push_u16(mut bytes: mem::Bytes, value: u16) {
+    mut bytes.push(u8.truncate(value))
+    mut bytes.push(u8.truncate(value >> 8))
+} push_u16

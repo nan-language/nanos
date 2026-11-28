@@ -1,0 +1,125 @@
+//! Generation manifests, and the owner and loader requests the loader verifies.
+
+/// The principal of the owner, a manifest's signer when not a vendor.
+const OWNER_PRINCIPAL: Str = "owner"
+
+/// The vendor whose signatures a development loader accepts, and its key: the sandbox's, which signs the generations the sandbox installs.
+const SANDBOX_VENDOR: Str = "vendor.sandbox"
+
+const SANDBOX_KEY: Slice[u8] = b"\x67\x90\x22\x66\x5f\x9a\x2a\x6f\xcf\x96\x7c\xde\x5c\x2c\x90\x0e\x9b\x8a\x82\xd6\xed\x35\xec\x8b\x82\x9c\xf4\xb1\x2e\x39\x26\x2e"
+
+/// The files of a generation's directory.
+pub const MANIFEST_FILE: Str = "manifest"
+
+pub const KERNEL_FILE: Str = "kernel.elf"
+
+pub const INTERFACE_FILE: Str = "kernel.nlif"
+
+pub const GENESIS_FILE: Str = "genesis"
+
+pub const KEYRING_FILE: Str = "keyring.nbun"
+
+/// A generation's manifest: its number, the blob ids of its kernel image, its genesis record and its `keyring` bundle, the lowest loader version that boots it, the newest store format its kernel reads and writes, and its signer, `owner` or a `vendor.<name>` principal.
+pub closed struct Manifest derives Eq, Encode {
+    pub generation: u64
+    pub kernel: ident::HashValue
+    pub genesis: ident::HashValue
+    pub keyring: ident::HashValue
+    pub min_loader: u32
+    pub store_format: u32
+    pub signer: ident::Principal
+} Manifest
+
+/// The file `manifest` of a generation: its manifest and its signer's signatures over the manifest hash.
+pub closed struct SignedManifest derives Eq, Encode {
+    pub manifest: Manifest
+    pub signatures: mem::Bounded[ident::Signature, 2]
+} SignedManifest
+
+/// What a replacement of the owner key by signature signs: the stored key, the requested key and the requested recovery digest.
+pub closed struct OwnerKeyRequest derives Copy, Eq, Encode {
+    pub current: Array[u8, 32]
+    pub key: Array[u8, 32]
+    pub recovery: Array[u8, 32]
+} OwnerKeyRequest
+
+/// What a loader replacement signs: the new loader's blob id and its version.
+pub closed struct LoaderRequest derives Copy, Eq, Encode {
+    pub loader: ident::HashValue
+    pub version: u32
+} LoaderRequest
+
+/// The manifest hash: the hash of kind `manifest` of the manifest's wire bytes.
+pub fn Manifest.hash(self, alloc: mem::Alloc) -> ident::HashValue {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Manifest].encode(self, out: mut bytes)
+    return ident::HashValue.of_object(ident::Kind.Manifest, bytes: bytes.view())
+} Manifest.hash
+
+/// Whether the manifest is signed by the owner.
+pub fn Manifest.owners(self) -> bool = self.signer.text.as_str() == OWNER_PRINCIPAL
+
+/// The key the manifest's signatures verify with: the owner key `owner` for `owner`, and for a development loader's boots the sandbox vendor's key for `vendor.sandbox`; `None` for a signer of no known key.
+pub fn Manifest.signer_key(self, owner: Option[Array[u8, 32]], development: bool) -> Option[Array[u8, 32]] {
+    if self.owners() {
+        return owner
+    }
+    if development and self.signer.text.as_str() == SANDBOX_VENDOR {
+        var key = Array[u8, 32].filled(0)
+        mut key.view_mut().copy_from(SANDBOX_KEY)
+        return Some(key)
+    }
+    return None
+} Manifest.signer_key
+
+/// The signed manifest a `manifest` file holds, `None` when it does not decode.
+pub validator fn SignedManifest.read(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[SignedManifest] {
+    return match attempt mem::wire::Codec[SignedManifest].decode(raw, alloc) {
+        Ok(signed) => Some(take signed)
+        Err(_) => None
+    }
+} SignedManifest.read
+
+/// Whether one of the signatures verifies the manifest hash with the Ed25519 key `key`.
+pub fn SignedManifest.verifies(self, key: Array[u8, 32], alloc: mem::Alloc) -> bool {
+    let hash = self.manifest.hash(alloc)
+    for signature in self.signatures.view() {
+        if signature.verifies(key, object: hash) {
+            return true
+        }
+    }
+    return false
+} SignedManifest.verifies
+
+/// The hash of kind `request` the owner signs to replace its key.
+pub fn OwnerKeyRequest.hash(self, alloc: mem::Alloc) -> ident::HashValue {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[OwnerKeyRequest].encode(self, out: mut bytes)
+    return ident::HashValue.of_object(ident::Kind.Request, bytes: bytes.view())
+} OwnerKeyRequest.hash
+
+/// The hash of kind `request` the owner signs to replace the loader.
+pub fn LoaderRequest.hash(self, alloc: mem::Alloc) -> ident::HashValue {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[LoaderRequest].encode(self, out: mut bytes)
+    return ident::HashValue.of_object(ident::Kind.Request, bytes: bytes.view())
+} LoaderRequest.hash
+
+test manifests_hash_their_wire_bytes for SignedManifest.verifies {
+    let alloc = testing::world().alloc
+    let key = core::crypto::SecretKey.of_seed(Array[u8, 32].filled(3))
+    let manifest = Manifest(generation: 2, kernel: ident::HashValue.of_content(b"kernel"), genesis: ident::HashValue.of_content(b"genesis"), keyring: ident::HashValue.of_content(b"keyring"), min_loader: 1, store_format: 1, signer: ident::Principal(text: text::Fixed[64].of("vendor.nanos")))
+    let hash = manifest.hash(alloc)
+    var signatures = mem::Bounded[ident::Signature, 2].empty()
+    mut signatures.push(ident::Signature(bytes: key.sign(hash.bytes.view()).bytes))
+    let signed = SignedManifest(manifest: take manifest, signatures: signatures)
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[SignedManifest].encode(signed, out: mut bytes)
+    let Some(read) = SignedManifest.read(Untrusted.of(bytes.view()), alloc) else {
+        expect false
+        return
+    }
+    let verified = read.verifies(key.public_key().bytes, alloc)
+    let other = read.verifies(core::crypto::SecretKey.of_seed(Array[u8, 32].filled(4)).public_key().bytes, alloc)
+    expect verified and not other and not read.manifest.owners()
+} manifests_hash_their_wire_bytes

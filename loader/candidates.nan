@@ -1,0 +1,162 @@
+//! Step 4: the verification of a candidate, which reads its files into the file heap.
+
+/// The directory of the generations.
+const GENERATIONS_DIR: Str = "nanos/gen"
+
+/// A candidate that passed verification: its choice, its kernel image with the image's layout, blob id and move, and for a generation its manifest hash, its genesis record and its `keyring` bundle with their blob ids, zeros for the genesis record's when the image holds it.
+struct Candidate {
+    choice: bootfmt::Choice
+    image: Untrusted[mem::Bytes]
+    kernel: bootfmt::KernelImage
+    hash: Array[u8, 33]
+    moved: u64
+    manifest: Array[u8, 33]
+    genesis_hash: Array[u8, 33]
+    genesis: Option[Shipped]
+    keyring: Option[Shipped]
+} Candidate
+
+/// A file a generation ships, with its blob id.
+struct Shipped {
+    contents: Untrusted[mem::Bytes]
+    hash: Array[u8, 33]
+} Shipped
+
+/// The path of the file `name` of generation `generation`'s directory.
+fn generation_file(generation: u64, name: Str, alloc: mem::Alloc) -> text::String {
+    var path = text::String.of(GENERATIONS_DIR, alloc)
+    mut path.push('/')
+    push_number(mut path, value: generation)
+    mut path.push('/')
+    mut path.append(name)
+    return path
+} generation_file
+
+/// The generations whose directories `/nanos/gen` holds, by their decimal names.
+fn generation_directories(services: boot::Services, alloc: mem::Alloc) -> mem::List[u64] {
+    var found = mem::List[u64].empty(alloc)
+    let Ok(entries) = attempt services.list_directory(GENERATIONS_DIR, alloc) else {
+        return found
+    }
+    for entry in entries {
+        if not entry.directory {
+            continue
+        }
+        match generation_named(entry.name.view()) {
+            Some(number) => mut found.push(number)
+            None => {
+            }
+        }
+    }
+    return found
+} generation_directories
+
+/// The generation a directory's name writes in decimal, `None` for another name.
+validator fn generation_named(raw: Untrusted[Slice[u8]]) -> Option[u64] {
+    let bytes = raw.inspect()
+    if bytes.len() == 0 or bytes.len() > 19 {
+        return None
+    }
+    var value: u64 = 0
+    for byte in bytes {
+        if byte < b'0' or byte > b'9' {
+            return None
+        }
+        value = value * 10 + u64.widen(byte - b'0')
+    }
+    if value == 0 {
+        return None
+    }
+    return Some(value)
+} generation_named
+
+/// Verifies `choice`, its files read into `files`: a generation's manifest, signer, signatures, numbers, files and kernel image, or the `dev` candidate's `/kernel.elf`; the code of the first check failing otherwise.
+fn verify(
+    services: boot::Services,
+    choice: bootfmt::Choice,
+    record: bootfmt::BootRecord,
+    kept: Kept,
+    files: mem::Alloc,
+    alloc: mem::Alloc,
+    ) -> Candidate fails Code {
+    if choice.mode == bootfmt::Mode.Dev.to_bits() {
+        let image = try read_into(services, path: KERNEL_FILE, files)
+        return try candidate_of(services, choice, take image, manifest: Array[u8, 33].filled(0), genesis_hash: Array[u8, 33].filled(0), genesis: None, keyring: None, alloc)
+    }
+    let n = choice.generation
+    let Ok(raw) = attempt services.read_file(generation_file(n, name: bootfmt::MANIFEST_FILE, alloc).as_str(), alloc) else {
+        fail Code.ManifestUnreadable
+    }
+    let Some(signed) = bootfmt::SignedManifest.read(raw.view(), alloc) else {
+        fail Code.ManifestMalformed
+    }
+    let owner = match kept.owner {
+        Some(stored) => Some(stored.key)
+        None => None
+    }
+    let Some(key) = signed.manifest.signer_key(owner, development: DEVELOPMENT) else {
+        fail Code.SignerUnknown
+    }
+    if not signed.verifies(key, alloc) {
+        fail Code.SignatureInvalid
+    }
+    let manifest = signed.manifest
+    let slotted = choice.slot != bootfmt::Slot.Neither.to_bits() and record.slot(choice.slot).generation != n
+    if manifest.generation != n or slotted {
+        fail Code.GenerationMismatch
+    }
+    if n < kept.floor {
+        fail Code.BelowFloor
+    }
+    if manifest.min_loader > VERSION {
+        fail Code.LoaderTooOld
+    }
+    let image = try read_into(services, path: generation_file(n, name: bootfmt::KERNEL_FILE, alloc).as_str(), files)
+    let genesis = try shipped_file(services, path: generation_file(n, name: bootfmt::GENESIS_FILE, alloc).as_str(), expected: manifest.genesis, files)
+    let keyring = try shipped_file(services, path: generation_file(n, name: bootfmt::KEYRING_FILE, alloc).as_str(), expected: manifest.keyring, files)
+    if blob_id(image) != manifest.kernel.bytes {
+        fail Code.HashMismatch
+    }
+    let genesis_hash = genesis.hash
+    return try candidate_of(services, choice, take image, manifest: manifest.hash(alloc).bytes, genesis_hash, genesis: Some(take genesis), keyring: Some(take keyring), alloc)
+} verify
+
+/// The candidate of `choice` whose kernel image is `image`, once the image validates and lies in free memory.
+fn candidate_of(
+    services: boot::Services,
+    choice: bootfmt::Choice,
+    take image: Untrusted[mem::Bytes],
+    manifest: Array[u8, 33],
+    genesis_hash: Array[u8, 33],
+    take genesis: Option[Shipped],
+    take keyring: Option[Shipped],
+    alloc: mem::Alloc,
+    ) -> Candidate fails Code {
+    let Ok(kernel) = attempt bootfmt::KernelImage.read(image.view()) else {
+        fail Code.ImageMalformed
+    }
+    let Some(moved) = placement(services, image, kernel, alloc) else {
+        fail Code.Placement
+    }
+    let hash = blob_id(image)
+    return Candidate(choice: choice, image: take image, kernel: kernel, hash: hash, moved: moved, manifest: manifest, genesis_hash: genesis_hash, genesis: take genesis, keyring: take keyring)
+} candidate_of
+
+/// The file `path` read into the file heap, with its blob id once it is `expected`.
+fn shipped_file(services: boot::Services, path: Str, expected: ident::HashValue, files: mem::Alloc) -> Shipped fails Code {
+    let contents = try read_into(services, path, files)
+    let hash = blob_id(contents)
+    if hash != expected.bytes {
+        fail Code.HashMismatch
+    }
+    return Shipped(contents: take contents, hash: hash)
+} shipped_file
+
+/// The file `path` read into the file heap: `boot.too-large` when the heap cannot hold it, `boot.file-unreadable` when it cannot be read.
+fn read_into(services: boot::Services, path: Str, files: mem::Alloc) -> Untrusted[mem::Bytes] fails Code {
+    return match first attempt services.read_file(path, alloc: files) {
+        Ok(bytes) => bytes
+        Err(boot::ServiceError.OutOfMemory) => fail Code.TooLarge
+        Err(_) => fail Code.FileUnreadable
+    }
+} read_into

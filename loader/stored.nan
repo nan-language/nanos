@@ -1,0 +1,213 @@
+//! The floor and the owner record the loader keeps across boots: in boot-services UEFI variables and, on a machine with `tpm`, in TPM NV indices it write-locks for the rest of the boot.
+
+/// The NV indices of the floor and of the owner record.
+const FLOOR_INDEX: u32 = 0x0180_4E00
+
+const OWNER_INDEX: u32 = 0x0180_4E01
+
+/// The UEFI variables of the floor and of the owner record.
+const FLOOR_VARIABLE: Str = "NanosFloor"
+
+const OWNER_VARIABLE: Str = "NanosOwner"
+
+/// The bytes of the floor and of the owner record.
+const FLOOR_BYTES: u16 = 8
+
+const OWNER_BYTES: u16 = 64
+
+/// The attributes of the NV indices: TPMA_NV_AUTHWRITE, TPMA_NV_WRITE_STCLEAR, TPMA_NV_AUTHREAD and TPMA_NV_NO_DA of an ordinary index.
+const NV_ATTRIBUTES: u32 = 0x0204_4004
+
+/// The owner key and the digest of the owner's recovery code.
+struct OwnerRecord derives Copy, Eq {
+    key: Array[u8, 32]
+    recovery: Array[u8, 32]
+} OwnerRecord
+
+/// What one store holds: the floor and the owner record it holds, and whether the loader reaches it.
+struct Store derives Copy {
+    floor: Option[u64]
+    owner: Option[OwnerRecord]
+    reached: bool
+} Store
+
+/// What the loader keeps: the floor and the owner record as this boot leaves them, and what the variables and the NV indices held when it read them.
+struct Kept derives Copy {
+    floor: u64
+    owner: Option[OwnerRecord]
+    variables: Store
+    indices: Store
+} Kept
+
+/// What the variables and, on a machine with `tpm`, the NV indices hold, each index defined when absent: the floor the greater of the stored ones, 0 when none is, and the owner record the variable's when it exists, else the index's.
+fn Kept.read(services: boot::Services, tpm: bool, alloc: mem::Alloc) -> Kept {
+    let variables = variables_of(services, alloc)
+    var indices = Store(floor: None, owner: None, reached: false)
+    if tpm {
+        indices = indices_of(services, alloc)
+    }
+    let floor = variables.floor.value_or(0).max(indices.floor.value_or(0))
+    var owner = variables.owner
+    if owner.is_none() {
+        owner = indices.owner
+    }
+    return Kept(floor: floor, owner: owner, variables: variables, indices: indices)
+} Kept.read
+
+/// Writes the floor and the owner record into each store not holding them, the variables first, write-locks the NV indices until the TPM's next start, and returns whether each store holds the floor: the TPM first, then the variables.
+fn Kept.write(self, services: boot::Services, alloc: mem::Alloc) -> Array[bool, 2] {
+    var held = Array[bool, 2].filled(false)
+    if self.variables.reached {
+        var floor_held = self.variables.floor == Some(self.floor)
+        if not floor_held {
+            floor_held = set_variable(services, name: FLOOR_VARIABLE, data: floor_encoding(self.floor).view())
+        }
+        if self.owner.is_some() and self.variables.owner != self.owner {
+            discard set_variable(services, name: OWNER_VARIABLE, data: owner_encoding(self.owner).view())
+        }
+        held[1] = floor_held
+    }
+    if self.indices.reached {
+        var floor_held = self.indices.floor == Some(self.floor)
+        if not floor_held {
+            floor_held = nv_write(services, index: FLOOR_INDEX, data: floor_encoding(self.floor).view(), alloc)
+        }
+        if self.owner.is_some() and self.indices.owner != self.owner {
+            discard nv_write(services, index: OWNER_INDEX, data: owner_encoding(self.owner).view(), alloc)
+        }
+        let locked = submitted(services, command: tpm::nv_write_lock(FLOOR_INDEX, alloc), alloc) and submitted(services, command: tpm::nv_write_lock(OWNER_INDEX, alloc), alloc)
+        held[0] = floor_held and locked
+    }
+    return held
+} Kept.write
+
+/// What the variables hold, `reached` unless the firmware refuses to read them.
+fn variables_of(services: boot::Services, alloc: mem::Alloc) -> Store {
+    var store = Store(floor: None, owner: None, reached: true)
+    match first attempt services.get_variable(FLOOR_VARIABLE, vendor: NANOS_GUID, alloc) {
+        Ok(variable) => {
+            store.floor = floor_of(variable.data.view())
+        }
+        Err(boot::ServiceError.NotFound) => {
+        }
+        Err(_) => {
+            store.reached = false
+        }
+    }
+    match attempt services.get_variable(OWNER_VARIABLE, vendor: NANOS_GUID, alloc) {
+        Ok(variable) => {
+            store.owner = owner_of(variable.data.view())
+        }
+        else => {
+        }
+    }
+    return store
+} variables_of
+
+/// What the NV indices hold, each defined when absent, `reached` when both exist.
+fn indices_of(services: boot::Services, alloc: mem::Alloc) -> Store {
+    let floor = nv_value(services, index: FLOOR_INDEX, size: FLOOR_BYTES, alloc)
+    let owner = nv_value(services, index: OWNER_INDEX, size: OWNER_BYTES, alloc)
+    var store = Store(floor: None, owner: None, reached: floor.defined and owner.defined)
+    match floor.value {
+        Some(bytes) => {
+            store.floor = floor_of(bytes.view())
+        }
+        None => {
+        }
+    }
+    match owner.value {
+        Some(bytes) => {
+            store.owner = owner_of(bytes.view())
+        }
+        None => {
+        }
+    }
+    return store
+} indices_of
+
+/// What an NV index holds: whether it is defined, the loader defining it when absent, and its bytes once written.
+struct NvValue {
+    defined: bool
+    value: Option[Untrusted[mem::Bytes]]
+} NvValue
+
+fn nv_value(services: boot::Services, index: u32, size: u16, alloc: mem::Alloc) -> NvValue {
+    match attempt answer(services, command: tpm::nv_read(index, offset: 0, count: size, alloc), sessions: true, alloc) {
+        Ok(response) => match attempt tpm::sized(response.parameters.view(), alloc) {
+            Ok(bytes) => return NvValue(defined: true, value: Some(take bytes))
+            Err(_) => return NvValue(defined: true, value: None)
+        }
+        Err(error) => {
+            if error.absent() {
+                return NvValue(defined: submitted(services, command: tpm::nv_define_space(index, size, attributes: NV_ATTRIBUTES, alloc), alloc), value: None)
+            }
+            return NvValue(defined: error.out_of_range(), value: None)
+        }
+    }
+} nv_value
+
+fn nv_write(services: boot::Services, index: u32, data: Slice[u8], alloc: mem::Alloc) -> bool {
+    return submitted(services, command: tpm::nv_write(index, offset: 0, data, alloc), alloc)
+} nv_write
+
+/// Whether the TPM ran `command`, one with an authorization area, successfully.
+fn submitted(services: boot::Services, command: mem::Bytes, alloc: mem::Alloc) -> bool {
+    return (attempt answer(services, command, sessions: true, alloc)).is_ok()
+} submitted
+
+/// The TPM's response to `command`, through the firmware.
+fn answer(services: boot::Services, command: mem::Bytes, sessions: bool, alloc: mem::Alloc) -> tpm::Response fails tpm::TpmError {
+    let Ok(raw) = attempt services.submit_tpm(command.view(), alloc) else {
+        fail tpm::TpmError.Malformed
+    }
+    return try tpm::Response.read(raw.view(), handle: false, sessions, alloc)
+} answer
+
+fn set_variable(services: boot::Services, name: Str, data: Slice[u8]) -> bool {
+    var attributes = boot::VariableAttributes.from_bits(0)
+    attributes.non_volatile = true
+    attributes.boot_service_access = true
+    return (attempt services.set_variable(name, vendor: NANOS_GUID, attributes, data)).is_ok()
+} set_variable
+
+/// The floor 8 stored bytes hold, little-endian.
+validator fn floor_of(raw: Untrusted[Slice[u8]]) -> Option[u64] {
+    let bytes = raw.inspect()
+    if bytes.len() != usize.widen(FLOOR_BYTES) {
+        return None
+    }
+    return Some(bytes.u64_le(0))
+} floor_of
+
+/// The owner record 64 stored bytes hold: the key, then the recovery digest.
+validator fn owner_of(raw: Untrusted[Slice[u8]]) -> Option[OwnerRecord] {
+    let bytes = raw.inspect()
+    if bytes.len() != usize.widen(OWNER_BYTES) {
+        return None
+    }
+    var record = OwnerRecord(key: Array[u8, 32].filled(0), recovery: Array[u8, 32].filled(0))
+    for at in 0..<32usize {
+        record.key[at] = bytes[at]
+        record.recovery[at] = bytes[32 + at]
+    }
+    return Some(record)
+} owner_of
+
+fn floor_encoding(floor: u64) -> Array[u8, 8] {
+    var bytes = Array[u8, 8].filled(0)
+    mut bytes.view_mut().write_u64_le(0, value: floor)
+    return bytes
+} floor_encoding
+
+fn owner_encoding(owner: Option[OwnerRecord]) -> Array[u8, 64] {
+    var bytes = Array[u8, 64].filled(0)
+    let Some(record) = owner else {
+        return bytes
+    }
+    for at in 0..<32usize {
+        bytes[at] = record.key[at]
+        bytes[32 + at] = record.recovery[at]
+    }
+    return bytes
+} owner_encoding

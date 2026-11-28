@@ -1,46 +1,60 @@
-//! The NaN OS boot loader: it chooses a candidate by the boot record, verifies it and enters the kernel with the handoff record.
+//! The NaN OS boot loader: it reads the boot record, applies its requests, chooses and verifies a candidate, raises the floor, writes the record, measures the candidate and enters the kernel with the handoff record.
 
-/// Whether this is a development loader, which boots `/kernel.elf` unverified in `dev` mode.
+/// Whether this is a development loader, which also boots `/kernel.elf` unverified in `dev` mode.
 pub const DEVELOPMENT: bool = true
 
 /// The loader's version.
 pub const VERSION: u32 = 1
 
+/// The development kernel image at the boot volume's root, and its interface file.
 const KERNEL_FILE: Str = "kernel.elf"
+
+const INTERFACE_FILE: Str = "kernel.nlif"
 
 /// The files of a development boot's `nan` job: the toolchain's image and its closure hash.
 const TOOLCHAIN_IMAGE_FILE: Str = "nan.nbun"
 
 const TOOLCHAIN_TREE_FILE: Str = "nan.ntree"
 
-/// The interface file of the kernel image.
-const INTERFACE_FILE: Str = "kernel.nlif"
-
-/// The file of the `keyring` bundle, which runs `keys`.
+/// The file of the `keyring` bundle a development boot passes, which runs `keys`.
 const KEYRING_FILE: Str = "keyring.nbun"
 
 const RECORD_FILE: Str = "nanos/boot.rec"
 
 const BACKUP_FILE: Str = "nanos/boot.bak"
 
+/// The modules of the genesis record and of the `keyring` bundle a generation passes.
+const GENESIS_MODULE: Slice[u8] = b"genesis"
+
+const KEYRING_MODULE: Slice[u8] = b"keyring.nbun"
+
+/// The key of the console that requests recovery.
+const RECOVERY_CHAR: char = 'r'
+
+/// The GUIDs of NaN OS's UEFI variables and of the firmware's global ones.
+const NANOS_GUID: boot::Guid = boot::Guid(data1: 0x032E_8F8B, data2: 0x8377, data3: 0x431E, data4: 0x9BAE_10C4_16C2_1BEF)
+
+const GLOBAL_GUID: boot::Guid = boot::Guid(data1: 0x8BE4_DF61, data2: 0x93CA, data3: 0x11D2, data4: 0xAA0D_00E0_9803_2B8C)
+
 /// A failure the loader prints on the firmware console.
 enum Code derives Copy, Eq {
     RecordInvalid
-    RecordUnwritable
+    TriesExhausted
+    ManifestUnreadable
+    ManifestMalformed
+    SignerUnknown
+    SignatureInvalid
+    GenerationMismatch
+    BelowFloor
+    LoaderTooOld
     FileUnreadable
     TooLarge
+    HashMismatch
     ImageMalformed
     Placement
+    RecordUnwritable
     NoneBootable
 } Code
-
-/// A kernel image that passed verification, with its blob id and how far its segments and entry move from their linked addresses.
-struct Candidate {
-    image: Untrusted[mem::Bytes]
-    kernel: bootfmt::KernelImage
-    hash: Array[u8, 33]
-    moved: u64
-} Candidate
 
 fn main(take m: boot::Machine) -> Never limits stack 65_536 {
     let cpu = mut m.ring0()
@@ -59,7 +73,27 @@ fn main(take m: boot::Machine) -> Never limits stack 65_536 {
 } main
 
 /// The steps before the hand-off: `None` when the loader stops.
-fn prepare(services: boot::Services, alloc: mem::Alloc, entry_counter: u64) -> Option[boot::Image] {
+fn prepare(services: boot::Services, alloc: mem::Alloc, entry_counter: u64) -> Option[boot::Image]
+    waive length "it carries out the loader's steps in their order"
+{
+    var handoff = bootfmt::Handoff.empty()
+    handoff.flags.development = DEVELOPMENT
+    handoff.loader_version = VERSION
+    handoff.entry_counter = entry_counter
+    let Ok(boot_device) = attempt services.boot_device(alloc) else {
+        report(services, code: Code.FileUnreadable, generation: 0)
+        return None
+    }
+    let own = file_path(boot_device.file.view(), alloc)
+    let Some(own_hash) = loader_hash(services, own, alloc) else {
+        report(services, code: Code.FileUnreadable, generation: 0)
+        return None
+    }
+    handoff.loader_hash = own_hash
+    describe_volume(boot_device.partition, mut handoff)
+    let tpm = tpm_active(services, alloc)
+    handoff.conditions.tpm = tpm
+    handoff.conditions.secure_boot = secure_boot(services, alloc)
     let held = read_record(services, alloc)
     var record = bootfmt::BootRecord.empty()
     match held {
@@ -68,45 +102,247 @@ fn prepare(services: boot::Services, alloc: mem::Alloc, entry_counter: u64) -> O
         }
         None => report(services, code: Code.RecordInvalid, generation: 0)
     }
-    let Some(candidate) = dev_candidate(services, alloc) else {
+    handoff.flags.recovery_requested = recovery_key(services)
+    var kept = Kept.read(services, tpm, alloc)
+    apply_owner_request(record, mut kept, mut handoff, alloc)
+    apply_loader_request(services, record, kept, own, volume: boot_device.partition, mut handoff, alloc)
+    let directories = generation_directories(services, alloc)
+    var listing = mut record.choices(recovery: handoff.flags.recovery_requested or held.is_none(), directories: directories.view(), alloc)
+    match listing.exhausted {
+        Some(slot) => report(services, code: Code.TriesExhausted, generation: record.slot(slot).generation)
+        None => {
+        }
+    }
+    if DEVELOPMENT {
+        mut listing.choices.push(bootfmt::Choice(generation: 0, mode: bootfmt::Mode.Dev.to_bits(), slot: bootfmt::Slot.Neither.to_bits()))
+    }
+    let Some(files) = file_heap(services, alloc) else {
+        report(services, code: Code.TooLarge, generation: 0)
+        return None
+    }
+    let Some(chosen) = choose(services, mut record, held, choices: listing.choices.view(), mut kept, mut handoff, files: files.alloc(), alloc) else {
         report(services, code: Code.NoneBootable, generation: 0)
         return None
     }
-    let device = attempt services.boot_device(alloc)
-    let Ok(boot_device) = device else {
-        report(services, code: Code.FileUnreadable, generation: 0)
-        return None
+    let mode = mode_name(chosen.choice.mode)
+    if tpm {
+        measure(services, candidate: chosen, mode)
     }
-    let Some(own_hash) = loader_hash(services, device: boot_device, alloc) else {
-        report(services, code: Code.FileUnreadable, generation: 0)
-        return None
-    }
-    record.boot_counter = record.boot_counter.wrapping_add(1)
-    record.next_once = bootfmt::NextOnce.Unset.to_bits()
-    var handoff = bootfmt::Handoff.empty()
-    handoff.flags.record_written = write_record(services, written: record.write_over(held))
-    handoff.flags.development = DEVELOPMENT
-    handoff.boot_counter = record.boot_counter
-    handoff.loader_version = VERSION
-    handoff.mode = bootfmt::Mode.Dev.to_bits()
-    handoff.kernel_hash = candidate.hash
-    handoff.loader_hash = own_hash
-    handoff.entry_counter = entry_counter
-    describe_volume(boot_device.partition, mut handoff)
     let drawn = attempt services.random(mut handoff.entropy.view_mut())
     handoff.flags.entropy = drawn.is_ok()
-    proceed(services, generation: 0, slot: bootfmt::Slot.Neither, mode: "dev")
-    let Some(segments) = place(services, candidate, alloc) else {
-        report(services, code: Code.Placement, generation: 0)
+    let log = event_log(services, tpm, alloc)
+    handoff.event_log_size = u64.widen(log.byte_len())
+    let stored = kept.write(services, alloc)
+    handoff.flags.floor_in_tpm = stored[0]
+    handoff.flags.floor_in_variable = stored[1]
+    proceed(services, generation: chosen.choice.generation, slot: chosen.choice.slot, mode: mode.as_str())
+    let Some(segments) = place(services, candidate: chosen, alloc) else {
+        report(services, code: Code.Placement, generation: chosen.choice.generation)
         return None
     }
     var modules = mem::List[boot::ModuleSource].empty(alloc)
     mut modules.push(module(b"handoff", contents: handoff.to_bits().view(), alloc))
-    pass_toolchain(services, mut modules, alloc)
-    pass_file(services, mut modules, name: INTERFACE_FILE, alloc)
-    pass_file(services, mut modules, name: KEYRING_FILE, alloc)
-    return Some(boot::Image(entry: candidate.kernel.entry + candidate.moved, segments: take segments, modules: take modules, command_line: mem::Bytes.empty(alloc)))
+    pass_shipped(mut modules, name: GENESIS_MODULE, file: take chosen.genesis, alloc)
+    pass_file(services, mut modules, path: interface_of(chosen.choice.generation, alloc).as_str(), name: INTERFACE_FILE, alloc)
+    if chosen.keyring.is_some() {
+        pass_shipped(mut modules, name: KEYRING_MODULE, file: take chosen.keyring, alloc)
+    } else {
+        pass_file(services, mut modules, path: KEYRING_FILE, name: KEYRING_FILE, alloc)
+    }
+    if chosen.choice.mode == bootfmt::Mode.Dev.to_bits() {
+        pass_toolchain(services, mut modules, alloc)
+    }
+    if log.byte_len() > 0 {
+        mut modules.push(boot::ModuleSource(name: name_of(EVENT_LOG_MODULE, alloc), contents: take log))
+    }
+    let entry = chosen.kernel.entry + chosen.moved
+    return Some(boot::Image(entry: entry, segments: take segments, modules: take modules, command_line: mem::Bytes.empty(alloc)))
 } prepare
+
+/// Steps 4 to 6: verifies the choices in order, reporting each failure, recording up to four in the handoff record and setting a failing slot `bad` unless its manifest or files are unreadable or it needs a newer loader. For the first that passes, it raises the floor in `normal` mode and writes the record; when that write fails, it abandons a `trial` candidate for the next not in `trial` mode, and boots any other with the record unwritten. It fills the boot's fields of the handoff record.
+fn choose(
+    services: boot::Services,
+    mut record: bootfmt::BootRecord,
+    held: Option[bootfmt::Held],
+    choices: Slice[bootfmt::Choice],
+    mut kept: Kept,
+    mut handoff: bootfmt::Handoff,
+    files: mem::Alloc,
+    alloc: mem::Alloc,
+    ) -> Option[Candidate] {
+    var trials = true
+    for choice in choices {
+        if not trials and choice.mode == bootfmt::Mode.Trial.to_bits() {
+            continue
+        }
+        let verified = attempt verify(services, choice, record, kept, files, alloc)
+        let Ok(candidate) = verified else {
+            let Err(code) = verified else {
+                continue
+            }
+            report(services, code, generation: choice.generation)
+            failed(mut handoff, generation: choice.generation, code)
+            if choice.slot != bootfmt::Slot.Neither.to_bits() and not keeps_slot(code) {
+                var entry = record.slot(choice.slot)
+                entry.state = bootfmt::SlotState.Bad.to_bits()
+                mut record.set_slot(choice.slot, held: entry)
+            }
+            continue
+        }
+        if choice.mode == bootfmt::Mode.Normal.to_bits() {
+            let raised = record.raised_floor(kept.floor, booting: choice.generation)
+            handoff.flags.floor_raised = raised > kept.floor
+            kept.floor = raised
+            record.floor_request = 0
+        }
+        var written = record
+        written.boot_counter = record.boot_counter.wrapping_add(1)
+        written.next_once = bootfmt::NextOnce.Unset.to_bits()
+        var tries: u8 = 0
+        if choice.slot != bootfmt::Slot.Neither.to_bits() {
+            var entry = written.slot(choice.slot)
+            if choice.mode == bootfmt::Mode.Trial.to_bits() {
+                entry.tries -= 1
+            }
+            tries = entry.tries
+            mut written.set_slot(choice.slot, held: entry)
+        }
+        cleared_requests(mut written)
+        let stored = write_record(services, held: written.write_over(held))
+        if not stored {
+            report(services, code: Code.RecordUnwritable, generation: choice.generation)
+            if choice.mode == bootfmt::Mode.Trial.to_bits() {
+                trials = false
+                continue
+            }
+        }
+        handoff.flags.record_written = stored
+        handoff.generation = choice.generation
+        handoff.mode = choice.mode
+        handoff.slot = choice.slot
+        handoff.tries = tries
+        handoff.floor = kept.floor
+        handoff.boot_counter = written.boot_counter
+        handoff.kernel_hash = candidate.hash
+        handoff.manifest_hash = candidate.manifest
+        handoff.genesis_hash = candidate.genesis_hash
+        match kept.owner {
+            Some(owner) => {
+                handoff.owner_key = owner.key
+                handoff.recovery_digest = owner.recovery
+            }
+            None => {
+            }
+        }
+        return Some(take candidate)
+    }
+    return None
+} choose
+
+/// Whether a candidate failing with `code` keeps its slot's state: its manifest or files unreadable, or a newer loader needed.
+fn keeps_slot(code: Code) -> bool {
+    return code == Code.ManifestUnreadable or code == Code.FileUnreadable or code == Code.LoaderTooOld
+} keeps_slot
+
+/// Records a candidate failure in the handoff record, the first four only.
+fn failed(mut handoff: bootfmt::Handoff, generation: u64, code: Code) {
+    let at = usize.widen(handoff.failure_count)
+    if at >= handoff.failures.len() {
+        return
+    }
+    handoff.failures[at].generation = generation
+    let name = code_name(code)
+    let bytes = name.as_str().as_bytes()
+    for i in 0..<bytes.len() {
+        if i < handoff.failures[at].code.len() {
+            handoff.failures[at].code[i] = bytes[i]
+        }
+    }
+    handoff.failure_count += 1
+} failed
+
+/// Clears the owner and loader requests, which step 2 handled.
+fn cleared_requests(mut record: bootfmt::BootRecord) {
+    record.owner_request_kind = bootfmt::OwnerRequestKind.Absent.to_bits()
+    record.owner_request_key = Array[u8, 32].filled(0)
+    record.owner_request_recovery = Array[u8, 32].filled(0)
+    record.owner_request_proof = Array[u8, 64].filled(0)
+    record.loader_request = Array[u8, 33].filled(0)
+    record.loader_request_version = 0
+    record.loader_request_signature = Array[u8, 64].filled(0)
+} cleared_requests
+
+/// Whether the key pending on the console is `r`, which requests recovery.
+fn recovery_key(services: boot::Services) -> bool {
+    let Ok(Some(key)) = attempt services.read_key(timeout_ms: 0) else {
+        return false
+    }
+    return key.text == Some(RECOVERY_CHAR)
+} recovery_key
+
+/// Whether the TPM the firmware reaches has an active SHA-256 PCR bank.
+fn tpm_active(services: boot::Services, alloc: mem::Alloc) -> bool {
+    let Ok(response) = attempt answer(services, command: tpm::pcr_banks(alloc), sessions: false, alloc) else {
+        return false
+    }
+    return match attempt tpm::sha256_active(response.parameters.view()) {
+        Ok(active) => active
+        Err(_) => false
+    }
+} tpm_active
+
+/// Whether the firmware enforces secure boot: `SecureBoot` holds 1 and `SetupMode` 0.
+fn secure_boot(services: boot::Services, alloc: mem::Alloc) -> bool {
+    return variable_byte(services, name: "SecureBoot", alloc) == Some(1) and variable_byte(services, name: "SetupMode", alloc) == Some(0)
+} secure_boot
+
+/// The one byte the global variable `name` holds.
+fn variable_byte(services: boot::Services, name: Str, alloc: mem::Alloc) -> Option[u8] {
+    let Ok(variable) = attempt services.get_variable(name, vendor: GLOBAL_GUID, alloc) else {
+        return None
+    }
+    return single_byte(variable.data.view())
+} variable_byte
+
+validator fn single_byte(raw: Untrusted[Slice[u8]]) -> Option[u8] {
+    let bytes = raw.inspect()
+    if bytes.len() != 1 {
+        return None
+    }
+    return Some(bytes[0])
+} single_byte
+
+/// The firmware's TPM event log, empty without `tpm`.
+fn event_log(services: boot::Services, tpm: bool, alloc: mem::Alloc) -> Untrusted[mem::Bytes] {
+    if not tpm {
+        return Untrusted.of(mem::Bytes.empty(alloc))
+    }
+    return match attempt services.event_log(alloc) {
+        Ok(log) => log.bytes
+        Err(_) => Untrusted.of(mem::Bytes.empty(alloc))
+    }
+} event_log
+
+/// The interface file beside the kernel image of generation `generation`, `/kernel.nlif` beside the development image.
+fn interface_of(generation: u64, alloc: mem::Alloc) -> text::String {
+    if generation == 0 {
+        return text::String.of(INTERFACE_FILE, alloc)
+    }
+    return generation_file(generation, name: bootfmt::INTERFACE_FILE, alloc)
+} interface_of
+
+fn mode_name(mode: u8) -> text::Fixed[16] {
+    if mode == bootfmt::Mode.Trial.to_bits() {
+        return text::Fixed[16].of("trial")
+    }
+    if mode == bootfmt::Mode.Recovery.to_bits() {
+        return text::Fixed[16].of("recovery")
+    }
+    if mode == bootfmt::Mode.Dev.to_bits() {
+        return text::Fixed[16].of("dev")
+    }
+    return text::Fixed[16].of("normal")
+} mode_name
 
 /// The record the two copies hold, each read through its validator.
 fn read_record(services: boot::Services, alloc: mem::Alloc) -> Option[bootfmt::Held] {
@@ -123,57 +359,18 @@ fn read_copy(services: boot::Services, path: Str, alloc: mem::Alloc) -> Option[b
 } read_copy
 
 /// Writes the record to its copy, reporting whether the write succeeded.
-fn write_record(services: boot::Services, written: bootfmt::Held) -> bool {
+fn write_record(services: boot::Services, held: bootfmt::Held) -> bool {
     var path = RECORD_FILE
-    if written.copy == 1 {
+    if held.copy == 1 {
         path = BACKUP_FILE
     }
-    let bits = written.record.to_bits()
-    let outcome = attempt services.write_file(path, data: bits.view())
-    if outcome.is_err() {
-        report(services, code: Code.RecordUnwritable, generation: 0)
-        return false
-    }
-    return true
+    let bits = held.record.to_bits()
+    return (attempt services.write_file(path, data: bits.view())).is_ok()
 } write_record
 
-/// The `dev` candidate, `/kernel.elf`, when it reads into the file heap, is a kernel image and lies in free memory.
-fn dev_candidate(services: boot::Services, alloc: mem::Alloc) -> Option[Candidate] {
-    if not DEVELOPMENT {
-        return None
-    }
-    let Some(files) = file_heap(services, alloc) else {
-        report(services, code: Code.TooLarge, generation: 0)
-        return None
-    }
-    let read = attempt services.read_file(KERNEL_FILE, alloc: files.alloc())
-    let image = match first read {
-        Ok(bytes) => bytes
-        Err(boot::ServiceError.OutOfMemory) => {
-            report(services, code: Code.TooLarge, generation: 0)
-            return None
-        }
-        Err(_) => {
-            report(services, code: Code.FileUnreadable, generation: 0)
-            return None
-        }
-    }
-    let validated = attempt bootfmt::KernelImage.read(image.view())
-    let Ok(kernel) = validated else {
-        report(services, code: Code.ImageMalformed, generation: 0)
-        return None
-    }
-    let Some(moved) = placement(services, image, kernel, alloc) else {
-        report(services, code: Code.Placement, generation: 0)
-        return None
-    }
-    let hash = blob_id(image)
-    return Some(Candidate(image: take image, kernel: kernel, hash: hash, moved: moved))
-} dev_candidate
-
-/// The blob id of the loader's own file, which `device` names.
-fn loader_hash(services: boot::Services, device: boot::BootDevice, alloc: mem::Alloc) -> Option[Array[u8, 33]] {
-    let Some(path) = file_path(device.file.view(), alloc) else {
+/// The blob id of the loader's own file, at `own`.
+fn loader_hash(services: boot::Services, own: Option[text::String], alloc: mem::Alloc) -> Option[Array[u8, 33]] {
+    let Some(path) = own else {
         return None
     }
     let Ok(bytes) = attempt services.read_file(path.as_str(), alloc) else {
@@ -225,14 +422,6 @@ fn pass_toolchain(services: boot::Services, mut modules: mem::List[boot::ModuleS
     mut modules.push(boot::ModuleSource(name: name_of(TOOLCHAIN_TREE_FILE, alloc), contents: take tree))
 } pass_toolchain
 
-/// Passes the kernel the file `name` when the boot volume holds it, as the module of its name.
-fn pass_file(services: boot::Services, mut modules: mem::List[boot::ModuleSource], name: Str, alloc: mem::Alloc) {
-    let Ok(contents) = attempt services.read_file(name, alloc) else {
-        return
-    }
-    mut modules.push(boot::ModuleSource(name: name_of(name, alloc), contents: take contents))
-} pass_file
-
 fn name_of(name: Str, alloc: mem::Alloc) -> mem::Bytes {
     var bytes = mem::Bytes.empty(alloc)
     mut bytes.append(name.as_bytes())
@@ -269,35 +458,6 @@ fn read_counter(cpu: Option[hw::Ring0]) -> u64 {
     }
 } read_counter
 
-fn report(services: boot::Services, code: Code, generation: u64) {
-    let name = match code {
-        Code.RecordInvalid => "boot.record-invalid"
-        Code.RecordUnwritable => "boot.record-unwritable"
-        Code.FileUnreadable => "boot.file-unreadable"
-        Code.TooLarge => "boot.too-large"
-        Code.ImageMalformed => "boot.image-malformed"
-        Code.Placement => "boot.placement"
-        Code.NoneBootable => "boot.none-bootable"
-    }
-    var line = text::Fixed[80].of("loader: ")
-    mut line.append(name)
-    mut line.append(" generation ")
-    push_decimal(mut line, value: generation)
-    mut line.push('\n')
-    discard attempt services.write_console(line.as_str())
-} report
-
-fn proceed(services: boot::Services, generation: u64, slot: bootfmt::Slot, mode: Str) {
-    var line = text::Fixed[80].of("loader: generation ")
-    push_decimal(mut line, value: generation)
-    mut line.append(" slot ")
-    push_decimal(mut line, value: u64.widen(slot.to_bits()))
-    mut line.append(" mode ")
-    mut line.append(mode)
-    mut line.push('\n')
-    discard attempt services.write_console(line.as_str())
-} proceed
-
 fn push_decimal(mut line: text::Fixed[80], value: u64) {
     var digits = Array[u8, 20].filled(0)
     var count: usize = 0
@@ -315,3 +475,80 @@ fn push_decimal(mut line: text::Fixed[80], value: u64) {
         mut line.push(char.checked_from_bits(0x30 + u32.widen(digits[count])).value_or('0'))
     }
 } push_decimal
+
+/// Passes the kernel the file `path` when the boot volume holds it, as the module `name`.
+fn pass_file(
+    services: boot::Services,
+    mut modules: mem::List[boot::ModuleSource],
+    path: Str,
+    name: Str,
+    alloc: mem::Alloc,
+    ) {
+    let Ok(contents) = attempt services.read_file(path, alloc) else {
+        return
+    }
+    mut modules.push(boot::ModuleSource(name: name_of(name, alloc), contents: take contents))
+} pass_file
+
+/// Passes the kernel the file a generation ships, when it ships one, as the module `name`.
+fn pass_shipped(mut modules: mem::List[boot::ModuleSource], name: Slice[u8], take file: Option[Shipped], alloc: mem::Alloc) {
+    let Some(shipped) = file else {
+        return
+    }
+    let Shipped(contents: contents, hash: _) = shipped
+    var named = mem::Bytes.empty(alloc)
+    mut named.append(name)
+    mut modules.push(boot::ModuleSource(name: take named, contents: take contents))
+} pass_shipped
+
+/// The name of a failure's code.
+fn code_name(code: Code) -> text::Fixed[32] {
+    let name = match code {
+        Code.RecordInvalid => "boot.record-invalid"
+        Code.TriesExhausted => "boot.tries-exhausted"
+        Code.ManifestUnreadable => "boot.manifest-unreadable"
+        Code.ManifestMalformed => "boot.manifest-malformed"
+        Code.SignerUnknown => "boot.signer-unknown"
+        Code.SignatureInvalid => "boot.signature-invalid"
+        Code.GenerationMismatch => "boot.generation-mismatch"
+        Code.BelowFloor => "boot.below-floor"
+        Code.LoaderTooOld => "boot.loader-too-old"
+        Code.FileUnreadable => "boot.file-unreadable"
+        Code.TooLarge => "boot.too-large"
+        Code.HashMismatch => "boot.hash-mismatch"
+        Code.ImageMalformed => "boot.image-malformed"
+        Code.Placement => "boot.placement"
+        Code.RecordUnwritable => "boot.record-unwritable"
+        Code.NoneBootable => "boot.none-bootable"
+    }
+    return text::Fixed[32].of(name)
+} code_name
+
+/// Prints `loader: <code> generation <n>` on the firmware console.
+fn report(services: boot::Services, code: Code, generation: u64) {
+    var line = text::Fixed[80].of("loader: ")
+    mut line.append(code_name(code).as_str())
+    mut line.append(" generation ")
+    push_decimal(mut line, value: generation)
+    mut line.push('\n')
+    discard attempt services.write_console(line.as_str())
+} report
+
+/// Prints `loader: generation <n> slot <slot> mode <mode>` on the firmware console.
+fn proceed(services: boot::Services, generation: u64, slot: u8, mode: Str) {
+    var line = text::Fixed[80].of("loader: generation ")
+    push_decimal(mut line, value: generation)
+    mut line.append(" slot ")
+    push_decimal(mut line, value: u64.widen(slot))
+    mut line.append(" mode ")
+    mut line.append(mode)
+    mut line.push('\n')
+    discard attempt services.write_console(line.as_str())
+} proceed
+
+/// Appends the decimal `value` to `path`.
+fn push_number(mut path: text::String, value: u64) {
+    var digits = text::Fixed[80].of("")
+    push_decimal(mut digits, value)
+    mut path.append(digits.as_str())
+} push_number

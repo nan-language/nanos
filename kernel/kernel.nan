@@ -55,6 +55,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536
     var memory = frames::Memory.build(take regions, plan, usable: usable_bytes(k.memory_map(alloc)), image: image_bytes(segments.view()), scratch: alloc)
     grow_heap(k, mut memory)
     let keyring = shipping.keyring(alloc)
+    let passed = shipping.genesis(alloc)
     let interfaces = shipping.interfaces(support, alloc)
     let shipped = shipped_toolchain(take shipping, loader, ram: plan.ram, mut memory, alloc)
     let core = memory.core.alloc()
@@ -74,6 +75,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536
     }
     let clock = k.clock()
     let wall = start_wall(tables.fadt, clock)
+    let reset = reset_of(tables.fadt)
     let rings = rings::Rings.of(cpus, clock, boot: handoff.boot_counter, alloc: core)
     rings.record_boot(handoff)
     let iommu = enabled_iommu(mut k, dmar: tables.dmar, rings, alloc)
@@ -81,7 +83,14 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536
     mut k.policy(sched::Scheduler.of(state.share()))
     let facts = Facts(cpus: cpus, nodes: nodes.count(), ram_bytes: ram, features: features, conditions: handoff.conditions, iommu: iommu.is_some(), user_mode: spaces::user_window(extents.view()) <= USER_WINDOW_LIMIT)
     let bundle = ident::HashValue(bytes: handoff.kernel_hash)
-    let known = image_genesis(bundle, handoff, alloc: core)
+    let recorded = genesis::Image(bundle: bundle, support: support, bytes: memory.fixed.image)
+    let jobs = genesis::Jobs.of(bundle, tree: toolchain_tree(shipped), alloc: core)
+    let Some(record) = boot_genesis(mint_shipped(passed), handoff, image: recorded, jobs, alloc: core) else {
+        halt(code: "fault.handoff-invalid", subject: "genesis")
+    }
+    let Some(known) = known_of(take record, alloc: core) else {
+        halt(code: "fault.handoff-invalid", subject: "genesis")
+    }
     let keeper = keeper_of(mut k, take tables, source, take iommu, alloc: core)
     let drawing = random::Drawing.of(take source, alloc: core)
     let Ok(drawn) = attempt drawing.random() else {
@@ -90,7 +99,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536
         }
     }
     let spacing = loader_of(k)
-    take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state, take known, take keeper, take rings, take loader, take spacing, take shipped, take keyring, take interfaces](exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
+    take k.anchor(Unit, run: fn[take cpu, take roots, take memory, take state, take known, take keeper, take rings, take loader, take spacing, take shipped, take keyring, take passed, take interfaces](exec: task::Executor) fails task::Cancelled uses wait limits stack 32_768 {
         discard attempt await start_cpus(cpu, take roots, features, state, frames: mut memory.frames, exec)
         state.contents().all_started()
         discard attempt await low.release(cpu)
@@ -103,13 +112,24 @@ fn main(take k: boot::Kernel) -> Never limits stack 65_536
             halt(code: "fault.memory-insufficient", subject: "hibernation")
         }
         let config = runner::Config(base: bundle, exec: exec, hibernation: images, alloc: core, cpus: cpus, clock: clock, wall: wall, random: drawn, classes: sched::classes(), system: ident::Cause.of(handoff.boot_counter, number: 1), user_mode: facts.user_mode)
-        discard attempt await run_base(cpu, rapl: features.rapl, take known, take keeper, bundle, support, boot: devices::BootVolume(scheme: handoff.volume_scheme, partition: handoff.volume_partition, signature: handoff.volume_signature), isa, handoff, machine: machine_of(facts), config, rings, cpus: state.share(), frames: mut memory.frames, take cells, fixed: memory.fixed, take loader, spacing, shipped, take keyring, take interfaces, heap: alloc)
+        discard attempt await run_base(cpu, rapl: features.rapl, take known, take keeper, bundle, support, boot: devices::BootVolume(scheme: handoff.volume_scheme, partition: handoff.volume_partition, signature: handoff.volume_signature), isa, handoff, reset, machine: machine_of(facts), config, rings, cpus: state.share(), frames: mut memory.frames, take cells, fixed: memory.fixed, take loader, spacing, shipped, take keyring, take passed, take interfaces, heap: alloc)
         let parked = hw::Signal[Unit].empty()
         loop {
             discard attempt await parked.wait()
         }
     })
 } main
+
+/// The reset register the FADT `fadt` names, `None` when it names none.
+fn reset_of(fadt: Option[Untrusted[mem::Bytes]]) -> Option[acpi::ResetRegister] {
+    let Some(table) = fadt else {
+        return None
+    }
+    return match attempt acpi::reset_register(table.view()) {
+        Ok(found) => found
+        Err(_) => None
+    }
+} reset_of
 
 /// Grows NaN's boot heap by the regions start step 3 set aside for it in `memory`.
 fn grow_heap(k: boot::Kernel, mut memory: frames::Memory) {

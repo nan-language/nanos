@@ -12,7 +12,7 @@ The **boot volume** is the FAT EFI system partition holding the loader, the gene
 | `/EFI/nanos/loader.prev` | the loader the last replacement replaced | the loader |
 | `/EFI/nanos/loader.new` | a loader waiting to replace the current one | `boot` |
 | `/nanos/boot.rec`, `/nanos/boot.bak` | copies 0 and 1 of the [boot record](#boot-record) | the loader, `boot` |
-| `/nanos/gen/<n>/` | generation n, n in decimal: `manifest`, its signed manifest; `kernel.elf`, its kernel image; `kernel.nlif`, the image's interface file; `genesis`, its genesis record | the installer, `boot` |
+| `/nanos/gen/<n>/` | generation n, n in decimal: `manifest`, its signed manifest; `kernel.elf`, its kernel image; `kernel.nlif`, the image's interface file; `genesis`, its genesis record; `keyring.nbun`, its `keyring` bundle | the installer, `boot` |
 | `/nanos/store.img` | the store, on a machine without a store partition ([12-store-format](12-store-format.md#placement)) | `devices`, through `fat` ([15-devices](15-devices.md#volumes-and-roles)) |
 | `/kernel.elf`, `/kernel.nlif` | the kernel image of a development boot and its interface file | `nan run` |
 | `/keyring.nbun` | the `keyring` bundle, which runs [`keys`](20-base.md#keys) | `nan run` |
@@ -22,13 +22,14 @@ An installer writes the loader, one generation, and a boot record holding that g
 
 ## Generations and manifests
 
-A **generation** is a bootable system: a signed manifest naming a kernel image and a genesis record. Its manifest is a `Manifest` record:
+A **generation** is a bootable system: a signed manifest naming a kernel image, a genesis record and the `keyring` bundle. Its manifest is a `Manifest` record:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `generation` | `u64` | its number, at least 1, the n of its directory |
 | `kernel` | `HashValue` | the blob id of its `kernel.elf` |
 | `genesis` | `HashValue` | the blob id of its `genesis` |
+| `keyring` | `HashValue` | the blob id of its `keyring.nbun` |
 | `min_loader` | `u32` | the lowest loader version that boots it |
 | `store_format` | `u32` | the newest store format version its kernel reads and writes, besides the version before it ([12-store-format](12-store-format.md#format-versions-and-upgrades)) |
 | `signer` | `Principal` | `owner` or a `vendor.<name>` principal |
@@ -124,7 +125,7 @@ Each failure prints the line `loader: <code> generation <n>` on the firmware con
     1. read `/nanos/gen/<n>/manifest` (`boot.manifest-unreadable`) and decode it (`boot.manifest-malformed`);
     2. find a key of its signer (`boot.signer-unknown`) with which one of its signatures verifies (`boot.signature-invalid`);
     3. check that its generation is n and, for a slot, the slot's (`boot.generation-mismatch`), at least the floor (`boot.below-floor`), and that its `min_loader` is at most the loader's version (`boot.loader-too-old`);
-    4. read `kernel.elf` and `genesis` (`boot.file-unreadable`) into a 64 MiB file heap the loader takes at the top of the highest range of free memory below 4 GiB that holds it (`boot.too-large`) and compare their blob ids with the manifest's (`boot.hash-mismatch`);
+    4. read `kernel.elf`, `genesis` and `keyring.nbun` (`boot.file-unreadable`) into a 64 MiB file heap the loader takes at the top of the highest range of free memory below 4 GiB that holds it (`boot.too-large`) and compare their blob ids with the manifest's (`boot.hash-mismatch`);
     5. validate the kernel image: an ELF64 executable for the architecture, with disjoint loadable segments inside the file and, on x86_64, a `XEN_ELFNOTE_PHYS32_ENTRY` note ([NaN 27 §Images](https://github.com/nan-language/nan/blob/main/docs/spec/27-program-model.md#images)) (`boot.image-malformed`), whose physical ranges lie in usable memory of the current memory map (`boot.placement`, requires [N31](22-nan.md#n31)).
 
     The `dev` candidate takes only sub-steps 4, for `/kernel.elf` alone, and 5. A failing candidate enters the handoff record's failures, up to four, and its slot becomes `bad` unless its code is `boot.manifest-unreadable`, `boot.file-unreadable` or `boot.loader-too-old`. With no candidate left, the loader prints `boot.none-bootable` and stops.
@@ -143,10 +144,11 @@ On a machine with `tpm`, the loader extends PCRs with `EFI_TCG2_PROTOCOL.HashLog
 | 1 | 8 | the manifest hash, 33 bytes |
 | 2 | 9 | the blob id of the kernel image, 33 bytes |
 | 3 | 9 | the blob id of the genesis record, 33 bytes |
-| 4 | 8 | the UTF-8 text `nanos.mode`, a space and the mode |
+| 4 | 9 | the blob id of the `keyring` bundle, 33 bytes |
+| 5 | 8 | the UTF-8 text `nanos.mode`, a space and the mode |
 
-- A `dev` boot measures events 2 and 4 only.
-- After its last measurement the loader copies the event log, in the TCG PC Client crypto-agile format (`EFI_TCG2_EVENT_LOG_FORMAT_TCG_2`), and passes the address of the `EFI_TCG2_FINAL_EVENTS_TABLE` configuration table, which holds the events logged after the copy.
+- A `dev` boot measures events 2 and 5 only.
+- After its last measurement the loader copies the event log, in the TCG PC Client crypto-agile format (`EFI_TCG2_EVENT_LOG_FORMAT_TCG_2`), and passes it as the module `eventlog`.
 
 ## Entropy
 
@@ -183,9 +185,9 @@ The **handoff record** is what the loader passes to the kernel: a 512-byte layou
 | genesis hash | 210 | 33 | the genesis record's blob id, zeros when the image holds it |
 | loader hash | 243 | 33 | the blob id of the loader's file |
 | reserved | 276 | 4 | 0 |
-| event log address | 280 | 8 | 0 without `tpm` |
+| event log address | 280 | 8 | 0, the copy being the module `eventlog` |
 | event log size | 288 | 8 | in bytes |
-| final events address | 296 | 8 | the address of `EFI_TCG2_FINAL_EVENTS_TABLE`, 0 without it |
+| final events address | 296 | 8 | 0 |
 | entropy | 304 | 64 | from the RNG, or zeros |
 | failures | 368 | 128 | 4 entries of 32 bytes: a generation (`u64`), then a code in ASCII, zero-padded |
 | entry counter | 496 | 8 | the time-stamp counter, `CNTVCT_EL0` on AArch64, at the loader's entry (requires [N11](22-nan.md#n11), [N14](22-nan.md#n14)) |
@@ -195,7 +197,7 @@ The flags are, by bit: 0, a development loader; 1, `record written`, step 6 wrot
 
 The **handoff block** is a range of pages below 4 GiB, in usable memory outside the kernel's segments, holding the start information, the handoff record, the genesis record and the event log copy.
 
-- On x86_64 the loader enters the kernel at its PVH 32-bit entry (requires [N14](22-nan.md#n14)) with `ebx` holding the address of a PVH start information structure, version 1, in the handoff block. Its module list holds module 0, the handoff record, module 1, the genesis record, absent when the image holds it, the interface file beside the candidate's kernel image as the module `kernel.nlif` when the boot volume holds it, and the other modules a [development loader](#development-loader) passes; `rsdp_paddr` is the ACPI RSDP of the EFI configuration table and `cmdline_paddr` is 0. Its memory map gives each range of the final UEFI memory map a type: 1 for `EfiConventionalMemory`, `EfiBootServicesCode`, `EfiBootServicesData`, `EfiLoaderCode` and `EfiLoaderData`; 3 for `EfiACPIReclaimMemory`; 4 for `EfiACPIMemoryNVS`; 5 for `EfiUnusableMemory`; 7 for `EfiPersistentMemory`; and 2 for the handoff block and every other type.
+- On x86_64 the loader enters the kernel at its PVH 32-bit entry (requires [N14](22-nan.md#n14)) with `ebx` holding the address of a PVH start information structure, version 1, in the handoff block. Its module list holds module 0, the handoff record, then the genesis record as the module `genesis`, absent when the image holds it, the interface file beside the candidate's kernel image as the module `kernel.nlif` when the boot volume holds it, the generation's `keyring` bundle as the module `keyring.nbun`, the event log copy as the module `eventlog` on a machine with `tpm`, and the other modules a [development loader](#development-loader) passes; `rsdp_paddr` is the ACPI RSDP of the EFI configuration table and `cmdline_paddr` is 0. Its memory map gives each range of the final UEFI memory map a type: 1 for `EfiConventionalMemory`, `EfiBootServicesCode`, `EfiBootServicesData`, `EfiLoaderCode` and `EfiLoaderData`; 3 for `EfiACPIReclaimMemory`; 4 for `EfiACPIMemoryNVS`; 5 for `EfiUnusableMemory`; 7 for `EfiPersistentMemory`; and 2 for the handoff block and every other type.
 - On AArch64 the loader enters the image at EL1 with the MMU off and `x0` holding the address of a flattened device tree in the handoff block: the firmware's device tree when the EFI configuration table holds one, else a tree holding the memory of the final map and `/chosen/nanos,acpi-rsdp`. It adds `/chosen/nanos,handoff` and `/chosen/nanos,genesis`, each an address and a size in two 64-bit cells, and lists the handoff block in the memory reservation block (requires [N30](22-nan.md#n30)).
 - At start the kernel emits `boot.started`, then one `boot.candidate-failed` per failure entry.
 - The kernel takes the module `kernel.nlif` as its **interface file** when its hash is the image's interface hash ([NaN 30 §Interface files](https://github.com/nan-language/nan/blob/main/docs/spec/30-artefacts.md#interface-files)), and has none otherwise.

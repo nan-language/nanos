@@ -1,0 +1,85 @@
+//! The `generation` command: a generation's directory, holding its kernel image, interface file, `keyring` bundle, the genesis record its kernel image gives and the manifest naming them, signed.
+
+/// The lowest loader version that boots the generations the bundler makes: the first, whose handoff record their kernels read.
+const MIN_LOADER: u32 = 1
+
+/// Writes the directory of generation `<n>` that the arguments `generation <n> <kernel image> <interface file> <keyring bundle> <signer> <seed file> <out>` name, `out` existing or not, and prints the manifest hash.
+fn generation(world: host::World, arguments: mem::List[text::String], alloc: mem::Alloc) fails BundlerError uses wait {
+    let Some(number) = decimal_of(arguments[1].as_str()) else {
+        fail BundlerError.Malformed
+    }
+    let kernel = try await world.fs.read_all(arguments[2].as_str(), alloc)
+    let interface_file = try await world.fs.read_all(arguments[3].as_str(), alloc)
+    let keyring = try await world.fs.read_all(arguments[4].as_str(), alloc)
+    let Some(signer) = principal_of(arguments[5].as_str(), alloc) else {
+        fail BundlerError.Malformed
+    }
+    let key = try await seed_key(world.fs, random: world.random, path: arguments[6].as_str(), alloc)
+    let Ok(image) = attempt bootfmt::KernelImage.read(kernel.view()) else {
+        fail BundlerError.Malformed
+    }
+    let blob = ident::HashValue.of_untrusted(kernel.view())
+    let recorded = genesis::Image(bundle: blob, support: ident::HashValue.of_untrusted(interface_file.view()), bytes: image.span(kernel.view()))
+    var record = mem::Bytes.empty(alloc)
+    mem::wire::Codec[store::service::Genesis].encode(genesis::record_of(number, image: recorded, jobs: genesis::Jobs.of(blob, tree: None, alloc), alloc), out: mut record)
+    let manifest = bootfmt::Manifest(generation: number, kernel: blob, genesis: ident::HashValue.of_content(record.view()), keyring: ident::HashValue.of_untrusted(keyring.view()), min_loader: MIN_LOADER, store_format: store::disk::FORMAT, signer: take signer)
+    let hash = manifest.hash(alloc)
+    var signatures = mem::Bounded[ident::Signature, 2].empty()
+    mut signatures.push(ident::Signature(bytes: key.sign(hash.bytes.view()).bytes))
+    var signed = mem::Bytes.empty(alloc)
+    mem::wire::Codec[bootfmt::SignedManifest].encode(bootfmt::SignedManifest(manifest: take manifest, signatures: signatures), out: mut signed)
+    let out = arguments[7].as_str()
+    if (attempt await world.fs.kind(out)).is_err() {
+        try await world.fs.create_dir(out)
+    }
+    try await write_in(world.fs, dir: out, name: bootfmt::MANIFEST_FILE, data: signed.view(), alloc)
+    try await write_in(world.fs, dir: out, name: bootfmt::GENESIS_FILE, data: record.view(), alloc)
+    try await write_in(world.fs, dir: out, name: bootfmt::KERNEL_FILE, data: copied(kernel.view(), alloc).view(), alloc)
+    try await write_in(world.fs, dir: out, name: bootfmt::INTERFACE_FILE, data: copied(interface_file.view(), alloc).view(), alloc)
+    try await write_in(world.fs, dir: out, name: bootfmt::KEYRING_FILE, data: copied(keyring.view(), alloc).view(), alloc)
+    try await world.stdio.write_out(b"manifest ")
+    try await world.stdio.write_out(hash.full_form().as_str().as_bytes())
+    try await world.stdio.write_out(b"\n")
+} generation
+
+/// Writes `data` as the file `name` of the directory `dir`.
+fn write_in(
+    fs: sys::Fs,
+    dir: Str,
+    name: Str,
+    data: Slice[u8],
+    alloc: mem::Alloc,
+    ) fails BundlerError uses wait {
+    var path = text::String.of(dir, alloc)
+    mut path.push('/')
+    mut path.append(name)
+    try await fs.write_all(path.as_str(), data)
+} write_in
+
+/// A copy of bytes read from a file, which the generation ships as they are.
+validator fn copied(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw.inspect())
+    return bytes
+} copied
+
+/// The number the decimal text `text` writes, `None` for other text.
+fn decimal_of(text: Str) -> Option[u64] {
+    if text.byte_len() == 0 {
+        return None
+    }
+    var value: u64 = 0
+    for byte in text.as_bytes() {
+        if byte < b'0' or byte > b'9' {
+            return None
+        }
+        let Some(scaled) = value.checked_mul(10) else {
+            return None
+        }
+        let Some(next) = scaled.checked_add(u64.widen(byte - b'0')) else {
+            return None
+        }
+        value = next
+    }
+    return Some(value)
+} decimal_of

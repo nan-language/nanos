@@ -15,7 +15,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | Path | Holds |
 | --- | --- |
 | `ident/` | The `ident` package: the names, identifiers, hashes and times of NaN OS records |
-| `bootfmt/` | The `bootfmt` package: the boot record, the handoff record and the kernel image |
+| `bootfmt/` | The `bootfmt` package: the boot record with the loader's choice among generations, the handoff record, the kernel image and the generation manifest |
 | `acpi/` | The `acpi` package: the ACPI tables NaN OS reads |
 | `crypto/` | The `crypto` package: XChaCha20-Poly1305 sealing and opening and BLAKE3 key derivation on secret values |
 | `tpm/` | The `tpm` package: the TPM 2.0 commands the `tpm-crb` driver sends, and the responses it reads |
@@ -32,6 +32,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `keys/` | The `keys` package: what the `keys` instance serves, its Env, what the kernel tells it at its start, and the work behind its operations on the machine's keys and the principals' |
 | `keyring/` | The `keyring` program: the `keys` instance as the bundle the generation ships |
 | `policy/` | The `policy` package: the policy's records, presets, patterns and evaluation, and the `policy` instance |
+| `genesis/` | The `genesis` package: a kernel image's genesis record, its base components with their protocols and state schemas, and their specifications, grants and admission records |
 | `generations/` | The `generations` package: the `boot` instance, recording each boot in the boot record, `/sys/boot` and `/live/boot` |
 | `clock/` | The `clock` package: the `clock` instance and its time sources |
 | `power/` | The `power` package: the `power` instance, the power settings and the switch the core carries out |
@@ -40,7 +41,7 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `loader/` | The `loader` package |
 | `jobs/` | The jobs a generation ships, one package each |
 | `kernel/` | The `kernel` package |
-| `tools/` | The `install`, `sandbox`, `toolchain` and `transcripts` scripts, and in `bundler/` the host program making bundle files |
+| `tools/` | The `install`, `sandbox`, `toolchain` and `transcripts` scripts, `sandbox.seed`, the seed of the sandbox vendor's key, and in `bundler/` the host program making bundle files and generations |
 | `docs/` | Documentation: the specification in `docs/spec/`, ADRs in `docs/decisions/` |
 
 One row per top-level directory; deeper only where the tree alone would not tell an agent where a change belongs.
@@ -60,6 +61,7 @@ One row per top-level directory; deeper only where the tree alone would not tell
 | `tools/transcripts [<instance>]` | Boot a fresh sandbox instance and run each link transcript of `link/transcripts/` on its serial console |
 | `nan run bundler -- key <seed file>` | Print the public key of a builder's seed file, writing a random seed when it is missing |
 | `nan run bundler -- bundle <root> <workspace> <interface file> <builder> <seed file> <out> [<vendor> <vendor seed file>]` | Write the bundle file of the bundle build of `root` in `workspace`, carrying its closure's sources, certified by `builder` with the seed's key and signed by `vendor` with its seed's key when given, and print its code hash and blob id |
+| `nan run bundler -- generation <n> <kernel image> <interface file> <keyring bundle> <signer> <seed file> <out>` | Write to the directory `out` generation `n` of the kernel image, its interface file and the `keyring` bundle, with the genesis record of the image and the manifest naming them signed by `signer` with the seed's key, and print the manifest hash; `vendor.sandbox` with `tools/sandbox.seed` signs generations a development loader boots |
 
 Run `nan` from the repository root. A scope is a package, module or item path, a `.nan` file or a `file:line`; omitted at the root, it is the whole workspace.
 
