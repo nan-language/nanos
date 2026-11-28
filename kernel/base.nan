@@ -23,6 +23,8 @@ const CMOS_DRIVER: Str = "drivers::cmos::Cmos"
 
 const AHCI: Str = "drivers::ahci::Ahci"
 
+const TPM_CRB: Str = "drivers::crb::Crb"
+
 const STORE_SERVICE: Str = "store::service::Service"
 
 const JOURNAL: Str = "journal::Recorder"
@@ -159,6 +161,9 @@ fn Base.protocols(self, component: Str) -> Option[os::Protocols] {
     if component == AHCI {
         return Some(os::Protocols(own: sys::Wire[drivers::ahci::AhciDevice].hash(), serves: Some(sys::Wire[devices::Block].hash())))
     }
+    if component == TPM_CRB {
+        return Some(os::Protocols(own: sys::Wire[drivers::crb::CrbDevice].hash(), serves: Some(sys::Wire[devices::Tpm].hash())))
+    }
     if component == STORE_SERVICE {
         return Some(os::Protocols(own: sys::Wire[store::service::Store].hash(), serves: None))
     }
@@ -226,6 +231,9 @@ fn Base.schema(self, component: Str, alloc: mem::Alloc) -> Option[sys::ProtocolS
     }
     if component == AHCI {
         return Some(sys::Wire[drivers::ahci::AhciDevice].schema(alloc))
+    }
+    if component == TPM_CRB {
+        return Some(sys::Wire[drivers::crb::CrbDevice].schema(alloc))
     }
     if component == STORE_SERVICE {
         return Some(sys::Wire[store::service::Store].schema(alloc))
@@ -438,6 +446,9 @@ fn Base.serve_driver(self, component: Str, take world: nanos::World, take servin
     if component == AHCI {
         return try await self.serve_ahci(take world, take serving)
     }
+    if component == TPM_CRB {
+        return try await self.serve_crb(take world, take serving)
+    }
     return try await self.serve_platform(component, take world, take serving)
 } Base.serve_driver
 
@@ -529,6 +540,45 @@ fn Base.serve_platform(self, component: Str, take world: nanos::World, take serv
     mut peers.push(sys::Wire[devices::Rtc].schema(alloc))
     return try await runner::Driven[drivers::cmos::Cmos, drivers::cmos::CmosEnv, drivers::cmos::CmosDevice].run(drivers::cmos::CmosEnv.of(take regs), exec, alloc, take serving, take peers, release: drivers::cmos::CmosEnv.abandon)
 } Base.serve_platform
+
+/// Serves `tpm-crb` on the first memory window its claimed platform device has.
+fn Base.serve_crb(self, take world: nanos::World, take serving: runner::Serving) -> runner::Ended fails task::Cancelled uses wait {
+    let alloc = world.alloc
+    let Some(path) = claimed_path(world) else {
+        return runner::Ended.EnvIncomplete
+    }
+    var resources = mem::List[devices::Resource].empty(alloc)
+    match try await self.claimed(path, serving, alloc) {
+        Some(devices::Claimed.Platform(claimed)) => {
+            resources = claimed
+        }
+        Some(devices::Claimed.Pci(attached)) => release_attached(take attached)
+        None => {
+        }
+    }
+    let Some(base) = first_window(resources) else {
+        return runner::Ended.EnvIncomplete
+    }
+    let regs = trusted "devices declared the TPM's memory window as the firmware's _CRS gives it, the keeper refuses a window overlapping another device's or the core's, and devices binds one driver per device" { hw::Mmio[drivers::crb::Regs].map(phys: base) }
+    let Some(env) = drivers::crb::CrbEnv.of(take regs, base, clock: world.clock, alloc) else {
+        return runner::Ended.EnvIncomplete
+    }
+    var peers = mem::List[sys::ProtocolSchema].empty(alloc)
+    mut peers.push(sys::Wire[devices::Tpm].schema(alloc))
+    return try await runner::Driven[drivers::crb::Crb, drivers::crb::CrbEnv, drivers::crb::CrbDevice].run(take env, exec: world.exec, alloc, take serving, take peers, release: drivers::crb::CrbEnv.abandon)
+} Base.serve_crb
+
+/// The base of the first memory window of `resources`.
+fn first_window(resources: mem::List[devices::Resource]) -> Option[u64] {
+    for resource in resources {
+        match resource {
+            devices::Resource.Window(base: base, size: _) => return Some(base)
+            else => {
+            }
+        }
+    }
+    return None
+} first_window
 
 /// A platform line as `install_platform` takes it: its global system interrupt, its trigger and its polarity.
 struct Routed derives Copy {
@@ -994,6 +1044,7 @@ fn image_genesis(bundle: ident::HashValue, handoff: bootfmt::Handoff, alloc: mem
     mut building.grant(mut keeping, holder: "keys", field: "principals", object: tree_of("/sys/principals", alloc), granted: tree_rights(alloc), alloc)
     mut building.grant(mut keeping, holder: "keys", field: "data", object: tree_of("/data", alloc), granted: tree_rights(alloc), alloc)
     mut building.grant(mut keeping, holder: "keys", field: "random", object: os::Object.Random, granted: mem::Set.empty(alloc), alloc)
+    discard mut keeping.wiring.insert(text::String.of("tpm", alloc), value: os::Wire(target: os::Target.Role(os::Role.Tpm), operations: None, credit: os::Credit(messages: 4, calls: 4)))
     discard mut building.specs.insert(moniker("journal"), value: take journaling)
     discard mut building.specs.insert(moniker("keys"), value: take keeping)
     var overseeing = os::InstanceSpec.of(principal: principal("system"), bundle, component: POLICY, alloc)

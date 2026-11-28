@@ -17,7 +17,7 @@ const POWERING: u64 = 0x9_0000
 
 const SUSPENDING: u64 = 0xA_0000
 
-/// How long an entropy driver goes without a message before `Auto` suspends it, and the bytes a reseed draws from it.
+/// How long an entropy driver goes without a message before `Auto` suspends it, and the bytes a reseed draws from an entropy driver or a TPM.
 const ENTROPY_IDLE_MS: u32 = 10_000
 
 const RESEED_BYTES: u32 = 64
@@ -901,6 +901,10 @@ fn Manager.serve_class(
                 }
             }
         }
+        Class.Tpm => {
+            mut self.resolve_roles(mut env, mut cx)
+            mut self.reseed_from_tpm(at, moniker: ident::Moniker(text: moniker.text), mut env, mut cx)
+        }
         Class.Rtc or Class.Console => mut self.resolve_roles(mut env, mut cx)
     }
 } Manager.serve_class
@@ -941,6 +945,59 @@ fn Manager.power_entropy(
     })
 } Manager.power_entropy
 
+/// Has a keyed task reseed the core's random source from the TPM driver `moniker` of the device at `at`.
+fn Manager.reseed_from_tpm(
+    mut self,
+    at: usize,
+    take moniker: ident::Moniker,
+    mut env: Env,
+    mut cx: sys::Cx[Devices],
+    ) {
+    let control = env.control
+    let root = env.root
+    let alloc = env.alloc
+    let key = mut self.key_of(self.records[at].path)
+    mut cx.spawn(key: POWERING + key, run: fn[take moniker](out: sys::Outbox[Devices]) fails task::Cancelled uses wait limits stack 16_384 {
+        try await reseed_tpm(control, root, take moniker, alloc)
+    })
+} Manager.reseed_from_tpm
+
+/// Draws random bytes from the TPM driver `moniker` and mixes them into the core's random source, unless the driver does not answer.
+fn reseed_tpm(control: os::Control, root: Root, take moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(handle) = try await port_of(control, take moniker, alloc) else {
+        return
+    }
+    let Some(device) = os::Port[Tpm].of(handle) else {
+        return
+    }
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[Tpm].random(mut call, count: u16.fit(RESEED_BYTES))
+    let drawn = match first attempt await device.call(take call, reply, alloc) {
+        Ok(bytes) => bytes
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return
+    }
+    try await mixed(root, take drawn)
+} reseed_tpm
+
+/// A port to the driver `moniker`, `None` when it has none.
+fn port_of(control: os::Control, take moniker: ident::Moniker, alloc: mem::Alloc) -> Option[os::PortHandle] fails task::Cancelled uses wait {
+    return match first attempt await control.port(take moniker, credit: os::Credit(messages: 1, calls: 1), alloc) {
+        Ok(found) => Some(found)
+        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => None
+    }
+} port_of
+
+/// Mixes `drawn` into the core's random source.
+fn mixed(root: Root, take drawn: Untrusted[mem::Bytes]) fails task::Cancelled uses wait {
+    match attempt await root.mix(take drawn) {
+        Err(RootError.Cancelled(cancelled)) => fail cancelled
+        else => {
+        }
+    }
+} mixed
+
 /// Whether `resources` hold a power management capability.
 fn power_managed(resources: mem::List[Resource]) -> bool {
     for resource in resources {
@@ -953,10 +1010,8 @@ fn power_managed(resources: mem::List[Resource]) -> bool {
 
 /// Draws bytes from the entropy driver `moniker` and mixes them into the core's random source, unless the driver does not answer.
 fn reseed(control: os::Control, root: Root, take moniker: ident::Moniker, alloc: mem::Alloc) fails task::Cancelled uses wait {
-    let handle = match first attempt await control.port(take moniker, credit: os::Credit(messages: 1, calls: 1), alloc) {
-        Ok(found) => found
-        Err(os::ControlError.Cancelled(cancelled)) => fail cancelled
-        Err(_) => return
+    let Some(handle) = try await port_of(control, take moniker, alloc) else {
+        return
     }
     let Some(device) = os::Port[Entropy].of(handle) else {
         return
@@ -968,11 +1023,7 @@ fn reseed(control: os::Control, root: Root, take moniker: ident::Moniker, alloc:
         Err(os::PortError.Cancelled(cancelled)) => fail cancelled
         Err(_) => return
     }
-    match attempt await root.mix(take drawn) {
-        Err(RootError.Cancelled(cancelled)) => fail cancelled
-        else => {
-        }
-    }
+    try await mixed(root, take drawn)
 } reseed
 
 /// Has a keyed task follow whether the driver `moniker` of the device at `at` is suspended, posting each change.

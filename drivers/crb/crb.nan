@@ -1,0 +1,618 @@
+//! The `tpm-crb` driver: a TPM 2.0 behind its command response buffer at locality 0 serving `Tpm`, one command at a time, its completion polled.
+
+/// The first and the longest wait between two polls of a command, and how long a command may take.
+const FIRST_POLL_NS: u64 = 50_000
+
+const LONGEST_POLL_NS: u64 = 10_000_000
+
+const COMMAND_NS: u64 = 120_000_000_000
+
+/// Where the command and response buffer starts in the interface, and its bytes.
+const BUFFER_OFFSET: u64 = 0x80
+
+const BUFFER_BYTES: usize = 3_968
+
+/// The most random bytes one request draws.
+const MOST_RANDOM: u16 = 64
+
+/// The bits of the locality registers: access requested, and granted.
+const REQUEST_ACCESS: u32 = 0x1
+
+const GRANTED: u32 = 0x1
+
+/// The bits of the control registers: the TPM made ready or idle, its fatal error, its idle state, and a command started.
+const COMMAND_READY: u32 = 0x1
+
+const FATAL: u32 = 0x1
+
+const IDLE: u32 = 0x2
+
+const START: u32 = 0x1
+
+const CANCEL: u32 = 0x1
+
+/// How many readings the driver waits for the TPM to grant the locality or become ready.
+const READINGS: u32 = 100_000
+
+contribute devices::drivers tpm_crb = devices::Registration(name: text::Fixed[20].of("tpm-crb"), matches: devices::matches(devices::DeviceMatch.AcpiId(text::Fixed[8].of("MSFT0101")), rest: devices::DeviceMatch.None), class: devices::Class.Tpm, component: text::Fixed[48].of("drivers::crb::Crb"), priority: 0)
+
+/// The registers of locality 0 of the interface, with its command and response buffer.
+pub registers Regs {
+    locality_control: u32 at 0x08 write
+    locality_status: u32 at 0x0C read
+    request: u32 at 0x40 read write
+    status: u32 at 0x44 read
+    cancel: u32 at 0x48 write
+    start: u32 at 0x4C read write
+    command_size: u32 at 0x58 read
+    command_low: u32 at 0x5C read
+    command_high: u32 at 0x60 read
+    response_size: u32 at 0x64 read
+    response_low: u32 at 0x68 read
+    response_high: u32 at 0x6C read
+    buffer: Array[u8, 3_968] at 0x80 stride 1 read write
+} Regs
+
+/// What the driver serves: `Tpm`'s operations, and the polls of the command on the TPM.
+pub protocol CrbDevice {
+    pub fn random(count: u16) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn pcr_read(pcr: u8) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn nv_read(index: u32, offset: u16, count: u16) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn seal(secret: mem::Bytes, pcrs: u32) -> mem::Bytes fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    pub fn unseal(blob: mem::Bytes) -> Untrusted[mem::Bytes] fails devices::DeviceError limits irreversible(emit, actuate, erase, spend)
+    fn poll(issued: u64) limits irreversible(emit, actuate, erase, spend)
+} CrbDevice
+
+/// The driver's Env: the interface's registers, its clock and its cell.
+pub open linear struct CrbEnv derives Send {
+    regs: hw::Mmio[Regs]
+    clock: sys::Clock
+    alloc: mem::Alloc
+} CrbEnv
+
+/// What a request asks of the TPM.
+pub closed enum Operation derives Encode {
+    Random(count: u16)
+    PcrRead(pcr: u8)
+    NvRead(index: u32, offset: u16, count: u16)
+    Seal(secret: mem::Bytes, pcrs: u32)
+    Unseal(sealed: tpm::Sealed)
+} Operation
+
+/// The command an operation has on the TPM or issues next.
+pub closed enum Step derives Copy, Eq, Encode {
+    Random
+    PcrRead
+    NvRead
+    Primary
+    Trial
+    TrialPcr
+    TrialDigest
+    FlushTrial
+    Create
+    FlushPrimary
+    Load
+    Session
+    SessionPcr
+    Unseal
+    FlushSession
+    FlushItem
+} Step
+
+/// A request waiting for the TPM: its id, its operation, its step, the handles of the storage key, the loaded object and the session it holds on the TPM, the policy digest a seal binds, what it returns once its handles are flushed, and its failure.
+pub closed struct Waiting derives Encode {
+    pub request: u64
+    pub operation: Operation
+    pub step: Step
+    pub primary: u32
+    pub item: u32
+    pub session: u32
+    pub policy: Option[Array[u8, 32]]
+    pub result: Option[mem::Bytes]
+    pub failure: Option[devices::DeviceError]
+} Waiting
+
+/// The driver's state: the requests waiting, the first one's step on the TPM when `busy`, the commands issued, the polls of the current one, and when it started.
+pub closed struct Crb derives Encode {
+    pub waiting: mem::List[Waiting]
+    pub busy: bool
+    pub issued: u64
+    pub polls: u32
+    pub started_ns: u64
+} Crb
+
+impl Crb: sys::Component[CrbEnv, CrbDevice]
+
+/// The Env over the interface at `regs`, `base` being its physical address: `None` unless its command and response buffer lies at offset 0x80 and the TPM grants locality 0.
+pub fn CrbEnv.of(take regs: hw::Mmio[Regs], base: u64, clock: sys::Clock, alloc: mem::Alloc) -> Option[CrbEnv] {
+    var mapped = regs
+    let command = u64.widen(mut mapped.read(Regs.command_low)) | (u64.widen(mut mapped.read(Regs.command_high)) << 32)
+    let response = u64.widen(mut mapped.read(Regs.response_low)) | (u64.widen(mut mapped.read(Regs.response_high)) << 32)
+    let buffer = base + BUFFER_OFFSET
+    let sized = usize.widen(mut mapped.read(Regs.command_size)) <= BUFFER_BYTES and usize.widen(mut mapped.read(Regs.response_size)) <= BUFFER_BYTES
+    if command != buffer or response != buffer or not sized {
+        take mapped.unmap()
+        return None
+    }
+    mut mapped.write(Regs.locality_control, value: REQUEST_ACCESS)
+    for _ in 0..<READINGS {
+        if (mut mapped.read(Regs.locality_status) & GRANTED) != 0 {
+            return Some(CrbEnv(regs: take mapped, clock: clock, alloc: alloc))
+        }
+    }
+    take mapped.unmap()
+    return None
+} CrbEnv.of
+
+pub fn CrbEnv.abandon(take self) {
+    let CrbEnv(regs: regs, clock: _, alloc: _) = self
+    take regs.unmap()
+} CrbEnv.abandon
+
+pub fn Crb.start(mut env: CrbEnv) -> Crb = Crb(waiting: mem::List.empty(env.alloc), busy: false, issued: 0, polls: 0, started_ns: 0)
+
+pub fn Crb.random(mut self, take count: u16, mut env: CrbEnv, mut cx: sys::Cx[CrbDevice]) -> Untrusted[mem::Bytes] fails devices::DeviceError {
+    if count == 0 or count > MOST_RANDOM {
+        fail devices::DeviceError.OutOfRange
+    }
+    mut self.queue(Operation.Random(count: count), step: Step.Random, mut env, mut cx)
+    return Untrusted.of(mem::Bytes.empty(env.alloc))
+} Crb.random
+
+pub fn Crb.pcr_read(mut self, take pcr: u8, mut env: CrbEnv, mut cx: sys::Cx[CrbDevice]) -> Untrusted[mem::Bytes] fails devices::DeviceError {
+    if pcr >= tpm::PCR_COUNT {
+        fail devices::DeviceError.OutOfRange
+    }
+    mut self.queue(Operation.PcrRead(pcr: pcr), step: Step.PcrRead, mut env, mut cx)
+    return Untrusted.of(mem::Bytes.empty(env.alloc))
+} Crb.pcr_read
+
+pub fn Crb.nv_read(
+    mut self,
+    take index: u32,
+    take offset: u16,
+    take count: u16,
+    mut env: CrbEnv,
+    mut cx: sys::Cx[CrbDevice],
+    ) -> Untrusted[mem::Bytes] fails devices::DeviceError {
+    if count == 0 or count > tpm::MOST_NV {
+        fail devices::DeviceError.OutOfRange
+    }
+    mut self.queue(Operation.NvRead(index: index, offset: offset, count: count), step: Step.NvRead, mut env, mut cx)
+    return Untrusted.of(mem::Bytes.empty(env.alloc))
+} Crb.nv_read
+
+pub fn Crb.seal(
+    mut self,
+    take secret: mem::Bytes,
+    take pcrs: u32,
+    mut env: CrbEnv,
+    mut cx: sys::Cx[CrbDevice],
+    ) -> mem::Bytes fails devices::DeviceError {
+    if secret.len() > tpm::MOST_SEALED {
+        fail devices::DeviceError.TooLarge
+    }
+    if (pcrs >> u32.widen(tpm::PCR_COUNT)) != 0 {
+        fail devices::DeviceError.OutOfRange
+    }
+    mut self.queue(Operation.Seal(secret: take secret, pcrs: pcrs), step: Step.Primary, mut env, mut cx)
+    return mem::Bytes.empty(env.alloc)
+} Crb.seal
+
+pub fn Crb.unseal(mut self, take blob: mem::Bytes, mut env: CrbEnv, mut cx: sys::Cx[CrbDevice]) -> Untrusted[mem::Bytes] fails devices::DeviceError {
+    let Some(sealed) = tpm::Sealed.read(blob.view(), alloc: env.alloc) else {
+        fail devices::DeviceError.Io
+    }
+    mut self.queue(Operation.Unseal(sealed: take sealed), step: Step.Primary, mut env, mut cx)
+    return Untrusted.of(mem::Bytes.empty(env.alloc))
+} Crb.unseal
+
+/// Answers the command on the TPM once it is done, then issues the next; polls it again later while it runs, and fails its request with `device.timeout` after 120 s.
+fn Crb.poll(mut self, take issued: u64, mut env: CrbEnv, mut cx: sys::Cx[CrbDevice]) {
+    if not self.busy or issued != self.issued {
+        return
+    }
+    if (mut env.regs.read(Regs.start) & START) != 0 {
+        let now = elapsed_ns(env.clock)
+        if now.saturating_sub(self.started_ns) < COMMAND_NS {
+            mut self.wait(mut cx)
+            return
+        }
+        mut env.regs.write(Regs.cancel, value: CANCEL)
+        self.busy = false
+        let Waiting(request: request, operation: operation, step: _, primary: _, item: _, session: _, policy: _, result: _, failure: _) = mut self.waiting.remove(0)
+        answer(request, take operation, result: None, failure: Some(devices::DeviceError.Timeout), alloc: env.alloc, mut cx)
+        mut self.issue(mut env, mut cx)
+        return
+    }
+    self.busy = false
+    let raw = read_response(mut env)
+    mut self.advance(raw.view(), mut env, mut cx)
+    mut self.issue(mut env, mut cx)
+} Crb.poll
+
+/// Postpones the request asking `operation`, its first command `step`, and issues it when the TPM is free.
+fn Crb.queue(
+    mut self,
+    take operation: Operation,
+    step: Step,
+    mut env: CrbEnv,
+    mut cx: sys::Cx[CrbDevice],
+    ) {
+    let Some(request) = mut cx.postpone() else {
+        return
+    }
+    mut self.waiting.push(Waiting(request: request, operation: take operation, step: step, primary: 0, item: 0, session: 0, policy: None, result: None, failure: None))
+    mut self.issue(mut env, mut cx)
+} Crb.queue
+
+/// Writes the command of the first request's step to the TPM and starts it, when no command runs; while the TPM is in its fatal error state or does not become ready, fails each request with `device.io`.
+fn Crb.issue(mut self, mut env: CrbEnv, mut cx: sys::Cx[CrbDevice]) {
+    if self.busy {
+        return
+    }
+    while self.waiting.len() > 0 and not ready(mut env.regs) {
+        let Waiting(request: request, operation: operation, step: _, primary: _, item: _, session: _, policy: _, result: _, failure: _) = mut self.waiting.remove(0)
+        answer(request, take operation, result: None, failure: Some(devices::DeviceError.Io), alloc: env.alloc, mut cx)
+    }
+    if self.waiting.len() == 0 {
+        return
+    }
+    let command = self.waiting[0].command(env.alloc)
+    var at: usize = 0
+    for byte in command.view() {
+        mut env.regs.write_at(Regs.buffer, index: at, value: byte)
+        at += 1
+    }
+    mut env.regs.write(Regs.start, value: START)
+    self.busy = true
+    self.issued += 1
+    self.polls = 0
+    self.started_ns = elapsed_ns(env.clock)
+    mut self.wait(mut cx)
+} Crb.issue
+
+/// Polls the command again after a wait doubling from 50 µs to 10 ms.
+fn Crb.wait(mut self, mut cx: sys::Cx[CrbDevice]) {
+    var delay = FIRST_POLL_NS
+    var doubled: u32 = 0
+    while doubled < self.polls and delay < LONGEST_POLL_NS {
+        delay = delay * 2
+        doubled += 1
+    }
+    if delay > LONGEST_POLL_NS {
+        delay = LONGEST_POLL_NS
+    }
+    self.polls += 1
+    mut cx.after_ns(ns: delay, send: CrbDevice.poll(issued: self.issued))
+} Crb.wait
+
+/// Takes the response `raw` to the first request's step: moves it to its next step, or answers it once it has none.
+fn Crb.advance(mut self, take raw: Slice[u8], mut env: CrbEnv, mut cx: sys::Cx[CrbDevice]) {
+    let alloc = env.alloc
+    let step = self.waiting[0].step
+    let read = attempt tpm::Response.read(Untrusted.of(take raw), handle: creates(step), sessions: authorized(step), alloc)
+    let next = match read {
+        Ok(found) => mut self.waiting.at_mut(0).took(take found, alloc)
+        Err(error) => mut self.waiting.at_mut(0).refused(error)
+    }
+    let Some(following) = next else {
+        let Waiting(request: request, operation: operation, step: _, primary: _, item: _, session: _, policy: _, result: result, failure: failure) = mut self.waiting.remove(0)
+        answer(request, take operation, take result, failure, alloc, mut cx)
+        return
+    }
+    self.waiting[0].step = following
+} Crb.advance
+
+/// The command of this request's step.
+fn Waiting.command(self, alloc: mem::Alloc) -> mem::Bytes {
+    return match self.step {
+        Step.Random => tpm::get_random(self.operation.count(), alloc)
+        Step.PcrRead => tpm::pcr_read(self.operation.pcr(), alloc)
+        Step.NvRead => self.operation.nv_command(alloc)
+        Step.Primary => tpm::create_primary(alloc)
+        Step.Trial => tpm::start_session(trial: true, alloc)
+        Step.TrialPcr or Step.SessionPcr => tpm::policy_pcr(self.session, pcrs: self.operation.pcrs(), alloc)
+        Step.TrialDigest => tpm::policy_get_digest(self.session, alloc)
+        Step.FlushTrial or Step.FlushSession => tpm::flush(self.session, alloc)
+        Step.Create => self.operation.create_command(parent: self.primary, policy: self.policy, alloc)
+        Step.FlushPrimary => tpm::flush(self.primary, alloc)
+        Step.Load => self.operation.load_command(parent: self.primary, alloc)
+        Step.Session => tpm::start_session(trial: false, alloc)
+        Step.Unseal => tpm::unseal(self.item, session: self.policy_session(), alloc)
+        Step.FlushItem => tpm::flush(self.item, alloc)
+    }
+} Waiting.command
+
+/// Takes the success of this request's step: the step after it, `None` when the request is done.
+fn Waiting.took(mut self, take response: tpm::Response, alloc: mem::Alloc) -> Option[Step] {
+    let tpm::Response(handle: handle, parameters: parameters) = response
+    match self.step {
+        Step.Random or Step.NvRead => mut self.keep(attempt tpm::sized(parameters.view(), alloc))
+        Step.PcrRead => mut self.keep(attempt tpm::pcr_value(parameters.view(), alloc))
+        Step.Primary => {
+            self.primary = handle
+        }
+        Step.Trial or Step.Session => {
+            self.session = handle
+        }
+        Step.TrialDigest => match attempt tpm::policy_digest(parameters.view()) {
+            Ok(digest) => {
+                self.policy = Some(digest)
+            }
+            Err(error) => {
+                self.failure = Some(failure_of(error, step: self.step))
+            }
+        }
+        Step.Create => match attempt tpm::created(parameters.view(), alloc) {
+            Ok(object) => {
+                self.result = Some(tpm::Sealed(pcrs: self.operation.pcrs(), object: take object).to_bytes(alloc))
+            }
+            Err(error) => {
+                self.failure = Some(failure_of(error, step: self.step))
+            }
+        }
+        Step.Load => {
+            self.item = handle
+        }
+        Step.Unseal => mut self.keep(attempt tpm::sized(parameters.view(), alloc))
+        Step.TrialPcr or Step.SessionPcr or Step.FlushTrial or Step.FlushPrimary or Step.FlushSession or Step.FlushItem => {
+        }
+    }
+    return self.after()
+} Waiting.took
+
+/// Takes the failure of this request's step: the step after it, `None` when the request is done.
+fn Waiting.refused(mut self, error: tpm::TpmError) -> Option[Step] {
+    if self.failure.is_none() {
+        self.failure = Some(failure_of(error, step: self.step))
+    }
+    return self.after()
+} Waiting.refused
+
+/// Keeps the bytes a response carries as the request's result, or its failure.
+fn Waiting.keep(mut self, take read: Result[Untrusted[mem::Bytes], tpm::TpmError]) {
+    match read {
+        Ok(bytes) => {
+            self.result = Some(take bytes.into_cleared())
+        }
+        Err(error) => {
+            self.failure = Some(failure_of(error, step: self.step))
+        }
+    }
+} Waiting.keep
+
+/// The step after this request's, the handles it holds flushed once it has failed: a seal makes the storage key, computes the policy of its PCRs in a trial session, creates the object and flushes the key; an unseal makes the storage key, loads the object, flushes the key, satisfies the policy in a session, unseals and flushes the session and the object.
+fn Waiting.after(self) -> Option[Step] {
+    let failed = self.failure.is_some()
+    let bound = self.operation.pcrs() != 0
+    let sealing = match self.operation {
+        Operation.Seal(secret: _, pcrs: _) => true
+        else => false
+    }
+    return match self.step {
+        Step.Random or Step.PcrRead or Step.NvRead => None
+        Step.Primary => after_primary(failed, sealing, bound)
+        Step.Trial => match failed {
+            true => Some(Step.FlushPrimary)
+            false => Some(Step.TrialPcr)
+        }
+        Step.TrialPcr => match failed {
+            true => Some(Step.FlushTrial)
+            false => Some(Step.TrialDigest)
+        }
+        Step.TrialDigest => Some(Step.FlushTrial)
+        Step.FlushTrial => match failed {
+            true => Some(Step.FlushPrimary)
+            false => Some(Step.Create)
+        }
+        Step.Create or Step.Load => Some(Step.FlushPrimary)
+        Step.FlushPrimary => after_flushed_primary(failed, sealing, bound)
+        Step.Session => match failed {
+            true => Some(Step.FlushItem)
+            false => Some(Step.SessionPcr)
+        }
+        Step.SessionPcr => match failed {
+            true => Some(Step.FlushSession)
+            false => Some(Step.Unseal)
+        }
+        Step.Unseal => match bound {
+            true => Some(Step.FlushSession)
+            false => Some(Step.FlushItem)
+        }
+        Step.FlushSession => Some(Step.FlushItem)
+        Step.FlushItem => None
+    }
+} Waiting.after
+
+/// The step after making the storage key: a seal binding PCRs computes their policy, another seal creates its object, and an unseal loads its object.
+fn after_primary(failed: bool, sealing: bool, bound: bool) -> Option[Step] {
+    if failed {
+        return None
+    }
+    if not sealing {
+        return Some(Step.Load)
+    }
+    if bound {
+        return Some(Step.Trial)
+    }
+    return Some(Step.Create)
+} after_primary
+
+/// The step after flushing the storage key: an unseal binding PCRs satisfies their policy, another unseals; a seal is done.
+fn after_flushed_primary(failed: bool, sealing: bool, bound: bool) -> Option[Step] {
+    if failed or sealing {
+        return None
+    }
+    if bound {
+        return Some(Step.Session)
+    }
+    return Some(Step.Unseal)
+} after_flushed_primary
+
+/// The policy session an unseal holds, `None` when its object has no policy.
+fn Waiting.policy_session(self) -> Option[u32] {
+    if self.operation.pcrs() == 0 {
+        return None
+    }
+    return Some(self.session)
+} Waiting.policy_session
+
+fn Operation.count(self) -> u16 {
+    return match self {
+        Operation.Random(count: count) => count
+        else => 0
+    }
+} Operation.count
+
+fn Operation.pcr(self) -> u8 {
+    return match self {
+        Operation.PcrRead(pcr: pcr) => pcr
+        else => 0
+    }
+} Operation.pcr
+
+/// The PCRs a seal or an unseal binds.
+fn Operation.pcrs(self) -> u32 {
+    return match self {
+        Operation.Seal(secret: _, pcrs: pcrs) => pcrs
+        Operation.Unseal(sealed: sealed) => sealed.pcrs
+        else => 0
+    }
+} Operation.pcrs
+
+fn Operation.nv_command(self, alloc: mem::Alloc) -> mem::Bytes {
+    return match self {
+        Operation.NvRead(index: index, offset: offset, count: count) => tpm::nv_read(index, offset, count, alloc)
+        else => mem::Bytes.empty(alloc)
+    }
+} Operation.nv_command
+
+fn Operation.create_command(self, parent: u32, policy: Option[Array[u8, 32]], alloc: mem::Alloc) -> mem::Bytes {
+    return match self {
+        Operation.Seal(secret: secret, pcrs: _) => tpm::create_sealed(parent, secret: secret.view(), policy, alloc)
+        else => mem::Bytes.empty(alloc)
+    }
+} Operation.create_command
+
+fn Operation.load_command(self, parent: u32, alloc: mem::Alloc) -> mem::Bytes {
+    return match self {
+        Operation.Unseal(sealed: sealed) => tpm::load(parent, object: sealed.object, alloc)
+        else => mem::Bytes.empty(alloc)
+    }
+} Operation.load_command
+
+/// Whether a step's command creates a handle, which its response names first.
+fn creates(step: Step) -> bool {
+    return step == Step.Primary or step == Step.Trial or step == Step.Session or step == Step.Load
+} creates
+
+/// Whether a step's command carries an authorization area, as its response then does.
+fn authorized(step: Step) -> bool {
+    return step == Step.NvRead or step == Step.Primary or step == Step.Create or step == Step.Load or step == Step.Unseal
+} authorized
+
+/// The device failure a step's TPM failure gives: `device.policy` for a policy that does not hold, `device.out-of-range` for a PCR or NV read outside what exists, else `device.io`.
+fn failure_of(error: tpm::TpmError, step: Step) -> devices::DeviceError {
+    if error.policy_failed() {
+        return devices::DeviceError.Policy
+    }
+    if (step == Step.NvRead or step == Step.PcrRead) and error.out_of_range() {
+        return devices::DeviceError.OutOfRange
+    }
+    return devices::DeviceError.Io
+} failure_of
+
+/// Whether the TPM takes a command: not in its fatal error state, and made ready from idle.
+fn ready(mut regs: hw::Mmio[Regs]) -> bool {
+    if (mut regs.read(Regs.status) & FATAL) != 0 {
+        return false
+    }
+    if (mut regs.read(Regs.status) & IDLE) == 0 {
+        return true
+    }
+    mut regs.write(Regs.request, value: COMMAND_READY)
+    for _ in 0..<READINGS {
+        if (mut regs.read(Regs.request) & COMMAND_READY) == 0 {
+            return (mut regs.read(Regs.status) & IDLE) == 0
+        }
+    }
+    return false
+} ready
+
+/// The response in the buffer: the bytes its header's size states, within the buffer.
+fn read_response(mut env: CrbEnv) -> mem::Bytes {
+    var head = Array[u8, 6].filled(0)
+    for at in 0..<6usize {
+        head[at] = mut env.regs.read_at(Regs.buffer, index: at)
+    }
+    var size = usize.widen(head.view().u32_be(2))
+    if size > BUFFER_BYTES {
+        size = BUFFER_BYTES
+    }
+    var bytes = mem::Bytes.empty(env.alloc)
+    for at in 0..<size {
+        mut bytes.push(mut env.regs.read_at(Regs.buffer, index: at))
+    }
+    return bytes
+} read_response
+
+/// Answers the request `request` asking `operation`: with `failure`, else with `result`.
+fn answer(
+    request: u64,
+    take operation: Operation,
+    take result: Option[mem::Bytes],
+    failure: Option[devices::DeviceError],
+    alloc: mem::Alloc,
+    mut cx: sys::Cx[CrbDevice],
+    ) {
+    let returned = match result {
+        Some(bytes) => bytes
+        None => mem::Bytes.empty(alloc)
+    }
+    var reply = sys::Encoded.empty(alloc)
+    match operation {
+        Operation.Seal(secret: _, pcrs: _) => {
+            let outcome: Result[mem::Bytes, devices::DeviceError] = match failure {
+                Some(error) => Err(error)
+                None => Ok(take returned)
+            }
+            mem::wire::Codec[Result[mem::Bytes, devices::DeviceError]].encode(outcome, out: mut reply.bytes)
+        }
+        else => {
+            let outcome: Result[Untrusted[mem::Bytes], devices::DeviceError] = match failure {
+                Some(error) => Err(error)
+                None => Ok(Untrusted.of(take returned))
+            }
+            mem::wire::Codec[Result[Untrusted[mem::Bytes], devices::DeviceError]].encode(outcome, out: mut reply.bytes)
+        }
+    }
+    discard attempt mut cx.reply(request, reply)
+} answer
+
+fn elapsed_ns(clock: sys::Clock) -> u64 {
+    return match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} elapsed_ns
+
+test seals_and_unseals_flush_what_they_hold for Waiting.after {
+    let alloc = testing::world().alloc
+    var waiting = Waiting(request: 1, operation: Operation.Seal(secret: mem::Bytes.empty(alloc), pcrs: 0x80), step: Step.Primary, primary: 0, item: 0, session: 0, policy: None, result: None, failure: None)
+    var steps = mem::List[Step].empty(alloc)
+    loop {
+        mut steps.push(waiting.step)
+        let Some(next) = waiting.after() else {
+            break
+        }
+        waiting.step = next
+    }
+    expect steps.len() == 7 and steps[1] == Step.Trial and steps[4] == Step.FlushTrial and steps[5] == Step.Create and steps[6] == Step.FlushPrimary
+    waiting.step = Step.SessionPcr
+    waiting.operation = Operation.Unseal(sealed: tpm::Sealed(pcrs: 0x80, object: tpm::Object(public: mem::Bytes.empty(alloc), private: mem::Bytes.empty(alloc))))
+    waiting.failure = Some(devices::DeviceError.Policy)
+    expect waiting.after() == Some(Step.FlushSession)
+    waiting.step = Step.FlushSession
+    expect waiting.after() == Some(Step.FlushItem)
+} seals_and_unseals_flush_what_they_hold

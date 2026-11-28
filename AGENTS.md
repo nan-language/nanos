@@ -17,7 +17,8 @@ Only what an agent needs to place a change correctly. The why is in ADRs.
 | `ident/` | The `ident` package: the names, identifiers, hashes and times of NaN OS records |
 | `bootfmt/` | The `bootfmt` package: the boot record, the handoff record and the kernel image |
 | `acpi/` | The `acpi` package: the ACPI tables NaN OS reads |
-| `crypto/` | The `crypto` package: XChaCha20-Poly1305 sealing and BLAKE3 key derivation on secret values |
+| `crypto/` | The `crypto` package: XChaCha20-Poly1305 sealing and opening and BLAKE3 key derivation on secret values |
+| `tpm/` | The `tpm` package: the TPM 2.0 commands the `tpm-crb` driver sends, and the responses it reads |
 | `code/` | The `code` package: the records of bundle files, their code hash and their admission, reading their artefacts, gathering the sources they carry, making a bundle from what a bundle build writes, the `nan` job's request and report, the capability running its toolchain with the file system the toolchain reaches, and the capability reading the running kernel's interface file |
 | `admission/` | The `admission` package: the `admission` instance, judging bundles by the steps of admission, and checking them from their sources with the `nan` job's toolchain |
 | `os/` | The `os` package: the records instances and the core share, message headers, and the capability kinds `Port`, `Control`, `Live`, `Callers`, `Accounts` and `Meter` |

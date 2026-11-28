@@ -1,0 +1,113 @@
+//! Where `keys` keeps the machine's keys at rest: encrypted under a key the TPM seals, or in plaintext.
+
+/// The associated data of the machine's keys encrypted at rest.
+const STORED_AAD: Slice[u8] = b"NaN OS keys 1"
+
+/// The machine's keys as the checkpoint of `keys` holds them.
+pub closed enum Kept derives Encode {
+    /// In plaintext.
+    Plain(Held)
+    /// Encrypted under a 256-bit key the TPM seals to no PCR: the sealed key, the nonce, and the XChaCha20-Poly1305 sealing of the keys' encoding.
+    Sealed(blob: mem::Bytes, nonce: Array[u8, 24], keys: mem::Bytes)
+} Kept
+
+/// Where `/live/security` shows the keys kept.
+pub fn Kept.storage(self) -> os::KeyStorage {
+    return match self {
+        Kept.Plain(_) => os::KeyStorage.Software
+        Kept.Sealed(blob: _, nonce: _, keys: _) => os::KeyStorage.Tpm
+    }
+} Kept.storage
+
+/// A copy of `kept`.
+pub fn Kept.copied(self, alloc: mem::Alloc) -> Kept {
+    return match self {
+        Kept.Plain(held) => Kept.Plain(held)
+        Kept.Sealed(blob: blob, nonce: nonce, keys: keys) => Kept.Sealed(blob: copy_of(blob.view(), alloc), nonce: nonce, keys: copy_of(keys.view(), alloc))
+    }
+} Kept.copied
+
+fn copy_of(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    return copy
+} copy_of
+
+/// Keeps `held` with the TPM behind `tpm`, and gives `keys` the form its checkpoint takes.
+pub fn keep(
+    out: sys::Outbox[Keys],
+    held: Held,
+    tpm: os::Port[devices::Tpm],
+    random: sys::Random,
+    alloc: mem::Alloc,
+    ) fails task::Cancelled uses wait {
+    let kept = try await kept_of(held, tpm, random, alloc)
+    discard attempt await out.stored(take kept)
+} keep
+
+/// Gives `keys` the keys `kept` holds once the TPM behind `tpm` unseals them, `None` when it does not.
+pub fn unseal(out: sys::Outbox[Keys], take kept: Kept, tpm: Option[os::Port[devices::Tpm]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let held = try await unsealed(take kept, tpm, alloc)
+    discard attempt await out.unsealed(held)
+} unseal
+
+/// `held` as `keys` keeps it with the TPM behind `tpm`: encrypted under a key drawn from `random` that the TPM seals, else in plaintext when the TPM does not seal it.
+fn kept_of(held: Held, tpm: os::Port[devices::Tpm], random: sys::Random, alloc: mem::Alloc) -> Kept fails task::Cancelled uses wait {
+    let storage = drawn(random)
+    var secret = mem::Bytes.empty(alloc)
+    mut secret.append(storage.view())
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Tpm].seal(mut call, take secret, pcrs: 0)
+    let blob = match first attempt await tpm.call(take call, reply, alloc) {
+        Ok(sealed) => sealed
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return Kept.Plain(held)
+    }
+    var nonce = Array[u8, 24].filled(0)
+    discard attempt random.fill(mut nonce.view_mut())
+    var plain = mem::Bytes.empty(alloc)
+    mem::wire::Codec[Held].encode(held, out: mut plain)
+    let keys = crypto::seal(crypto::Key.of(storage), nonce, aad: STORED_AAD, plain: plain.view(), alloc)
+    return Kept.Sealed(blob: take blob, nonce: nonce, keys: take keys)
+} kept_of
+
+/// The keys `kept` holds: in plaintext, or once the TPM behind `tpm` unseals their key; `None` when it does not, or their key does not open them.
+fn unsealed(take kept: Kept, tpm: Option[os::Port[devices::Tpm]], alloc: mem::Alloc) -> Option[Held] fails task::Cancelled uses wait {
+    let Kept.Sealed(blob: blob, nonce: nonce, keys: keys) = kept else {
+        let Kept.Plain(held) = kept else {
+            return None
+        }
+        return Some(held)
+    }
+    let Some(port) = tpm else {
+        return None
+    }
+    var call = sys::Encoded.empty(alloc)
+    let reply = sys::Wire[devices::Tpm].unseal(mut call, take blob)
+    let secret = match first attempt await port.call(take call, reply, alloc) {
+        Ok(opened) => opened
+        Err(os::PortError.Cancelled(cancelled)) => fail cancelled
+        Err(_) => return None
+    }
+    let Some(storage) = storage_key(secret.view()) else {
+        return None
+    }
+    let Some(plain) = crypto::open(crypto::Key.of(storage), nonce, aad: STORED_AAD, sealed: keys.view(), alloc) else {
+        return None
+    }
+    return match attempt mem::wire::Codec[Held].decode(Untrusted.of(plain.view()), alloc) {
+        Ok(held) => Some(held)
+        Err(_) => None
+    }
+} unsealed
+
+/// The 256-bit key the TPM unsealed, `None` when it gave another length.
+validator fn storage_key(secret: Untrusted[Slice[u8]]) -> Option[Array[u8, 32]] {
+    let bytes = secret.inspect()
+    if bytes.len() != 32 {
+        return None
+    }
+    var key = Array[u8, 32].filled(0)
+    mut key.view_mut().copy_from(bytes)
+    return Some(key)
+} storage_key

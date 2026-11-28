@@ -1,0 +1,276 @@
+//! TPM 2.0 responses: their header checked, and the results NaN OS reads of them.
+
+/// The response codes NaN OS tells apart, each a format-zero code or a format-one error number.
+const HANDLE_ERROR: u32 = 0x0B
+
+const POLICY_FAIL: u32 = 0x1D
+
+const PCR_CHANGED: u32 = 0x0128
+
+const NV_RANGE: u32 = 0x0146
+
+const NV_UNINITIALIZED: u32 = 0x014A
+
+/// The bit marking a format-one response code, and the error number it carries.
+const FORMAT_ONE: u32 = 0x80
+
+const ERROR_NUMBER: u32 = 0x3F
+
+/// The bytes of a SHA-256 digest.
+const DIGEST_BYTES: usize = 32
+
+/// Why a response is not its command's success.
+pub closed enum TpmError derives Copy, Eq, Render {
+    /// It is shorter than its fields or its stated size, or holds another tag.
+    Malformed
+    /// The TPM failed the command with this response code.
+    Failed(u32)
+} TpmError
+
+/// What a successful response holds: the handle it names when its command creates an object or a session, then its parameters.
+pub closed struct Response {
+    pub handle: u32
+    pub parameters: Untrusted[mem::Bytes]
+} Response
+
+/// An object TPM2_Create returned: its public and its private area, each sized.
+pub closed struct Object derives Eq, Encode {
+    pub public: mem::Bytes
+    pub private: mem::Bytes
+} Object
+
+/// What `seal` returns and `unseal` takes: the PCRs the object's policy binds, then the object.
+pub closed struct Sealed derives Eq, Encode {
+    pub pcrs: u32
+    pub object: Object
+} Sealed
+
+/// Whether the TPM failed the command because a policy did not hold or the PCRs it reads changed meanwhile.
+pub fn TpmError.policy_failed(self) -> bool {
+    let TpmError.Failed(code) = self else {
+        return false
+    }
+    return code == PCR_CHANGED or ((code & FORMAT_ONE) != 0 and (code & ERROR_NUMBER) == POLICY_FAIL)
+} TpmError.policy_failed
+
+/// Whether the TPM failed the command because a handle it names does not exist, such as an NV index never defined.
+fn TpmError.absent(self) -> bool {
+    let TpmError.Failed(code) = self else {
+        return false
+    }
+    return (code & FORMAT_ONE) != 0 and (code & ERROR_NUMBER) == HANDLE_ERROR
+} TpmError.absent
+
+/// Whether the TPM failed an NV read outside the index, of an index never written, or of an absent one.
+pub fn TpmError.out_of_range(self) -> bool {
+    return self.absent() or self == TpmError.Failed(NV_RANGE) or self == TpmError.Failed(NV_UNINITIALIZED)
+} TpmError.out_of_range
+
+/// The success `raw` answers a command with: a handle first when `handle`, and when `sessions` the parameters sized and followed by an authorization area.
+pub validator fn Response.read(raw: Untrusted[Slice[u8]], handle: bool, sessions: bool, alloc: mem::Alloc) -> Response fails TpmError {
+    let bytes = raw.inspect()
+    if bytes.len() < 10 or usize.widen(bytes.u32_be(2)) != bytes.len() {
+        fail TpmError.Malformed
+    }
+    let code = bytes.u32_be(6)
+    if code != 0 {
+        fail TpmError.Failed(code)
+    }
+    let tag = match sessions {
+        true => TAG_SESSIONS
+        false => TAG_NO_SESSIONS
+    }
+    if bytes.u16_be(0) != tag {
+        fail TpmError.Malformed
+    }
+    var at: usize = 10
+    var named: u32 = 0
+    if handle {
+        named = try next_u32(bytes, mut at)
+    }
+    var end = bytes.len()
+    if sessions {
+        let size = usize.widen(try next_u32(bytes, mut at))
+        if size > bytes.len() - at {
+            fail TpmError.Malformed
+        }
+        end = at + size
+    }
+    return Response(handle: named, parameters: Untrusted.of(copied(bytes, from: at, to: end, alloc)))
+} Response.read
+
+/// The first sized buffer of `parameters`: the bytes TPM2_GetRandom, TPM2_NV_Read and TPM2_Unseal return.
+pub validator fn sized(parameters: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails TpmError {
+    let bytes = parameters.inspect()
+    var at: usize = 0
+    let size = usize.widen(try next_u16(bytes, mut at))
+    try skip(bytes, mut at, count: size)
+    return Untrusted.of(copied(bytes, from: 2, to: at, alloc))
+} sized
+
+/// The policy digest TPM2_PolicyGetDigest returns.
+pub validator fn policy_digest(parameters: Untrusted[Slice[u8]]) -> Array[u8, 32] fails TpmError {
+    let bytes = parameters.inspect()
+    var at: usize = 0
+    if usize.widen(try next_u16(bytes, mut at)) != DIGEST_BYTES or bytes.len() < at + DIGEST_BYTES {
+        fail TpmError.Malformed
+    }
+    var digest = Array[u8, 32].filled(0)
+    for i in 0..<DIGEST_BYTES {
+        digest[i] = bytes[at + i]
+    }
+    return digest
+} policy_digest
+
+/// The SHA-256 value TPM2_PCR_Read returns of the one PCR it was asked.
+pub validator fn pcr_value(parameters: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails TpmError {
+    let bytes = parameters.inspect()
+    var at: usize = 4
+    let selections = try next_u32(bytes, mut at)
+    for _ in 0..<selections {
+        try skip(bytes, mut at, count: 2)
+        let size = usize.widen(try next_u8(bytes, mut at))
+        try skip(bytes, mut at, count: size)
+    }
+    if try next_u32(bytes, mut at) != 1 or usize.widen(try next_u16(bytes, mut at)) != DIGEST_BYTES {
+        fail TpmError.Malformed
+    }
+    let start = at
+    try skip(bytes, mut at, count: DIGEST_BYTES)
+    return Untrusted.of(copied(bytes, from: start, to: at, alloc))
+} pcr_value
+
+/// The object TPM2_Create returns: its private area, then its public one, each sized.
+pub validator fn created(parameters: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Object fails TpmError {
+    let bytes = parameters.inspect()
+    var at: usize = 0
+    let private = try sized_area(bytes, mut at, alloc)
+    let public = try sized_area(bytes, mut at, alloc)
+    return Object(public: take public, private: take private)
+} created
+
+/// The bytes `seal` returns: the PCRs, then the object's public and private areas.
+pub fn Sealed.to_bytes(self, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.zeroed(4, alloc)
+    mut bytes.view_mut().write_u32_be(0, value: self.pcrs)
+    mut bytes.append(self.object.public.view())
+    mut bytes.append(self.object.private.view())
+    return bytes
+} Sealed.to_bytes
+
+/// The sealed object `blob` holds, `None` when it is no such object.
+pub fn Sealed.read(blob: Slice[u8], alloc: mem::Alloc) -> Option[Sealed] {
+    var at: usize = 4
+    if blob.len() < at {
+        return None
+    }
+    let Ok(public) = attempt sized_area(blob, mut at, alloc) else {
+        return None
+    }
+    let Ok(private) = attempt sized_area(blob, mut at, alloc) else {
+        return None
+    }
+    if at != blob.len() {
+        return None
+    }
+    return Some(Sealed(pcrs: blob.u32_be(0), object: Object(public: take public, private: take private)))
+} Sealed.read
+
+/// The sized area at `at`, its size included.
+fn sized_area(bytes: Slice[u8], mut at: usize, alloc: mem::Alloc) -> mem::Bytes fails TpmError {
+    let start = at
+    let size = usize.widen(try next_u16(bytes, mut at))
+    try skip(bytes, mut at, count: size)
+    return copied(bytes, from: start, to: at, alloc)
+} sized_area
+
+fn next_u8(bytes: Slice[u8], mut at: usize) -> u8 fails TpmError {
+    if at >= bytes.len() {
+        fail TpmError.Malformed
+    }
+    at += 1
+    return bytes[at - 1]
+} next_u8
+
+fn next_u16(bytes: Slice[u8], mut at: usize) -> u16 fails TpmError {
+    if at > bytes.len() or bytes.len() - at < 2 {
+        fail TpmError.Malformed
+    }
+    at += 2
+    return bytes.u16_be(at - 2)
+} next_u16
+
+fn next_u32(bytes: Slice[u8], mut at: usize) -> u32 fails TpmError {
+    if at > bytes.len() or bytes.len() - at < 4 {
+        fail TpmError.Malformed
+    }
+    at += 4
+    return bytes.u32_be(at - 4)
+} next_u32
+
+fn skip(bytes: Slice[u8], mut at: usize, count: usize) fails TpmError {
+    if at > bytes.len() or bytes.len() - at < count {
+        fail TpmError.Malformed
+    }
+    at += count
+} skip
+
+/// The bytes of `bytes` from `from` to `to`, excluded.
+fn copied(bytes: Slice[u8], from: usize, to: usize, alloc: mem::Alloc) -> mem::Bytes {
+    var copy = mem::Bytes.empty(alloc)
+    for at in from..<to {
+        mut copy.push(bytes[at])
+    }
+    return copy
+} copied
+
+fn read_bytes(raw: Slice[u8], handle: bool, sessions: bool, alloc: mem::Alloc) -> Result[Response, TpmError] {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(raw)
+    return attempt Response.read(Untrusted.of(bytes.view()), handle, sessions, alloc)
+} read_bytes
+
+test responses_give_their_parameters for Response.read {
+    let alloc = testing::world().alloc
+    let Ok(random) = read_bytes(b"\x80\x01\x00\x00\x00\x10\x00\x00\x00\x00\x00\x04\x01\x02\x03\x04", handle: false, sessions: false, alloc) else {
+        expect false
+        return
+    }
+    let drawn = try sized(random.parameters.view(), alloc)
+    expect drawn.byte_len() == 4
+    let Ok(primary) = read_bytes(b"\x80\x02\x00\x00\x00\x16\x00\x00\x00\x00\x80\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01\x00", handle: true, sessions: true, alloc) else {
+        expect false
+        return
+    }
+    expect primary.handle == 0x8000_0001 and primary.parameters.byte_len() == 0
+    let refused = read_bytes(b"\x80\x01\x00\x00\x00\x0a\x00\x00\x09\x9d", handle: false, sessions: false, alloc)
+    let Err(policy) = refused else {
+        expect false
+        return
+    }
+    expect policy == TpmError.Failed(0x099D) and policy.policy_failed()
+    expect TpmError.Failed(0x018B).absent() and TpmError.Failed(0x014A).out_of_range()
+    let short = read_bytes(b"\x80\x01\x00\x00\x00\x0b\x00\x00\x00\x00", handle: false, sessions: false, alloc)
+    let Err(malformed) = short else {
+        expect false
+        return
+    }
+    expect malformed == TpmError.Malformed
+} responses_give_their_parameters
+
+test sealed_objects_read_back for Sealed.read {
+    let alloc = testing::world().alloc
+    var public = mem::Bytes.empty(alloc)
+    mut public.append(b"\x00\x02\xAA\xBB")
+    var private = mem::Bytes.empty(alloc)
+    mut private.append(b"\x00\x01\xCC")
+    let sealed = Sealed(pcrs: 0x0000_0080, object: Object(public: take public, private: take private))
+    let bytes = sealed.to_bytes(alloc)
+    let Some(read) = Sealed.read(bytes.view(), alloc) else {
+        expect false
+        return
+    }
+    expect read == sealed
+    let cut = Sealed.read(b"\x00\x00\x00\x00\x00\x05\xAA", alloc)
+    expect cut.is_none()
+} sealed_objects_read_back

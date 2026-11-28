@@ -1,4 +1,4 @@
-//! The `keys` instance: the link, audit and keyring master keys it generates from the kernel's entropy and keeps in plaintext in its checkpoint, the principal records it writes at enrollment, rotation and revocation, and the signatures it verifies against them.
+//! The `keys` instance: the link, audit and keyring master keys it generates from the kernel's entropy and keeps in its checkpoint, encrypted under a key the TPM seals or in plaintext without one, the principal records it writes at enrollment, rotation and revocation, and the signatures it verifies against them.
 
 /// The key of the keyed task bringing `/sys/principals/owner` to the loader's owner key.
 const OWNING: u64 = 1
@@ -6,33 +6,34 @@ const OWNING: u64 = 1
 /// The key of the keyed task publishing what `keys` tells of the machine's security.
 const SHOWING: u64 = 2
 
+/// The keys of the keyed tasks sealing the machine's keys and unsealing them.
+const KEEPING: u64 = 3
+
+const UNSEALING: u64 = 4
+
 /// The key of the keyed task serving a request, plus its number.
 const SERVING: u64 = 0x1_0000_0000
 
 /// The type of the part of `/live/security` `keys` publishes.
 const KEYS_SECURITY_TYPE: Str = "os::KeysSecurity"
 
-/// The state of `keys`, its checkpoint: the machine's keys once generated.
+/// The state of `keys`, its checkpoint: the machine's keys as it keeps them, once generated.
 pub closed struct Keyring derives Encode {
-    pub held: Option[keys::Held]
+    pub kept: Option[keys::Kept]
 } Keyring
 
 impl Keyring: sys::Component[keys::Env, keys::Keys]
 
 impl Keyring: sys::Resume[keys::Env, keys::Keys]
 
-pub fn Keyring.start(mut env: keys::Env) -> Keyring = Keyring(held: None)
+pub fn Keyring.start(mut env: keys::Env) -> Keyring = Keyring(kept: None)
 
-/// Once its checkpoints are kept, generates the machine's keys when it holds none and has them checkpointed at once, publishes its part of `/live/security`, and brings the owner's record to the loader's owner key.
+/// Once its checkpoints are kept: generates the machine's keys when it holds none and keeps them, seals keys it holds in plaintext on a machine with a TPM, unseals the keys it holds sealed, publishes its part of `/live/security`, and brings the owner's record to the loader's owner key.
 pub fn Keyring.resume(mut self, reason: sys::ResumeReason, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
     if not env.kept {
         return
     }
-    if self.held.is_none() {
-        self.held = Some(keys::generated(env.random))
-        discard attempt mut cx.sync()
-    }
-    mut self.show(mut env, mut cx)
+    mut self.hold(mut env, mut cx)
     let principals = env.principals
     let events = env.events
     let owner = env.owner
@@ -41,6 +42,61 @@ pub fn Keyring.resume(mut self, reason: sys::ResumeReason, mut env: keys::Env, m
         try await keys::own(principals, events, owner, alloc)
     })
 } Keyring.resume
+
+/// Holds the machine's keys: those it generates when it keeps none, those it keeps in plaintext, sealed anew on a machine with a TPM, or, from a keyed task, those the TPM unseals.
+fn Keyring.hold(mut self, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
+    let Some(kept) = self.kept else {
+        mut self.keep(keys::generated(env.random), mut env, mut cx)
+        return
+    }
+    let copy = kept.copied(env.alloc)
+    match copy {
+        keys::Kept.Plain(held) => {
+            if env.tpm.is_some() {
+                mut self.keep(held, mut env, mut cx)
+                return
+            }
+            env.held = Some(held)
+            mut self.show(mut env, mut cx)
+        }
+        keys::Kept.Sealed(blob: _, nonce: _, keys: _) => {
+            let tpm = env.tpm
+            let alloc = env.alloc
+            mut cx.spawn(key: UNSEALING, run: fn[take copy](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+                try await keys::unseal(out, kept: take copy, tpm, alloc)
+            })
+        }
+    }
+} Keyring.hold
+
+/// Holds `held` and keeps it: sealed by the TPM from a keyed task, the checkpoint taking it once sealed, or in plaintext at once without a TPM.
+fn Keyring.keep(mut self, held: keys::Held, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
+    env.held = Some(held)
+    let Some(tpm) = env.tpm else {
+        self.kept = Some(keys::Kept.Plain(held))
+        discard attempt mut cx.sync()
+        mut self.show(mut env, mut cx)
+        return
+    }
+    let random = env.random
+    let alloc = env.alloc
+    mut cx.spawn(key: KEEPING, run: fn(out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
+        try await keys::keep(out, held, tpm, random, alloc)
+    })
+} Keyring.keep
+
+/// Takes the form in which the checkpoint keeps the machine's keys, has it checkpointed at once, and publishes its part of `/live/security`.
+fn Keyring.stored(mut self, take kept: keys::Kept, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
+    self.kept = Some(take kept)
+    discard attempt mut cx.sync()
+    mut self.show(mut env, mut cx)
+} Keyring.stored
+
+/// Holds the machine's keys the TPM unsealed, and publishes its part of `/live/security`; without them `keys` serves nothing that needs them.
+fn Keyring.unsealed(mut self, take held: Option[keys::Held], mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
+    env.held = held
+    mut self.show(mut env, mut cx)
+} Keyring.unsealed
 
 pub fn Keyring.verify(
     mut self,
@@ -129,7 +185,10 @@ pub fn Keyring.seal_secret(
     mut env: keys::Env,
     mut cx: sys::Cx[keys::Keys],
     ) -> mem::Bytes fails store::service::Failure {
-    let Some(held) = self.held else {
+    let Some(held) = env.held else {
+        fail store::service::Failure.Denied
+    }
+    if self.kept.is_none() {
         fail store::service::Failure.Denied
     }
     let alloc = env.alloc
@@ -169,17 +228,17 @@ pub fn Keyring.rotate(mut self, take rotation: keys::Rotation, mut env: keys::En
             fail keys::KeysFailure.Unavailable
         }
         keys::Rotation.Link => {
-            let Some(held) = mut self.held.extract() else {
+            let Some(held) = env.held else {
                 fail keys::KeysFailure.Unavailable
             }
-            self.held = Some(keys::Held(link_static: keys::drawn(env.random), link_identity: keys::drawn(env.random), audit: held.audit, master: held.master))
+            mut self.keep(keys::Held(link_static: keys::drawn(env.random), link_identity: keys::drawn(env.random), audit: held.audit, master: held.master), mut env, mut cx)
             mut self.rotated(keys::KeyRotated.Link, mut env, mut cx)
         }
         keys::Rotation.Audit => {
-            let Some(held) = mut self.held.extract() else {
+            let Some(held) = env.held else {
                 fail keys::KeysFailure.Unavailable
             }
-            self.held = Some(keys::Held(link_static: held.link_static, link_identity: held.link_identity, audit: keys::drawn(env.random), master: held.master))
+            mut self.keep(keys::Held(link_static: held.link_static, link_identity: held.link_identity, audit: keys::drawn(env.random), master: held.master), mut env, mut cx)
             mut self.rotated(keys::KeyRotated.Audit, mut env, mut cx)
         }
     }
@@ -216,9 +275,8 @@ fn Keyring.answered(
     mut cx.cancel(key: SERVING + request)
 } Keyring.answered
 
-/// Has the rotated machine keys checkpointed at once, emits `auth.key-rotated` naming `rotated` and publishes the new public keys.
+/// Emits `auth.key-rotated` naming `rotated` and publishes the new public keys.
 fn Keyring.rotated(mut self, take rotated: keys::KeyRotated, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
-    discard attempt mut cx.sync()
     mut self.show(mut env, mut cx)
     let events = env.events
     let alloc = env.alloc
@@ -227,11 +285,15 @@ fn Keyring.rotated(mut self, take rotated: keys::KeyRotated, mut env: keys::Env,
     })
 } Keyring.rotated
 
-/// Publishes the part of `/live/security` `keys` tells: whether it runs in its isolated space, that it keeps its keys in software, and the public halves of the link key.
+/// Publishes the part of `/live/security` `keys` tells once it holds and keeps the machine's keys: whether it runs in its isolated space, whether the TPM seals its keys, and the public halves of the link key.
 fn Keyring.show(mut self, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
     let alloc = env.alloc
-    let identity = match self.held {
+    let identity = match env.held {
         Some(held) => core::crypto::SecretKey.of_seed(held.link_identity).public_key().bytes
+        None => return
+    }
+    let storage = match self.kept {
+        Some(kept) => kept.storage()
         None => return
     }
     var ed25519 = mem::Bytes.empty(alloc)
@@ -240,7 +302,7 @@ fn Keyring.show(mut self, mut env: keys::Env, mut cx: sys::Cx[keys::Keys]) {
         true => os::KeysSpace.Isolated
         false => os::KeysSpace.Unconfined
     }
-    let part = os::KeysSecurity(keys: space, key_storage: os::KeyStorage.Software, link_keys: os::LinkKeys(x25519: mem::Bytes.empty(alloc), ed25519: take ed25519))
+    let part = os::KeysSecurity(keys: space, key_storage: storage, link_keys: os::LinkKeys(x25519: mem::Bytes.empty(alloc), ed25519: take ed25519))
     let live = env.live
     mut cx.spawn(key: SHOWING, run: fn[take part](out: sys::Outbox[keys::Keys]) fails task::Cancelled uses wait limits stack 32_768 {
         try await live.publish(type: KEYS_SECURITY_TYPE, value: part, alloc)
